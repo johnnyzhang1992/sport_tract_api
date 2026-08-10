@@ -1,0 +1,24 @@
+# 仅后端容器；MongoDB 使用现有实例（决策 D11），通过环境变量注入连接串
+services:
+  api:
+    build: .
+    image: sport-track-api:latest
+    container_name: sport-track-api
+    ports:
+      - "3004:3004"
+    environment:
+      NODE_ENV: production
+      PORT: 3004
+      MONGODB_URI: ${MONGODB_URI}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      WX_APPID: ${WX_APPID}
+      WX_SECRET: ${WX_SECRET}
+      OSS_REGION: ${OSS_REGION}
+      OSS_BUCKET: ${OSS_BUCKET}
+      OSS_ENDPOINT: ${OSS_ENDPOINT}
+      OSS_AK_ID: ${OSS_AK_ID}
+      OSS_AK_SECRET: ${OSS_AK_SECRET}
+      OSS_ROLE_ARN: ${OSS_ROLE_ARN}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+    restart: unless-stopped
