@@ -8,6 +8,8 @@ import errorHandlerPlugin from './plugins/error-handler.js';
 import { authRoutes } from './routes/auth.routes.js';
 import { userRoutes } from './routes/user.routes.js';
 import { ossRoutes } from './routes/oss.routes.js';
+import { activityRoutes } from './routes/activity.routes.js';
+import { statsRoutes } from './routes/stats.routes.js';
 
 export interface BuildAppOptions {
   /** 日志开关（测试传 false；默认 dev 用 pino-pretty，prod 用 JSON） */
@@ -38,6 +40,8 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(authRoutes, { prefix: `${config.apiPrefix}/auth` });
   await fastify.register(userRoutes, { prefix: `${config.apiPrefix}/users` });
   await fastify.register(ossRoutes, { prefix: `${config.apiPrefix}/oss` });
+  await fastify.register(activityRoutes, { prefix: `${config.apiPrefix}/activities` });
+  await fastify.register(statsRoutes, { prefix: `${config.apiPrefix}/stats` });
 
   // 健康检查（含 MongoDB 状态）
   fastify.get('/health', async () => ({

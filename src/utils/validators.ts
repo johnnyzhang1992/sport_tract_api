@@ -31,6 +31,87 @@ export const StsSchema = z.object({
   dir: z.string().regex(/^[a-z0-9-]+$/, '目录名只允许小写字母/数字/中划线').optional(),
 });
 
+// ==================== 运动记录（M2） ====================
+
+const TrackPointSchema = z.object({
+  seq: z.number().int().positive('seq 必须为正整数'),
+  lat: z.number().min(-90).max(90, '纬度不合法'),
+  lng: z.number().min(-180).max(180, '经度不合法'),
+  altitude: z.number().nullable().optional(),
+  speed: z.number().nonnegative().nullable().optional(),
+  timestamp: z.number().positive('时间戳不合法'),
+});
+
+/** 创建活动 */
+export const CreateActivitySchema = z.object({
+  type: z.enum(['hiking', 'walking', 'running', 'cycling', 'mountaineering', 'swimming'], {
+    message: '运动类型不合法',
+  }),
+  startTime: z.number().positive('开始时间不合法'),
+  deviceInfo: z.record(z.string(), z.unknown()).optional(),
+});
+
+/** 增量上传轨迹点 */
+export const AppendPointsSchema = z.object({
+  fromSeq: z.number().int().nonnegative().optional(),
+  points: z
+    .array(TrackPointSchema)
+    .min(1, 'points 不能为空')
+    .max(2000, '单次最多上传 2000 个点'),
+});
+
+/** 打点类型 */
+export const MarkerTypeSchema = z.enum(['checkpoint', 'rest', 'photo', 'note']);
+
+/** 照片 URL：允许空字符串（未拍照）或合法 URL */
+const PhotoUrlSchema = z.union([z.literal(''), z.string().url('照片地址不合法').max(500)]);
+
+/** 新增打点 */
+export const CreateMarkerSchema = z.object({
+  id: z.string().min(1).max(64),
+  lat: z.number().min(-90).max(90),
+  lng: z.number().min(-180).max(180),
+  timestamp: z.number().positive(),
+  type: MarkerTypeSchema.default('checkpoint'),
+  note: z.string().max(500).default(''),
+  photoUrl: PhotoUrlSchema.optional().default(''),
+  address: z.string().max(200).optional().default(''),
+});
+
+/** 编辑打点 */
+export const UpdateMarkerSchema = z.object({
+  type: MarkerTypeSchema.optional(),
+  note: z.string().max(500).optional(),
+  photoUrl: PhotoUrlSchema.optional(),
+  address: z.string().max(200).optional(),
+});
+
+/** 结束活动（final 包，服务端对账） */
+export const FinishActivitySchema = z.object({
+  trackPoints: z.array(TrackPointSchema).max(20000, '轨迹点超出上限'),
+  markers: z.array(CreateMarkerSchema).optional(),
+  startAddress: z.string().max(200).optional().default(''),
+  endAddress: z.string().max(200).optional().default(''),
+  pausedMs: z.number().nonnegative().optional().default(0),
+  endTime: z.number().positive('结束时间不合法').optional(),
+  weightKg: z.number().positive().max(300).optional(),
+  deviceInfo: z.record(z.string(), z.unknown()).optional(),
+});
+
+/** 活动列表查询 */
+export const ListActivitiesQuery = z.object({
+  type: z.enum(['hiking', 'walking', 'running', 'cycling', 'mountaineering', 'swimming']).optional(),
+  month: z.string().regex(/^\d{4}-\d{2}$/, 'month 格式应为 YYYY-MM').optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(100).default(20),
+});
+
 export type LoginInput = z.infer<typeof LoginSchema>;
 export type RefreshInput = z.infer<typeof RefreshSchema>;
 export type UpdateMeInput = z.infer<typeof UpdateMeSchema>;
+export type CreateActivityInput = z.infer<typeof CreateActivitySchema>;
+export type AppendPointsInput = z.infer<typeof AppendPointsSchema>;
+export type CreateMarkerInput = z.infer<typeof CreateMarkerSchema>;
+export type UpdateMarkerInput = z.infer<typeof UpdateMarkerSchema>;
+export type FinishActivityInput = z.infer<typeof FinishActivitySchema>;
+export type ListActivitiesQueryInput = z.infer<typeof ListActivitiesQuery>;

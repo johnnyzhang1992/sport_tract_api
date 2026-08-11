@@ -83,21 +83,41 @@ sport_track_api/
 └── pnpm-workspace.yaml      # 依赖构建脚本白名单
 ```
 
-## API 一览（M1 已实现）
+## API 一览（M1 + M2 已实现）
 
+### 认证与用户
 | 方法 | 路径 | 说明 | 鉴权 |
 |---|---|---|---|
 | POST | `/api/auth/login` | 微信 code → openid → 查/建用户 → JWT | 无 |
 | POST | `/api/auth/refresh` | refreshToken → 新 accessToken | 无 |
 | GET | `/api/users/me` | 当前用户资料 | ✅ |
 | PUT | `/api/users/me` | 更新昵称/头像/性别/设置 | ✅ |
-| POST | `/api/oss/sts` | 签发 OSS 直传临时凭证（目录按 userId 隔离） | ✅ |
-| GET | `/health` | 健康检查（含 MongoDB 状态） | 无 |
+
+### 运动记录（M2 核心同步协议）
+| 方法 | 路径 | 说明 | 鉴权 |
+|---|---|---|---|
+| POST | `/api/activities` | 创建进行中活动 | ✅ |
+| POST | `/api/activities/:id/points` | 增量上传轨迹点（按 seq 幂等去重） | ✅ |
+| POST | `/api/activities/:id/markers` | 新增打点（运动中） | ✅ |
+| PUT | `/api/activities/:id/finish` | 结束：final 包对账 + 服务端重算指标 | ✅ |
+| PUT | `/api/activities/:id/cancel` | 放弃活动 | ✅ |
+| GET | `/api/activities` | 列表（分页 + 类型/月份筛选，含 pointsCount/markerCount/首尾点） | ✅ |
+| GET | `/api/activities/:id` | 详情（完整点集 + 打点） | ✅ |
+| GET | `/api/activities/:id/gpx` | 导出 GPX（markers 作航点） | ✅ |
+| DELETE | `/api/activities/:id` | 删除 | ✅ |
+
+### 统计与其他
+| 方法 | 路径 | 说明 | 鉴权 |
+|---|---|---|---|
+| GET | `/api/stats/overview` | 今日/本周/本月/累计聚合 | ✅ |
+| GET | `/api/stats/trend` | 近 7/30 天距离与时长（补零） | ✅ |
+| POST | `/api/oss/sts` | 签发 OSS 直传临时凭证 | ✅ |
+| GET | `/health` | 健康检查 | 无 |
 
 ## 里程碑进度
 
 - [x] M1：Fastify 骨架、MongoDB 连接建库、微信登录 + JWT、OSS STS、Docker 化
-- [ ] M2：运动记录核心（活动 CRUD + 增量上传同步 + finish 对账）
-- [ ] M3：打点 + 轨迹管理
-- [ ] M4：统计聚合、GPX 导出、小程序码
+- [x] M2：运动记录核心（活动 CRUD + 增量上传幂等同步 + finish 对账 + GPX 导出 + 统计聚合）
+- [ ] M3：打点管理（编辑/删除） + 轨迹列表前端
+- [ ] M4：小程序码、分享
 - [ ] M5：打磨发布
