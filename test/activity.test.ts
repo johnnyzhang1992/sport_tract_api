@@ -347,6 +347,38 @@ test('删除不存在的打点 → 404', async () => {
   assert.equal(res.statusCode, 404);
 });
 
+test('轨迹平滑：抖动点被滑动平均修正，端点保持', async () => {
+  const created = await req('POST', '/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+
+  // 5 个点：直线 31.2304→31.2344，中间点故意抖动（31.2420 偏离 ~850m）
+  const res = await req('PUT', `/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.2304, lng: 121.4737, altitude: null, speed: null, timestamp: TEST_NOW - 40000 },
+        { seq: 2, lat: 31.2314, lng: 121.4738, altitude: null, speed: null, timestamp: TEST_NOW - 30000 },
+        { seq: 3, lat: 31.2420, lng: 121.4739, altitude: null, speed: null, timestamp: TEST_NOW - 20000 }, // 抖动点
+        { seq: 4, lat: 31.2334, lng: 121.474, altitude: null, speed: null, timestamp: TEST_NOW - 10000 },
+        { seq: 5, lat: 31.2344, lng: 121.4741, altitude: null, speed: null, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const pts = res.json().data.activity.trackPoints;
+  assert.equal(pts.length, 5);
+  // 端点保持原值
+  assert.equal(pts[0].lat, 31.2304);
+  assert.equal(pts[4].lat, 31.2344);
+  // 抖动点（第 3 个）被修正：远离 31.2420，接近 5 点窗口均值 31.23432
+  assert.ok(Math.abs(pts[2].lat - 31.2420) > 0.005, `抖动点应被修正, lat=${pts[2].lat}`);
+  assert.ok(Math.abs(pts[2].lat - 31.23432) < 0.001, `应接近窗口均值, lat=${pts[2].lat}`);
+});
+
 test('删除带照片的活动：OSS 未配置时优雅跳过，不影响删除', async () => {
   const created = await req('POST', '/api/activities', {
     token: tokenA,

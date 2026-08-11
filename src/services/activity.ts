@@ -1,7 +1,8 @@
 import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
-import { calcStats } from '../utils/pace.js';
+import { calcStats, haversineDistance } from '../utils/pace.js';
+import { smoothTrackSmart } from '../utils/smooth.js';
 import { deleteOssObjects } from './oss.js';
 import type {
   AppendPointsInput,
@@ -217,7 +218,10 @@ export async function finishActivity(
 
   const endTime = input.endTime ?? Date.now();
   const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs) / 1000);
-  const stats = calcStats(trackPoints, {
+
+  // 轨迹平滑（滑动平均 + 位移守卫）：抑制 GPS 抖动，端点保持，位移过大回退原值
+  const smoothedPoints = smoothTrackSmart(trackPoints, 5, haversineDistance);
+  const stats = calcStats(smoothedPoints, {
     type: activity.type,
     durationSec,
     weightKg: input.weightKg,
@@ -229,7 +233,7 @@ export async function finishActivity(
       $set: {
         status: 'finished',
         endTime,
-        trackPoints,
+        trackPoints: smoothedPoints,
         markers: input.markers ?? activity.markers ?? [],
         startAddress: input.startAddress,
         endAddress: input.endAddress,
