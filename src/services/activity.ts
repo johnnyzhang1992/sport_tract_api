@@ -3,6 +3,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance } from '../utils/pace.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
+import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
 import type {
   AppendPointsInput,
@@ -226,8 +227,11 @@ export async function finishActivity(
   const endTime = input.endTime ?? Date.now();
   const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs) / 1000);
 
+  // 海拔尖刺清洗（GPS 误差：短时间大幅跳变且方向反转 → 海拔置 null）
+  const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
+
   // 轨迹平滑（滑动平均 + 位移守卫）：抑制 GPS 抖动，端点保持，位移过大回退原值
-  const smoothedPoints = smoothTrackSmart(trackPoints, 5, haversineDistance);
+  const smoothedPoints = smoothTrackSmart(altitudeCleaned, 5, haversineDistance);
   const stats = calcStats(smoothedPoints, {
     type: activity.type,
     durationSec,

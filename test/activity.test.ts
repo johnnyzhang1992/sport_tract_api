@@ -411,3 +411,64 @@ test('删除带照片的活动：OSS 未配置时优雅跳过，不影响删除'
   const detail = await req('GET', `/api/activities/${id}`, { token: tokenA });
   assert.equal(detail.statusCode, 404);
 });
+
+// ==================== 海拔尖刺清洗 ====================
+
+test('海拔尖刺清洗：短时间跳变且方向反转 → 置 null', async () => {
+  const created = await req('POST', '/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+
+  const base = TEST_NOW - 50000;
+  // 海拔：38 → 25(尖刺) → 38，时间间隔 10s
+  const res = await req('PUT', `/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.2304, lng: 121.4737, altitude: 38, speed: 1, timestamp: base },
+        { seq: 2, lat: 31.2314, lng: 121.4738, altitude: 25, speed: 1, timestamp: base + 10000 }, // 尖刺
+        { seq: 3, lat: 31.2324, lng: 121.4739, altitude: 38, speed: 1, timestamp: base + 20000 },
+        { seq: 4, lat: 31.2334, lng: 121.474, altitude: 39, speed: 1, timestamp: base + 30000 },
+        { seq: 5, lat: 31.2344, lng: 121.4741, altitude: 40, speed: 1, timestamp: base + 40000 },
+      ],
+      endTime: TEST_NOW,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const pts = res.json().data.activity.trackPoints;
+  // 尖刺点海拔被置 null，正常点保留
+  assert.equal(pts[1].altitude, null, '尖刺点海拔应为 null');
+  assert.equal(pts[0].altitude, 38);
+  assert.equal(pts[4].altitude, 40);
+  // 经纬度保留
+  assert.equal(pts[1].lat, 31.2314);
+});
+
+test('海拔尖刺清洗：真实爬坡（速率正常）不被误伤', async () => {
+  const created = await req('POST', '/api/activities', {
+    token: tokenA,
+    body: { type: 'hiking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+
+  const base = TEST_NOW - 50000;
+  // 缓慢爬升：每 10s 升 2m（0.2 m/s，正常）
+  const res = await req('PUT', `/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 30, lng: 120, altitude: 100, speed: 1, timestamp: base },
+        { seq: 2, lat: 30.001, lng: 120, altitude: 102, speed: 1, timestamp: base + 10000 },
+        { seq: 3, lat: 30.002, lng: 120, altitude: 104, speed: 1, timestamp: base + 20000 },
+        { seq: 4, lat: 30.003, lng: 120, altitude: 106, speed: 1, timestamp: base + 30000 },
+      ],
+      endTime: TEST_NOW,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const pts = res.json().data.activity.trackPoints;
+  assert.equal(pts[1].altitude, 102, '正常爬升海拔应保留');
+  assert.equal(pts[3].altitude, 106);
+});
