@@ -164,6 +164,25 @@ test('重复 finish → 幂等返回', async () => {
   assert.equal(res.json().data.status, 'finished');
 });
 
+test('空轨迹点直接结束（随时可结束）', async () => {
+  const created = await req('POST', '/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 30000 },
+  });
+  const id = created.json().data.activityId;
+
+  const res = await req('PUT', `/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: [], endTime: TEST_NOW },
+  });
+  assert.equal(res.statusCode, 200);
+  const data = res.json().data;
+  assert.equal(data.status, 'finished');
+  assert.equal(data.lastPointSeq, 0);
+  assert.equal(data.activity.distance, 0);
+  assert.equal(data.activity.trackPoints.length, 0);
+});
+
 test('越权：B 用户访问 A 的活动 → 404', async () => {
   const res = await req('GET', `/api/activities/${activityId}`, { token: tokenB });
   assert.equal(res.statusCode, 404);
@@ -173,8 +192,10 @@ test('活动列表：包含统计字段，不含完整点集', async () => {
   const res = await req('GET', '/api/activities?page=1&pageSize=10', { token: tokenA });
   assert.equal(res.statusCode, 200);
   const data = res.json().data;
-  assert.equal(data.total, 1);
-  const item = data.items[0];
+  assert.ok(data.total >= 1);
+  // 按 id 定位主活动（列表按 startTime 倒序，主活动不一定在首位；聚合返回 _id）
+  const item = data.items.find((i: { _id: string }) => String(i._id) === activityId);
+  assert.ok(item, '列表包含主活动');
   assert.equal(item.pointsCount, 5);
   assert.equal(item.markerCount, 1);
   assert.ok(item.firstPoint);

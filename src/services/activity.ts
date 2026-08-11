@@ -213,9 +213,7 @@ export async function finishActivity(
     })
     .sort((a, b) => a.seq - b.seq);
 
-  if (trackPoints.length === 0) {
-    throw new AppError(400, 'final 包缺少轨迹点');
-  }
+  // 允许空轨迹点（用户随时结束）：指标按 0 处理
 
   const endTime = input.endTime ?? Date.now();
   const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs) / 1000);
@@ -242,7 +240,7 @@ export async function finishActivity(
         calories: stats.calories,
         elevationGain: stats.elevationGain,
         maxAltitude: stats.maxAltitude,
-        lastPointSeq: trackPoints[trackPoints.length - 1].seq,
+        lastPointSeq: trackPoints.length > 0 ? trackPoints[trackPoints.length - 1].seq : 0,
       },
     },
     { returnDocument: 'after' },
