@@ -38,7 +38,8 @@ const TrackPointSchema = z.object({
   lat: z.number().min(-90).max(90, '纬度不合法'),
   lng: z.number().min(-180).max(180, '经度不合法'),
   altitude: z.number().nullable().optional(),
-  speed: z.number().nonnegative().nullable().optional(),
+  // 负数 speed（微信定位异常值）容错归 null
+  speed: z.number().nullable().optional().default(null).transform((v) => (v != null && v < 0 ? null : v)),
   timestamp: z.number().positive('时间戳不合法'),
 });
 
@@ -97,7 +98,7 @@ export const FinishActivitySchema = z.object({
   markers: z.array(CreateMarkerSchema).optional(),
   startAddress: z.string().max(200).optional().default(''),
   endAddress: z.string().max(200).optional().default(''),
-  pausedMs: z.number().nonnegative().optional().default(0),
+  pausedMs: z.number().optional().default(0).transform((v) => (v != null && v < 0 ? 0 : v)),
   endTime: z.number().positive('结束时间不合法').optional(),
   weightKg: z.number().positive().max(300).optional(),
   deviceInfo: z.record(z.string(), z.unknown()).optional(),
