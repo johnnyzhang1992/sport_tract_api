@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import jsonwebtoken from 'jsonwebtoken';
 import { UserModel } from '../models/user.model.js';
 import { code2Session } from '../services/wechat.js';
+import { getSignedUrl } from '../services/oss.js';
 import { LoginSchema, RefreshSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
@@ -30,7 +31,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     const accessToken = fastify.signAccessToken(userId);
     const refreshToken = fastify.signRefreshToken(userId);
 
-    // openid/sessionKey 为敏感字段，不出接口
+    // openid/sessionKey 为敏感字段，不出接口；头像签名（bucket 私有）
     return success(
       {
         accessToken,
@@ -38,7 +39,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         user: {
           id: userId,
           nickname: user.nickname,
-          avatarUrl: user.avatarUrl,
+          avatarUrl: user.avatarUrl ? getSignedUrl(user.avatarUrl) : '',
           gender: user.gender,
           settings: user.settings,
         },

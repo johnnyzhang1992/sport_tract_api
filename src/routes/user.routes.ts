@@ -1,9 +1,15 @@
 import type { FastifyInstance } from 'fastify';
 import { UserModel } from '../models/user.model.js';
 import { checkImage, checkText } from '../services/wechat-sec.js';
+import { getSignedUrl } from '../services/oss.js';
 import { UpdateMeSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
+
+/** 头像 URL 签名（bucket 私有，展示需签名 URL；未配置 OSS 时原样返回） */
+function signAvatar(url: string): string {
+  return url ? getSignedUrl(url) : '';
+}
 
 /** 用户资料路由：GET/PUT /api/users/me（仅本人）+ 图片合规检测 */
 export async function userRoutes(fastify: FastifyInstance) {
@@ -15,7 +21,7 @@ export async function userRoutes(fastify: FastifyInstance) {
     return success({
       id: String(user._id),
       nickname: user.nickname,
-      avatarUrl: user.avatarUrl,
+      avatarUrl: signAvatar(user.avatarUrl),
       gender: user.gender,
       settings: user.settings,
       createdAt: user.createdAt,
@@ -47,7 +53,7 @@ export async function userRoutes(fastify: FastifyInstance) {
       {
         id: String(user._id),
         nickname: user.nickname,
-        avatarUrl: user.avatarUrl,
+        avatarUrl: signAvatar(user.avatarUrl),
         gender: user.gender,
         settings: user.settings,
       },
