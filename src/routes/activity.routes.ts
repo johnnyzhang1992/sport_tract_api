@@ -9,8 +9,11 @@ import {
   getActivityDetail,
   getActivityForGpx,
   listActivities,
+  removeMarker,
+  updateMarker,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
+import { deleteOssObjects } from '../services/oss.js';
 import { success } from '../utils/response.js';
 import {
   AppendPointsSchema,
@@ -18,6 +21,7 @@ import {
   CreateMarkerSchema,
   FinishActivitySchema,
   ListActivitiesQuery,
+  UpdateMarkerSchema,
 } from '../utils/validators.js';
 
 /**
@@ -46,6 +50,28 @@ export async function activityRoutes(fastify: FastifyInstance) {
     const input = CreateMarkerSchema.parse(request.body);
     const result = await addMarker(id, request.user.userId, input);
     return success(result, '打点成功');
+  });
+
+  // 编辑打点（运动结束后可补充/编辑）
+  fastify.put('/:id/markers/:markerId', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { id, markerId } = request.params as { id: string; markerId: string };
+    const input = UpdateMarkerSchema.parse(request.body);
+    const result = await updateMarker(id, request.user.userId, markerId, input);
+    return success(result, '打点已更新');
+  });
+
+  // 删除打点（同步清理照片 OSS 文件）
+  fastify.delete('/:id/markers/:markerId', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { id, markerId } = request.params as { id: string; markerId: string };
+    const { marker } = await removeMarker(id, request.user.userId, markerId);
+    if (marker.photoUrl) {
+      try {
+        await deleteOssObjects([marker.photoUrl]);
+      } catch {
+        // 照片清理失败不阻塞删除
+      }
+    }
+    return success(null, '打点已删除');
   });
 
   // 结束活动（final 包对账）

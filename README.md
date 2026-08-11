@@ -99,12 +99,14 @@ sport_track_api/
 | POST | `/api/activities` | 创建进行中活动 | ✅ |
 | POST | `/api/activities/:id/points` | 增量上传轨迹点（按 seq 幂等去重） | ✅ |
 | POST | `/api/activities/:id/markers` | 新增打点（运动中） | ✅ |
+| PUT | `/api/activities/:id/markers/:markerId` | 编辑打点（结束后可补编辑，坐标不可改） | ✅ |
+| DELETE | `/api/activities/:id/markers/:markerId` | 删除打点（同步清理 OSS 照片） | ✅ |
 | PUT | `/api/activities/:id/finish` | 结束：final 包对账 + 服务端重算指标 | ✅ |
 | PUT | `/api/activities/:id/cancel` | 放弃活动 | ✅ |
 | GET | `/api/activities` | 列表（分页 + 类型/月份筛选，含 pointsCount/markerCount/首尾点） | ✅ |
 | GET | `/api/activities/:id` | 详情（完整点集 + 打点） | ✅ |
 | GET | `/api/activities/:id/gpx` | 导出 GPX（markers 作航点） | ✅ |
-| DELETE | `/api/activities/:id` | 删除 | ✅ |
+| DELETE | `/api/activities/:id` | 删除（同步清理打点照片 OSS 文件） | ✅ |
 
 ### 统计与其他
 | 方法 | 路径 | 说明 | 鉴权 |
@@ -118,6 +120,7 @@ sport_track_api/
 
 - [x] M1：Fastify 骨架、MongoDB 连接建库、微信登录 + JWT、OSS STS、Docker 化
 - [x] M2：运动记录核心（活动 CRUD + 增量上传幂等同步 + finish 对账 + GPX 导出 + 统计聚合）
-- [ ] M3：打点管理（编辑/删除） + 轨迹列表前端
+- [x] M3 后端：打点管理（编辑/删除 + OSS 照片清理）
+- [ ] M3 前端：小程序轨迹列表/详情/回放 + 打点交互
 - [ ] M4：小程序码、分享
 - [ ] M5：打磨发布

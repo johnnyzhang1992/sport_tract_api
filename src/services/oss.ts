@@ -1,6 +1,7 @@
 import StsClient from '@alicloud/sts20150401';
 import { AssumeRoleRequest } from '@alicloud/sts20150401';
 import { Config as OpenApiConfig } from '@alicloud/openapi-client';
+import OSS from 'ali-oss';
 import { config, isOssConfigured } from '../config/index.js';
 import { AppError } from '../utils/app-error.js';
 
@@ -97,4 +98,33 @@ export async function issueStsCredentials(userId: string, dir = 'common'): Promi
     bucket,
     region,
   };
+}
+
+/**
+ * 从 OSS URL 提取对象 key（删除文件用）
+ * 例：https://bucket.oss-cn-hangzhou.aliyuncs.com/sport-track/users/xxx/a.jpg
+ *   → sport-track/users/xxx/a.jpg
+ */
+export function extractKeyFromUrl(url: string): string | null {
+  if (!url) return null;
+  const base = config.oss.endpoint.replace(/\/$/, '');
+  if (!base || !url.startsWith(base)) return null;
+  const path = url.slice(base.length).replace(/^\//, '').split('?')[0];
+  return path || null;
+}
+
+/**
+ * 服务端删除 OSS 文件（固定 AK 管理面操作，决策 D12：删除接口同步清理）
+ * - 未配置 OSS 时静默跳过（本地开发无 OSS 不影响主流程）
+ * - 仅删除属于本服务 baseDir 前缀的对象（防止误删）
+ */
+export async function deleteOssObjects(urls: string[]): Promise<void> {
+  const valid = urls
+    .map(extractKeyFromUrl)
+    .filter((k): k is string => k !== null && k.startsWith(`${config.oss.baseDir}/`));
+  if (valid.length === 0 || !isOssConfigured()) return;
+
+  const { region, bucket, accessKeyId, accessKeySecret } = config.oss;
+  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket });
+  await client.deleteMulti(valid);
 }

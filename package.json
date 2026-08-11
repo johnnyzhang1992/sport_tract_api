@@ -27,6 +27,7 @@
     "@alicloud/sts20150401": "^1.2.0",
     "@fastify/cors": "^11.2.0",
     "@fastify/jwt": "^10.0.0",
+    "ali-oss": "^6.23.0",
     "axios": "^1.15.0",
     "dotenv": "^17.4.0",
     "fastify": "^5.8.4",
@@ -36,6 +37,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/ali-oss": "^6.23.3",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.19.17",
     "pino-pretty": "^13.1.3",

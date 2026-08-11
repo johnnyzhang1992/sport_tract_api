@@ -260,3 +260,100 @@ test('删除活动', async () => {
   const detail = await req('GET', `/api/activities/${id}`, { token: tokenA });
   assert.equal(detail.statusCode, 404);
 });
+
+// ==================== M3：打点管理（编辑/删除） ====================
+// 注意：这些测试依赖前面 finish 对账测试写入的 marker m1
+
+test('编辑打点：更新备注与类型', async () => {
+  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+    token: tokenA,
+    body: { note: '补给点(更新)', type: 'rest' },
+  });
+  assert.equal(res.statusCode, 200);
+  const data = res.json().data;
+  assert.equal(data.marker.id, 'm1');
+  assert.equal(data.marker.note, '补给点(更新)');
+  assert.equal(data.marker.type, 'rest');
+});
+
+test('编辑打点：仅更新部分字段，未传字段保持不变', async () => {
+  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+    token: tokenA,
+    body: { note: '只改备注' },
+  });
+  assert.equal(res.statusCode, 200);
+  const marker = res.json().data.marker;
+  assert.equal(marker.note, '只改备注');
+  assert.equal(marker.type, 'rest'); // 上次更新的 type 保留
+  assert.equal(marker.lat, 31.2305); // 坐标不可被编辑接口改动
+});
+
+test('编辑不存在的打点 → 404', async () => {
+  const res = await req('PUT', `/api/activities/${activityId}/markers/nope`, {
+    token: tokenA,
+    body: { note: 'x' },
+  });
+  assert.equal(res.statusCode, 404);
+});
+
+test('编辑打点非法 type → 400', async () => {
+  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+    token: tokenA,
+    body: { type: 'invalid-type' },
+  });
+  assert.equal(res.statusCode, 400);
+});
+
+test('越权编辑打点 → 404', async () => {
+  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+    token: tokenB,
+    body: { note: 'hack' },
+  });
+  assert.equal(res.statusCode, 404);
+});
+
+test('删除打点', async () => {
+  const res = await req('DELETE', `/api/activities/${activityId}/markers/m1`, { token: tokenA });
+  assert.equal(res.statusCode, 200);
+
+  const detail = await req('GET', `/api/activities/${activityId}`, { token: tokenA });
+  assert.equal(detail.json().data.markers.length, 0);
+});
+
+test('删除不存在的打点 → 404', async () => {
+  const res = await req('DELETE', `/api/activities/${activityId}/markers/m1`, { token: tokenA });
+  assert.equal(res.statusCode, 404);
+});
+
+test('删除带照片的活动：OSS 未配置时优雅跳过，不影响删除', async () => {
+  const created = await req('POST', '/api/activities', {
+    token: tokenA,
+    body: { type: 'hiking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+
+  await req('POST', `/api/activities/${id}/markers`, {
+    token: tokenA,
+    body: {
+      id: 'ph1',
+      lat: 31.2,
+      lng: 121.4,
+      timestamp: TEST_NOW,
+      type: 'photo',
+      photoUrl:
+        'https://example-bucket.oss-cn-hangzhou.aliyuncs.com/sport-track/users/000000000000000000000000/photos/a.jpg',
+    },
+  });
+  await req('PUT', `/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [{ seq: 1, lat: 31.2, lng: 121.4, altitude: null, speed: null, timestamp: TEST_NOW }],
+    },
+  });
+
+  const del = await req('DELETE', `/api/activities/${id}`, { token: tokenA });
+  assert.equal(del.statusCode, 200);
+
+  const detail = await req('GET', `/api/activities/${id}`, { token: tokenA });
+  assert.equal(detail.statusCode, 404);
+});

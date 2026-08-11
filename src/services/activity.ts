@@ -2,12 +2,14 @@ import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats } from '../utils/pace.js';
+import { deleteOssObjects } from './oss.js';
 import type {
   AppendPointsInput,
   CreateActivityInput,
   CreateMarkerInput,
   FinishActivityInput,
   ListActivitiesQueryInput,
+  UpdateMarkerInput,
 } from '../utils/validators.js';
 import { MAX_TRACK_POINTS } from '../config/constants.js';
 
@@ -325,12 +327,80 @@ export async function getActivityDetail(activityId: ObjectIdLike, userId: string
   return toActivityDto(activity);
 }
 
-/** 删除活动（硬删；OSS 照片清理在 M3 打点管理时一并处理） */
+/** 删除活动（硬删；同步清理打点照片的 OSS 文件，失败不影响主流程） */
 export async function deleteActivity(activityId: ObjectIdLike, userId: string): Promise<void> {
+  const activity = await findOwnedActivity(activityId, userId);
+
   const result = await ActivityModel.deleteOne({ _id: activityId, userId });
   if (result.deletedCount === 0) {
     throw new AppError(404, '活动不存在');
   }
+
+  // 清理 OSS 照片（决策：删除接口同步清理文件；未配置 OSS 或失败时静默跳过）
+  const photoUrls = ((activity.markers ?? []) as Array<{ photoUrl?: string }>)
+    .map((m) => m.photoUrl)
+    .filter((u): u is string => Boolean(u));
+  if (photoUrls.length > 0) {
+    try {
+      await deleteOssObjects(photoUrls);
+    } catch (err) {
+      // 记录但不上抛：OSS 清理失败不应阻塞删除主流程
+      console.error('[oss] 清理活动照片失败:', (err as Error).message);
+    }
+  }
+}
+
+/**
+ * 编辑打点（决策 F13：运动结束后可补充、编辑或删除打点）
+ * 仅更新传入字段，坐标（lat/lng）不可经此接口修改
+ */
+export async function updateMarker(
+  activityId: ObjectIdLike,
+  userId: string,
+  markerId: string,
+  input: UpdateMarkerInput,
+): Promise<{ marker: MarkerDto }> {
+  const activity = await findOwnedActivity(activityId, userId);
+  const marker = ((activity.markers ?? []) as Array<MarkerDto>).find((m) => m.id === markerId);
+  if (!marker) {
+    throw new AppError(404, '打点不存在');
+  }
+
+  const set: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input)) {
+    set[`markers.$.${k}`] = v;
+  }
+  if (Object.keys(set).length === 0) {
+    throw new AppError(400, '没有可更新的字段');
+  }
+
+  await ActivityModel.updateOne(
+    { _id: activityId, 'markers.id': markerId },
+    { $set: set },
+  );
+
+  const updated = await findOwnedActivity(activityId, userId);
+  const updatedMarker = ((updated.markers ?? []) as Array<MarkerDto>).find((m) => m.id === markerId);
+  return { marker: updatedMarker as MarkerDto };
+}
+
+/**
+ * 删除打点
+ * 返回被删打点（含 photoUrl，路由层可据此清理 OSS 照片）
+ */
+export async function removeMarker(
+  activityId: ObjectIdLike,
+  userId: string,
+  markerId: string,
+): Promise<{ marker: MarkerDto }> {
+  const activity = await findOwnedActivity(activityId, userId);
+  const marker = ((activity.markers ?? []) as Array<MarkerDto>).find((m) => m.id === markerId);
+  if (!marker) {
+    throw new AppError(404, '打点不存在');
+  }
+
+  await ActivityModel.updateOne({ _id: activityId }, { $pull: { markers: { id: markerId } } });
+  return { marker: marker as MarkerDto };
 }
 
 /** GPX 导出数据源 */
