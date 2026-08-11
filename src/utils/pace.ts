@@ -40,6 +40,9 @@ export interface CalcStatsOptions {
   climbDeadZoneM?: number;
 }
 
+/** 配速最小有效距离（米）：低于此值配速无意义（如刚起步/静止） */
+const MIN_PACE_DISTANCE_M = 200;
+
 export interface CalcStatsResult {
   distance: number; // 米
   avgPace: number | null; // 秒/公里（非跑步类返回 null）
@@ -90,11 +93,11 @@ export function calcStats(points: TrackPointLike[], opts: CalcStatsOptions): Cal
     maxAltitude = Math.max(...smoothed);
   }
 
-  // 配速（秒/公里）；游泳/骑行不展示配速
+  // 配速（秒/公里）；游泳/骑行不展示；距离过短配速无意义
   const paceTypes: ActivityType[] = ['swimming', 'cycling'];
   const avgPace = paceTypes.includes(type)
     ? null
-    : distance > 0
+    : distance >= MIN_PACE_DISTANCE_M
       ? durationSec / (distance / 1000)
       : null;
 
