@@ -33,6 +33,7 @@ export interface MarkerDto {
   type: 'checkpoint' | 'rest' | 'photo' | 'note';
   note: string;
   photoUrl: string;
+  photos: string[];
   address: string;
 }
 
@@ -163,7 +164,10 @@ export async function addMarker(
   }
 
   const marker = { ...input };
-  // 幂等：同 id 覆盖（客户端重试）
+  // 幂等：同 id 覆盖（客户端重试）；photos 缺失时回退 photoUrl
+  if (!marker.photos && marker.photoUrl) {
+    marker.photos = [marker.photoUrl];
+  }
   await ActivityModel.updateOne(
     { _id: activityId },
     {
@@ -339,8 +343,11 @@ export async function deleteActivity(activityId: ObjectIdLike, userId: string): 
   }
 
   // 清理 OSS 照片（决策：删除接口同步清理文件；未配置 OSS 或失败时静默跳过）
-  const photoUrls = ((activity.markers ?? []) as Array<{ photoUrl?: string }>)
-    .map((m) => m.photoUrl)
+  const photoUrls = ((activity.markers ?? []) as Array<{
+    photoUrl?: string;
+    photos?: string[];
+  }>)
+    .flatMap((m) => [m.photoUrl, ...(m.photos ?? [])])
     .filter((u): u is string => Boolean(u));
   if (photoUrls.length > 0) {
     try {
@@ -371,6 +378,10 @@ export async function updateMarker(
   const set: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(input)) {
     set[`markers.$.${k}`] = v;
+  }
+  // photos 全量替换时同步 photoUrl 为首图（保持一致性）
+  if (input.photos) {
+    set['markers.$.photoUrl'] = input.photos[0] || '';
   }
   if (Object.keys(set).length === 0) {
     throw new AppError(400, '没有可更新的字段');

@@ -28,7 +28,8 @@ const markerSchema = new Schema(
     timestamp: { type: Number, required: true },
     type: { type: String, enum: MARKER_TYPES, default: 'checkpoint' },
     note: { type: String, default: '' },
-    photoUrl: { type: String, default: '' },
+    photoUrl: { type: String, default: '' }, // 兼容旧数据（首图）
+    photos: { type: [String], default: [] }, // 多图（上限 3，前端约束）
     address: { type: String, default: '' },
   },
   { _id: false },

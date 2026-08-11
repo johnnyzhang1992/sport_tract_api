@@ -66,6 +66,9 @@ export const MarkerTypeSchema = z.enum(['checkpoint', 'rest', 'photo', 'note']);
 /** 照片 URL：允许空字符串（未拍照）或合法 URL */
 const PhotoUrlSchema = z.union([z.literal(''), z.string().url('照片地址不合法').max(500)]);
 
+/** 多图数组（上限 3 张，决策 F11：打卡点可带多张现场照片） */
+const PhotosSchema = z.array(PhotoUrlSchema).max(3, '每个打卡点最多 3 张图片').default([]);
+
 /** 新增打点 */
 export const CreateMarkerSchema = z.object({
   id: z.string().min(1).max(64),
@@ -75,14 +78,16 @@ export const CreateMarkerSchema = z.object({
   type: MarkerTypeSchema.default('checkpoint'),
   note: z.string().max(500).default(''),
   photoUrl: PhotoUrlSchema.optional().default(''),
+  photos: PhotosSchema.optional(),
   address: z.string().max(200).optional().default(''),
 });
 
-/** 编辑打点 */
+/** 编辑打点（photos 传入时全量替换） */
 export const UpdateMarkerSchema = z.object({
   type: MarkerTypeSchema.optional(),
   note: z.string().max(500).optional(),
   photoUrl: PhotoUrlSchema.optional(),
+  photos: PhotosSchema.optional(),
   address: z.string().max(200).optional(),
 });
 

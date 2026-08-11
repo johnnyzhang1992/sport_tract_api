@@ -23,10 +23,10 @@ function dayRange(daysAgo: number): { start: number; end: number } {
 }
 
 export interface OverviewResult {
-  today: { count: number; distance: number; duration: number; elevationGain: number };
-  week: { count: number; distance: number; duration: number; elevationGain: number };
-  month: { count: number; distance: number; duration: number; elevationGain: number };
-  total: { count: number; distance: number; duration: number; elevationGain: number };
+  today: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
+  week: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
+  month: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
+  total: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
 }
 
 /** 概览聚合：今日 / 本周（自然周）/ 本月 / 累计（决策 F18） */
@@ -72,6 +72,7 @@ const sumAgg = [
       distance: { $sum: '$distance' },
       duration: { $sum: '$duration' },
       elevationGain: { $sum: '$elevationGain' },
+      calories: { $sum: '$calories' },
     },
   },
 ] as const;
@@ -83,6 +84,7 @@ function toSection(rows: Array<Record<string, any>>): OverviewResult['today'] {
     distance: r?.distance ?? 0,
     duration: r?.duration ?? 0,
     elevationGain: r?.elevationGain ?? 0,
+    calories: r?.calories ?? 0,
   };
 }
 

@@ -64,9 +64,10 @@ export async function activityRoutes(fastify: FastifyInstance) {
   fastify.delete('/:id/markers/:markerId', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id, markerId } = request.params as { id: string; markerId: string };
     const { marker } = await removeMarker(id, request.user.userId, markerId);
-    if (marker.photoUrl) {
+    const urls = [marker.photoUrl, ...(marker.photos ?? [])].filter(Boolean);
+    if (urls.length > 0) {
       try {
-        await deleteOssObjects([marker.photoUrl]);
+        await deleteOssObjects(urls);
       } catch {
         // 照片清理失败不阻塞删除
       }
