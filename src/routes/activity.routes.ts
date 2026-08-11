@@ -103,9 +103,12 @@ export async function activityRoutes(fastify: FastifyInstance) {
     const activity = await getActivityDetail(id, request.user.userId);
     // 私有 bucket：给打点照片签发访问签名 URL（库内仍存裸 URL）
     for (const m of activity.markers) {
-      if (m.photoUrl) m.photoUrl = getSignedUrl(m.photoUrl);
       if (m.photos && m.photos.length > 0) {
         m.photos = m.photos.map((p) => getSignedUrl(p));
+        // photoUrl 复用首图签名（同一 URL，避免前端按地址去重失效）
+        m.photoUrl = m.photos[0];
+      } else if (m.photoUrl) {
+        m.photoUrl = getSignedUrl(m.photoUrl);
       }
     }
     return success(activity);
