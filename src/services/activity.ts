@@ -3,7 +3,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance } from '../utils/pace.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
-import { deleteOssObjects } from './oss.js';
+import { deleteOssObjects, cleanUrl } from './oss.js';
 import type {
   AppendPointsInput,
   CreateActivityInput,
@@ -168,6 +168,9 @@ export async function addMarker(
   if (!marker.photos && marker.photoUrl) {
     marker.photos = [marker.photoUrl];
   }
+  // 净化：编辑回传的签名 URL → 裸 URL 入库
+  marker.photoUrl = cleanUrl(marker.photoUrl);
+  marker.photos = (marker.photos ?? []).map(cleanUrl);
   await ActivityModel.updateOne(
     { _id: activityId },
     {
@@ -379,9 +382,11 @@ export async function updateMarker(
   for (const [k, v] of Object.entries(input)) {
     set[`markers.$.${k}`] = v;
   }
-  // photos 全量替换时同步 photoUrl 为首图（保持一致性）
+  // photos 全量替换时：净化签名 URL 入库 + 同步 photoUrl 为首图
   if (input.photos) {
-    set['markers.$.photoUrl'] = input.photos[0] || '';
+    const cleaned = input.photos.map(cleanUrl);
+    set['markers.$.photos'] = cleaned;
+    set['markers.$.photoUrl'] = cleaned[0] || '';
   }
   if (Object.keys(set).length === 0) {
     throw new AppError(400, '没有可更新的字段');

@@ -91,7 +91,7 @@ export async function deleteOssObjects(urls: string[]): Promise<void> {
   if (valid.length === 0 || !isOssConfigured()) return;
 
   const { region, bucket, accessKeyId, accessKeySecret } = config.oss;
-  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket });
+  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket, secure: true });
   await client.deleteMulti(valid);
 }
 
@@ -108,7 +108,26 @@ export async function uploadBuffer(
     throw new AppError(503, 'OSS 未配置');
   }
   const { region, bucket, accessKeyId, accessKeySecret, endpoint } = config.oss;
-  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket });
+  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket, secure: true });
   await client.put(key, buffer, { headers: { 'Content-Type': contentType } });
   return `${endpoint.replace(/\/$/, '')}/${key}`;
+}
+
+/** 去掉 URL 的 query 参数（签名 URL → 裸 URL） */
+export function cleanUrl(url: string): string {
+  return String(url || '').split('?')[0];
+}
+
+/**
+ * 生成 OSS 签名访问 URL（bucket 私有时前端加载图片用）
+ * 库内只存裸 URL，展示时签发；签名 URL 过期后需重新签发
+ * @returns 签名 URL；OSS 未配置/无法提取 key 时返回原 URL
+ */
+export function getSignedUrl(url: string, expiresSec = 86400): string {
+  if (!isOssConfigured()) return url;
+  const key = extractKeyFromUrl(url);
+  if (!key) return url;
+  const { region, bucket, accessKeyId, accessKeySecret } = config.oss;
+  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket, secure: true });
+  return client.signatureUrl(key, { expires: expiresSec, method: 'GET' });
 }

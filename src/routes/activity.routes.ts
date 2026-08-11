@@ -13,7 +13,7 @@ import {
   updateMarker,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
-import { deleteOssObjects } from '../services/oss.js';
+import { deleteOssObjects, getSignedUrl } from '../services/oss.js';
 import { success } from '../utils/response.js';
 import {
   AppendPointsSchema,
@@ -97,10 +97,17 @@ export async function activityRoutes(fastify: FastifyInstance) {
     return success(result);
   });
 
-  // 活动详情（完整轨迹点 + 打点）
+  // 活动详情（完整轨迹点 + 打点；照片 URL 签名，bucket 私有可正常加载）
   fastify.get('/:id', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id } = request.params as { id: string };
     const activity = await getActivityDetail(id, request.user.userId);
+    // 私有 bucket：给打点照片签发访问签名 URL（库内仍存裸 URL）
+    for (const m of activity.markers) {
+      if (m.photoUrl) m.photoUrl = getSignedUrl(m.photoUrl);
+      if (m.photos && m.photos.length > 0) {
+        m.photos = m.photos.map((p) => getSignedUrl(p));
+      }
+    }
     return success(activity);
   });
 
