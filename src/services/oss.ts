@@ -94,3 +94,21 @@ export async function deleteOssObjects(urls: string[]): Promise<void> {
   const client = new OSS({ region, accessKeyId, accessKeySecret, bucket });
   await client.deleteMulti(valid);
 }
+
+/**
+ * 服务端上传 Buffer 到 OSS（固定 AK；小程序码等后端生成的文件）
+ * @returns OSS URL
+ */
+export async function uploadBuffer(
+  buffer: Buffer,
+  key: string,
+  contentType = 'image/png',
+): Promise<string> {
+  if (!isOssConfigured()) {
+    throw new AppError(503, 'OSS 未配置');
+  }
+  const { region, bucket, accessKeyId, accessKeySecret, endpoint } = config.oss;
+  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket });
+  await client.put(key, buffer, { headers: { 'Content-Type': contentType } });
+  return `${endpoint.replace(/\/$/, '')}/${key}`;
+}

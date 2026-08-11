@@ -178,6 +178,19 @@ test('图片合规检测：未传文件 → 400', async () => {
   assert.ok([400, 406].includes(res.statusCode), `statusCode=${res.statusCode}`);
 });
 
+test('分享：非本人活动生成小程序码 → 404', async () => {
+  // B 用户没有活动，用假 id 请求 A 的接口验证归属校验
+  const res = await post('/api/share/mini-code', {
+    activityId: '000000000000000000000000',
+  }, tokenB);
+  assert.equal(res.statusCode, 404);
+});
+
+test('分享：非法 activityId → 400', async () => {
+  const res = await post('/api/share/mini-code', { activityId: 'not-a-valid-id' }, tokenA);
+  assert.equal(res.statusCode, 400);
+});
+
 test('未匹配路由 → 404 统一格式', async () => {
   const res = await app.inject({ method: 'GET', url: '/api/not-exist' });
   assert.equal(res.statusCode, 404);
