@@ -200,3 +200,27 @@ test('未匹配路由 → 404 统一格式', async () => {
   assert.equal(res.statusCode, 404);
   assert.equal(res.json().success, false);
 });
+
+test('逆地理编码：未配置 key 时返回空地址（200）', async () => {
+  const login = await post('/api/auth/login', { code: 'geo-test' });
+  const t = login.json().data.accessToken;
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/geo/reverse?lat=31.2304&lng=121.4737',
+    headers: { authorization: `Bearer ${t}` },
+  });
+  assert.equal(res.statusCode, 200);
+  // key 已配置时返回地址，未配置返回空；均 200 不报错
+  assert.ok(typeof res.json().data.address === 'string');
+});
+
+test('逆地理编码：参数非法 → 400', async () => {
+  const login = await post('/api/auth/login', { code: 'geo-bad' });
+  const t = login.json().data.accessToken;
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/geo/reverse?lat=999&lng=121',
+    headers: { authorization: `Bearer ${t}` },
+  });
+  assert.equal(res.statusCode, 400);
+});
