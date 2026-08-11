@@ -1,102 +1,68 @@
-import StsClient from '@alicloud/sts20150401';
-import { AssumeRoleRequest } from '@alicloud/sts20150401';
-import { Config as OpenApiConfig } from '@alicloud/openapi-client';
+import crypto from 'node:crypto';
 import OSS from 'ali-oss';
 import { config, isOssConfigured } from '../config/index.js';
 import { AppError } from '../utils/app-error.js';
 
-// CJS 双形态包类型缺陷：d.ts 为 ESM 声明、运行时是 exports.default，
-// TS NodeNext 将 default import 解析为命名空间，这里显式断言为构造器
-interface StsAssumeRoleResponse {
-  body?: {
-    credentials?: {
-      accessKeyId?: string;
-      accessKeySecret?: string;
-      securityToken?: string;
-      expiration?: string;
-    };
-  };
-}
-const StsClientCtor = StsClient as unknown as new (config: OpenApiConfig) => {
-  assumeRole(request: AssumeRoleRequest): Promise<StsAssumeRoleResponse>;
-};
+/** 照片上传大小上限（字节，10MB） */
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
-export interface StsCredentials {
-  accessKeyId: string;
-  accessKeySecret: string;
-  securityToken: string;
-  expiration: string;
-  /** 上传目标目录（OSS key 前缀） */
-  dir: string;
+export interface UploadCredential {
   /** 直传域名 */
   endpoint: string;
   bucket: string;
   region: string;
+  /** 上传目标目录（OSS key 前缀） */
+  dir: string;
+  /** 签名直传表单字段（决策 D12 简化版：固定 AK 签名，无需 RAM 角色/roleArn） */
+  OSSAccessKeyId: string;
+  policy: string;
+  signature: string;
+  /** 凭证过期时间（ISO 8601） */
+  expiration: string;
 }
 
 /**
- * 阿里云 OSS STS 临时凭证签发（决策 D12）
+ * 签发 OSS 表单上传签名（AK 签名直传，无需 STS/RAM 角色）
  *
  * 安全模型：
- * - 最小权限：仅允许 PutObject，禁止 List/Delete/其他 Action
- * - 目录隔离：资源限定在 users/{userId}/{dir}/ 下
+ * - AK 不落地前端：后端用固定 AK 计算 policy + signature，前端仅持有一次性签名
+ * - 目录隔离：policy 限定 key 前缀 users/{userId}/{dir}/，只能传不能读/删
  * - 短时效：默认 15 分钟
- * - 前端拿凭证直传 OSS，后端只存 URL，不接触文件内容
+ * - 大小限制：content-length-range 0 ~ 10MB
  */
-export async function issueStsCredentials(userId: string, dir = 'common'): Promise<StsCredentials> {
+export async function issueUploadCredential(userId: string, dir = 'common'): Promise<UploadCredential> {
   if (!isOssConfigured()) {
     throw new AppError(
       503,
-      'OSS 未配置，请联系管理员（需设置 OSS_REGION/OSS_BUCKET/OSS_AK_ID/OSS_AK_SECRET/OSS_ROLE_ARN）',
+      'OSS 未配置，请联系管理员（需设置 OSS_REGION/OSS_BUCKET/OSS_ENDPOINT/OSS_AK_ID/OSS_AK_SECRET）',
     );
   }
 
-  const { region, bucket, accessKeyId, accessKeySecret, roleArn, stsDuration, endpoint, baseDir } =
-    config.oss;
+  const { region, bucket, accessKeyId, accessKeySecret, endpoint, baseDir } = config.oss;
 
-  // 目录规则：{baseDir}/users/{userId}/{dir}/  —— 按用户隔离，防越权
-  const ossDir = `${baseDir}/users/${userId}/${dir}/`;
+  // 目录规则：{baseDir}/users/{userId}/{dir}/ —— 按用户隔离，防越权
+  const dirKey = `${baseDir}/users/${userId}/${dir}/`;
 
-  const policy = JSON.stringify({
-    Version: '1',
-    Statement: [
-      {
-        Effect: 'Allow',
-        Action: ['oss:PutObject'],
-        Resource: [`acs:oss:*:*:${bucket}/${ossDir}*`],
-      },
+  const expiration = new Date(Date.now() + config.oss.stsDuration * 1000).toISOString();
+  const policyObj = {
+    expiration,
+    conditions: [
+      ['content-length-range', 0, MAX_FILE_SIZE],
+      ['starts-with', '$key', dirKey],
     ],
-  });
-
-  const openApiConfig = new OpenApiConfig({
-    accessKeyId,
-    accessKeySecret,
-  });
-  const client = new StsClientCtor(openApiConfig);
-
-  const req = new AssumeRoleRequest({
-    roleArn,
-    roleSessionName: `sport-track-${userId.slice(-8)}`,
-    durationSeconds: stsDuration,
-    policy,
-  });
-
-  const res = await client.assumeRole(req);
-  const creds = res.body?.credentials;
-
-  if (!creds?.accessKeyId || !creds?.accessKeySecret || !creds?.securityToken) {
-    throw new AppError(500, 'STS 凭证签发失败：返回数据不完整');
-  }
+  };
+  const policy = Buffer.from(JSON.stringify(policyObj)).toString('base64');
+  const signature = crypto.createHmac('sha1', accessKeySecret).update(policy).digest('base64');
 
   return {
-    accessKeyId: creds.accessKeyId,
-    accessKeySecret: creds.accessKeySecret,
-    securityToken: creds.securityToken,
-    expiration: creds.expiration ?? '',
-    dir: ossDir,
     endpoint,
     bucket,
     region,
+    dir: dirKey,
+    OSSAccessKeyId: accessKeyId,
+    policy,
+    signature,
+    expiration,
   };
 }
 
@@ -114,8 +80,8 @@ export function extractKeyFromUrl(url: string): string | null {
 }
 
 /**
- * 服务端删除 OSS 文件（固定 AK 管理面操作，决策 D12：删除接口同步清理）
- * - 未配置 OSS 时静默跳过（本地开发无 OSS 不影响主流程）
+ * 服务端删除 OSS 文件（固定 AK 管理面操作，删除接口同步清理）
+ * - 未配置 OSS 时静默跳过（不影响主流程）
  * - 仅删除属于本服务 baseDir 前缀的对象（防止误删）
  */
 export async function deleteOssObjects(urls: string[]): Promise<void> {

@@ -8,7 +8,8 @@
 - **TypeScript + Fastify 5 + Mongoose 9**（决策 D10）
 - 数据库：MongoDB（本地/线上已有实例，新建独立库 `sport-track-dev`）
 - 校验：zod（请求参数强校验）
-- 文件存储：阿里云 OSS **STS 临时凭证直传**（决策 D12）
+- 文件存储：阿里云 OSS **AK 签名直传**（后端签发 policy/signature，无需 RAM 角色；决策 D12）
+- 内容安全：**微信 msgSecCheck / imgSecCheck**（昵称、图片上传前合规检测，未配置降级放行）
 - 鉴权：JWT（access 7 天 + refresh 30 天静默续期，决策 D14）
 - 包管理：**pnpm**
 - 部署：云服务器 + Docker（仅后端容器，决策 D11）
@@ -91,7 +92,8 @@ sport_track_api/
 | POST | `/api/auth/login` | 微信 code → openid → 查/建用户 → JWT | 无 |
 | POST | `/api/auth/refresh` | refreshToken → 新 accessToken | 无 |
 | GET | `/api/users/me` | 当前用户资料 | ✅ |
-| PUT | `/api/users/me` | 更新昵称/头像/性别/设置 | ✅ |
+| PUT | `/api/users/me` | 更新昵称/头像/性别/设置（昵称合规检测） | ✅ |
+| POST | `/api/users/check-image` | 图片合规检测（imgSecCheck，≤1MB，直传前调用） | ✅ |
 
 ### 运动记录（M2 核心同步协议）
 | 方法 | 路径 | 说明 | 鉴权 |
@@ -113,7 +115,7 @@ sport_track_api/
 |---|---|---|---|
 | GET | `/api/stats/overview` | 今日/本周/本月/累计聚合 | ✅ |
 | GET | `/api/stats/trend` | 近 7/30 天距离与时长（补零） | ✅ |
-| POST | `/api/oss/sts` | 签发 OSS 直传临时凭证 | ✅ |
+| POST | `/api/oss/credential` | 签发 OSS 直传签名凭证（policy+signature） | ✅ |
 | GET | `/health` | 健康检查 | 无 |
 
 ## 里程碑进度
@@ -121,6 +123,7 @@ sport_track_api/
 - [x] M1：Fastify 骨架、MongoDB 连接建库、微信登录 + JWT、OSS STS、Docker 化
 - [x] M2：运动记录核心（活动 CRUD + 增量上传幂等同步 + finish 对账 + GPX 导出 + 统计聚合）
 - [x] M3 后端：打点管理（编辑/删除 + OSS 照片清理）
+- [x] 内容安全：昵称/图片微信合规检测
 - [ ] M3 前端：小程序轨迹列表/详情/回放 + 打点交互
 - [ ] M4：小程序码、分享
 - [ ] M5：打磨发布

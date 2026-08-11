@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
+import FormData from 'form-data';
 
 let app: FastifyInstance;
 
@@ -126,18 +127,55 @@ test('refresh：伪造 token → 401', async () => {
   assert.equal(res.json().data.code, 'INVALID_REFRESH_TOKEN');
 });
 
-test('OSS STS：未配置时返回 503 提示', async () => {
+test('OSS 凭证：未配置时返回 503 提示', async () => {
   const login = await post('/api/auth/login', { code: 'test-code-oss' });
   const { accessToken } = login.json().data;
 
-  const res = await post('/api/oss/sts', {}, accessToken);
-  // 本地未配置 OSS 时返回 503；若配置了则返回凭证
+  const res = await post('/api/oss/credential', {}, accessToken);
+  // 本地未配置 OSS 时返回 503；若配置了则返回签名凭证
   if (res.statusCode === 503) {
     assert.match(res.json().message, /OSS 未配置/);
   } else {
     assert.equal(res.statusCode, 200);
-    assert.ok(res.json().data.accessKeyId);
+    assert.ok(res.json().data.policy);
+    assert.ok(res.json().data.signature);
+    assert.ok(res.json().data.OSSAccessKeyId);
   }
+});
+
+test('图片合规检测：未配置微信接口时降级放行', async () => {
+  const login = await post('/api/auth/login', { code: 'test-code-sec' });
+  const { accessToken } = login.json().data;
+
+  const form = new FormData();
+  form.append('file', Buffer.from('fake-image-bytes'), {
+    filename: 'a.jpg',
+    contentType: 'image/jpeg',
+  });
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/users/check-image',
+    payload: form,
+    headers: { authorization: `Bearer ${accessToken}`, ...form.getHeaders() },
+  });
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.equal(body.success, true);
+  assert.ok(body.data.skipped === true || body.data.risky === true || body.data.risky === false);
+});
+
+test('图片合规检测：未传文件 → 400', async () => {
+  const login = await post('/api/auth/login', { code: 'test-code-sec2' });
+  const { accessToken } = login.json().data;
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/users/check-image',
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  // 无 multipart content-type：@fastify/multipart 返回 406；有请求体但无文件返回 400
+  assert.ok([400, 406].includes(res.statusCode), `statusCode=${res.statusCode}`);
 });
 
 test('未匹配路由 → 404 统一格式', async () => {

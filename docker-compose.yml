@@ -19,6 +19,5 @@ services:
       OSS_ENDPOINT: ${OSS_ENDPOINT}
       OSS_AK_ID: ${OSS_AK_ID}
       OSS_AK_SECRET: ${OSS_AK_SECRET}
-      OSS_ROLE_ARN: ${OSS_ROLE_ARN}
       CORS_ORIGIN: ${CORS_ORIGIN}
     restart: unless-stopped

@@ -39,14 +39,13 @@ export const config = {
   // 本地开发无真实 AppID 时开启 mock 登录（任意 code 直接换取测试 openid）
   wxMockLogin: process.env.WX_MOCK_LOGIN === 'true',
 
-  // 阿里云 OSS（STS 直传）
+  // 阿里云 OSS（AK 签名直传，无需 STS/RAM 角色；roleArn 不再需要）
   oss: {
     region: process.env.OSS_REGION ?? '',
     bucket: process.env.OSS_BUCKET ?? '',
     endpoint: process.env.OSS_ENDPOINT ?? '',
     accessKeyId: process.env.OSS_AK_ID ?? '',
     accessKeySecret: process.env.OSS_AK_SECRET ?? '',
-    roleArn: process.env.OSS_ROLE_ARN ?? '',
     // 凭证有效期（秒）
     stsDuration: int(process.env.OSS_STS_DURATION, 900),
     // OSS 内文件根目录，按 userId 隔离
@@ -55,6 +54,6 @@ export const config = {
 } as const;
 
 export function isOssConfigured(): boolean {
-  const { region, bucket, accessKeyId, accessKeySecret, roleArn } = config.oss;
-  return Boolean(region && bucket && accessKeyId && accessKeySecret && roleArn);
+  const { region, bucket, accessKeyId, accessKeySecret } = config.oss;
+  return Boolean(region && bucket && accessKeyId && accessKeySecret);
 }

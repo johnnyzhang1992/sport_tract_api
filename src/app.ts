@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
+import multipart from '@fastify/multipart';
 import mongoose from 'mongoose';
 import { config } from './config/index.js';
 import mongodbPlugin from './plugins/mongodb.js';
@@ -30,6 +31,9 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   // CORS：开发环境全放开；生产白名单
   const corsOrigin = config.isDev ? true : [process.env.CORS_ORIGIN ?? ''].filter(Boolean);
   await fastify.register(cors, { origin: corsOrigin, credentials: true });
+
+  // multipart（图片合规检测上传）
+  await fastify.register(multipart, { limits: { fileSize: 2 * 1024 * 1024 } });
 
   // 基础插件
   await fastify.register(mongodbPlugin);
