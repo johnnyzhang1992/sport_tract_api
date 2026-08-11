@@ -98,9 +98,14 @@ export const FinishActivitySchema = z.object({
   deviceInfo: z.record(z.string(), z.unknown()).optional(),
 });
 
-/** 活动列表查询 */
+/** 活动列表查询（type 空字符串视为不筛选） */
 export const ListActivitiesQuery = z.object({
-  type: z.enum(['hiking', 'walking', 'running', 'cycling', 'mountaineering', 'swimming']).optional(),
+  type: z
+    .union([
+      z.enum(['hiking', 'walking', 'running', 'cycling', 'mountaineering', 'swimming']),
+      z.literal(''),
+    ])
+    .optional(),
   month: z.string().regex(/^\d{4}-\d{2}$/, 'month 格式应为 YYYY-MM').optional(),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(20),
