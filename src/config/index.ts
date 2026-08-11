@@ -39,6 +39,9 @@ export const config = {
   // 本地开发无真实 AppID 时开启 mock 登录（任意 code 直接换取测试 openid）
   wxMockLogin: process.env.WX_MOCK_LOGIN === 'true',
 
+  // 腾讯位置服务（WebService API：轨迹纠偏 trace / 逆地理编码等）
+  tencentMapKey: process.env.TENCENT_MAP_KEY ?? '',
+
   // 阿里云 OSS（AK 签名直传，无需 STS/RAM 角色；roleArn 不再需要）
   oss: {
     region: process.env.OSS_REGION ?? '',
