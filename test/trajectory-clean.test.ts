@@ -75,7 +75,7 @@ test('起点跳点剔除：起点 GPS 未收敛（首段 29m，其余 ~5m）', (
   ];
   const cleaned = cleanTrajectory(shifted);
   assert.equal(cleaned.length, pts.length, '起点跳点应被剔除，其余保留');
-  assert.ok(!cleaned.some((p) => p.lat > 30.5 + 0.0002), '跳点起点不在结果中');
+  assert.ok(!cleaned.some((p) => Math.abs(p.lat - 30.50026) < 1e-6 && Math.abs(p.lng - 114.3999) < 1e-6), '跳点起点不在结果中');
 });
 
 test('尾点跳点剔除：结束时 GPS 漂移', () => {
