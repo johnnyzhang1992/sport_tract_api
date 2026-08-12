@@ -81,11 +81,11 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
   opts: CleanOptions = {},
 ): T[] {
   const {
-    minSpikeSpeed = 6,
-    spikeRatio = 4,
-    minTurnDeg = 110,
-    minOutlierM = 30,
-    outlierRatio = 6,
+    minSpikeSpeed = 5,
+    spikeRatio = 3.5,
+    minTurnDeg = 100,
+    minOutlierM = 25,
+    outlierRatio = 5,
   } = opts;
   const n = points.length;
   if (n < 4) return points;
