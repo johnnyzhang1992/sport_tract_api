@@ -9,6 +9,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance, type TrackPointLike } from '../utils/pace.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
+import { wgs84ToGcj02 } from '../utils/coordinate.js';
 import { ACTIVITY_TYPES, MAX_TRACK_POINTS } from '../config/constants.js';
 
 export interface ImportedPoint {
@@ -242,6 +243,12 @@ export async function importActivity(
   typeOverride?: string,
 ): Promise<{ id: string; type: string; distance: number; duration: number; pointCount: number }> {
   let points = parseTrackFile(filename, content);
+  // 坐标系转换（决策 M7）：第三方文件为 WGS-84，微信地图为 GCJ-02，中国境内偏移数百米
+  // 转换后再做类型推断/去重/入库
+  points = points.map((p) => {
+    const c = wgs84ToGcj02(p.lat, p.lng);
+    return { ...p, lat: c.lat, lng: c.lng };
+  });
   let type = typeOverride || guessType(filename, points);
   if (!ACTIVITY_TYPES.includes(type as (typeof ACTIVITY_TYPES)[number])) {
     type = 'running';
