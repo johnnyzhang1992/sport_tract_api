@@ -100,12 +100,12 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
   const sortedSteps = stepDists.slice().sort((x, y) => x - y);
   const medStep = sortedSteps.length > 0 ? sortedSteps[Math.floor(sortedSteps.length / 2)] : 0;
 
-  // 首点跳（起点 GPS 未收敛）：首段距离远超局部步长 → 剔首点
-  if (n >= 3 && stepDists.length >= 2 && stepDists[0] > Math.max(15, medStep * 5)) {
+  // 首点跳（起点 GPS 未收敛，实测 29m）：首段距离远超局部步长 → 剔首点
+  if (n >= 3 && stepDists.length >= 2 && stepDists[0] > Math.max(12, medStep * 4)) {
     drop[0] = true;
   }
   // 尾点跳：末段距离远超局部步长 → 剔尾点
-  if (n >= 3 && stepDists.length >= 2 && stepDists[stepDists.length - 1] > Math.max(15, medStep * 5)) {
+  if (n >= 3 && stepDists.length >= 2 && stepDists[stepDists.length - 1] > Math.max(12, medStep * 4)) {
     drop[n - 1] = true;
   }
 
