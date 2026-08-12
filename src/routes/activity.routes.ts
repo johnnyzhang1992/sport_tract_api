@@ -14,7 +14,9 @@ import {
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import { deleteOssObjects, getSignedUrl } from '../services/oss.js';
+import { importActivity } from '../services/import.js';
 import { success } from '../utils/response.js';
+import { AppError } from '../utils/app-error.js';
 import {
   AppendPointsSchema,
   CreateActivitySchema,
@@ -129,5 +131,20 @@ export async function activityRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     await deleteActivity(id, request.user.userId);
     return success(null, '已删除');
+  });
+
+  // 导入轨迹文件（GPX/KML/TCX，multipart 上传）
+  fastify.post('/import', { onRequest: [fastify.authenticate] }, async (request) => {
+    const part = await request.file({ limits: { fileSize: 2 * 1024 * 1024 } });
+    if (!part) {
+      throw new AppError(400, '请上传轨迹文件');
+    }
+    const content = await part.toBuffer();
+    const filename = part.filename || 'track.gpx';
+    const body = request.body as Record<string, unknown> | undefined;
+    const typeOverride =
+      typeof body?.type === 'string' && body.type ? (body.type as string) : undefined;
+    const result = await importActivity(request.user.userId, filename, content.toString('utf8'), typeOverride);
+    return success(result, '导入成功');
   });
 }
