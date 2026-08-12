@@ -254,7 +254,7 @@ export async function importActivity(
   content: string,
   typeOverride?: string,
   source?: string,
-): Promise<{ id: string; type: string; distance: number; duration: number; pointCount: number }> {
+): Promise<{ id: string; type: string; distance: number; duration: number; pointCount: number; source: string }> {
   let points = parseTrackFile(filename, content);
   // 坐标系转换（决策 M7）：第三方文件为 WGS-84，微信地图为 GCJ-02，中国境内偏移数百米
   // 转换后再做类型推断/去重/入库
@@ -317,5 +317,6 @@ export async function importActivity(
     distance: stats.distance,
     duration: durationSec,
     pointCount: trackPoints.length,
+    source: source || guessSource(filename),
   };
 }
