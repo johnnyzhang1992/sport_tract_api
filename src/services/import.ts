@@ -106,13 +106,36 @@ export function parseGpx(xml: string): ImportedPoint[] {
   return finalize(points);
 }
 
-/** KML 解析：Placemark/LineString/coordinates（"lon,lat,alt" 空格分隔） */
+/** KML 解析：递归收集所有 Placemark（两步路轨迹在 Folder 内） */
 export function parseKml(xml: string): ImportedPoint[] {
   const root = parser.parse(xml);
   const doc = root?.kml?.Document ?? root?.kml ?? {};
-  const placemarks = asArray(doc.Placemark);
+  const placemarks = collectPlacemarks(doc);
   const points: ImportedPoint[] = [];
   for (const pm of placemarks) {
+    // 优先 gx:Track（两步路格式，含时间）；fallback LineString coordinates
+    const gx = pm?.['gx:Track'];
+    if (gx) {
+      const whens = asArray(gx.when);
+      const coords = asArray(gx['gx:coord']);
+      for (let i = 0; i < coords.length; i++) {
+        const parts = String(coords[i]).trim().split(/\s+/);
+        if (parts.length < 2) continue;
+        const lng = toNum(parts[0]);
+        const lat = toNum(parts[1]);
+        if (!validLatLng(lat, lng)) continue;
+        const alt = toNum(parts[2]);
+        const when = whens[i];
+        const t = when ? new Date(String(when)).getTime() : 0;
+        points.push({
+          lat: lat as number,
+          lng: lng as number,
+          altitude: alt != null ? Math.round(alt * 10) / 10 : null,
+          timestamp: Number.isFinite(t) && t > 0 ? t : 0,
+        });
+      }
+      continue;
+    }
     const coords = pm?.LineString?.coordinates ?? pm?.MultiGeometry?.LineString?.coordinates;
     if (typeof coords !== 'string') continue;
     for (const chunk of coords.trim().split(/\s+/)) {
@@ -131,6 +154,28 @@ export function parseKml(xml: string): ImportedPoint[] {
     }
   }
   return finalize(points);
+}
+
+/** 递归收集节点下所有 Placemark（Folder 可多层嵌套） */
+function collectPlacemarks(node: unknown): any[] {
+  const out: any[] = [];
+  if (Array.isArray(node)) {
+    node.forEach((n) => out.push(...collectPlacemarks(n)));
+    return out;
+  }
+  if (!node || typeof node !== 'object') return out;
+  const obj = node as Record<string, unknown>;
+  if (obj.Placemark) out.push(...asArray(obj.Placemark));
+  for (const key of Object.keys(obj)) {
+    if (key === 'Placemark') continue;
+    const v = obj[key];
+    if (Array.isArray(v)) {
+      v.forEach((n) => out.push(...collectPlacemarks(n)));
+    } else if (v && typeof v === 'object') {
+      out.push(...collectPlacemarks(v));
+    }
+  }
+  return out;
 }
 
 /** TCX 解析：Activities/Activity/Lap/Track/Trackpoint */

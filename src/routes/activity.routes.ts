@@ -11,10 +11,12 @@ import {
   listActivities,
   removeMarker,
   updateMarker,
+  updateActivityType,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import { deleteOssObjects, getSignedUrl } from '../services/oss.js';
 import { importActivity } from '../services/import.js';
+import { z } from 'zod';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 import {
@@ -126,6 +128,14 @@ export async function activityRoutes(fastify: FastifyInstance) {
     return toGpx(activity);
   });
 
+  // 更新活动类型（导入后修正）
+  fastify.put('/:id/type', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const { type } = z.object({ type: z.string().min(1) }).parse(request.body);
+    const result = await updateActivityType(id, request.user.userId, type);
+    return success(result, '已更新');
+  });
+
   // 删除活动
   fastify.delete('/:id', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id } = request.params as { id: string };
@@ -141,9 +151,9 @@ export async function activityRoutes(fastify: FastifyInstance) {
     }
     const content = await part.toBuffer();
     const filename = part.filename || 'track.gpx';
-    const body = request.body as Record<string, unknown> | undefined;
-    const typeOverride =
-      typeof body?.type === 'string' && body.type ? (body.type as string) : undefined;
+    // multipart 字段（wx.uploadFile formData）
+    const typeField = (part.fields?.type ?? part.fields?.['type']) as string | undefined;
+    const typeOverride = typeof typeField === 'string' && typeField ? typeField : undefined;
     const result = await importActivity(request.user.userId, filename, content.toString('utf8'), typeOverride);
     return success(result, '导入成功');
   });

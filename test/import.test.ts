@@ -53,6 +53,27 @@ test('KML 解析：coordinates 经度在前调换', () => {
   assert.equal(pts[0].altitude, 10.5);
 });
 
+const KML_GXTRACK = `<?xml version="1.0"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
+  <Document><Folder><Placemark>
+    <gx:Track>
+      <when>2026-08-12T00:00:00Z</when><gx:coord>121.4731 31.2301 10.5</gx:coord>
+      <when>2026-08-12T00:00:05Z</when><gx:coord>121.4732 31.2302 10.8</gx:coord>
+      <when>2026-08-12T00:00:10Z</when><gx:coord>121.4733 31.2303 11.0</gx:coord>
+    </gx:Track>
+  </Placemark></Folder></Document>
+</kml>`;
+
+test('KML gx:Track 解析（两步路格式）：when 时间 + coord 经纬度', () => {
+  const pts = parseKml(KML_GXTRACK);
+  assert.equal(pts.length, 3);
+  assert.equal(pts[0].lat, 31.2301);
+  assert.equal(pts[0].lng, 121.4731);
+  assert.equal(pts[0].altitude, 10.5);
+  assert.equal(pts[0].timestamp, Date.parse('2026-08-12T00:00:00Z'));
+  assert.equal(pts[2].timestamp - pts[1].timestamp, 5000);
+});
+
 test('TCX 解析：Position/Altitude 正确', () => {
   const pts = parseTcx(TCX_SAMPLE);
   assert.equal(pts.length, 2);
