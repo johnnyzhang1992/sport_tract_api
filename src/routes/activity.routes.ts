@@ -11,7 +11,7 @@ import {
   listActivities,
   removeMarker,
   updateMarker,
-  updateActivityType,
+  updateActivityMeta,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import { deleteOssObjects, getSignedUrl } from '../services/oss.js';
@@ -128,11 +128,13 @@ export async function activityRoutes(fastify: FastifyInstance) {
     return toGpx(activity);
   });
 
-  // 更新活动类型（导入后修正）
-  fastify.put('/:id/type', { onRequest: [fastify.authenticate] }, async (request) => {
+  // 更新活动信息（类型/备注）
+  fastify.put('/:id/meta', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id } = request.params as { id: string };
-    const { type } = z.object({ type: z.string().min(1) }).parse(request.body);
-    const result = await updateActivityType(id, request.user.userId, type);
+    const input = z
+      .object({ type: z.string().min(1).optional(), note: z.string().max(500).optional() })
+      .parse(request.body);
+    const result = await updateActivityMeta(id, request.user.userId, input);
     return success(result, '已更新');
   });
 

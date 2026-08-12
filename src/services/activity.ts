@@ -54,6 +54,7 @@ export interface ActivityDto {
   endAddress: string;
   lastPointSeq: number;
   pausedMs: number;
+  note: string;
   trackPoints: TrackPointDto[];
   markers: MarkerDto[];
   createdAt: string;
@@ -77,6 +78,7 @@ function toActivityDto(doc: Record<string, any>): ActivityDto {
     endAddress: doc.endAddress ?? '',
     lastPointSeq: doc.lastPointSeq ?? 0,
     pausedMs: doc.pausedMs ?? 0,
+    note: doc.note ?? '',
     trackPoints: doc.trackPoints ?? [],
     markers: doc.markers ?? [],
     createdAt: doc.createdAt?.toISOString?.() ?? '',
@@ -340,25 +342,40 @@ export async function getActivityDetail(activityId: ObjectIdLike, userId: string
   return toActivityDto(activity);
 }
 
-/** 更新活动类型（导入后修正；类型影响配速/卡路里，需重算） */
-export async function updateActivityType(
+/** 更新活动信息（类型/备注；类型变化时重算配速/卡路里） */
+export async function updateActivityMeta(
   activityId: ObjectIdLike,
   userId: string,
-  type: string,
-): Promise<{ id: string; type: string; avgPace: number | null; calories: number }> {
-  if (!ACTIVITY_TYPES.includes(type as (typeof ACTIVITY_TYPES)[number])) {
-    throw new AppError(400, '无效运动类型');
-  }
+  input: { type?: string; note?: string },
+): Promise<{ id: string; type: string; note: string; avgPace: number | null; calories: number }> {
   const activity = await findOwnedActivity(activityId, userId);
-  const stats = calcStats(activity.trackPoints ?? [], {
-    type: type as never,
-    durationSec: activity.duration ?? 0,
-  });
-  await ActivityModel.updateOne(
-    { _id: activityId, userId },
-    { type, avgPace: stats.avgPace, calories: stats.calories },
-  );
-  return { id: String(activity._id), type, avgPace: stats.avgPace, calories: stats.calories };
+  const patch: Record<string, unknown> = {};
+
+  if (input.type != null && input.type !== activity.type) {
+    if (!ACTIVITY_TYPES.includes(input.type as (typeof ACTIVITY_TYPES)[number])) {
+      throw new AppError(400, '无效运动类型');
+    }
+    const stats = calcStats(activity.trackPoints ?? [], {
+      type: input.type as never,
+      durationSec: activity.duration ?? 0,
+    });
+    patch.type = input.type;
+    patch.avgPace = stats.avgPace;
+    patch.calories = stats.calories;
+  }
+  if (input.note != null) {
+    patch.note = String(input.note).slice(0, 500);
+  }
+  if (Object.keys(patch).length > 0) {
+    await ActivityModel.updateOne({ _id: activityId, userId }, patch);
+  }
+  return {
+    id: String(activity._id),
+    type: input.type ?? activity.type,
+    note: input.note != null ? String(input.note).slice(0, 500) : activity.note ?? '',
+    avgPace: (patch.avgPace as number | null) ?? activity.avgPace ?? null,
+    calories: (patch.calories as number | undefined) ?? activity.calories ?? 0,
+  };
 }
 
 /** 删除活动（硬删；同步清理打点照片的 OSS 文件，失败不影响主流程） */

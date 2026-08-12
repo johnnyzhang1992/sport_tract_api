@@ -65,6 +65,7 @@ const activitySchema = new Schema(
     lastPointSeq: { type: Number, default: 0 }, // 已接收最大 seq（幂等去重）
     pausedMs: { type: Number, default: 0 },
     deviceInfo: { type: Schema.Types.Mixed, default: null },
+    note: { type: String, default: '' }, // 备注（用户编辑）
   },
   { timestamps: true },
 );
