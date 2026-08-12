@@ -13,7 +13,7 @@ import type {
   ListActivitiesQueryInput,
   UpdateMarkerInput,
 } from '../utils/validators.js';
-import { MAX_TRACK_POINTS } from '../config/constants.js';
+import { ACTIVITY_TYPES, MAX_TRACK_POINTS } from '../config/constants.js';
 
 type ObjectIdLike = Types.ObjectId | string;
 
