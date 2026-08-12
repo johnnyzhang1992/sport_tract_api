@@ -83,7 +83,7 @@ export async function getOverview(
     tracks: activities.map((a, i) => ({
       id: String(a._id),
       type: a.type,
-      startTime: a.startTime.toISOString(),
+      startTime: new Date(a.startTime).toISOString(), // startTime 存的是 Number 时间戳
       distance: a.distance || 0,
       duration: a.duration || 0,
       points: tracks[i] || [],
