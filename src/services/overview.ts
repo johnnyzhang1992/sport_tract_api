@@ -20,6 +20,8 @@ export interface OverviewTrack {
   id: string;
   type: string;
   startTime: string;
+  distance: number;
+  duration: number;
   points: LatLng[];
 }
 
@@ -82,6 +84,8 @@ export async function getOverview(
       id: String(a._id),
       type: a.type,
       startTime: a.startTime.toISOString(),
+      distance: a.distance || 0,
+      duration: a.duration || 0,
       points: tracks[i] || [],
     })),
     heat,
