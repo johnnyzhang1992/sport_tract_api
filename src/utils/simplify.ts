@@ -95,6 +95,17 @@ export function simplifyTracks(
     const diag = bboxDiagonal(t);
     const epsM = Math.max(5, diag * 0.015);
     let pts = douglasPeucker(t, epsM);
+    // 保形修复：环形/回环轨迹首尾接近，DP 可能退化成重合两点（画不出线）。
+    // 首尾距离 < 跨度 10% 时用更小容差重抽，至少保留形状拐点
+    if (pts.length < 4 && t.length > 8) {
+      const headTail = Math.hypot(
+        (pts[pts.length - 1].lat - pts[0].lat) * 111320,
+        (pts[pts.length - 1].lng - pts[0].lng) * 111320 * 0.85,
+      );
+      if (headTail < diag * 0.1) {
+        pts = douglasPeucker(t, Math.max(2, diag * 0.004));
+      }
+    }
     // 单轨迹硬上限：均匀采样降点
     if (pts.length > maxPerTrack) {
       const step = Math.ceil(pts.length / maxPerTrack);
