@@ -125,7 +125,23 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
       continue;
     }
 
-    // 2) 孤立离群：距前后连线远（绝对 + 相对局部尺度）且两侧位移均不小 → 剔除
+    // 2) 绝对超速（物理不可能，如 70m/s）：前后两段都超 25m/s（90km/h）才是孤立漂移点；
+    //    单段超速由规则 3 相对判定（避免级联误剔超速段的正常邻居）
+    if (v1 > 25 && v2 > 25) {
+      drop[i] = true;
+      continue;
+    }
+
+    // 3) 单侧高速跳：一侧远超局部速度（同向高速/跳出又跳回），另一侧也不算慢 → 剔除
+    //    实测模式：17m/s 同向跳、26m 跳出 + 6.5m/s 跳回
+    const highV = Math.max(7, med * 4);
+    const lowV = Math.max(3, med * 1.5);
+    if ((v1 > highV || v2 > highV) && Math.min(v1, v2) > lowV) {
+      drop[i] = true;
+      continue;
+    }
+
+    // 4) 孤立离群：距前后连线远（绝对 + 相对局部尺度）且两侧位移均不小 → 剔除
     const distLine = pointToSegmentDistM(b, a, c);
     const outlierTh = Math.max(minOutlierM, med * outlierRatio);
     if (distLine > outlierTh && d1 > 15 && d2 > 15) {
