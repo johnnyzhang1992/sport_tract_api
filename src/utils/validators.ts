@@ -40,6 +40,7 @@ const TrackPointSchema = z.object({
   altitude: z.number().nullable().optional(),
   // 负数 speed（微信定位异常值）容错归 null
   speed: z.number().nullable().optional().default(null).transform((v) => (v != null && v < 0 ? null : v)),
+  accuracy: z.number().min(0).nullable().optional(), // 水平精度（米）
   timestamp: z.number().positive('时间戳不合法'),
 });
 

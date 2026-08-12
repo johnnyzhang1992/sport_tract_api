@@ -59,6 +59,31 @@ function pointToSegmentDistM(p: CleanTrackPoint, a: CleanTrackPoint, b: CleanTra
   return Math.hypot(P.x - (A.x + t * (B.x - A.x)), P.y - (A.y + t * (B.y - A.y)));
 }
 
+/** 按运动类型的阈值配置（决策：不同运动速度特征差异大，统一阈值会误杀） */
+export interface TypeConfig {
+  /** 尖刺速度下限（m/s）：低于该值不判尖刺 */
+  minSpikeSpeed: number;
+  /** 绝对超速（m/s）：物理不可能上限 */
+  maxAbsSpeed: number;
+  /** 单侧高速下限（m/s）：相对局部速度判定的绝对基线 */
+  minHighSpeed: number;
+}
+
+export const TYPE_CONFIGS: Record<string, TypeConfig> = {
+  walking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7 }, // 步行 ~1.5m/s
+  hiking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7 }, // 徒步 ~1.5m/s
+  running: { minSpikeSpeed: 8, maxAbsSpeed: 18, minHighSpeed: 10 }, // 跑步 ~3-5m/s，冲刺 8m/s
+  cycling: { minSpikeSpeed: 12, maxAbsSpeed: 30, minHighSpeed: 14 }, // 骑行 ~8m/s，冲刺 12m/s，下坡可 25m/s
+  mountaineering: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7 }, // 登山慢，信号差
+  swimming: { minSpikeSpeed: 3, maxAbsSpeed: 8, minHighSpeed: 5 }, // 游泳 ~1.5m/s
+};
+
+export const DEFAULT_TYPE_CONFIG: TypeConfig = {
+  minSpikeSpeed: 5,
+  maxAbsSpeed: 25,
+  minHighSpeed: 7,
+};
+
 export interface CleanOptions {
   /** 尖刺速度下限（m/s）：低于该值不判尖刺（防误杀慢速运动） */
   minSpikeSpeed?: number;
@@ -79,14 +104,17 @@ export interface CleanOptions {
 export function cleanTrajectory<T extends CleanTrackPoint>(
   points: T[],
   opts: CleanOptions = {},
+  type?: string,
 ): T[] {
+  const typeCfg = (type && TYPE_CONFIGS[type]) || DEFAULT_TYPE_CONFIG;
   const {
-    minSpikeSpeed = 5,
+    minSpikeSpeed = typeCfg.minSpikeSpeed,
     spikeRatio = 3.5,
     minTurnDeg = 100,
     minOutlierM = 25,
     outlierRatio = 5,
   } = opts;
+  const maxAbsSpeed = typeCfg.maxAbsSpeed;
   const n = points.length;
   if (n < 4) return points;
 
@@ -142,16 +170,16 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
       continue;
     }
 
-    // 2) 绝对超速（物理不可能，如 70m/s）：前后两段都超 25m/s（90km/h）才是孤立漂移点；
+    // 2) 绝对超速（物理不可能，如 70m/s）：前后两段都超上限（按类型，如骑行 30m/s/跑步 18m/s）才是孤立漂移点；
     //    单段超速由规则 3 相对判定（避免级联误剔超速段的正常邻居）
-    if (v1 > 25 && v2 > 25) {
+    if (v1 > maxAbsSpeed && v2 > maxAbsSpeed) {
       drop[i] = true;
       continue;
     }
 
     // 3) 单侧高速跳：一侧远超局部速度（同向高速/跳出又跳回），另一侧也不算慢 → 剔除
     //    实测模式：17m/s 同向跳、26m 跳出 + 6.5m/s 跳回
-    const highV = Math.max(7, med * 4);
+    const highV = Math.max(typeCfg.minHighSpeed, med * 4);
     const lowV = Math.max(3, med * 1.5);
     if ((v1 > highV || v2 > highV) && Math.min(v1, v2) > lowV) {
       drop[i] = true;

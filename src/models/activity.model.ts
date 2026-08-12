@@ -15,6 +15,7 @@ const trackPointSchema = new Schema(
     lng: { type: Number, required: true },
     altitude: { type: Number, default: null },
     speed: { type: Number, default: null },
+    accuracy: { type: Number, default: null }, // 水平精度（米，实时定位质量）
     timestamp: { type: Number, required: true },
   },
   { _id: false },

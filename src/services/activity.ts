@@ -24,6 +24,7 @@ export interface TrackPointDto {
   lng: number;
   altitude: number | null;
   speed: number | null;
+  accuracy: number | null;
   timestamp: number;
 }
 
@@ -234,7 +235,7 @@ export async function finishActivity(
   const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
 
   // 轨迹纠偏（决策：GPS 漂移点剔除）—— 尖刺点（短时高速来回跳）与孤立离群点
-  const trajectoryCleaned = cleanTrajectory(altitudeCleaned);
+  const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
 
   // 轨迹平滑（滑动平均 + 位移守卫）：抑制 GPS 抖动，端点保持，位移过大回退原值
   const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
@@ -357,7 +358,7 @@ export async function reprocessActivity(
     throw new AppError(400, '轨迹点为空');
   }
   const altitudeCleaned = cleanAltitudeSpikes(raw);
-  const trajectoryCleaned = cleanTrajectory(altitudeCleaned);
+  const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
   const smoothed = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
   const stats = calcStats(smoothed, {
     type: activity.type,
