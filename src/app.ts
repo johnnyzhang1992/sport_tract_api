@@ -40,12 +40,13 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
 
   // 容错：application/json 空 body（GET/DELETE 客户端可能带空 JSON body）→ 视为无 body
   fastify.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
-    if (body === undefined || body === null || body === '') {
+    const str = typeof body === 'string' ? body : String(body);
+    if (str === '') {
       done(null, null);
       return;
     }
     try {
-      done(null, JSON.parse(body));
+      done(null, JSON.parse(str));
     } catch (err) {
       done(err as Error, undefined);
     }
