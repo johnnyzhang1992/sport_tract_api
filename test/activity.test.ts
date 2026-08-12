@@ -376,7 +376,7 @@ test('轨迹平滑：抖动点被滑动平均修正，端点保持', async () =>
   assert.equal(pts[0].lat, 31.2304);
   assert.equal(pts[pts.length - 1].lat, 31.2344);
   // 剔除的是抖动点（31.2420 不在结果中）
-  assert.ok(!pts.some((p) => Math.abs(p.lat - 31.2420) < 0.0001), '850m 级抖动点应被剔除');
+  assert.ok(!pts.some((p: { lat: number }) => Math.abs(p.lat - 31.2420) < 0.0001), '850m 级抖动点应被剔除');
 });
 
 test('删除带照片的活动：OSS 未配置时优雅跳过，不影响删除', async () => {
