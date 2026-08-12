@@ -12,6 +12,7 @@ import {
   removeMarker,
   updateMarker,
   updateActivityMeta,
+  reprocessActivity,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import { deleteOssObjects, getSignedUrl } from '../services/oss.js';
@@ -126,6 +127,13 @@ export async function activityRoutes(fastify: FastifyInstance) {
     reply.header('Content-Type', 'application/gpx+xml; charset=utf-8');
     reply.header('Content-Disposition', `attachment; filename="activity-${id}.gpx"`);
     return toGpx(activity);
+  });
+
+  // 重新纠偏（事后清洗历史轨迹）
+  fastify.post('/:id/reprocess', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const activity = await reprocessActivity(id, request.user.userId);
+    return success({ activity }, '已重新纠偏');
   });
 
   // 更新活动信息（类型/备注）

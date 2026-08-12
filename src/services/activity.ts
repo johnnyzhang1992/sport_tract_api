@@ -346,6 +346,41 @@ export async function getActivityDetail(activityId: ObjectIdLike, userId: string
   return toActivityDto(activity);
 }
 
+/** 重新纠偏：对已完成活动重跑 海拔清洗→轨迹纠偏→平滑→重算指标（决策：事后清洗历史脏数据） */
+export async function reprocessActivity(
+  activityId: ObjectIdLike,
+  userId: string,
+): Promise<ActivityDto> {
+  const activity = await findOwnedActivity(activityId, userId);
+  const raw = (activity.trackPoints ?? []) as TrackPointDto[];
+  if (raw.length === 0) {
+    throw new AppError(400, '轨迹点为空');
+  }
+  const altitudeCleaned = cleanAltitudeSpikes(raw);
+  const trajectoryCleaned = cleanTrajectory(altitudeCleaned);
+  const smoothed = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
+  const stats = calcStats(smoothed, {
+    type: activity.type,
+    durationSec: activity.duration ?? 0,
+  });
+  const updated = await ActivityModel.findByIdAndUpdate(
+    activityId,
+    {
+      $set: {
+        trackPoints: smoothed,
+        distance: stats.distance,
+        avgPace: stats.avgPace,
+        calories: stats.calories,
+        elevationGain: stats.elevationGain,
+        maxAltitude: stats.maxAltitude,
+        lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
+      },
+    },
+    { returnDocument: 'after' },
+  );
+  return toActivityDto(updated!.toObject());
+}
+
 /** 更新活动信息（类型/备注；类型变化时重算配速/卡路里） */
 export async function updateActivityMeta(
   activityId: ObjectIdLike,
