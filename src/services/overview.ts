@@ -1,0 +1,89 @@
+/**
+ * 轨迹合集（决策 M6）：一周/一月/一年/全部 的聚合轨迹 + 热力
+ * 查询 finished 活动 → 后端抽稀（DP + 预算）→ 网格热力 → 聚合统计
+ */
+import { ActivityModel } from '../models/activity.model.js';
+import { simplifyTracks, gridHeat, type LatLng } from '../utils/simplify.js';
+
+export const OVERVIEW_RANGES = ['week', 'month', 'year', 'all'] as const;
+export type OverviewRange = (typeof OVERVIEW_RANGES)[number];
+
+/** 范围 → 起始时间偏移（天） */
+const RANGE_DAYS: Record<OverviewRange, number | null> = {
+  week: 7,
+  month: 30,
+  year: 365,
+  all: null,
+};
+
+export interface OverviewTrack {
+  id: string;
+  type: string;
+  startTime: string;
+  points: LatLng[];
+}
+
+export interface OverviewResult {
+  range: OverviewRange;
+  count: number;
+  totalDistanceKm: number;
+  totalDurationSec: number;
+  totalElevationGain: number;
+  tracks: OverviewTrack[];
+  heat: { lat: number; lng: number; weight: number }[];
+}
+
+/** 查询 + 抽稀 + 热力（轨迹多则每轨迹点少，总量受预算约束） */
+export async function getOverview(
+  userId: string,
+  range: OverviewRange,
+): Promise<OverviewResult> {
+  const days = RANGE_DAYS[range];
+  const query: Record<string, unknown> = {
+    userId,
+    status: 'finished',
+  };
+  if (days != null) {
+    query.startTime = { $gte: new Date(Date.now() - days * 86400000) };
+  }
+
+  // 只取必要字段，避免大文档传输（trackPoints 仅 lat/lng，抽稀不需要海拔/时间）
+  const activities = await ActivityModel.find(query)
+    .select({
+      _id: 1,
+      type: 1,
+      startTime: 1,
+      distance: 1,
+      duration: 1,
+      elevationGain: 1,
+      'trackPoints.lat': 1,
+      'trackPoints.lng': 1,
+    })
+    .sort({ startTime: -1 })
+    .lean();
+
+  // 按轨迹抽稀：轨迹越多，每轨迹点越少（全局预算 3000）
+  const rawTracks: LatLng[][] = activities.map(
+    (a) =>
+      ((a.trackPoints ?? []) as Array<{ lat?: number; lng?: number }>)
+        .filter((p) => p && typeof p.lat === 'number' && typeof p.lng === 'number')
+        .map((p) => ({ lat: p.lat as number, lng: p.lng as number })),
+  );
+  const tracks = simplifyTracks(rawTracks, { maxPoints: 3000, maxPerTrack: 100 });
+  const heat = gridHeat(rawTracks, 150, 200);
+
+  return {
+    range,
+    count: activities.length,
+    totalDistanceKm: Math.round(activities.reduce((s, a) => s + (a.distance || 0), 0) / 10) / 100,
+    totalDurationSec: activities.reduce((s, a) => s + (a.duration || 0), 0),
+    totalElevationGain: Math.round(activities.reduce((s, a) => s + (a.elevationGain || 0), 0)),
+    tracks: activities.map((a, i) => ({
+      id: String(a._id),
+      type: a.type,
+      startTime: a.startTime.toISOString(),
+      points: tracks[i] || [],
+    })),
+    heat,
+  };
+}

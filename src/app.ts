@@ -13,6 +13,7 @@ import { activityRoutes } from './routes/activity.routes.js';
 import { statsRoutes } from './routes/stats.routes.js';
 import { shareRoutes } from './routes/share.routes.js';
 import { geoRoutes } from './routes/geo.routes.js';
+import { overviewRoutes } from './routes/overview.routes.js';
 
 export interface BuildAppOptions {
   /** 日志开关（测试传 false；默认 dev 用 pino-pretty，prod 用 JSON） */
@@ -50,6 +51,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(statsRoutes, { prefix: `${config.apiPrefix}/stats` });
   await fastify.register(shareRoutes, { prefix: `${config.apiPrefix}/share` });
   await fastify.register(geoRoutes, { prefix: `${config.apiPrefix}/geo` });
+  await fastify.register(overviewRoutes, { prefix: `${config.apiPrefix}/overview` });
 
   // 健康检查（含 MongoDB 状态）
   fastify.get('/health', async () => ({
