@@ -340,6 +340,27 @@ export async function getActivityDetail(activityId: ObjectIdLike, userId: string
   return toActivityDto(activity);
 }
 
+/** 更新活动类型（导入后修正；类型影响配速/卡路里，需重算） */
+export async function updateActivityType(
+  activityId: ObjectIdLike,
+  userId: string,
+  type: string,
+): Promise<{ id: string; type: string; avgPace: number | null; calories: number }> {
+  if (!ACTIVITY_TYPES.includes(type as (typeof ACTIVITY_TYPES)[number])) {
+    throw new AppError(400, '无效运动类型');
+  }
+  const activity = await findOwnedActivity(activityId, userId);
+  const stats = calcStats(activity.trackPoints ?? [], {
+    type: type as never,
+    durationSec: activity.duration ?? 0,
+  });
+  await ActivityModel.updateOne(
+    { _id: activityId, userId },
+    { type, avgPace: stats.avgPace, calories: stats.calories },
+  );
+  return { id: String(activity._id), type, avgPace: stats.avgPace, calories: stats.calories };
+}
+
 /** 删除活动（硬删；同步清理打点照片的 OSS 文件，失败不影响主流程） */
 export async function deleteActivity(activityId: ObjectIdLike, userId: string): Promise<void> {
   const activity = await findOwnedActivity(activityId, userId);
