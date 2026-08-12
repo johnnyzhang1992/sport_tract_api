@@ -4,6 +4,7 @@ import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance } from '../utils/pace.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
+import { cleanTrajectory } from '../utils/trajectory-clean.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
 import type {
   AppendPointsInput,
@@ -232,8 +233,11 @@ export async function finishActivity(
   // 海拔尖刺清洗（GPS 误差：短时间大幅跳变且方向反转 → 海拔置 null）
   const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
 
+  // 轨迹纠偏（决策：GPS 漂移点剔除）—— 尖刺点（短时高速来回跳）与孤立离群点
+  const trajectoryCleaned = cleanTrajectory(altitudeCleaned);
+
   // 轨迹平滑（滑动平均 + 位移守卫）：抑制 GPS 抖动，端点保持，位移过大回退原值
-  const smoothedPoints = smoothTrackSmart(altitudeCleaned, 5, haversineDistance);
+  const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
   const stats = calcStats(smoothedPoints, {
     type: activity.type,
     durationSec,
@@ -257,7 +261,7 @@ export async function finishActivity(
         calories: stats.calories,
         elevationGain: stats.elevationGain,
         maxAltitude: stats.maxAltitude,
-        lastPointSeq: trackPoints.length > 0 ? trackPoints[trackPoints.length - 1].seq : 0,
+        lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
       },
     },
     { returnDocument: 'after' },

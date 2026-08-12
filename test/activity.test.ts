@@ -370,13 +370,13 @@ test('轨迹平滑：抖动点被滑动平均修正，端点保持', async () =>
   });
   assert.equal(res.statusCode, 200);
   const pts = res.json().data.activity.trackPoints;
-  assert.equal(pts.length, 5);
+  // 决策更新：850m 级抖动点被轨迹纠偏（cleanTrajectory）直接剔除，而非平滑修正
+  assert.equal(pts.length, 4, '抖动点应被剔除');
   // 端点保持原值
   assert.equal(pts[0].lat, 31.2304);
-  assert.equal(pts[4].lat, 31.2344);
-  // 抖动点（第 3 个）被修正：远离 31.2420，接近 5 点窗口均值 31.23432
-  assert.ok(Math.abs(pts[2].lat - 31.2420) > 0.005, `抖动点应被修正, lat=${pts[2].lat}`);
-  assert.ok(Math.abs(pts[2].lat - 31.23432) < 0.001, `应接近窗口均值, lat=${pts[2].lat}`);
+  assert.equal(pts[pts.length - 1].lat, 31.2344);
+  // 剔除的是抖动点（31.2420 不在结果中）
+  assert.ok(!pts.some((p) => Math.abs(p.lat - 31.2420) < 0.0001), '850m 级抖动点应被剔除');
 });
 
 test('删除带照片的活动：OSS 未配置时优雅跳过，不影响删除', async () => {
