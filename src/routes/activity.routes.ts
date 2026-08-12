@@ -132,7 +132,7 @@ export async function activityRoutes(fastify: FastifyInstance) {
   fastify.put('/:id/meta', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id } = request.params as { id: string };
     const input = z
-      .object({ type: z.string().min(1).optional(), note: z.string().max(500).optional() })
+      .object({ type: z.string().min(1).optional(), note: z.string().max(500).optional(), source: z.string().max(50).optional() })
       .parse(request.body);
     const result = await updateActivityMeta(id, request.user.userId, input);
     return success(result, '已更新');
@@ -156,7 +156,9 @@ export async function activityRoutes(fastify: FastifyInstance) {
     // multipart 字段（wx.uploadFile formData）
     const typeField = (part.fields?.type ?? part.fields?.['type']) as string | undefined;
     const typeOverride = typeof typeField === 'string' && typeField ? typeField : undefined;
-    const result = await importActivity(request.user.userId, filename, content.toString('utf8'), typeOverride);
+    const sourceField = (part.fields?.source ?? part.fields?.['source']) as string | undefined;
+    const source = typeof sourceField === 'string' && sourceField ? sourceField : undefined;
+    const result = await importActivity(request.user.userId, filename, content.toString('utf8'), typeOverride, source);
     return success(result, '导入成功');
   });
 }

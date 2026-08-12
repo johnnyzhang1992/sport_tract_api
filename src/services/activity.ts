@@ -346,8 +346,8 @@ export async function getActivityDetail(activityId: ObjectIdLike, userId: string
 export async function updateActivityMeta(
   activityId: ObjectIdLike,
   userId: string,
-  input: { type?: string; note?: string },
-): Promise<{ id: string; type: string; note: string; avgPace: number | null; calories: number }> {
+  input: { type?: string; note?: string; source?: string },
+): Promise<{ id: string; type: string; note: string; source: string; avgPace: number | null; calories: number }> {
   const activity = await findOwnedActivity(activityId, userId);
   const patch: Record<string, unknown> = {};
 
@@ -366,6 +366,9 @@ export async function updateActivityMeta(
   if (input.note != null) {
     patch.note = String(input.note).slice(0, 500);
   }
+  if (input.source != null) {
+    patch.deviceInfo = { ...(activity.deviceInfo ?? {}), source: String(input.source).slice(0, 50) };
+  }
   if (Object.keys(patch).length > 0) {
     await ActivityModel.updateOne({ _id: activityId, userId }, patch);
   }
@@ -373,6 +376,10 @@ export async function updateActivityMeta(
     id: String(activity._id),
     type: input.type ?? activity.type,
     note: input.note != null ? String(input.note).slice(0, 500) : activity.note ?? '',
+    source:
+      input.source != null
+        ? String(input.source).slice(0, 50)
+        : ((activity.deviceInfo as { source?: string } | null)?.source ?? ''),
     avgPace: (patch.avgPace as number | null) ?? activity.avgPace ?? null,
     calories: (patch.calories as number | undefined) ?? activity.calories ?? 0,
   };

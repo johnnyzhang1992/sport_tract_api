@@ -215,6 +215,18 @@ function asArray(v: unknown): any[] {
   return Array.isArray(v) ? v : [v];
 }
 
+/** 从文件名推断数据来源（用户可在前端修正/自定义） */
+export function guessSource(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (/2bulu|两步路/i.test(lower) || /\.kml$/i.test(lower)) return '两步路';
+  if (/strava/i.test(lower)) return 'Strava';
+  if (/garmin|connect|佳明/i.test(lower) || /\.tcx$/i.test(lower)) return '佳明';
+  if (/huawei|华为/i.test(lower)) return '华为运动健康';
+  if (/xiaomi|mifitness|zepp|小米/i.test(lower)) return '小米运动';
+  if (/keep/i.test(lower)) return 'Keep';
+  return '其他';
+}
+
 /** 从文件名推断运动类型（GPX/KML 通常无类型字段） */
 export function guessType(filename: string, points: ImportedPoint[]): string {
   const lower = filename.toLowerCase();
@@ -241,6 +253,7 @@ export async function importActivity(
   filename: string,
   content: string,
   typeOverride?: string,
+  source?: string,
 ): Promise<{ id: string; type: string; distance: number; duration: number; pointCount: number }> {
   let points = parseTrackFile(filename, content);
   // 坐标系转换（决策 M7）：第三方文件为 WGS-84，微信地图为 GCJ-02，中国境内偏移数百米
@@ -295,7 +308,7 @@ export async function importActivity(
     trackPoints: trackPoints.slice(0, MAX_TRACK_POINTS),
     markers: [],
     lastPointSeq: trackPoints.length,
-    deviceInfo: { source: 'import', filename },
+    deviceInfo: { source: source || guessSource(filename), filename },
   });
 
   return {
