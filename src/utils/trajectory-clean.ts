@@ -92,6 +92,23 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
 
   const drop = new Array<boolean>(n).fill(false);
 
+  // 局部相邻位移中位数（首尾跳点判定基准；窗口全轨迹 ±5 点）
+  const stepDists: number[] = [];
+  for (let j = 1; j < n; j++) {
+    stepDists.push(distM(points[j - 1], points[j]));
+  }
+  const sortedSteps = stepDists.slice().sort((x, y) => x - y);
+  const medStep = sortedSteps.length > 0 ? sortedSteps[Math.floor(sortedSteps.length / 2)] : 0;
+
+  // 首点跳（起点 GPS 未收敛）：首段距离远超局部步长 → 剔首点
+  if (n >= 3 && stepDists.length >= 2 && stepDists[0] > Math.max(15, medStep * 5)) {
+    drop[0] = true;
+  }
+  // 尾点跳：末段距离远超局部步长 → 剔尾点
+  if (n >= 3 && stepDists.length >= 2 && stepDists[stepDists.length - 1] > Math.max(15, medStep * 5)) {
+    drop[n - 1] = true;
+  }
+
   for (let i = 1; i < n - 1; i++) {
     const a = points[i - 1];
     const b = points[i];

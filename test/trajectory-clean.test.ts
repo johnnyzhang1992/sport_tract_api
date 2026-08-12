@@ -65,3 +65,23 @@ test('边界：短轨迹/空数组安全', () => {
   const two = [{ lat: 30.5, lng: 114.4, timestamp: 0 }, { lat: 30.51, lng: 114.41, timestamp: 1000 }];
   assert.deepEqual(cleanTrajectory(two), two);
 });
+
+test('起点跳点剔除：起点 GPS 未收敛（首段 29m，其余 ~5m）', () => {
+  const pts = walkTrack(15);
+  // 起点在东北 29m 处（GPS 未收敛），点1 起为正常轨迹
+  const shifted = [
+    { lat: 30.5 + 0.00026, lng: 114.4 - 0.0001, timestamp: -1000 },
+    ...pts.map((p) => ({ ...p, timestamp: p.timestamp + 1000 })),
+  ];
+  const cleaned = cleanTrajectory(shifted);
+  assert.equal(cleaned.length, pts.length, '起点跳点应被剔除，其余保留');
+  assert.ok(!cleaned.some((p) => p.lat > 30.5 + 0.0002), '跳点起点不在结果中');
+});
+
+test('尾点跳点剔除：结束时 GPS 漂移', () => {
+  const pts = walkTrack(15);
+  const tail = { lat: 30.5 + 14 * 0.00004 + 0.0003, lng: 114.4 + 14 * 0.00004, timestamp: 14 * 3000 + 500 };
+  const withTail = [...pts.slice(0, 14), tail];
+  const cleaned = cleanTrajectory(withTail);
+  assert.equal(cleaned.length, 14, '尾跳点应被剔除');
+});
