@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { overview, trend } from '../services/stats.js';
+import { footprint } from '../services/footprint.js';
 import { success } from '../utils/response.js';
 
 /** 统计路由：/api/stats（决策 F18/F19） */
@@ -7,6 +8,12 @@ export async function statsRoutes(fastify: FastifyInstance) {
   // 概览：今日/本周/本月/累计
   fastify.get('/overview', { onRequest: [fastify.authenticate] }, async (request) => {
     const result = await overview(request.user.userId);
+    return success(result);
+  });
+
+  // 足迹点亮：省/市统计
+  fastify.get('/footprint', { onRequest: [fastify.authenticate] }, async (request) => {
+    const result = await footprint(request.user.userId);
     return success(result);
   });
 

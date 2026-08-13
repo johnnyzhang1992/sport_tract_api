@@ -5,6 +5,7 @@ import { calcStats, haversineDistance } from '../utils/pace.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { cleanTrajectory } from '../utils/trajectory-clean.js';
+import { markFootprintDirty } from './footprint.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
 import type {
   AppendPointsInput,
@@ -268,6 +269,8 @@ export async function finishActivity(
     { returnDocument: 'after' },
   );
 
+  await markFootprintDirty(String(activity.userId)); // 足迹失效，下次读取重算
+
   return {
     status: 'finished',
     lastPointSeq: updated!.lastPointSeq,
@@ -449,6 +452,8 @@ export async function deleteActivity(activityId: ObjectIdLike, userId: string): 
       console.error('[oss] 清理活动照片失败:', (err as Error).message);
     }
   }
+
+  await markFootprintDirty(String(activity.userId)); // 足迹失效
 }
 
 /**

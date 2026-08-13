@@ -13,6 +13,9 @@ const userSchema = new Schema(
       defaultType: { type: String, default: 'walking' },
       highAccuracy: { type: Boolean, default: true },
     },
+    // 足迹点亮缓存（懒重算：写入只置 dirty，读时 dirty 才重算）
+    footprintCache: { type: Schema.Types.Mixed, default: null },
+    footprintDirty: { type: Boolean, default: true },
   },
   { timestamps: true },
 );

@@ -15,5 +15,6 @@ ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --registry=https://registry.npmmirror.com && npm cache clean --force
 COPY --from=builder /app/dist ./dist
+COPY data ./data
 EXPOSE 3004
 CMD ["node", "dist/server.js"]

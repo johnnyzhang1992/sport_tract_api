@@ -10,6 +10,7 @@ import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance, type TrackPointLike } from '../utils/pace.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { wgs84ToGcj02 } from '../utils/coordinate.js';
+import { markFootprintDirty } from './footprint.js';
 import { ACTIVITY_TYPES, MAX_TRACK_POINTS } from '../config/constants.js';
 
 export interface ImportedPoint {
@@ -310,6 +311,8 @@ export async function importActivity(
     lastPointSeq: trackPoints.length,
     deviceInfo: { source: source || guessSource(filename), filename },
   });
+
+  await markFootprintDirty(String(activity.userId)); // 足迹失效
 
   return {
     id: String(activity._id),
