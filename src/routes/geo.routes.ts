@@ -19,6 +19,6 @@ export async function geoRoutes(fastify: FastifyInstance) {
 
   // 中国省界地图数据（点亮地图用；体积大放后端，前端按需拉取缓存）
   fastify.get('/china-map', { onRequest: [fastify.authenticate] }, async () => {
-    return getChinaMap();
+    return success(getChinaMap());
   });
 }
