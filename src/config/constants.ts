@@ -10,6 +10,8 @@ export const ACTIVITY_TYPES = [
   'cycling',
   'mountaineering',
   'swimming',
+  'skiing',
+  'rowing',
 ] as const;
 
 export type ActivityType = (typeof ACTIVITY_TYPES)[number];
@@ -35,6 +37,8 @@ export const ACTIVITY_TYPE_META: Record<ActivityType, ActivityTypeMeta> = {
   cycling: { type: 'cycling', label: '骑行', met: 7.5 },
   mountaineering: { type: 'mountaineering', label: '登山', met: 8.0 },
   swimming: { type: 'swimming', label: '游泳', met: 8.0 },
+  skiing: { type: 'skiing', label: '滑雪', met: 6.0 },
+  rowing: { type: 'rowing', label: '划船', met: 7.0 },
 };
 
 /** 轨迹点数组保护上限（超出提示客户端抽稀） */

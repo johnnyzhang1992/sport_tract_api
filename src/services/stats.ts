@@ -26,6 +26,7 @@ export interface OverviewResult {
   today: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
   week: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
   month: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
+  year: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
   total: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
 }
 
@@ -33,7 +34,7 @@ export interface OverviewResult {
 export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
   const finished: Record<string, any> = { userId: toObjectId(userId), status: 'finished' };
 
-  const [today, week, month, total] = await Promise.all([
+  const [today, week, month, year, total] = await Promise.all([
     ActivityModel.aggregate([
       { $match: { ...finished, startTime: { $gte: dayStart(Date.now()) } } },
       ...sumAgg,
@@ -53,6 +54,15 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
       },
       ...sumAgg,
     ]),
+    ActivityModel.aggregate([
+      {
+        $match: {
+          ...finished,
+          startTime: { $gte: new Date(new Date().getFullYear(), 0, 1).getTime() }, // 当年
+        },
+      },
+      ...sumAgg,
+    ]),
     ActivityModel.aggregate([{ $match: finished }, ...sumAgg]),
   ]);
 
@@ -60,6 +70,7 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
     today: toSection(today),
     week: toSection(week),
     month: toSection(month),
+    year: toSection(year),
     total: toSection(total),
   };
 }
