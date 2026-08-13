@@ -173,3 +173,13 @@ function provinceAdcodeOfCity(rec: RegionRecord): number {
 export function regionStats() {
   return { provinces: provinceRecords.length, cities: cityRecords.length };
 }
+
+/** 返回中国省界 GeoJSON（原始，前端 echarts registerMap 用） */
+export function getChinaMap() {
+  return chinaMapData;
+}
+
+const chinaMapData = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../data/provinces.geojson'), 'utf8'),
+);
+

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { reverseGeocode } from '../services/geo.js';
+import { getChinaMap } from '../services/region.js';
 import { success } from '../utils/response.js';
 
 const ReverseQuery = z.object({
@@ -14,5 +15,10 @@ export async function geoRoutes(fastify: FastifyInstance) {
     const { lat, lng } = ReverseQuery.parse(request.query);
     const address = await reverseGeocode(lat, lng);
     return success({ address });
+  });
+
+  // 中国省界地图数据（点亮地图用；体积大放后端，前端按需拉取缓存）
+  fastify.get('/china-map', { onRequest: [fastify.authenticate] }, async () => {
+    return getChinaMap();
   });
 }
