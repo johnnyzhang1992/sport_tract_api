@@ -249,6 +249,19 @@ test('创建活动缺 type → 400', async () => {
   assert.equal(res.statusCode, 400);
 });
 
+test('列表返回轨迹缩略预览点（≤60 点均匀采样）', async () => {
+  const list = await req('GET', '/api/activities?page=1&pageSize=20', { token: tokenA });
+  assert.equal(list.statusCode, 200);
+  const mine = list.json().data.items.find((i: { _id: unknown }) => String(i._id) === activityId);
+  assert.ok(mine, 'finished 活动应在列表中');
+  const pp = mine.previewPoints;
+  assert.ok(Array.isArray(pp));
+  assert.ok(pp.length >= 2 && pp.length <= 60, `previewPoints 点数异常: ${pp.length}`);
+  assert.equal(typeof pp[0].lat, 'number');
+  assert.equal(typeof pp[0].lng, 'number');
+  assert.ok(Math.abs(pp[0].lat - 31.2304) < 1e-6, '首点应近似轨迹起点');
+});
+
 test('cancel 活动', async () => {
   const created = await req('POST', '/api/activities', {
     token: tokenA,

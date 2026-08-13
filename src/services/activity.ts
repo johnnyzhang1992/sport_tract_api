@@ -336,6 +336,33 @@ export async function listActivities(
           markerCount: { $size: '$markers' },
           firstPoint: { $arrayElemAt: ['$trackPoints', 0] },
           lastPoint: { $arrayElemAt: ['$trackPoints', -1] },
+          // 轨迹缩略图：均匀采样 60 点（列表卡片预览用，避免全量点下发）
+          previewPoints: {
+            $map: {
+              input: { $range: [0, 60] },
+              as: 'i',
+              in: {
+                $let: {
+                  vars: {
+                    idx: {
+                      $min: [
+                        { $subtract: [{ $size: '$trackPoints' }, 1] },
+                        { $floor: { $multiply: ['$$i', { $divide: [{ $size: '$trackPoints' }, 60] }] } },
+                      ],
+                    },
+                  },
+                  in: {
+                    $let: {
+                      vars: {
+                        p: { $ifNull: [{ $arrayElemAt: ['$trackPoints', '$$idx'] }, { lat: 0, lng: 0 }] },
+                      },
+                      in: { lat: '$$p.lat', lng: '$$p.lng' },
+                    },
+                  },
+                },
+              },
+            },
+          },
         },
       },
     ]),
