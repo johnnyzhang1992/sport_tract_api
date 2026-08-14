@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
+import { WeightLogModel } from '../src/models/weight-log.model.js';
 import FormData from 'form-data';
 
 let app: FastifyInstance;
@@ -12,6 +13,7 @@ before(async () => {
   await app.ready();
   // 清理测试数据
   await UserModel.deleteMany({ openid: /^mock_openid_/ });
+  await WeightLogModel.deleteMany({});
 });
 
 after(async () => {
@@ -223,4 +225,39 @@ test('逆地理编码：参数非法 → 400', async () => {
     headers: { authorization: `Bearer ${t}` },
   });
   assert.equal(res.statusCode, 400);
+});
+
+test('保存体重变化 → 记录体重日志并可查询', async () => {
+  const login = await post('/api/auth/login', { code: 'weight-user' });
+  const t = login.json().data.accessToken;
+  // 保存体重 65
+  await app.inject({
+    method: 'PUT',
+    url: '/api/users/me',
+    payload: { weightKg: 65 },
+    headers: { authorization: `Bearer ${t}` },
+  });
+  // 再次保存相同体重 → 不重复记录
+  await app.inject({
+    method: 'PUT',
+    url: '/api/users/me',
+    payload: { weightKg: 65 },
+    headers: { authorization: `Bearer ${t}` },
+  });
+  // 改成 64 → 新增一条
+  await app.inject({
+    method: 'PUT',
+    url: '/api/users/me',
+    payload: { weightKg: 64 },
+    headers: { authorization: `Bearer ${t}` },
+  });
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/users/weight-logs',
+    headers: { authorization: `Bearer ${t}` },
+  });
+  assert.equal(res.statusCode, 200);
+  const items = res.json().data.items;
+  assert.equal(items.length, 2, '相同体重不重复记录，应只有 2 条（65、64）');
+  assert.equal(items[0].weightKg, 64, '最新体重在前');
 });

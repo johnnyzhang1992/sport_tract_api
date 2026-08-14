@@ -41,6 +41,8 @@ export async function authRoutes(fastify: FastifyInstance) {
           nickname: user.nickname,
           avatarUrl: user.avatarUrl ? getSignedUrl(user.avatarUrl) : '',
           gender: user.gender,
+          weightKg: user.weightKg,
+          heightCm: user.heightCm,
           settings: user.settings,
         },
       },

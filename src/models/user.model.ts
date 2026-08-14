@@ -8,10 +8,13 @@ const userSchema = new Schema(
     nickname: { type: String, default: '' },
     avatarUrl: { type: String, default: '' },
     gender: { type: Number, enum: [0, 1, 2], default: 0 }, // 0 未知 1 男 2 女
+    weightKg: { type: Number, default: 60, min: 20, max: 300 }, // 体重 kg（卡路里计算用）
+    heightCm: { type: Number, default: 170, min: 50, max: 250 }, // 身高 cm
     settings: {
       unit: { type: String, enum: ['metric', 'imperial'], default: 'metric' },
       defaultType: { type: String, default: 'walking' },
       highAccuracy: { type: Boolean, default: true },
+      showBodyData: { type: Boolean, default: true }, // 个人中心是否展示身高体重
     },
     // 足迹点亮缓存（懒重算：写入只置 dirty，读时 dirty 才重算）
     footprintCache: { type: Schema.Types.Mixed, default: null },

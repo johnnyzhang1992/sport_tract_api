@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { UserModel } from '../models/user.model.js';
+import { WeightLogModel } from '../models/weight-log.model.js';
 import { checkImage, checkText } from '../services/wechat-sec.js';
 import { getSignedUrl } from '../services/oss.js';
 import { UpdateMeSchema } from '../utils/validators.js';
@@ -23,6 +24,8 @@ export async function userRoutes(fastify: FastifyInstance) {
       nickname: user.nickname,
       avatarUrl: signAvatar(user.avatarUrl),
       gender: user.gender,
+      weightKg: user.weightKg,
+      heightCm: user.heightCm,
       settings: user.settings,
       createdAt: user.createdAt,
     });
@@ -37,6 +40,18 @@ export async function userRoutes(fastify: FastifyInstance) {
       const sec = await checkText(body.nickname, user?.openid);
       if (sec.risky) {
         throw new AppError(400, '昵称包含不当内容，请更换后再试', { code: 'NICKNAME_RISKY' });
+      }
+    }
+
+    // 体重变化趋势：更新前读取旧体重，若本次体重与旧值不同则插入体重记录
+    if (typeof body.weightKg === 'number') {
+      const prev = await UserModel.findById(request.user.userId).select('weightKg').lean();
+      const prevWeight = prev?.weightKg ?? null;
+      if (prevWeight === null || Math.abs(prevWeight - body.weightKg) >= 0.1) {
+        await WeightLogModel.create({
+          userId: request.user.userId,
+          weightKg: body.weightKg,
+        });
       }
     }
 
@@ -55,6 +70,8 @@ export async function userRoutes(fastify: FastifyInstance) {
         nickname: user.nickname,
         avatarUrl: signAvatar(user.avatarUrl),
         gender: user.gender,
+        weightKg: user.weightKg,
+        heightCm: user.heightCm,
         settings: user.settings,
       },
       '更新成功',
@@ -79,5 +96,33 @@ export async function userRoutes(fastify: FastifyInstance) {
     const user = await UserModel.findById(request.user.userId);
     const result = await checkImage(buf, user?.openid, file.filename);
     return success(result, '检测完成');
+  });
+
+  // 体重变化趋势：最近 N 条（时间倒序）
+  // 体重变化趋势：按维度（today/week/month/year）返回记录（时间倒序）
+  fastify.get('/weight-logs', { onRequest: [fastify.authenticate] }, async (request) => {
+    const q = request.query as { range?: string; limit?: string };
+    const limit = Math.min(Number(q.limit) || 200, 1000);
+    const filter: Record<string, unknown> = { userId: request.user.userId };
+    if (q.range && q.range !== 'all') {
+      const now = Date.now();
+      const DAY = 86400000;
+      const start =
+        q.range === 'today'
+          ? new Date(new Date(now).setHours(0, 0, 0, 0)).getTime()
+          : q.range === 'week'
+            ? now - 7 * DAY
+            : q.range === 'month'
+              ? now - 30 * DAY
+              : now - 365 * DAY;
+      filter.createdAt = { $gte: start };
+    }
+    const logs = await WeightLogModel.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+    return success({
+      items: logs.map((l) => ({ weightKg: l.weightKg, createdAt: l.createdAt })),
+    });
   });
 }

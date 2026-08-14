@@ -16,11 +16,14 @@ export const UpdateMeSchema = z
     nickname: z.string().trim().min(1, '昵称不能为空').max(30, '昵称最长 30 字').optional(),
     avatarUrl: z.string().url('头像地址不合法').max(500).optional(),
     gender: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional(),
+    weightKg: z.number().min(20, '体重最低 20kg').max(300, '体重最高 300kg').optional(),
+    heightCm: z.number().min(50, '身高最低 50cm').max(250, '身高最高 250cm').optional(),
     settings: z
       .object({
         unit: z.enum(['metric', 'imperial']).optional(),
         defaultType: z.string().optional(),
         highAccuracy: z.boolean().optional(),
+        showBodyData: z.boolean().optional(),
       })
       .optional(),
   })
