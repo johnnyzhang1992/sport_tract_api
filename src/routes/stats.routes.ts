@@ -20,7 +20,7 @@ export async function statsRoutes(fastify: FastifyInstance) {
   // 趋势：近 7/30 天距离与时长
   fastify.get('/trend', { onRequest: [fastify.authenticate] }, async (request) => {
     const { days } = request.query as { days?: string };
-    const d = days === '30' ? 30 : 7;
+    const d = days === '365' ? 365 : days === '30' ? 30 : 7;
     const result = await trend(request.user.userId, d);
     return success(result);
   });

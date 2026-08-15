@@ -111,8 +111,8 @@ export interface TrendResult {
   data: TrendDay[];
 }
 
-/** 趋势聚合：近 7 / 30 天距离与时长（决策 F19） */
-export async function trend(userId: ObjectIdLike, days: 7 | 30): Promise<TrendResult> {
+/** 趋势聚合：近 7 / 30 / 365 天距离与时长（决策 F19；365 供日历热力图） */
+export async function trend(userId: ObjectIdLike, days: 7 | 30 | 365): Promise<TrendResult> {
   const { start, end } = dayRange(days - 1);
 
   const rows = await ActivityModel.aggregate([
