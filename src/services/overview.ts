@@ -22,6 +22,9 @@ export interface OverviewTrack {
   startTime: string;
   distance: number;
   duration: number;
+  avgPace: number | null;
+  elevationGain: number;
+  calories: number;
   points: LatLng[];
 }
 
@@ -31,6 +34,7 @@ export interface OverviewResult {
   totalDistanceKm: number;
   totalDurationSec: number;
   totalElevationGain: number;
+  totalCalories: number;
   tracks: OverviewTrack[];
   heat: { lat: number; lng: number; weight: number }[];
 }
@@ -58,6 +62,7 @@ export async function getOverview(
       distance: 1,
       duration: 1,
       elevationGain: 1,
+      calories: 1,
       'trackPoints.lat': 1,
       'trackPoints.lng': 1,
     })
@@ -80,12 +85,16 @@ export async function getOverview(
     totalDistanceKm: Math.round(activities.reduce((s, a) => s + (a.distance || 0), 0) / 10) / 100,
     totalDurationSec: activities.reduce((s, a) => s + (a.duration || 0), 0),
     totalElevationGain: Math.round(activities.reduce((s, a) => s + (a.elevationGain || 0), 0)),
+    totalCalories: Math.round(activities.reduce((s, a) => s + (a.calories || 0), 0)),
     tracks: activities.map((a, i) => ({
       id: String(a._id),
       type: a.type,
       startTime: new Date(a.startTime).toISOString(), // startTime 存的是 Number 时间戳
       distance: a.distance || 0,
       duration: a.duration || 0,
+      avgPace: a.avgPace ?? null,
+      elevationGain: a.elevationGain || 0,
+      calories: a.calories || 0,
       points: tracks[i] || [],
     })),
     heat,

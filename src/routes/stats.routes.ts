@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { overview, trend } from '../services/stats.js';
+import { overview, trend, bestRecords } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
 import { success } from '../utils/response.js';
 
@@ -14,6 +14,12 @@ export async function statsRoutes(fastify: FastifyInstance) {
   // 足迹点亮：省/市统计
   fastify.get('/footprint', { onRequest: [fastify.authenticate] }, async (request) => {
     const result = await footprint(request.user.userId);
+    return success(result);
+  });
+
+  // 个人最佳纪录（PR）
+  fastify.get('/best', { onRequest: [fastify.authenticate] }, async (request) => {
+    const result = await bestRecords(request.user.userId);
     return success(result);
   });
 
