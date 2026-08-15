@@ -10,6 +10,7 @@ const userSchema = new Schema(
     gender: { type: Number, enum: [0, 1, 2], default: 0 }, // 0 未知 1 男 2 女
     weightKg: { type: Number, default: 60, min: 20, max: 300 }, // 体重 kg（卡路里计算用）
     heightCm: { type: Number, default: 170, min: 50, max: 250 }, // 身高 cm
+    lastLoginAt: { type: Number, default: () => Date.now() }, // 最后登录时间（管理后台排序用）
     settings: {
       unit: { type: String, enum: ['metric', 'imperial'], default: 'metric' },
       defaultType: { type: String, default: 'walking' },

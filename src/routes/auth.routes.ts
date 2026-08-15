@@ -28,6 +28,8 @@ export async function authRoutes(fastify: FastifyInstance) {
     }
 
     const userId = String(user._id);
+    // 更新最后登录时间（管理后台排序/展示用，不阻塞）
+    UserModel.updateOne({ _id: user._id }, { $set: { lastLoginAt: Date.now() } }).catch(() => {});
     const accessToken = fastify.signAccessToken(userId);
     const refreshToken = fastify.signRefreshToken(userId);
 

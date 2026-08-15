@@ -15,6 +15,7 @@ import {
   reprocessActivity,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
+import { ActivityModel } from '../models/activity.model.js';
 import { deleteOssObjects, getSignedUrl } from '../services/oss.js';
 import { importActivity } from '../services/import.js';
 import { z } from 'zod';
@@ -29,13 +30,32 @@ import {
   UpdateMarkerSchema,
 } from '../utils/validators.js';
 
+/** 轨迹新增防刷：1 小时滑动窗口内最多创建 10 条，超出拒绝（冻结 1 小时） */
+const CREATE_LIMIT = 10;
+const CREATE_WINDOW_MS = 3600000;
+
+async function assertCanCreate(userId: string) {
+  const since = Date.now() - CREATE_WINDOW_MS;
+  const recent = await ActivityModel.countDocuments({
+    userId,
+    createdAt: { $gte: new Date(since) },
+  });
+  if (recent >= CREATE_LIMIT) {
+    throw new AppError(
+      429,
+      `创建过于频繁，1 小时内最多新增 ${CREATE_LIMIT} 条，请 1 小时后再试`,
+    );
+  }
+}
+
 /**
  * 运动记录路由（M2 核心同步协议）
- * 前缀：/api/activities，全部需登录
+ * 前缀：/api/activities，全部需登录（未登录无法新增/读取）
  */
 export async function activityRoutes(fastify: FastifyInstance) {
   // 创建进行中活动
   fastify.post('/', { onRequest: [fastify.authenticate] }, async (request) => {
+    await assertCanCreate(request.user.userId); // 防刷：1 小时 10 条上限
     const input = CreateActivitySchema.parse(request.body);
     const activity = await createActivity(request.user.userId, input);
     return success({ activityId: activity.id, activity }, '活动已创建');
@@ -155,6 +175,7 @@ export async function activityRoutes(fastify: FastifyInstance) {
 
   // 导入轨迹文件（GPX/KML/TCX，multipart 上传）
   fastify.post('/import', { onRequest: [fastify.authenticate] }, async (request) => {
+    await assertCanCreate(request.user.userId); // 防刷：导入也算新增
     const part = await request.file({ limits: { fileSize: 2 * 1024 * 1024 } });
     if (!part) {
       throw new AppError(400, '请上传轨迹文件');

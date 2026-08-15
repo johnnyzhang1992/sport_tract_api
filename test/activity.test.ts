@@ -485,3 +485,36 @@ test('海拔尖刺清洗：真实爬坡（速率正常）不被误伤', async ()
   assert.equal(pts[1].altitude, 102, '正常爬升海拔应保留');
   assert.equal(pts[3].altitude, 106);
 });
+
+test('防刷：1 小时窗口内最多创建 10 条，第 11 条返回 429', async () => {
+  const t = (await login('m2-rate-limit')).accessToken;
+  for (let i = 0; i < 10; i++) {
+    const r = await req('POST', '/api/activities', {
+      token: t,
+      body: { type: 'walking', startTime: 1700000000000 + i * 1000 },
+    });
+    assert.equal(r.statusCode, 200, `第 ${i + 1} 条应创建成功`);
+  }
+  const over = await req('POST', '/api/activities', {
+    token: t,
+    body: { type: 'walking', startTime: 1700000000000 + 100000 },
+  });
+  assert.equal(over.statusCode, 429, '第 11 条应被限流');
+});
+
+test('数据隔离：B 用户不能读取/修改 A 用户的轨迹', async () => {
+  const created = await req('POST', '/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: 1700000000000 },
+  });
+  const id = created.json().data.activityId;
+  // B 读 A 的详情 → 404
+  const detail = await req('GET', `/api/activities/${id}`, { token: tokenB });
+  assert.equal(detail.statusCode, 404, 'B 读 A 轨迹应 404');
+  // B 改 A 的轨迹 → 404
+  const meta = await req('PUT', `/api/activities/${id}/meta`, {
+    token: tokenB,
+    body: { note: '越权修改' },
+  });
+  assert.equal(meta.statusCode, 404, 'B 改 A 轨迹应 404');
+});

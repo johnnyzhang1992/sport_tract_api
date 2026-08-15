@@ -26,6 +26,12 @@ export const config = {
   mongodbUri:
     process.env.MONGODB_URI ?? 'mongodb://localhost:27017/sport-track-dev',
 
+  // 管理后台（admin 接口独立鉴权，与小程序用户隔离）
+  adminUsername: process.env.ADMIN_USERNAME ?? 'admin',
+  adminPassword: process.env.ADMIN_PASSWORD ?? 'admin123456',
+  adminJwtSecret: process.env.ADMIN_JWT_SECRET ?? 'dev-insecure-admin-secret',
+  adminTokenTtl: process.env.ADMIN_TOKEN_TTL ?? '12h',
+
   // JWT
   jwtSecret: process.env.JWT_SECRET ?? 'dev-insecure-jwt-secret',
   jwtRefreshSecret:

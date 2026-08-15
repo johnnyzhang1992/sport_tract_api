@@ -14,6 +14,8 @@ import { statsRoutes } from './routes/stats.routes.js';
 import { shareRoutes } from './routes/share.routes.js';
 import { geoRoutes } from './routes/geo.routes.js';
 import { overviewRoutes } from './routes/overview.routes.js';
+import { adminRoutes } from './routes/admin.routes.js';
+import { AdminModel, hashPassword } from './models/admin.model.js';
 
 export interface BuildAppOptions {
   /** 日志开关（测试传 false；默认 dev 用 pino-pretty，prod 用 JSON） */
@@ -66,6 +68,19 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(shareRoutes, { prefix: `${config.apiPrefix}/share` });
   await fastify.register(geoRoutes, { prefix: `${config.apiPrefix}/geo` });
   await fastify.register(overviewRoutes, { prefix: `${config.apiPrefix}/overview` });
+  await fastify.register(adminRoutes, { prefix: `${config.apiPrefix}/admin` });
+
+  // 初始管理员 seed：Admin 集合为空时用环境变量创建
+  fastify.addHook('onReady', async () => {
+    const exists = await AdminModel.countDocuments({});
+    if (exists === 0) {
+      await AdminModel.create({
+        username: config.adminUsername,
+        passwordHash: await hashPassword(config.adminPassword),
+      });
+      fastify.log.info(`初始管理员已创建: ${config.adminUsername}`);
+    }
+  });
 
   // 健康检查（含 MongoDB 状态）
   fastify.get('/health', async () => ({
