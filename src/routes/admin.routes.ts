@@ -6,6 +6,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
+import { locateRegion } from '../services/region.js';
 
 /**
  * 管理后台路由：/api/admin/*（与小程序用户接口隔离）
@@ -85,6 +86,76 @@ export async function adminRoutes(fastify: FastifyInstance) {
       activityCount,
       finishedCount,
       totalDistanceKm: Math.round(((distAgg[0]?.total as number) ?? 0) / 10) / 100,
+    });
+  });
+
+  // 时间维度数据量：新增用户/新增轨迹（today/week/month）
+  fastify.get('/stats', { onRequest: [adminAuth] }, async (request) => {
+    const DAY = 86400000;
+    const now = Date.now();
+    const ranges = {
+      today: new Date(new Date(now).setHours(0, 0, 0, 0)).getTime(),
+      week: now - 7 * DAY,
+      month: now - 30 * DAY,
+    };
+    const out: Record<string, { newUsers: number; newActivities: number }> = {};
+    for (const [k, start] of Object.entries(ranges)) {
+      const [newUsers, newActivities] = await Promise.all([
+        UserModel.countDocuments({ createdAt: { $gte: new Date(start) } }),
+        ActivityModel.countDocuments({ createdAt: { $gte: new Date(start) } }),
+      ]);
+      out[k] = { newUsers, newActivities };
+    }
+    return success(out);
+  });
+
+  // 数据趋势：近 N 天新增用户/轨迹（折线图）
+  fastify.get('/trend', { onRequest: [adminAuth] }, async (request) => {
+    const days = Math.min(90, Number((request.query as { days?: string }).days) || 30);
+    const start = new Date(Date.now() - (days - 1) * 86400000);
+    start.setHours(0, 0, 0, 0);
+    const [uRows, aRows] = await Promise.all([
+      UserModel.aggregate([
+        { $match: { createdAt: { $gte: start } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+      ]),
+      ActivityModel.aggregate([
+        { $match: { createdAt: { $gte: start } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+      ]),
+    ]);
+    const uMap = new Map(uRows.map((r) => [r._id, r.count]));
+    const aMap = new Map(aRows.map((r) => [r._id, r.count]));
+    const data: { date: string; newUsers: number; newActivities: number }[] = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400000);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      data.push({ date: key, newUsers: uMap.get(key) ?? 0, newActivities: aMap.get(key) ?? 0 });
+    }
+    return success({ days, data });
+  });
+
+  // 轨迹省份/城市分布（按轨迹起点定位，离线 GeoJSON）
+  fastify.get('/region-stats', { onRequest: [adminAuth] }, async () => {
+    const acts = await ActivityModel.find({ status: 'finished' })
+      .select('trackPoints')
+      .lean();
+    const provMap = new Map<string, number>();
+    const cityMap = new Map<string, number>();
+    for (const a of acts) {
+      const pts = (a.trackPoints ?? []) as Array<{ lat?: number; lng?: number }>;
+      const first = pts.find((p) => typeof p.lat === 'number' && typeof p.lng === 'number');
+      if (!first) continue;
+      const r = locateRegion(Number(first.lat), Number(first.lng));
+      if (!r) continue;
+      provMap.set(r.province, (provMap.get(r.province) ?? 0) + 1);
+      cityMap.set(r.city, (cityMap.get(r.city) ?? 0) + 1);
+    }
+    const top = (m: Map<string, number>, n: number) =>
+      [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([name, count]) => ({ name, count }));
+    return success({
+      provinces: top(provMap, 20),
+      cities: top(cityMap, 20),
     });
   });
 

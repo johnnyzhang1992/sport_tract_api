@@ -232,11 +232,11 @@ test('统计 overview：今日/本周/本月/累计', async () => {
   }
 });
 
-test('统计 trend：近 7 天数据', async () => {
-  const res = await req('GET', '/api/stats/trend?days=7', { token: tokenA });
+test('统计 trend：近 7 天（week）数据', async () => {
+  const res = await req('GET', '/api/stats/trend?type=week', { token: tokenA });
   assert.equal(res.statusCode, 200);
   const data = res.json().data;
-  assert.equal(data.days, 7);
+  assert.equal(data.type, 'week');
   assert.equal(data.data.length, 7);
   assert.ok(data.data.some((d: { distance: number }) => d.distance > 0));
 });

@@ -23,11 +23,18 @@ export async function statsRoutes(fastify: FastifyInstance) {
     return success(result);
   });
 
-  // 趋势：近 7/30 天距离与时长
+  // 趋势：week(7天) / month(30天) / week6(6个月按周) / year(年按月)；days=365 兼容日历热力图
   fastify.get('/trend', { onRequest: [fastify.authenticate] }, async (request) => {
-    const { days } = request.query as { days?: string };
-    const d = days === '365' ? 365 : days === '30' ? 30 : 7;
-    const result = await trend(request.user.userId, d);
+    const { days, type } = request.query as { days?: string; type?: string };
+    let result;
+    if (type === 'month' || type === 'week6' || type === 'year' || type === 'week') {
+      result = await trend(request.user.userId, type);
+    } else if (days === '365') {
+      // 日历热力图：近 365 天按天
+      result = await trend(request.user.userId, 'daily365');
+    } else {
+      result = await trend(request.user.userId, 'week');
+    }
     return success(result);
   });
 }

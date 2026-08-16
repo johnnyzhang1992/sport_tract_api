@@ -107,27 +107,61 @@ export interface TrendDay {
 }
 
 export interface TrendResult {
-  days: number;
+  type: string;
   data: TrendDay[];
 }
 
-/** 趋势聚合：近 7 / 30 / 365 天距离与时长（决策 F19；365 供日历热力图） */
-export async function trend(userId: ObjectIdLike, days: 7 | 30 | 365): Promise<TrendResult> {
-  const { start, end } = dayRange(days - 1);
+export type TrendType = 'week' | 'month' | 'week6' | 'year' | 'daily365';
+
+/** ISO 年-周 格式（近 6 个月按周聚合） */
+function isoWeekKey(d: Date): string {
+  // 复制避免修改原日期
+  const date = new Date(d.getTime());
+  const day = (date.getDay() + 6) % 7; // 周一 = 0
+  date.setDate(date.getDate() - day + 3); // 移到周四
+  const firstThursday = new Date(date.getFullYear(), 0, 4);
+  const firstDay = (firstThursday.getDay() + 6) % 7;
+  firstThursday.setDate(firstThursday.getDate() - firstDay + 3);
+  const week = 1 + Math.round((date.getTime() - firstThursday.getTime()) / (7 * 86400000));
+  return `${date.getFullYear()}-W${String(week).padStart(2, '0')}`;
+}
+
+/**
+ * 趋势聚合（决策 F19）
+ * - week：近 7 天按天（7 条）
+ * - month：近 30 天按天（30 条）
+ * - week6：近 6 个月按周（≤24 条）
+ * - year：近 12 个月按月（12 条）
+ * - daily365：近 365 天按天（日历热力图用）
+ */
+export async function trend(userId: ObjectIdLike, type: TrendType): Promise<TrendResult> {
+  const now = Date.now();
+  const DAY = 86400000;
+  // 注意：activity.startTime 是 Number 时间戳，start 必须也是数字（Date 对象会导致 $gte 类型不匹配）
+  const startRaw = new Date(
+    type === 'week' ? now - 6 * DAY
+    : type === 'month' ? now - 29 * DAY
+    : type === 'week6' ? now - 180 * DAY
+    : now - 364 * DAY,
+  );
+  startRaw.setHours(0, 0, 0, 0);
+  const start = startRaw.getTime();
+
+  // 聚合粒度：week/month 按天；week6 按周；year 按月
+  const format =
+    type === 'year' ? '%Y-%m' : type === 'week6' ? '%G-W%V' : '%Y-%m-%d';
 
   const rows = await ActivityModel.aggregate([
     {
       $match: {
         userId: toObjectId(userId),
         status: 'finished',
-        startTime: { $gte: start, $lt: end },
+        startTime: { $gte: start },
       },
     },
     {
       $group: {
-        _id: {
-          $dateToString: { format: '%Y-%m-%d', date: { $toDate: '$startTime' } },
-        },
+        _id: { $dateToString: { format, date: { $toDate: '$startTime' } } },
         distance: { $sum: '$distance' },
         duration: { $sum: '$duration' },
         count: { $sum: 1 },
@@ -136,19 +170,43 @@ export async function trend(userId: ObjectIdLike, days: 7 | 30 | 365): Promise<T
     { $sort: { _id: 1 } },
   ]);
 
-  // 补齐无数据的日期（前端画图需要连续日期）
   const map = new Map<string, TrendDay>();
   for (const r of rows) {
     map.set(r._id, { date: r._id, distance: r.distance, duration: r.duration, count: r.count });
   }
+
+  // 补齐连续桶
   const data: TrendDay[] = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(end - (i + 1) * 86400000);
-    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
+  if (type === 'year') {
+    // 近 12 个月，每月一条
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now - i * 30 * DAY);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
+    }
+  } else if (type === 'week6') {
+    // 近 6 个月按周（最多 26 周，取最近 24 周）
+    const keys: string[] = [];
+    const cursor = new Date(start);
+    while (cursor.getTime() <= now && keys.length < 26) {
+      keys.push(isoWeekKey(cursor));
+      cursor.setDate(cursor.getDate() + 7);
+    }
+    const recent = keys.slice(-24);
+    for (const key of recent) {
+      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
+    }
+  } else {
+    // 近 7 / 30 天 / 365 天按天
+    const days = type === 'week' ? 7 : type === 'month' ? 30 : 365;
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(now - i * DAY);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
+    }
   }
 
-  return { days, data };
+  return { type, data };
 }
 
 /** 个人最佳纪录（PR）：最远距离/最快配速/最长时长/最大爬升 + 对应轨迹信息 */
