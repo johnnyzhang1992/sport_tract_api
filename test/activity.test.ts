@@ -205,6 +205,22 @@ test('活动列表：包含统计字段，不含完整点集', async () => {
   assert.equal(item.trackPoints, undefined); // 列表不返回完整点集
 });
 
+test('列表惰性清理：超时 in_progress 自动作废（cancelled）', async () => {
+  // 创建 in_progress 活动（startTime 25 小时前）
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: Date.now() - 25 * 3600 * 1000 },
+  });
+  const id = created.json().data.activityId;
+  // 模拟异常退出：updatedAt 置为 25 小时前（无更新）
+  await ActivityModel.updateOne({ _id: id }, { $set: { updatedAt: new Date(Date.now() - 25 * 3600 * 1000) } }, { timestamps: false });
+  // 调列表 → 触发惰性清理
+  await req('GET', '/sport-track/api/activities?page=1&pageSize=10', { token: tokenA });
+  const act = await ActivityModel.findById(id).lean();
+  assert.equal(act?.status, 'cancelled');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('活动详情：返回完整轨迹点与打点', async () => {
   const res = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenA });
   assert.equal(res.statusCode, 200);

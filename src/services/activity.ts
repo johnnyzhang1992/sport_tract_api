@@ -300,6 +300,17 @@ export async function listActivities(
 ): Promise<{ items: Array<Record<string, any>>; total: number; page: number; pageSize: number }> {
   const { type, month, page, pageSize } = query;
 
+  // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动作废，避免堆积
+  // 列表接口是用户活跃入口，天然覆盖所有使用者；updateMany 幂等 + userId/status 索引，开销可控
+  await ActivityModel.updateMany(
+    {
+      userId: new Types.ObjectId(userId),
+      status: 'in_progress',
+      updatedAt: { $lt: new Date(Date.now() - 24 * 3600 * 1000) },
+    },
+    { $set: { status: 'cancelled' } },
+  ).catch(() => {});
+
   // aggregate 的 $match 不做 Mongoose 类型转换，userId 需手动转 ObjectId
   const filter: Record<string, any> = { userId: new Types.ObjectId(userId), status: 'finished' };
   if (type) filter.type = type;
