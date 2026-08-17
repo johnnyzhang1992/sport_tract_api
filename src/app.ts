@@ -33,8 +33,13 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
         : true),
   });
 
-  // CORS：开发环境全放开；生产白名单
-  const corsOrigin = config.isDev ? true : [process.env.CORS_ORIGIN ?? ''].filter(Boolean);
+  // CORS：开发环境全放开；生产白名单（CORS_ORIGIN 支持逗号分隔多个，如 https://a.com,https://b.com）
+  const corsOrigin = config.isDev
+    ? true
+    : (process.env.CORS_ORIGIN ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
   await fastify.register(cors, { origin: corsOrigin, credentials: true });
 
   // multipart（图片合规检测上传）

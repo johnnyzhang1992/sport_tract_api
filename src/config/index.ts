@@ -20,7 +20,7 @@ export const config = {
   // 服务
   port: int(process.env.PORT, 3004),
   host: process.env.HOST ?? '0.0.0.0',
-  apiPrefix: '/api',
+  apiPrefix: '/sport-track/api', // 前缀区分同域名下的其他服务（nginx 按 /sport-track/ 转发）
 
   // MongoDB
   mongodbUri:

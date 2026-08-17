@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import jsonwebtoken from 'jsonwebtoken';
 import { UserModel } from '../models/user.model.js';
+import { LoginLogModel } from '../models/login-log.model.js';
 import { code2Session } from '../services/wechat.js';
 import { getSignedUrl } from '../services/oss.js';
 import { LoginSchema, RefreshSchema } from '../utils/validators.js';
@@ -30,6 +31,8 @@ export async function authRoutes(fastify: FastifyInstance) {
     const userId = String(user._id);
     // 更新最后登录时间（管理后台排序/展示用，不阻塞）
     UserModel.updateOne({ _id: user._id }, { $set: { lastLoginAt: Date.now() } }).catch(() => {});
+    // 登录日志（管理后台 UV/PV 统计，不阻塞）
+    LoginLogModel.create({ userId: user._id }).catch(() => {});
     const accessToken = fastify.signAccessToken(userId);
     const refreshToken = fastify.signRefreshToken(userId);
 

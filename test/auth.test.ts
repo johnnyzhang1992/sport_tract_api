@@ -4,6 +4,7 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { WeightLogModel } from '../src/models/weight-log.model.js';
+import { LoginLogModel } from '../src/models/login-log.model.js';
 import FormData from 'form-data';
 
 let app: FastifyInstance;
@@ -12,11 +13,19 @@ before(async () => {
   app = await buildApp({ logger: false });
   await app.ready();
   // 清理测试数据
+  await clearMockLoginLogs();
   await UserModel.deleteMany({ openid: /^mock_openid_/ });
   await WeightLogModel.deleteMany({});
 });
 
+/** 删除 mock 用户产生的登录日志（避免污染 dev 库 UV/PV） */
+async function clearMockLoginLogs() {
+  const ids = (await UserModel.find({ openid: /^mock_openid_/ }).select('_id')).map((u) => u._id);
+  if (ids.length) await LoginLogModel.deleteMany({ userId: { $in: ids } });
+}
+
 after(async () => {
+  await clearMockLoginLogs();
   await UserModel.deleteMany({ openid: /^mock_openid_/ });
   await app.close();
 });
@@ -43,7 +52,7 @@ test('GET /health 返回 ok 且 MongoDB 已连接', async () => {
 });
 
 test('登录：code 换 token，返回 accessToken/refreshToken/user', async () => {
-  const res = await post('/api/auth/login', { code: 'test-code-abc' });
+  const res = await post('/sport-track/api/auth/login', { code: 'test-code-abc' });
   assert.equal(res.statusCode, 200);
   const body = res.json();
   assert.equal(body.success, true);
@@ -55,30 +64,30 @@ test('登录：code 换 token，返回 accessToken/refreshToken/user', async () 
 });
 
 test('登录幂等：同一 code 返回同一用户', async () => {
-  const r1 = await post('/api/auth/login', { code: 'same-code' });
-  const r2 = await post('/api/auth/login', { code: 'same-code' });
+  const r1 = await post('/sport-track/api/auth/login', { code: 'same-code' });
+  const r2 = await post('/sport-track/api/auth/login', { code: 'same-code' });
   assert.equal(r1.json().data.user.id, r2.json().data.user.id);
 });
 
 test('登录缺少 code → 400', async () => {
-  const res = await post('/api/auth/login', {});
+  const res = await post('/sport-track/api/auth/login', {});
   assert.equal(res.statusCode, 400);
   assert.equal(res.json().success, false);
 });
 
 test('GET /users/me 无 token → 401', async () => {
-  const res = await app.inject({ method: 'GET', url: '/api/users/me' });
+  const res = await app.inject({ method: 'GET', url: '/sport-track/api/users/me' });
   assert.equal(res.statusCode, 401);
   assert.equal(res.json().success, false);
 });
 
 test('GET /users/me 带 token 返回当前用户', async () => {
-  const login = await post('/api/auth/login', { code: 'test-code-me' });
+  const login = await post('/sport-track/api/auth/login', { code: 'test-code-me' });
   const { accessToken } = login.json().data;
 
   const res = await app.inject({
     method: 'GET',
-    url: '/api/users/me',
+    url: '/sport-track/api/users/me',
     headers: { authorization: `Bearer ${accessToken}` },
   });
   assert.equal(res.statusCode, 200);
@@ -86,12 +95,12 @@ test('GET /users/me 带 token 返回当前用户', async () => {
 });
 
 test('PUT /users/me 更新昵称与性别', async () => {
-  const login = await post('/api/auth/login', { code: 'test-code-update' });
+  const login = await post('/sport-track/api/auth/login', { code: 'test-code-update' });
   const { accessToken } = login.json().data;
 
   const res = await app.inject({
     method: 'PUT',
-    url: '/api/users/me',
+    url: '/sport-track/api/users/me',
     payload: { nickname: '跑者小王', gender: 1 },
     headers: { authorization: `Bearer ${accessToken}` },
   });
@@ -101,12 +110,12 @@ test('PUT /users/me 更新昵称与性别', async () => {
 });
 
 test('PUT /users/me 空昵称 → 400', async () => {
-  const login = await post('/api/auth/login', { code: 'test-code-bad-update' });
+  const login = await post('/sport-track/api/auth/login', { code: 'test-code-bad-update' });
   const { accessToken } = login.json().data;
 
   const res = await app.inject({
     method: 'PUT',
-    url: '/api/users/me',
+    url: '/sport-track/api/users/me',
     payload: { nickname: '   ' },
     headers: { authorization: `Bearer ${accessToken}` },
   });
@@ -114,26 +123,26 @@ test('PUT /users/me 空昵称 → 400', async () => {
 });
 
 test('refresh：合法 refreshToken 换新 accessToken', async () => {
-  const login = await post('/api/auth/login', { code: 'test-code-refresh' });
+  const login = await post('/sport-track/api/auth/login', { code: 'test-code-refresh' });
   const { refreshToken } = login.json().data;
 
-  const res = await post('/api/auth/refresh', { refreshToken });
+  const res = await post('/sport-track/api/auth/refresh', { refreshToken });
   assert.equal(res.statusCode, 200);
   assert.ok(res.json().data.accessToken);
   assert.ok(res.json().data.refreshToken);
 });
 
 test('refresh：伪造 token → 401', async () => {
-  const res = await post('/api/auth/refresh', { refreshToken: 'fake.token.value' });
+  const res = await post('/sport-track/api/auth/refresh', { refreshToken: 'fake.token.value' });
   assert.equal(res.statusCode, 401);
   assert.equal(res.json().data.code, 'INVALID_REFRESH_TOKEN');
 });
 
 test('OSS 凭证：未配置时返回 503 提示', async () => {
-  const login = await post('/api/auth/login', { code: 'test-code-oss' });
+  const login = await post('/sport-track/api/auth/login', { code: 'test-code-oss' });
   const { accessToken } = login.json().data;
 
-  const res = await post('/api/oss/credential', {}, accessToken);
+  const res = await post('/sport-track/api/oss/credential', {}, accessToken);
   // 本地未配置 OSS 时返回 503；若配置了则返回签名凭证
   if (res.statusCode === 503) {
     assert.match(res.json().message, /OSS 未配置/);
@@ -146,7 +155,7 @@ test('OSS 凭证：未配置时返回 503 提示', async () => {
 });
 
 test('图片合规检测：未配置微信接口时降级放行', async () => {
-  const login = await post('/api/auth/login', { code: 'test-code-sec' });
+  const login = await post('/sport-track/api/auth/login', { code: 'test-code-sec' });
   const { accessToken } = login.json().data;
 
   const form = new FormData();
@@ -157,7 +166,7 @@ test('图片合规检测：未配置微信接口时降级放行', async () => {
 
   const res = await app.inject({
     method: 'POST',
-    url: '/api/users/check-image',
+    url: '/sport-track/api/users/check-image',
     payload: form,
     headers: { authorization: `Bearer ${accessToken}`, ...form.getHeaders() },
   });
@@ -168,12 +177,12 @@ test('图片合规检测：未配置微信接口时降级放行', async () => {
 });
 
 test('图片合规检测：未传文件 → 400', async () => {
-  const login = await post('/api/auth/login', { code: 'test-code-sec2' });
+  const login = await post('/sport-track/api/auth/login', { code: 'test-code-sec2' });
   const { accessToken } = login.json().data;
 
   const res = await app.inject({
     method: 'POST',
-    url: '/api/users/check-image',
+    url: '/sport-track/api/users/check-image',
     headers: { authorization: `Bearer ${accessToken}` },
   });
   // 无 multipart content-type：@fastify/multipart 返回 406；有请求体但无文件返回 400
@@ -182,33 +191,33 @@ test('图片合规检测：未传文件 → 400', async () => {
 
 test('分享：非本人活动生成小程序码 → 404', async () => {
   // 用另一个登录用户请求（假 id 验证归属校验）
-  const login = await post('/api/auth/login', { code: 'share-other-user' });
+  const login = await post('/sport-track/api/auth/login', { code: 'share-other-user' });
   const otherToken = login.json().data.accessToken;
-  const res = await post('/api/share/mini-code', {
+  const res = await post('/sport-track/api/share/mini-code', {
     activityId: '000000000000000000000000',
   }, otherToken);
   assert.equal(res.statusCode, 404);
 });
 
 test('分享：非法 activityId → 400', async () => {
-  const login = await post('/api/auth/login', { code: 'share-bad-id' });
+  const login = await post('/sport-track/api/auth/login', { code: 'share-bad-id' });
   const t = login.json().data.accessToken;
-  const res = await post('/api/share/mini-code', { activityId: 'not-a-valid-id' }, t);
+  const res = await post('/sport-track/api/share/mini-code', { activityId: 'not-a-valid-id' }, t);
   assert.equal(res.statusCode, 400);
 });
 
 test('未匹配路由 → 404 统一格式', async () => {
-  const res = await app.inject({ method: 'GET', url: '/api/not-exist' });
+  const res = await app.inject({ method: 'GET', url: '/sport-track/api/not-exist' });
   assert.equal(res.statusCode, 404);
   assert.equal(res.json().success, false);
 });
 
 test('逆地理编码：未配置 key 时返回空地址（200）', async () => {
-  const login = await post('/api/auth/login', { code: 'geo-test' });
+  const login = await post('/sport-track/api/auth/login', { code: 'geo-test' });
   const t = login.json().data.accessToken;
   const res = await app.inject({
     method: 'GET',
-    url: '/api/geo/reverse?lat=31.2304&lng=121.4737',
+    url: '/sport-track/api/geo/reverse?lat=31.2304&lng=121.4737',
     headers: { authorization: `Bearer ${t}` },
   });
   assert.equal(res.statusCode, 200);
@@ -217,43 +226,43 @@ test('逆地理编码：未配置 key 时返回空地址（200）', async () => 
 });
 
 test('逆地理编码：参数非法 → 400', async () => {
-  const login = await post('/api/auth/login', { code: 'geo-bad' });
+  const login = await post('/sport-track/api/auth/login', { code: 'geo-bad' });
   const t = login.json().data.accessToken;
   const res = await app.inject({
     method: 'GET',
-    url: '/api/geo/reverse?lat=999&lng=121',
+    url: '/sport-track/api/geo/reverse?lat=999&lng=121',
     headers: { authorization: `Bearer ${t}` },
   });
   assert.equal(res.statusCode, 400);
 });
 
 test('保存体重变化 → 记录体重日志并可查询', async () => {
-  const login = await post('/api/auth/login', { code: 'weight-user' });
+  const login = await post('/sport-track/api/auth/login', { code: 'weight-user' });
   const t = login.json().data.accessToken;
   // 保存体重 65
   await app.inject({
     method: 'PUT',
-    url: '/api/users/me',
+    url: '/sport-track/api/users/me',
     payload: { weightKg: 65 },
     headers: { authorization: `Bearer ${t}` },
   });
   // 再次保存相同体重 → 不重复记录
   await app.inject({
     method: 'PUT',
-    url: '/api/users/me',
+    url: '/sport-track/api/users/me',
     payload: { weightKg: 65 },
     headers: { authorization: `Bearer ${t}` },
   });
   // 改成 64 → 新增一条
   await app.inject({
     method: 'PUT',
-    url: '/api/users/me',
+    url: '/sport-track/api/users/me',
     payload: { weightKg: 64 },
     headers: { authorization: `Bearer ${t}` },
   });
   const res = await app.inject({
     method: 'GET',
-    url: '/api/users/weight-logs',
+    url: '/sport-track/api/users/weight-logs',
     headers: { authorization: `Bearer ${t}` },
   });
   assert.equal(res.statusCode, 200);

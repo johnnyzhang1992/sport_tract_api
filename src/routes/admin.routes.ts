@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import jsonwebtoken from 'jsonwebtoken';
 import { AdminModel, hashPassword, verifyPassword } from '../models/admin.model.js';
 import { UserModel } from '../models/user.model.js';
+import { LoginLogModel } from '../models/login-log.model.js';
 import { ActivityModel } from '../models/activity.model.js';
 import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
@@ -98,41 +99,110 @@ export async function adminRoutes(fastify: FastifyInstance) {
       week: now - 7 * DAY,
       month: now - 30 * DAY,
     };
-    const out: Record<string, { newUsers: number; newActivities: number }> = {};
+    const out: Record<string, { newUsers: number; newActivities: number; uv: number; pv: number }> = {};
     for (const [k, start] of Object.entries(ranges)) {
-      const [newUsers, newActivities] = await Promise.all([
-        UserModel.countDocuments({ createdAt: { $gte: new Date(start) } }),
-        ActivityModel.countDocuments({ createdAt: { $gte: new Date(start) } }),
+      const since = new Date(start);
+      // 登录 UV/PV：PV = 登录次数，UV = 周期内登录过的去重用户数
+      const [newUsers, newActivities, pv, uvRows] = await Promise.all([
+        UserModel.countDocuments({ createdAt: { $gte: since } }),
+        ActivityModel.countDocuments({ createdAt: { $gte: since } }),
+        LoginLogModel.countDocuments({ createdAt: { $gte: since } }),
+        LoginLogModel.aggregate([
+          { $match: { createdAt: { $gte: since } } },
+          { $group: { _id: '$userId' } },
+        ]),
       ]);
-      out[k] = { newUsers, newActivities };
+      out[k] = { newUsers, newActivities, uv: uvRows.length, pv };
     }
     return success(out);
   });
 
-  // 数据趋势：近 N 天新增用户/轨迹（折线图）
+  // 数据趋势：新增用户/轨迹（折线图），维度 type=day|week|month|year
+  // day：近 30 天按天；week：近 25 周按周；month：近 12 个月按月；year：近 6 年按半年（12 个点）
   fastify.get('/trend', { onRequest: [adminAuth] }, async (request) => {
-    const days = Math.min(90, Number((request.query as { days?: string }).days) || 30);
-    const start = new Date(Date.now() - (days - 1) * 86400000);
-    start.setHours(0, 0, 0, 0);
+    const type = String((request.query as { type?: string }).type || 'day');
+    const DAY = 86400000;
+    // 各维度配置：桶 key 生成函数 + 标签 + 起止
+    let fmt = '%Y-%m-%d';
+    let labelOf: (d: Date) => string;
+    let buckets: string[] = [];
+    const now = new Date();
+
+    if (type === 'week') {
+      // 近 25 周（ISO 年-周）
+      fmt = '%G-W%V';
+      labelOf = (d) => {
+        const t = new Date(d.getTime());
+        t.setHours(12, 0, 0, 0); // 避免周末边界时区问题
+        const day = (t.getDay() + 6) % 7; // 周一 = 0
+        t.setDate(t.getDate() - day + 3); // 周四（ISO 周锚点）
+        const isoYear = t.getFullYear();
+        const week = Math.ceil(((t.getTime() - new Date(isoYear, 0, 4).getTime()) / DAY + 1) / 7);
+        return `${isoYear}-W${String(week).padStart(2, '0')}`;
+      };
+      for (let i = 24; i >= 0; i--) {
+        buckets.push(labelOf(new Date(Date.now() - i * 7 * DAY)));
+      }
+    } else if (type === 'month') {
+      fmt = '%Y-%m';
+      labelOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      for (let i = 11; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        buckets.push(labelOf(d));
+      }
+    } else if (type === 'year') {
+      // 近 6 年按半年（H1/H2）
+      fmt = '%Y-%m';
+      labelOf = (d) => {
+        const half = d.getMonth() < 6 ? 'H1' : 'H2';
+        return `${d.getFullYear()}-${half}`;
+      };
+      // 最近 12 个半年（含当前半年）
+      const y = now.getFullYear();
+      const halfIdx = now.getMonth() < 6 ? 0 : 1; // 当前半年的下半年索引
+      for (let i = 11; i >= 0; i--) {
+        const n = halfIdx - i; // 相对当前半年的偏移（0=当前，-1=上一半年…）
+        const ty = y + Math.floor(n / 2);
+        const th = ((n % 2) + 2) % 2 === 0 ? 'H1' : 'H2';
+        buckets.push(`${ty}-${th}`);
+      }
+    } else {
+      // day：近 30 天
+      labelOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      for (let i = 29; i >= 0; i--) buckets.push(labelOf(new Date(Date.now() - i * DAY)));
+    }
+
+    // 聚合：把日期时间戳按桶归并（用 ${fmt} 分组，day 直接用天）
+    const start = new Date(Date.now() - 6 * 365 * DAY); // 最多取近 6 年数据足够
+    // year 维度：按月分组后桶是 年-H1/H2 不匹配，直接用 年+半年 拼接分组
+    const idExpr =
+      type === 'year'
+        ? {
+            $concat: [
+              { $dateToString: { format: '%Y', date: '$createdAt' } },
+              '-',
+              { $cond: [{ $lt: [{ $month: '$createdAt' }, 7] }, 'H1', 'H2'] },
+            ],
+          }
+        : { $dateToString: { format: fmt, date: '$createdAt' } };
     const [uRows, aRows] = await Promise.all([
       UserModel.aggregate([
         { $match: { createdAt: { $gte: start } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+        { $group: { _id: idExpr, count: { $sum: 1 } } },
       ]),
       ActivityModel.aggregate([
         { $match: { createdAt: { $gte: start } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+        { $group: { _id: idExpr, count: { $sum: 1 } } },
       ]),
     ]);
     const uMap = new Map(uRows.map((r) => [r._id, r.count]));
     const aMap = new Map(aRows.map((r) => [r._id, r.count]));
-    const data: { date: string; newUsers: number; newActivities: number }[] = [];
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 86400000);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      data.push({ date: key, newUsers: uMap.get(key) ?? 0, newActivities: aMap.get(key) ?? 0 });
-    }
-    return success({ days, data });
+    const data: { date: string; newUsers: number; newActivities: number }[] = buckets.map((key) => ({
+      date: key,
+      newUsers: uMap.get(key) ?? 0,
+      newActivities: aMap.get(key) ?? 0,
+    }));
+    return success({ type, data });
   });
 
   // 轨迹省份/城市分布（按轨迹起点定位，离线 GeoJSON）

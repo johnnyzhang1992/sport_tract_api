@@ -4,6 +4,7 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
+import { LoginLogModel } from '../src/models/login-log.model.js';
 
 let app: FastifyInstance;
 let tokenA = '';
@@ -21,6 +22,7 @@ before(async () => {
   const users = await UserModel.find({ openid: /^mock_openid_/ }).select('_id');
   const ids = users.map((u) => u._id);
   await ActivityModel.deleteMany({ userId: { $in: ids } });
+  await LoginLogModel.deleteMany({ userId: { $in: ids } });
   await UserModel.deleteMany({ openid: /^mock_openid_/ });
 
   // 两个测试用户：A 是活动所有者，B 用于越权测试
@@ -35,7 +37,7 @@ after(async () => {
 async function login(code: string) {
   const res = await app.inject({
     method: 'POST',
-    url: '/api/auth/login',
+    url: '/sport-track/api/auth/login',
     payload: { code },
   });
   return res.json().data;
@@ -64,7 +66,7 @@ const P = (seq: number, lat: number, lng: number, altitude?: number) => ({
 });
 
 test('创建进行中活动', async () => {
-  const res = await req('POST', '/api/activities', {
+  const res = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'running', startTime: TEST_NOW - 60000 },
   });
@@ -77,7 +79,7 @@ test('创建进行中活动', async () => {
 });
 
 test('增量上传轨迹点，返回 lastPointSeq', async () => {
-  const res = await req('POST', `/api/activities/${activityId}/points`, {
+  const res = await req('POST', `/sport-track/api/activities/${activityId}/points`, {
     token: tokenA,
     body: { points: [P(1, 31.2304, 121.4737), P(2, 31.2305, 121.4738), P(3, 31.2306, 121.4739)] },
   });
@@ -89,7 +91,7 @@ test('增量上传轨迹点，返回 lastPointSeq', async () => {
 
 test('幂等去重：重复 seq 不重复追加', async () => {
   // 重传 1-3 + 新增 4-5
-  const res = await req('POST', `/api/activities/${activityId}/points`, {
+  const res = await req('POST', `/sport-track/api/activities/${activityId}/points`, {
     token: tokenA,
     body: { points: [P(1, 31.2304, 121.4737), P(3, 31.2306, 121.4739), P(4, 31.2307, 121.474), P(5, 31.2308, 121.4741)] },
   });
@@ -99,7 +101,7 @@ test('幂等去重：重复 seq 不重复追加', async () => {
 });
 
 test('新增打点', async () => {
-  const res = await req('POST', `/api/activities/${activityId}/markers`, {
+  const res = await req('POST', `/sport-track/api/activities/${activityId}/markers`, {
     token: tokenA,
     body: {
       id: 'm1',
@@ -116,7 +118,7 @@ test('新增打点', async () => {
 });
 
 test('finish 对账：以 final 包为准重算指标', async () => {
-  const res = await req('PUT', `/api/activities/${activityId}/finish`, {
+  const res = await req('PUT', `/sport-track/api/activities/${activityId}/finish`, {
     token: tokenA,
     body: {
       trackPoints: [
@@ -148,7 +150,7 @@ test('finish 对账：以 final 包为准重算指标', async () => {
 });
 
 test('finish 后禁止再上传轨迹点 → 409', async () => {
-  const res = await req('POST', `/api/activities/${activityId}/points`, {
+  const res = await req('POST', `/sport-track/api/activities/${activityId}/points`, {
     token: tokenA,
     body: { points: [P(6, 31.2309, 121.4742)] },
   });
@@ -157,7 +159,7 @@ test('finish 后禁止再上传轨迹点 → 409', async () => {
 });
 
 test('重复 finish → 幂等返回', async () => {
-  const res = await req('PUT', `/api/activities/${activityId}/finish`, {
+  const res = await req('PUT', `/sport-track/api/activities/${activityId}/finish`, {
     token: tokenA,
     body: { trackPoints: [P(1, 31.2304, 121.4737)] },
   });
@@ -166,13 +168,13 @@ test('重复 finish → 幂等返回', async () => {
 });
 
 test('空轨迹点直接结束（随时可结束）', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: TEST_NOW - 30000 },
   });
   const id = created.json().data.activityId;
 
-  const res = await req('PUT', `/api/activities/${id}/finish`, {
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: { trackPoints: [], endTime: TEST_NOW },
   });
@@ -185,12 +187,12 @@ test('空轨迹点直接结束（随时可结束）', async () => {
 });
 
 test('越权：B 用户访问 A 的活动 → 404', async () => {
-  const res = await req('GET', `/api/activities/${activityId}`, { token: tokenB });
+  const res = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenB });
   assert.equal(res.statusCode, 404);
 });
 
 test('活动列表：包含统计字段，不含完整点集', async () => {
-  const res = await req('GET', '/api/activities?page=1&pageSize=10', { token: tokenA });
+  const res = await req('GET', '/sport-track/api/activities?page=1&pageSize=10', { token: tokenA });
   assert.equal(res.statusCode, 200);
   const data = res.json().data;
   assert.ok(data.total >= 1);
@@ -204,7 +206,7 @@ test('活动列表：包含统计字段，不含完整点集', async () => {
 });
 
 test('活动详情：返回完整轨迹点与打点', async () => {
-  const res = await req('GET', `/api/activities/${activityId}`, { token: tokenA });
+  const res = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenA });
   assert.equal(res.statusCode, 200);
   const data = res.json().data;
   assert.equal(data.trackPoints.length, 5);
@@ -213,7 +215,7 @@ test('活动详情：返回完整轨迹点与打点', async () => {
 });
 
 test('GPX 导出', async () => {
-  const res = await req('GET', `/api/activities/${activityId}/gpx`, { token: tokenA });
+  const res = await req('GET', `/sport-track/api/activities/${activityId}/gpx`, { token: tokenA });
   assert.equal(res.statusCode, 200);
   assert.match(res.headers['content-type'] ?? '', /application\/gpx\+xml/);
   const xml = res.body;
@@ -223,7 +225,7 @@ test('GPX 导出', async () => {
 });
 
 test('统计 overview：今日/本周/本月/累计', async () => {
-  const res = await req('GET', '/api/stats/overview', { token: tokenA });
+  const res = await req('GET', '/sport-track/api/stats/overview', { token: tokenA });
   assert.equal(res.statusCode, 200);
   const data = res.json().data;
   for (const key of ['today', 'week', 'month', 'total']) {
@@ -233,7 +235,7 @@ test('统计 overview：今日/本周/本月/累计', async () => {
 });
 
 test('统计 trend：近 7 天（week）数据', async () => {
-  const res = await req('GET', '/api/stats/trend?type=week', { token: tokenA });
+  const res = await req('GET', '/sport-track/api/stats/trend?type=week', { token: tokenA });
   assert.equal(res.statusCode, 200);
   const data = res.json().data;
   assert.equal(data.type, 'week');
@@ -242,7 +244,7 @@ test('统计 trend：近 7 天（week）数据', async () => {
 });
 
 test('创建活动缺 type → 400', async () => {
-  const res = await req('POST', '/api/activities', {
+  const res = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { startTime: 1700000000000 },
   });
@@ -250,7 +252,7 @@ test('创建活动缺 type → 400', async () => {
 });
 
 test('列表返回轨迹缩略预览点（≤60 点均匀采样）', async () => {
-  const list = await req('GET', '/api/activities?page=1&pageSize=20', { token: tokenA });
+  const list = await req('GET', '/sport-track/api/activities?page=1&pageSize=20', { token: tokenA });
   assert.equal(list.statusCode, 200);
   const mine = list.json().data.items.find((i: { _id: unknown }) => String(i._id) === activityId);
   assert.ok(mine, 'finished 活动应在列表中');
@@ -263,36 +265,36 @@ test('列表返回轨迹缩略预览点（≤60 点均匀采样）', async () =>
 });
 
 test('cancel 活动', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: 1700000000000 },
   });
   const id = created.json().data.activityId;
 
-  const res = await req('PUT', `/api/activities/${id}/cancel`, { token: tokenA });
+  const res = await req('PUT', `/sport-track/api/activities/${id}/cancel`, { token: tokenA });
   assert.equal(res.statusCode, 200);
 
   // cancelled 不在列表（列表只返回 finished）
-  const list = await req('GET', '/api/activities', { token: tokenA });
+  const list = await req('GET', '/sport-track/api/activities', { token: tokenA });
   assert.ok(!list.json().data.items.some((i: { id: string }) => i.id === id));
 });
 
 test('删除活动', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: 1700000000000 },
   });
   const id = created.json().data.activityId;
   // finish 它使其进入列表
-  await req('PUT', `/api/activities/${id}/finish`, {
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: { trackPoints: [P(1, 31.0, 121.0)] },
   });
 
-  const del = await req('DELETE', `/api/activities/${id}`, { token: tokenA });
+  const del = await req('DELETE', `/sport-track/api/activities/${id}`, { token: tokenA });
   assert.equal(del.statusCode, 200);
 
-  const detail = await req('GET', `/api/activities/${id}`, { token: tokenA });
+  const detail = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenA });
   assert.equal(detail.statusCode, 404);
 });
 
@@ -300,7 +302,7 @@ test('删除活动', async () => {
 // 注意：这些测试依赖前面 finish 对账测试写入的 marker m1
 
 test('编辑打点：更新备注与类型', async () => {
-  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+  const res = await req('PUT', `/sport-track/api/activities/${activityId}/markers/m1`, {
     token: tokenA,
     body: { note: '补给点(更新)', type: 'rest' },
   });
@@ -312,7 +314,7 @@ test('编辑打点：更新备注与类型', async () => {
 });
 
 test('编辑打点：仅更新部分字段，未传字段保持不变', async () => {
-  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+  const res = await req('PUT', `/sport-track/api/activities/${activityId}/markers/m1`, {
     token: tokenA,
     body: { note: '只改备注' },
   });
@@ -324,7 +326,7 @@ test('编辑打点：仅更新部分字段，未传字段保持不变', async ()
 });
 
 test('编辑不存在的打点 → 404', async () => {
-  const res = await req('PUT', `/api/activities/${activityId}/markers/nope`, {
+  const res = await req('PUT', `/sport-track/api/activities/${activityId}/markers/nope`, {
     token: tokenA,
     body: { note: 'x' },
   });
@@ -332,7 +334,7 @@ test('编辑不存在的打点 → 404', async () => {
 });
 
 test('编辑打点非法 type → 400', async () => {
-  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+  const res = await req('PUT', `/sport-track/api/activities/${activityId}/markers/m1`, {
     token: tokenA,
     body: { type: 'invalid-type' },
   });
@@ -340,7 +342,7 @@ test('编辑打点非法 type → 400', async () => {
 });
 
 test('越权编辑打点 → 404', async () => {
-  const res = await req('PUT', `/api/activities/${activityId}/markers/m1`, {
+  const res = await req('PUT', `/sport-track/api/activities/${activityId}/markers/m1`, {
     token: tokenB,
     body: { note: 'hack' },
   });
@@ -348,27 +350,27 @@ test('越权编辑打点 → 404', async () => {
 });
 
 test('删除打点', async () => {
-  const res = await req('DELETE', `/api/activities/${activityId}/markers/m1`, { token: tokenA });
+  const res = await req('DELETE', `/sport-track/api/activities/${activityId}/markers/m1`, { token: tokenA });
   assert.equal(res.statusCode, 200);
 
-  const detail = await req('GET', `/api/activities/${activityId}`, { token: tokenA });
+  const detail = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenA });
   assert.equal(detail.json().data.markers.length, 0);
 });
 
 test('删除不存在的打点 → 404', async () => {
-  const res = await req('DELETE', `/api/activities/${activityId}/markers/m1`, { token: tokenA });
+  const res = await req('DELETE', `/sport-track/api/activities/${activityId}/markers/m1`, { token: tokenA });
   assert.equal(res.statusCode, 404);
 });
 
 test('轨迹平滑：抖动点被滑动平均修正，端点保持', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: TEST_NOW - 60000 },
   });
   const id = created.json().data.activityId;
 
   // 5 个点：直线 31.2304→31.2344，中间点故意抖动（31.2420 偏离 ~850m）
-  const res = await req('PUT', `/api/activities/${id}/finish`, {
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: {
       trackPoints: [
@@ -393,13 +395,13 @@ test('轨迹平滑：抖动点被滑动平均修正，端点保持', async () =>
 });
 
 test('删除带照片的活动：OSS 未配置时优雅跳过，不影响删除', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'hiking', startTime: TEST_NOW - 60000 },
   });
   const id = created.json().data.activityId;
 
-  await req('POST', `/api/activities/${id}/markers`, {
+  await req('POST', `/sport-track/api/activities/${id}/markers`, {
     token: tokenA,
     body: {
       id: 'ph1',
@@ -411,24 +413,24 @@ test('删除带照片的活动：OSS 未配置时优雅跳过，不影响删除'
         'https://example-bucket.oss-cn-hangzhou.aliyuncs.com/sport-track/users/000000000000000000000000/photos/a.jpg',
     },
   });
-  await req('PUT', `/api/activities/${id}/finish`, {
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: {
       trackPoints: [{ seq: 1, lat: 31.2, lng: 121.4, altitude: null, speed: null, timestamp: TEST_NOW }],
     },
   });
 
-  const del = await req('DELETE', `/api/activities/${id}`, { token: tokenA });
+  const del = await req('DELETE', `/sport-track/api/activities/${id}`, { token: tokenA });
   assert.equal(del.statusCode, 200);
 
-  const detail = await req('GET', `/api/activities/${id}`, { token: tokenA });
+  const detail = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenA });
   assert.equal(detail.statusCode, 404);
 });
 
 // ==================== 海拔尖刺清洗 ====================
 
 test('海拔尖刺清洗：短时间跳变且方向反转 → 置 null', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: TEST_NOW - 60000 },
   });
@@ -436,7 +438,7 @@ test('海拔尖刺清洗：短时间跳变且方向反转 → 置 null', async (
 
   const base = TEST_NOW - 50000;
   // 海拔：38 → 25(尖刺) → 38，时间间隔 10s
-  const res = await req('PUT', `/api/activities/${id}/finish`, {
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: {
       trackPoints: [
@@ -460,7 +462,7 @@ test('海拔尖刺清洗：短时间跳变且方向反转 → 置 null', async (
 });
 
 test('海拔尖刺清洗：真实爬坡（速率正常）不被误伤', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'hiking', startTime: TEST_NOW - 60000 },
   });
@@ -468,7 +470,7 @@ test('海拔尖刺清洗：真实爬坡（速率正常）不被误伤', async ()
 
   const base = TEST_NOW - 50000;
   // 缓慢爬升：每 10s 升 2m（0.2 m/s，正常）
-  const res = await req('PUT', `/api/activities/${id}/finish`, {
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: {
       trackPoints: [
@@ -489,13 +491,13 @@ test('海拔尖刺清洗：真实爬坡（速率正常）不被误伤', async ()
 test('防刷：1 小时窗口内最多创建 10 条，第 11 条返回 429', async () => {
   const t = (await login('m2-rate-limit')).accessToken;
   for (let i = 0; i < 10; i++) {
-    const r = await req('POST', '/api/activities', {
+    const r = await req('POST', '/sport-track/api/activities', {
       token: t,
       body: { type: 'walking', startTime: 1700000000000 + i * 1000 },
     });
     assert.equal(r.statusCode, 200, `第 ${i + 1} 条应创建成功`);
   }
-  const over = await req('POST', '/api/activities', {
+  const over = await req('POST', '/sport-track/api/activities', {
     token: t,
     body: { type: 'walking', startTime: 1700000000000 + 100000 },
   });
@@ -503,16 +505,16 @@ test('防刷：1 小时窗口内最多创建 10 条，第 11 条返回 429', asy
 });
 
 test('数据隔离：B 用户不能读取/修改 A 用户的轨迹', async () => {
-  const created = await req('POST', '/api/activities', {
+  const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: 1700000000000 },
   });
   const id = created.json().data.activityId;
   // B 读 A 的详情 → 404
-  const detail = await req('GET', `/api/activities/${id}`, { token: tokenB });
+  const detail = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenB });
   assert.equal(detail.statusCode, 404, 'B 读 A 轨迹应 404');
   // B 改 A 的轨迹 → 404
-  const meta = await req('PUT', `/api/activities/${id}/meta`, {
+  const meta = await req('PUT', `/sport-track/api/activities/${id}/meta`, {
     token: tokenB,
     body: { note: '越权修改' },
   });
