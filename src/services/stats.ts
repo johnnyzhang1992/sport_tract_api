@@ -209,13 +209,15 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
   return { type, data };
 }
 
-/** 个人最佳纪录（PR）：最远距离/最快配速/最长时长/最大爬升 + 对应轨迹信息 */
+/** 个人最佳纪录（PR）：最远距离/最快配速/最长时长/最大爬升 + 对应轨迹信息
+ * 最快配速口径：轨迹内最快 1km 分段（fastestKm），非全程平均配速
+ */
 export async function bestRecords(userId: ObjectIdLike) {
   const base = { userId: toObjectId(userId), status: 'finished' };
-  const select = '_id type startTime distance avgPace duration elevationGain';
+  const select = '_id type startTime distance avgPace fastestKm duration elevationGain';
   const [maxDist, minPace, maxDur, maxElev] = await Promise.all([
     ActivityModel.find(base).sort({ distance: -1 }).limit(1).select(select).lean(),
-    ActivityModel.find({ ...base, avgPace: { $gt: 0 } }).sort({ avgPace: 1 }).limit(1).select(select).lean(),
+    ActivityModel.find({ ...base, fastestKm: { $gt: 0 } }).sort({ fastestKm: 1 }).limit(1).select(select).lean(),
     ActivityModel.find(base).sort({ duration: -1 }).limit(1).select(select).lean(),
     ActivityModel.find(base).sort({ elevationGain: -1 }).limit(1).select(select).lean(),
   ]);
@@ -227,13 +229,14 @@ export async function bestRecords(userId: ObjectIdLike) {
           startTime: a.startTime,
           distance: a.distance ?? 0,
           avgPace: a.avgPace ?? null,
+          fastestKm: a.fastestKm ?? null, // 最快 1km 分段（秒/公里）
           duration: a.duration ?? 0,
           elevationGain: a.elevationGain ?? 0,
         }
       : null;
   return {
     maxDistance: fmt(maxDist[0]),
-    minPace: fmt(minPace[0]), // avgPace 秒/公里
+    minPace: fmt(minPace[0]),
     maxDuration: fmt(maxDur[0]),
     maxElevation: fmt(maxElev[0]),
   };

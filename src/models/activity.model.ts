@@ -46,7 +46,8 @@ const activitySchema = new Schema(
     endTime: { type: Number, default: null },
     duration: { type: Number, default: 0 }, // 秒（扣除暂停）
     distance: { type: Number, default: 0 }, // 米
-    avgPace: { type: Number, default: null }, // 秒/公里
+    avgPace: { type: Number, default: null }, // 全程平均配速（秒/公里）
+    fastestKm: { type: Number, default: null }, // 轨迹内最快 1km 分段（秒/公里）
     calories: { type: Number, default: 0 },
     elevationGain: { type: Number, default: 0 },
     maxAltitude: { type: Number, default: null },

@@ -38,3 +38,42 @@ test('转换可逆性：GCJ-02 → WGS-84 往返（用近似反向验证偏移�
   const b = wgs84ToGcj02(30.507991, 114.486967);
   assert.deepEqual(a, b);
 });
+
+test('calcFastestKm：1km 分段取最快，尾段不足 1km 剔除', async () => {
+  const { calcFastestKm } = await import('../src/utils/pace.js');
+  const mk = (lat: number, lng: number, t: number) => ({ lat, lng, timestamp: t });
+  const pts: any[] = [];
+  const d1 = 1000 / 111000; // ~1km 纬度
+  let t = 1700000000000;
+  // 段1：5×60s = 300s/km（间隔 ≤60s 不触发空档剔除）
+  for (let i = 0; i <= 5; i++) pts.push(mk(31 + (d1 * i) / 5, 121, t + i * 60000));
+  const b2 = pts[pts.length - 1];
+  // 段2：5×20s = 100s/km（最快）
+  for (let i = 1; i <= 5; i++) pts.push(mk(b2.lat + (d1 * i) / 5, 121, b2.timestamp + i * 20000));
+  const b3 = pts[pts.length - 1];
+  // 段3：5×30s = 150s/km
+  for (let i = 1; i <= 5; i++) pts.push(mk(b3.lat + (d1 * i) / 5, 121, b3.timestamp + i * 30000));
+  // 尾段：仅 200m（不足 1km 剔除）
+  const b4 = pts[pts.length - 1];
+  for (let i = 1; i <= 2; i++) pts.push(mk(b4.lat + (200 / 111000) * (i / 2), 121, b4.timestamp + i * 20000));
+  const r = calcFastestKm(pts);
+  assert.ok(r !== null, '有分段');
+  assert.ok(Math.abs(r - 100) < 2, `最快段应约 100s/km，实际 ${r}`);
+});
+
+test('calcFastestKm：暂停空档（>60s）不计入运动时间', async () => {
+  const { calcFastestKm } = await import('../src/utils/pace.js');
+  const mk = (lat: number, lng: number, t: number) => ({ lat, lng, timestamp: t });
+  const d1 = 1000 / 111000;
+  const pts: any[] = [];
+  let t = 1700000000000;
+  // 1km：4 个 250m 间隔，正常 3 个 10s，1 个 120s 空档 → 运动时间 30s，空档剔除
+  pts.push(mk(31, 121, t));
+  pts.push(mk(31 + 0.25 * d1, 121, t + 10000));
+  pts.push(mk(31 + 0.5 * d1, 121, t + 20000));
+  pts.push(mk(31 + 0.75 * d1, 121, t + 140000)); // 间隔 120s > 60s：空档剔除
+  pts.push(mk(31 + d1, 121, t + 150000));
+  const r = calcFastestKm(pts);
+  assert.ok(r !== null, '有分段');
+  assert.ok(Math.abs(r - 30) < 2, `运动时间 30s，实际 ${r}`);
+});

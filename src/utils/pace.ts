@@ -120,3 +120,39 @@ export function formatPace(secPerKm: number): string {
   const s = Math.round(secPerKm % 60);
   return `${m}'${s.toString().padStart(2, '0')}"`;
 }
+
+/** 轨迹内最快 1 公里分段（秒/公里）
+ * - 1km 分段：从起点起每累计 1000m 记一段，尾段不足 1km 剔除
+ * - 纯运动时间：段内相邻点时间戳差累加；相邻点间隔 > 60s 视为暂停/空档，不计入
+ * - 返回 null：轨迹不足 1km 或点缺少 timestamp
+ */
+const GAP_MS = 60000;
+export function calcFastestKm(points: TrackPointLike[]): number | null {
+  const sorted = [...points]
+    .filter((p) => p.timestamp != null)
+    .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+  if (sorted.length < 2) return null;
+  let fastest: number | null = null;
+  let segDist = 0;
+  let segSec = 0;
+  let prev = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const d = haversineDistance(prev, cur);
+    let dt = ((cur.timestamp ?? 0) - (prev.timestamp ?? 0)) / 1000; // 秒
+    if (!Number.isFinite(dt) || dt < 0) dt = 0;
+    if (dt > GAP_MS / 1000) dt = 0; // 暂停/空档不计
+    segDist += d;
+    segSec += dt;
+    if (segDist >= 1000) {
+      // 段完成：按比例归一化到 1km
+      const pace = segSec / (segDist / 1000);
+      if (fastest === null || pace < fastest) fastest = pace;
+      // 下一段从当前点重新开始（尾段不足 1km 自然剔除）
+      segDist = 0;
+      segSec = 0;
+    }
+    prev = cur;
+  }
+  return fastest === null ? null : Math.round(fastest * 10) / 10;
+}

@@ -1,7 +1,7 @@
 import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
-import { calcStats, haversineDistance } from '../utils/pace.js';
+import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { cleanTrajectory } from '../utils/trajectory-clean.js';
@@ -245,6 +245,8 @@ export async function finishActivity(
     durationSec,
     weightKg: input.weightKg,
   });
+  // 轨迹内最快 1km 分段（个人最佳"最快配速"口径：分段最快，非全程平均）
+  const fastestKm = calcFastestKm(smoothedPoints);
 
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
@@ -260,6 +262,7 @@ export async function finishActivity(
         duration: Math.round(durationSec),
         distance: stats.distance,
         avgPace: stats.avgPace,
+        fastestKm,
         calories: stats.calories,
         elevationGain: stats.elevationGain,
         maxAltitude: stats.maxAltitude,
@@ -405,6 +408,7 @@ export async function reprocessActivity(
     type: activity.type,
     durationSec: activity.duration ?? 0,
   });
+  const fastestKm = calcFastestKm(smoothed);
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
     {
@@ -412,6 +416,7 @@ export async function reprocessActivity(
         trackPoints: smoothed,
         distance: stats.distance,
         avgPace: stats.avgPace,
+        fastestKm,
         calories: stats.calories,
         elevationGain: stats.elevationGain,
         maxAltitude: stats.maxAltitude,
@@ -442,6 +447,7 @@ export async function updateActivityMeta(
     });
     patch.type = input.type;
     patch.avgPace = stats.avgPace;
+    patch.fastestKm = calcFastestKm(activity.trackPoints ?? []);
     patch.calories = stats.calories;
   }
   if (input.note != null) {
