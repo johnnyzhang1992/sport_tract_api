@@ -50,6 +50,7 @@ export interface ActivityDto {
   duration: number;
   distance: number;
   avgPace: number | null;
+  fastestKm: number | null;
   calories: number;
   elevationGain: number;
   maxAltitude: number | null;
@@ -74,6 +75,7 @@ function toActivityDto(doc: Record<string, any>): ActivityDto {
     duration: doc.duration ?? 0,
     distance: doc.distance ?? 0,
     avgPace: doc.avgPace ?? null,
+    fastestKm: doc.fastestKm ?? null,
     calories: doc.calories ?? 0,
     elevationGain: doc.elevationGain ?? 0,
     maxAltitude: doc.maxAltitude ?? null,
