@@ -40,7 +40,12 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
-  await fastify.register(cors, { origin: corsOrigin, credentials: true });
+  await fastify.register(cors, {
+    origin: corsOrigin,
+    credentials: true,
+    // 显式声明方法（@fastify/cors 默认不含 PUT，改密接口 /admin/password 是 PUT）
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE'],
+  });
 
   // multipart（图片合规检测上传）
   await fastify.register(multipart, { limits: { fileSize: 2 * 1024 * 1024 } });
