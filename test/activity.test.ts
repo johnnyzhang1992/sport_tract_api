@@ -205,6 +205,37 @@ test('活动列表：包含统计字段，不含完整点集', async () => {
   assert.equal(item.trackPoints, undefined); // 列表不返回完整点集
 });
 
+test('best 惰性补算：历史轨迹无 fastestKm 自动补齐', async () => {
+  // 创建并 finish 一条轨迹，然后删除 fastestKm（模拟历史数据）
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 上传轨迹点（2 段 1km，每段 5 间隔 20s/10s → 最快 50s/km）并 finish
+  const pts = [];
+  const d1 = 1000 / 111000;
+  let ts = TEST_NOW - 60000;
+  const baseLat = 31;
+  for (let i = 0; i <= 5; i++) pts.push({ seq: i + 1, lat: baseLat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: ts + i * 20000 });
+  const b2 = pts[pts.length - 1];
+  for (let i = 1; i <= 5; i++) pts.push({ seq: pts.length + 1, lat: b2.lat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: b2.timestamp + i * 10000 });
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: pts, endTime: TEST_NOW, pausedMs: 0 },
+  });
+  // P() 是固定 timestamp——用真实时间点重算 fastestKm 后删字段模拟历史
+  await ActivityModel.updateOne({ _id: id }, { $set: { fastestKm: null } }, { timestamps: false });
+  const before = await ActivityModel.findById(id).lean();
+  assert.equal(before?.fastestKm, null);
+  // 调 best → 触发补算
+  const res = await req('GET', '/sport-track/api/stats/best', { token: tokenA });
+  assert.equal(res.statusCode, 200);
+  const after = await ActivityModel.findById(id).lean();
+  assert.ok(after?.fastestKm !== null, 'fastestKm 被补算');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('列表惰性清理：超时 in_progress 自动作废（cancelled）', async () => {
   // 创建 in_progress 活动（startTime 25 小时前）
   const created = await req('POST', '/sport-track/api/activities', {

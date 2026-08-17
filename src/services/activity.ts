@@ -246,7 +246,7 @@ export async function finishActivity(
     weightKg: input.weightKg,
   });
   // 轨迹内最快 1km 分段（个人最佳"最快配速"口径：分段最快，非全程平均）
-  const fastestKm = calcFastestKm(smoothedPoints);
+  const fastestKm = calcFastestKm(smoothedPoints, activity.type);
 
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
@@ -408,7 +408,7 @@ export async function reprocessActivity(
     type: activity.type,
     durationSec: activity.duration ?? 0,
   });
-  const fastestKm = calcFastestKm(smoothed);
+  const fastestKm = calcFastestKm(smoothed, activity.type);
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
     {
@@ -447,7 +447,7 @@ export async function updateActivityMeta(
     });
     patch.type = input.type;
     patch.avgPace = stats.avgPace;
-    patch.fastestKm = calcFastestKm(activity.trackPoints ?? []);
+    patch.fastestKm = calcFastestKm(activity.trackPoints ?? [], activity.type);
     patch.calories = stats.calories;
   }
   if (input.note != null) {

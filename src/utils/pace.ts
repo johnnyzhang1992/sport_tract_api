@@ -126,8 +126,11 @@ export function formatPace(secPerKm: number): string {
  * - 纯运动时间：段内相邻点时间戳差累加；相邻点间隔 > 60s 视为暂停/空档，不计入
  * - 返回 null：轨迹不足 1km 或点缺少 timestamp
  */
+/** 无配速概念的运动类型（与 calcStats 一致） */
+const NO_PACE_TYPES = ['swimming', 'cycling'];
 const GAP_MS = 60000;
-export function calcFastestKm(points: TrackPointLike[]): number | null {
+export function calcFastestKm(points: TrackPointLike[], type?: string): number | null {
+  if (type && NO_PACE_TYPES.includes(type)) return null; // 游泳/骑行不统计配速
   const sorted = [...points]
     .filter((p) => p.timestamp != null)
     .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));

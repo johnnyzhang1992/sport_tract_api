@@ -1,5 +1,6 @@
 import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
+import { calcFastestKm } from '../utils/pace.js';
 
 type ObjectIdLike = Types.ObjectId | string;
 
@@ -214,14 +215,17 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
  */
 export async function bestRecords(userId: ObjectIdLike) {
   const base = { userId: toObjectId(userId), status: 'finished' };
+  // 惰性补算：fastestKm 新字段上线前完成的历史轨迹无该字段 → 批量补算（每次本用户全量，数据量小）
+  const missing = await ActivityModel.find({ ...base, fastestKm: null })
+    .select('_id trackPoints')
+    .limit(100)
+    .lean();
+  for (const a of missing) {
+    const fk = calcFastestKm(a.trackPoints ?? [], a.type);
+    await ActivityModel.updateOne({ _id: a._id }, { $set: { fastestKm: fk } });
+  }
   const select = '_id type startTime distance avgPace fastestKm duration elevationGain';
-  const [maxDist, minPace, maxDur, maxElev] = await Promise.all([
-    ActivityModel.find(base).sort({ distance: -1 }).limit(1).select(select).lean(),
-    ActivityModel.find({ ...base, fastestKm: { $gt: 0 } }).sort({ fastestKm: 1 }).limit(1).select(select).lean(),
-    ActivityModel.find(base).sort({ duration: -1 }).limit(1).select(select).lean(),
-    ActivityModel.find(base).sort({ elevationGain: -1 }).limit(1).select(select).lean(),
-  ]);
-  const fmt = (a: Record<string, any> | undefined) =>
+  const fmt = (a: Record<string, any> | undefined): Record<string, any> | null =>
     a
       ? {
           id: String(a._id),
@@ -234,10 +238,29 @@ export async function bestRecords(userId: ObjectIdLike) {
           elevationGain: a.elevationGain ?? 0,
         }
       : null;
+  const byTypeAgg = (sortField: string, dir: 1 | -1, extraMatch: Record<string, unknown> = {}) =>
+    ActivityModel.aggregate([
+      { $match: { ...base, ...extraMatch } },
+      { $sort: { [sortField]: dir } },
+      { $project: { type: 1, startTime: 1, distance: 1, avgPace: 1, fastestKm: 1, duration: 1, elevationGain: 1 } },
+      { $group: { _id: '$type', doc: { $first: '$$ROOT' } } },
+    ]);
+  const [distRows, paceRows, durRows, elevRows] = await Promise.all([
+    byTypeAgg('distance', -1),
+    byTypeAgg('fastestKm', 1, { fastestKm: { $gt: 0 } }),
+    byTypeAgg('duration', -1),
+    byTypeAgg('elevationGain', -1),
+  ]);
+  // 个人最佳按类型分组：各运动类型分别取最佳（不同类型绝对值/配速均不可比）
+  type BestRow = { type: string; [k: string]: any };
+  const mapByType = (rows: Array<{ _id: string; doc: Record<string, any> }>, sortKey: string, dir: 1 | -1): BestRow[] =>
+    rows
+      .map((r) => ({ type: r._id, ...fmt(r.doc) }) as BestRow)
+      .sort((a, b) => ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * dir);
   return {
-    maxDistance: fmt(maxDist[0]),
-    minPace: fmt(minPace[0]),
-    maxDuration: fmt(maxDur[0]),
-    maxElevation: fmt(maxElev[0]),
+    maxDistanceByType: mapByType(distRows, 'distance', -1),
+    minPaceByType: mapByType(paceRows, 'fastestKm', 1), // 配速升序=最快
+    maxDurationByType: mapByType(durRows, 'duration', -1),
+    maxElevationByType: mapByType(elevRows, 'elevationGain', -1),
   };
 }
