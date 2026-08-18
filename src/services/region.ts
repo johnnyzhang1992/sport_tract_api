@@ -170,6 +170,46 @@ function provinceAdcodeOfCity(rec: RegionRecord): number {
   return parent;
 }
 
+export interface PointsRegion {
+  /** 轨迹经过的省（去重，保持出现顺序；用于按省查询轨迹） */
+  provinces: string[];
+  startProvince: string;
+  startCity: string;
+}
+
+/**
+ * 轨迹点集 → 经过的省/起点省市
+ * 采样：首/尾 + 约每 25% 一点（与 footprint 统计口径一致，覆盖跨市/跨省轨迹）
+ * 落库字段用（finish/导入/纠偏时写入），避免每次查询都做点-in-polygon
+ */
+export function provincesOfPoints(
+  points: Array<{ lat: number; lng: number }>,
+): PointsRegion {
+  const result: PointsRegion = { provinces: [], startProvince: '', startCity: '' };
+  if (points.length === 0) return result;
+
+  const idxs = new Set<number>([0, points.length - 1]);
+  for (const r of [0.25, 0.5, 0.75]) {
+    idxs.add(Math.floor(points.length * r));
+  }
+  const seen = new Set<string>();
+  for (const i of [...idxs].sort((a, b) => a - b)) {
+    const p = points[i];
+    if (!p || !Number.isFinite(p.lat) || !Number.isFinite(p.lng)) continue;
+    const d = locateRegion(p.lat, p.lng);
+    if (!d) continue;
+    if (!seen.has(d.province)) {
+      seen.add(d.province);
+      result.provinces.push(d.province);
+    }
+    if (!result.startProvince) {
+      result.startProvince = d.province;
+      result.startCity = d.city;
+    }
+  }
+  return result;
+}
+
 export function regionStats() {
   return { provinces: provinceRecords.length, cities: cityRecords.length };
 }

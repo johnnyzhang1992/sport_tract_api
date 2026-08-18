@@ -105,7 +105,7 @@ sport_track_api/
 | DELETE | `/api/activities/:id/markers/:markerId` | 删除打点（同步清理 OSS 照片） | ✅ |
 | PUT | `/api/activities/:id/finish` | 结束：final 包对账 + 服务端重算指标 | ✅ |
 | PUT | `/api/activities/:id/cancel` | 放弃活动 | ✅ |
-| GET | `/api/activities` | 列表（分页 + 类型/月份筛选，含 pointsCount/markerCount/首尾点） | ✅ |
+| GET | `/api/activities` | 列表（分页 + 类型/月份/省份筛选，含 pointsCount/markerCount/首尾点/省市字段） | ✅ |
 | GET | `/api/activities/:id` | 详情（完整点集 + 打点） | ✅ |
 | GET | `/api/activities/:id/gpx` | 导出 GPX（markers 作航点） | ✅ |
 | DELETE | `/api/activities/:id` | 删除（同步清理打点照片 OSS 文件） | ✅ |

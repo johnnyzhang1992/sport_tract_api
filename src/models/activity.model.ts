@@ -53,6 +53,10 @@ const activitySchema = new Schema(
     maxAltitude: { type: Number, default: null },
     startAddress: { type: String, default: '' },
     endAddress: { type: String, default: '' },
+    // 落库省市（点亮地图按省查询用；finish/导入时由离线 locateRegion 计算写入）
+    provinces: { type: [String], default: [] }, // 轨迹经过的省（去重）
+    startProvince: { type: String, default: '' },
+    startCity: { type: String, default: '' },
 
     trackPoints: {
       type: [trackPointSchema],
@@ -74,6 +78,8 @@ const activitySchema = new Schema(
 
 // 列表查询：用户 + 状态 + 开始时间倒序
 activitySchema.index({ userId: 1, status: 1, startTime: -1 });
+// 按省查询轨迹（点亮地图省下钻）：provinces 为多键索引
+activitySchema.index({ userId: 1, provinces: 1 });
 
 export type Activity = mongoose.InferSchemaType<typeof activitySchema>;
 

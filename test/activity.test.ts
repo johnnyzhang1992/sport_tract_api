@@ -149,6 +149,103 @@ test('finish 对账：以 final 包为准重算指标', async () => {
   assert.equal(data.activity.markers.length, 1);
 });
 
+test('finish 落库省市：写入经过的省与起点城市', async () => {
+  // 轨迹从上海(31.25,121.1)跨到苏州(31.30,121.1)，跨两省 ~5.5km
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  const pts = [
+    { seq: 1, lat: 31.25, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 50000 },
+    { seq: 2, lat: 31.26, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 40000 },
+    { seq: 3, lat: 31.27, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 30000 },
+    { seq: 4, lat: 31.28, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 20000 },
+    { seq: 5, lat: 31.29, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 10000 },
+    { seq: 6, lat: 31.3, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW },
+  ];
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: pts, endTime: TEST_NOW, pausedMs: 0 },
+  });
+  assert.equal(res.statusCode, 200);
+  const act = res.json().data.activity;
+  assert.deepEqual(act.provinces, ['上海市', '江苏省'], '应记录经过的省（按出现顺序）');
+  assert.equal(act.startProvince, '上海市');
+  assert.equal(act.startCity, '上海市');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
+test('列表按省筛选：?province= 只返回该省轨迹', async () => {
+  // 前置：构造一条上海轨迹 + 一条跨省轨迹（上海→江苏）
+  const sh = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const shId = sh.json().data.activityId;
+  await req('PUT', `/sport-track/api/activities/${shId}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.25, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 20000 },
+        { seq: 2, lat: 31.26, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 10000 },
+        { seq: 3, lat: 31.27, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+  const cross = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 60000 },
+  });
+  const crossProvinceId = cross.json().data.activityId;
+  await req('PUT', `/sport-track/api/activities/${crossProvinceId}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.25, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 50000 },
+        { seq: 2, lat: 31.26, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 40000 },
+        { seq: 3, lat: 31.27, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 30000 },
+        { seq: 4, lat: 31.28, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 20000 },
+        { seq: 5, lat: 31.29, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 10000 },
+        { seq: 6, lat: 31.3, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+
+  // 按省筛选：上海市 → 两条都命中（上海轨迹 + 跨省轨迹起点在上海）
+  const bySh = await req('GET', '/sport-track/api/activities?province=上海市&pageSize=100', { token: tokenA });
+  assert.equal(bySh.statusCode, 200);
+  const shIds = bySh.json().data.items.map((i: { _id: string }) => String(i._id));
+  assert.ok(shIds.includes(shId), '上海轨迹应命中');
+  assert.ok(shIds.includes(crossProvinceId), '跨省轨迹（含上海）应命中');
+
+  // 按省筛选：江苏省 → 只有跨省轨迹
+  const byJs = await req('GET', '/sport-track/api/activities?province=江苏省&pageSize=100', { token: tokenA });
+  assert.equal(byJs.statusCode, 200);
+  const jsIds = byJs.json().data.items.map((i: { _id: string }) => String(i._id));
+  assert.ok(jsIds.includes(crossProvinceId), '跨省轨迹应命中江苏省');
+  assert.ok(!jsIds.includes(shId), '纯上海轨迹不应命中江苏省');
+
+  // 省份 + 月份组合筛选
+  const month = new Date(TEST_NOW).toISOString().slice(0, 7);
+  const byShMonth = await req('GET', `/sport-track/api/activities?province=上海市&month=${month}&pageSize=100`, { token: tokenA });
+  assert.equal(byShMonth.statusCode, 200);
+  assert.ok(byShMonth.json().data.items.some((i: { _id: string }) => String(i._id) === crossProvinceId));
+
+  // 列表条目带省市字段
+  const item = bySh.json().data.items.find((i: { _id: string }) => String(i._id) === crossProvinceId);
+  assert.ok(item.provinces.includes('江苏省'));
+  assert.equal(item.startCity, '上海市');
+
+  // 清理
+  await ActivityModel.deleteOne({ _id: shId });
+  await ActivityModel.deleteOne({ _id: crossProvinceId });
+});
+
 test('finish 后禁止再上传轨迹点 → 409', async () => {
   const res = await req('POST', `/sport-track/api/activities/${activityId}/points`, {
     token: tokenA,

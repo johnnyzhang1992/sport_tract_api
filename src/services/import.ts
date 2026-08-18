@@ -11,6 +11,7 @@ import { calcStats, haversineDistance, type TrackPointLike } from '../utils/pace
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { wgs84ToGcj02 } from '../utils/coordinate.js';
 import { markFootprintDirty } from './footprint.js';
+import { provincesOfPoints } from './region.js';
 import { ACTIVITY_TYPES, MAX_TRACK_POINTS } from '../config/constants.js';
 
 export interface ImportedPoint {
@@ -293,6 +294,8 @@ export async function importActivity(
     speed: null,
     timestamp: p.timestamp,
   }));
+  // 落库省市（按省查询轨迹用）
+  const regions = provincesOfPoints(trackPoints);
 
   const activity = await ActivityModel.create({
     userId,
@@ -306,6 +309,9 @@ export async function importActivity(
     calories: stats.calories,
     elevationGain: stats.elevationGain,
     maxAltitude: stats.maxAltitude,
+    provinces: regions.provinces,
+    startProvince: regions.startProvince,
+    startCity: regions.startCity,
     trackPoints: trackPoints.slice(0, MAX_TRACK_POINTS),
     markers: [],
     lastPointSeq: trackPoints.length,

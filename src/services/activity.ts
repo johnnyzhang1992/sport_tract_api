@@ -6,6 +6,7 @@ import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { cleanTrajectory } from '../utils/trajectory-clean.js';
 import { markFootprintDirty } from './footprint.js';
+import { provincesOfPoints } from './region.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
 import type {
   AppendPointsInput,
@@ -56,6 +57,9 @@ export interface ActivityDto {
   maxAltitude: number | null;
   startAddress: string;
   endAddress: string;
+  provinces: string[]; // 轨迹经过的省
+  startProvince: string;
+  startCity: string;
   lastPointSeq: number;
   pausedMs: number;
   note: string;
@@ -81,6 +85,9 @@ function toActivityDto(doc: Record<string, any>): ActivityDto {
     maxAltitude: doc.maxAltitude ?? null,
     startAddress: doc.startAddress ?? '',
     endAddress: doc.endAddress ?? '',
+    provinces: doc.provinces ?? [],
+    startProvince: doc.startProvince ?? '',
+    startCity: doc.startCity ?? '',
     lastPointSeq: doc.lastPointSeq ?? 0,
     pausedMs: doc.pausedMs ?? 0,
     note: doc.note ?? '',
@@ -249,6 +256,8 @@ export async function finishActivity(
   });
   // 轨迹内最快 1km 分段（个人最佳"最快配速"口径：分段最快，非全程平均）
   const fastestKm = calcFastestKm(smoothedPoints, activity.type);
+  // 落库省市（按省查询轨迹 + 点亮地图省下钻）
+  const regions = provincesOfPoints(smoothedPoints);
 
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
@@ -260,6 +269,9 @@ export async function finishActivity(
         markers: input.markers ?? activity.markers ?? [],
         startAddress: input.startAddress,
         endAddress: input.endAddress,
+        provinces: regions.provinces,
+        startProvince: regions.startProvince,
+        startCity: regions.startCity,
         pausedMs: input.pausedMs,
         duration: Math.round(durationSec),
         distance: stats.distance,
@@ -303,7 +315,7 @@ export async function listActivities(
   userId: string,
   query: ListActivitiesQueryInput,
 ): Promise<{ items: Array<Record<string, any>>; total: number; page: number; pageSize: number }> {
-  const { type, month, page, pageSize } = query;
+  const { type, month, province, page, pageSize } = query;
 
   // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动作废，避免堆积
   // 列表接口是用户活跃入口，天然覆盖所有使用者；updateMany 幂等 + userId/status 索引，开销可控
@@ -319,6 +331,7 @@ export async function listActivities(
   // aggregate 的 $match 不做 Mongoose 类型转换，userId 需手动转 ObjectId
   const filter: Record<string, any> = { userId: new Types.ObjectId(userId), status: 'finished' };
   if (type) filter.type = type;
+  if (province) filter.provinces = province; // 多键索引 { userId, provinces } 命中
   if (month) {
     const [y, m] = month.split('-').map(Number);
     const start = new Date(y, m - 1, 1).getTime();
@@ -347,6 +360,9 @@ export async function listActivities(
           maxAltitude: 1,
           startAddress: 1,
           endAddress: 1,
+          provinces: 1,
+          startProvince: 1,
+          startCity: 1,
           createdAt: 1,
           pointsCount: { $size: '$trackPoints' },
           markerCount: { $size: '$markers' },
@@ -411,11 +427,16 @@ export async function reprocessActivity(
     durationSec: activity.duration ?? 0,
   });
   const fastestKm = calcFastestKm(smoothed, activity.type);
+  // 纠偏后轨迹点变化 → 重算省市并更新
+  const regions = provincesOfPoints(smoothed);
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
     {
       $set: {
         trackPoints: smoothed,
+        provinces: regions.provinces,
+        startProvince: regions.startProvince,
+        startCity: regions.startCity,
         distance: stats.distance,
         avgPace: stats.avgPace,
         fastestKm,
