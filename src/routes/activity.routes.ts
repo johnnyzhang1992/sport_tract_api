@@ -122,11 +122,11 @@ export async function activityRoutes(fastify: FastifyInstance) {
     return success(result);
   });
 
-  // 活动详情（分享/只读查看：本人全功能，非本人仅 finished 且 isOwner=false 只读）
-  // 完整轨迹点 + 打点；照片 URL 签名，bucket 私有可正常加载
-  fastify.get('/:id', { onRequest: [fastify.authenticate] }, async (request) => {
+  // 活动详情（分享/只读查看：未登录/非本人仅 finished 可读，isOwner=false 只读；本人全功能）
+  // 可选鉴权：游客也能打开分享链接查看；照片 URL 签名，bucket 私有可正常加载
+  fastify.get('/:id', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     const { id } = request.params as { id: string };
-    const activity = await getActivityDetailView(id, request.user.userId);
+    const activity = await getActivityDetailView(id, request.user?.userId);
     // 私有 bucket：给打点照片签发访问签名 URL（库内仍存裸 URL）
     for (const m of activity.markers) {
       if (m.photos && m.photos.length > 0) {

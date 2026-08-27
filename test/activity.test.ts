@@ -343,6 +343,45 @@ test('分享查看：非本人读取未完成（in_progress）轨迹 → 404', a
   await ActivityModel.deleteOne({ _id: id });
 });
 
+test('分享查看：未登录（游客）读 finished 轨迹 → 200 + isOwner=false', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'hiking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.25, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 20000 },
+        { seq: 2, lat: 31.26, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 10000 },
+        { seq: 3, lat: 31.27, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+
+  // 不带 token（游客）读取 → 200 + isOwner=false + 完整轨迹点
+  const guest = await req('GET', `/sport-track/api/activities/${id}`);
+  assert.equal(guest.statusCode, 200);
+  const data = guest.json().data;
+  assert.equal(data.isOwner, false);
+  assert.equal(data.trackPoints.length, 3);
+
+  // 游客读 in_progress → 404
+  const created2 = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id2 = created2.json().data.activityId;
+  const guest2 = await req('GET', `/sport-track/api/activities/${id2}`);
+  assert.equal(guest2.statusCode, 404, '游客不可见未完成轨迹');
+  await ActivityModel.deleteOne({ _id: id2 });
+
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('活动列表：包含统计字段，不含完整点集', async () => {
   const res = await req('GET', '/sport-track/api/activities?page=1&pageSize=10', { token: tokenA });
   assert.equal(res.statusCode, 200);

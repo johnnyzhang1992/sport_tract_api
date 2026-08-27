@@ -52,6 +52,19 @@ export default fp(
         });
       }
     });
+
+    // 可选鉴权：有效 access token → 注入 user；无 token/无效/refresh → 放行（游客，业务内自行区分）
+    // 用途：分享/只读接口（未登录用户可查看 finished 轨迹等）
+    fastify.decorate('authenticateOptional', async (request: FastifyRequest) => {
+      try {
+        await request.jwtVerify<JwtPayload>();
+        if (request.user.type !== 'access') {
+          delete (request as { user?: unknown }).user;
+        }
+      } catch {
+        // 游客或无有效 token：不注入 user，直接放行
+      }
+    });
   },
   { name: 'jwt' },
 );

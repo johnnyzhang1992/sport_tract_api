@@ -413,13 +413,13 @@ export type ActivityDetailView = ActivityDto & { isOwner: boolean };
  */
 export async function getActivityDetailView(
   activityId: ObjectIdLike,
-  userId: string,
+  userId?: string | null,
 ): Promise<ActivityDetailView> {
   const activity = await ActivityModel.findOne({ _id: activityId }).lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
   }
-  const isOwner = String(activity.userId) === String(userId);
+  const isOwner = !!userId && String(activity.userId) === String(userId);
   if (!isOwner && activity.status !== 'finished') {
     throw new AppError(404, '活动不存在');
   }
