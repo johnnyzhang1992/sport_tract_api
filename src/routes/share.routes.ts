@@ -16,11 +16,13 @@ export async function shareRoutes(fastify: FastifyInstance) {
   fastify.post('/mini-code', { onRequest: [fastify.authenticate] }, async (request) => {
     const { activityId } = MiniCodeSchema.parse(request.body);
 
-    // 校验活动归属（仅本人可生成自己活动的码）
-    const activity = await ActivityModel.findOne({ _id: activityId, userId: request.user.userId })
-      .select('_id')
-      .lean();
+    // 校验活动可见性：本人任意状态；非本人仅 finished 可生成（分享/只读）
+    const activity = await ActivityModel.findOne({ _id: activityId }).select('userId status').lean();
     if (!activity) {
+      throw new AppError(404, '活动不存在');
+    }
+    const isOwner = String(activity.userId) === String(request.user.userId);
+    if (!isOwner && activity.status !== 'finished') {
       throw new AppError(404, '活动不存在');
     }
 

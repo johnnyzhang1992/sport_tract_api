@@ -404,9 +404,26 @@ export async function listActivities(
 }
 
 /** 活动详情（含完整轨迹点与打点） */
-export async function getActivityDetail(activityId: ObjectIdLike, userId: string): Promise<ActivityDto> {
-  const activity = await findOwnedActivity(activityId, userId);
-  return toActivityDto(activity);
+export type ActivityDetailView = ActivityDto & { isOwner: boolean };
+
+/**
+ * 轨迹详情（分享/只读查看）
+ * - 本人：完整可见（isOwner=true）
+ * - 非本人：仅可查看 finished 轨迹（isOwner=false，前端隐藏编辑入口）；进行中/未完成轨迹对外 404
+ */
+export async function getActivityDetailView(
+  activityId: ObjectIdLike,
+  userId: string,
+): Promise<ActivityDetailView> {
+  const activity = await ActivityModel.findOne({ _id: activityId }).lean();
+  if (!activity) {
+    throw new AppError(404, '活动不存在');
+  }
+  const isOwner = String(activity.userId) === String(userId);
+  if (!isOwner && activity.status !== 'finished') {
+    throw new AppError(404, '活动不存在');
+  }
+  return { ...toActivityDto(activity), isOwner };
 }
 
 /** 重新纠偏：对已完成活动重跑 海拔清洗→轨迹纠偏→平滑→重算指标（决策：事后清洗历史脏数据） */

@@ -283,9 +283,64 @@ test('空轨迹点直接结束（随时可结束）', async () => {
   assert.equal(data.activity.trackPoints.length, 0);
 });
 
-test('越权：B 用户访问 A 的活动 → 404', async () => {
+test('分享查看：B 用户读取 A 的 finished 主活动 → 200 + isOwner=false', async () => {
   const res = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenB });
-  assert.equal(res.statusCode, 404);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().data.isOwner, false);
+});
+
+test('分享查看：B 用户读 A 的 finished 轨迹 → 200 + isOwner=false（只读）', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.25, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 20000 },
+        { seq: 2, lat: 31.26, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 10000 },
+        { seq: 3, lat: 31.27, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+
+  // 本人读 → isOwner=true
+  const mine = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenA });
+  assert.equal(mine.statusCode, 200);
+  assert.equal(mine.json().data.isOwner, true);
+
+  // B 读 → 200 + isOwner=false（可看轨迹数据）
+  const shared = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenB });
+  assert.equal(shared.statusCode, 200);
+  const data = shared.json().data;
+  assert.equal(data.isOwner, false);
+  assert.equal(data.trackPoints.length, 3, '非本人也应能读到完整轨迹点');
+  assert.equal(data.markers.length, 0);
+
+  // B 仍不能写（编辑接口 404，保持 owner 隔离）
+  const meta = await req('PUT', `/sport-track/api/activities/${id}/meta`, {
+    token: tokenB,
+    body: { note: 'hack' },
+  });
+  assert.equal(meta.statusCode, 404, '非本人编辑应 404');
+
+  await ActivityModel.deleteOne({ _id: id });
+});
+
+test('分享查看：非本人读取未完成（in_progress）轨迹 → 404', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 不 finish，保持 in_progress
+  const res = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenB });
+  assert.equal(res.statusCode, 404, '非本人不可见未完成轨迹');
+  await ActivityModel.deleteOne({ _id: id });
 });
 
 test('活动列表：包含统计字段，不含完整点集', async () => {
