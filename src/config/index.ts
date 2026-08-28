@@ -30,7 +30,7 @@ export const config = {
   adminUsername: process.env.ADMIN_USERNAME ?? 'admin',
   adminPassword: process.env.ADMIN_PASSWORD ?? 'admin123456',
   adminJwtSecret: process.env.ADMIN_JWT_SECRET ?? 'dev-insecure-admin-secret',
-  adminTokenTtl: process.env.ADMIN_TOKEN_TTL ?? '12h',
+  adminTokenTtl: process.env.ADMIN_TOKEN_TTL ?? '7d',
 
   // JWT
   jwtSecret: process.env.JWT_SECRET ?? 'dev-insecure-jwt-secret',

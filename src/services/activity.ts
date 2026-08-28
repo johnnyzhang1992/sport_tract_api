@@ -69,7 +69,7 @@ export interface ActivityDto {
   updatedAt: string;
 }
 
-function toActivityDto(doc: Record<string, any>): ActivityDto {
+export function toActivityDto(doc: Record<string, any>): ActivityDto {
   return {
     id: String(doc._id),
     type: doc.type,

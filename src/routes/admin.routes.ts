@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import jsonwebtoken from 'jsonwebtoken';
+import { Types } from 'mongoose';
 import { AdminModel, hashPassword, verifyPassword } from '../models/admin.model.js';
 import { UserModel } from '../models/user.model.js';
 import { LoginLogModel } from '../models/login-log.model.js';
@@ -8,6 +9,10 @@ import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 import { locateRegion } from '../services/region.js';
+import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
+import { footprint } from '../services/footprint.js';
+import { toActivityDto } from '../services/activity.js';
+import { getSignedUrl } from '../services/oss.js';
 
 /**
  * 管理后台路由：/api/admin/*（与小程序用户接口隔离）
@@ -318,4 +323,73 @@ export async function adminRoutes(fastify: FastifyInstance) {
       })),
     });
   });
+
+  // 用户详情（管理后台用户页聚合：资料 + 周/月/年/总概况 + 个人最佳 + 点亮城市）
+  fastify.get('/users/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '用户不存在');
+    const user = await UserModel.findById(id).lean();
+    if (!user) throw new AppError(404, '用户不存在');
+    const [stats, best, fp, activityCount] = await Promise.all([
+      userStatsOverview(id),
+      bestRecords(id),
+      footprint(id),
+      ActivityModel.countDocuments({ userId: new Types.ObjectId(id) }),
+    ]);
+    return success({
+      user: {
+        id,
+        nickname: user.nickname ?? '',
+        avatarUrl: user.avatarUrl ?? '',
+        gender: user.gender ?? 0,
+        openid: user.openid,
+        weightKg: user.weightKg ?? null,
+        heightCm: user.heightCm ?? null,
+        createdAt: user.createdAt,
+        lastLoginAt: user.lastLoginAt ?? user.createdAt,
+      },
+      activityCount,
+      overview: stats,
+      best,
+      footprint: fp,
+    });
+  });
+
+  // 轨迹详情（管理后台弹窗：完整字段 + 打点照片签名 + 抽稀轨迹点供图）
+  fastify.get('/activities/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '轨迹不存在');
+    const activity = await ActivityModel.findById(id).lean();
+    if (!activity) throw new AppError(404, '轨迹不存在');
+    const owner = await UserModel.findById(activity.userId).select('nickname').lean();
+    const dto = toActivityDto(activity);
+    // 私有 bucket：给打点照片签发访问签名（与用户端详情口径一致）
+    for (const m of dto.markers) {
+      if (m.photos && m.photos.length > 0) {
+        m.photos = m.photos.map((p) => getSignedUrl(p));
+        m.photoUrl = m.photos[0];
+      } else if (m.photoUrl) {
+        m.photoUrl = getSignedUrl(m.photoUrl);
+      }
+    }
+    return success({
+      ...dto,
+      userId: String(activity.userId),
+      userNickname: owner?.nickname || '微信用户',
+      pointsCount: dto.trackPoints.length,
+      // 抽稀到 ≤600 点：弹窗海拔/速度图用，避免 2 万点全量下发
+      trackPoints: samplePoints(dto.trackPoints, 600),
+    });
+  });
+}
+
+/** 均匀采样（保留首尾点） */
+function samplePoints<T>(points: T[], max: number): T[] {
+  if (points.length <= max) return points;
+  const out: T[] = [];
+  const step = (points.length - 1) / (max - 1);
+  for (let i = 0; i < max; i++) {
+    out.push(points[Math.round(i * step)]);
+  }
+  return out;
 }
