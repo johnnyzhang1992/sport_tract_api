@@ -273,12 +273,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
-  // 轨迹列表（含用户昵称；支持 类型/状态/距离/时长/用户昵称 筛选）
+  // 轨迹列表（含用户昵称；支持 类型/状态/距离/时长/用户昵称 筛选 + 距离/时长排序）
   fastify.get('/activities', { onRequest: [adminAuth] }, async (request) => {
     const q = request.query as {
       page?: string; pageSize?: string; userId?: string;
       type?: string; status?: string; keyword?: string;
       minDistance?: string; maxDistance?: string; minDuration?: string; maxDuration?: string;
+      sortBy?: string; order?: string;
     };
     const p = Math.max(1, Number(q.page) || 1);
     const ps = Math.min(100, Number(q.pageSize) || 20);
@@ -302,9 +303,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
       const ids = matched.map((u) => String(u._id));
       filter.userId = { $in: ids };
     }
+    const allowedSortFields = ['distance', 'duration', 'startTime'];
+    const sortField = allowedSortFields.includes(q.sortBy || '') ? q.sortBy! : 'startTime';
+    const sortOrder = q.order === 'asc' ? 1 : -1;
     const [total, items, users] = await Promise.all([
       ActivityModel.countDocuments(filter),
-      ActivityModel.find(filter).sort({ startTime: -1 }).skip((p - 1) * ps).limit(ps).lean(),
+      ActivityModel.find(filter).sort({ [sortField]: sortOrder }).skip((p - 1) * ps).limit(ps).lean(),
       UserModel.find({}).select('_id nickname').lean(),
     ]);
     const nickMap = new Map(users.map((u) => [String(u._id), u.nickname || '微信用户']));
