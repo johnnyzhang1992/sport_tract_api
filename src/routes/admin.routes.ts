@@ -234,19 +234,22 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
-  // 用户列表（含每人轨迹数；默认按最后登录时间倒序；支持昵称搜索）
+  // 用户列表（含每人轨迹数；支持昵称搜索 + 创建时间/最后登录排序）
   fastify.get('/users', { onRequest: [adminAuth] }, async (request) => {
-    const { page = '1', pageSize = '20', keyword } = request.query as { page?: string; pageSize?: string; keyword?: string };
+    const { page = '1', pageSize = '20', keyword, sortBy, order } = request.query as { page?: string; pageSize?: string; keyword?: string; sortBy?: string; order?: string };
     const p = Math.max(1, Number(page) || 1);
     const ps = Math.min(100, Number(pageSize) || 20);
     const filter: Record<string, unknown> = {};
     if (keyword && String(keyword).trim()) {
       filter.nickname = { $regex: String(keyword).trim(), $options: 'i' };
     }
+    const allowedSortFields = ['createdAt', 'lastLoginAt'];
+    const sortField = allowedSortFields.includes(sortBy || '') ? sortBy! : 'lastLoginAt';
+    const sortOrder = order === 'asc' ? 1 : -1;
     const [total, users, counts] = await Promise.all([
       UserModel.countDocuments(filter),
       UserModel.find(filter)
-        .sort({ lastLoginAt: -1, createdAt: -1 })
+        .sort({ [sortField]: sortOrder })
         .skip((p - 1) * ps)
         .limit(ps)
         .lean(),
