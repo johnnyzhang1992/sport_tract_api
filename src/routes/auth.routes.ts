@@ -4,11 +4,24 @@ import { UserModel } from '../models/user.model.js';
 import { LoginLogModel } from '../models/login-log.model.js';
 import { code2Session } from '../services/wechat.js';
 import { getSignedUrl } from '../services/oss.js';
+import { locateByIp } from '../services/ip-locate.js';
 import { LoginSchema, RefreshSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 import { config } from '../config/index.js';
 import type { JwtPayload } from '../plugins/jwt.js';
+
+/** 从请求提取客户端 IP（优先 x-forwarded-for，其次 x-real-ip，最后 request.ip） */
+function getClientIp(request: any): string | undefined {
+  const forwarded = request.headers['x-forwarded-for'];
+  if (forwarded) {
+    const first = Array.isArray(forwarded) ? forwarded[0] : String(forwarded).split(',')[0].trim();
+    if (first) return first;
+  }
+  const realIp = request.headers['x-real-ip'];
+  if (realIp) return String(realIp);
+  return request.ip;
+}
 
 /**
  * 认证路由（决策 D2/D14）
@@ -17,9 +30,10 @@ import type { JwtPayload } from '../plugins/jwt.js';
  */
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.post('/login', async (request) => {
-    const { code } = LoginSchema.parse(request.body);
+    const { code, platform, system, brand, model, sdkVersion, appVersion } = request.body as Record<string, unknown>;
+    const parsed = LoginSchema.parse({ code });
 
-    const session = await code2Session(code);
+    const session = await code2Session(parsed.code);
 
     // 查/建用户（openid 唯一索引幂等）
     let user = await UserModel.findOne({ openid: session.openid });
@@ -31,8 +45,23 @@ export async function authRoutes(fastify: FastifyInstance) {
     const userId = String(user._id);
     // 更新最后登录时间（管理后台排序/展示用，不阻塞）
     UserModel.updateOne({ _id: user._id }, { $set: { lastLoginAt: Date.now() } }).catch(() => {});
-    // 登录日志（管理后台 UV/PV 统计，不阻塞）
-    LoginLogModel.create({ userId: user._id }).catch(() => {});
+
+    // 登录日志：IP + 设备信息（不阻塞）
+    const ip = getClientIp(request);
+    const loc = ip ? await locateByIp(ip).catch(() => null) : null;
+    LoginLogModel.create({
+      userId: user._id,
+      ip,
+      province: loc?.province,
+      city: loc?.city,
+      platform: typeof platform === 'string' ? platform : undefined,
+      system: typeof system === 'string' ? system : undefined,
+      brand: typeof brand === 'string' ? brand : undefined,
+      model: typeof model === 'string' ? model : undefined,
+      sdkVersion: typeof sdkVersion === 'string' ? sdkVersion : undefined,
+      appVersion: typeof appVersion === 'string' ? appVersion : undefined,
+    }).catch(() => {});
+
     const accessToken = fastify.signAccessToken(userId);
     const refreshToken = fastify.signRefreshToken(userId);
 
