@@ -45,7 +45,10 @@ export async function locateByIp(ip: string): Promise<IpLocation | null> {
     const res = await fetch(url);
     const json: TencentIpResult = (await res.json()) as TencentIpResult;
 
-    if (json.status !== 0 || !json.result?.ad_info) return null;
+    if (json.status !== 0 || !json.result?.ad_info) {
+      console.log('[IP-Locate] Tencent API response for', ip, ':', JSON.stringify(json));
+      return null;
+    }
 
     const { province, city } = json.result.ad_info;
     const loc = { province: province || '', city: city || '' };
