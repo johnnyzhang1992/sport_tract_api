@@ -273,6 +273,38 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
+  // 用户登录历史（分页，按时间倒序）
+  fastify.get('/users/:id/login-logs', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const { page = '1', pageSize = '20' } = request.query as { page?: string; pageSize?: string };
+    const p = Math.max(1, Number(page) || 1);
+    const ps = Math.min(100, Number(pageSize) || 20);
+    const total = await LoginLogModel.countDocuments({ userId: id });
+    const logs = await LoginLogModel.find({ userId: id })
+      .sort({ createdAt: -1 })
+      .skip((p - 1) * ps)
+      .limit(ps)
+      .lean();
+    return success({
+      total,
+      page: p,
+      pageSize: ps,
+      items: logs.map((l) => ({
+        id: String(l._id),
+        ip: l.ip ?? '',
+        province: l.province ?? '',
+        city: l.city ?? '',
+        platform: l.platform ?? '',
+        system: l.system ?? '',
+        brand: l.brand ?? '',
+        model: l.model ?? '',
+        sdkVersion: l.sdkVersion ?? '',
+        appVersion: l.appVersion ?? '',
+        createdAt: l.createdAt,
+      })),
+    });
+  });
+
   // 轨迹列表（含用户昵称；支持 类型/状态/距离/时长/用户昵称 筛选 + 距离/时长排序）
   fastify.get('/activities', { onRequest: [adminAuth] }, async (request) => {
     const q = request.query as {
