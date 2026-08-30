@@ -27,6 +27,7 @@ export interface TrackPointDto {
   altitude: number | null;
   speed: number | null;
   accuracy: number | null;
+  pauseGap?: boolean;
   timestamp: number;
 }
 
@@ -388,7 +389,7 @@ export async function listActivities(
                       vars: {
                         p: { $ifNull: [{ $arrayElemAt: ['$trackPoints', '$$idx'] }, { lat: 0, lng: 0 }] },
                       },
-                      in: { lat: '$$p.lat', lng: '$$p.lng' },
+                      in: { lat: '$$p.lat', lng: '$$p.lng', pauseGap: '$$p.pauseGap' },
                     },
                   },
                 },

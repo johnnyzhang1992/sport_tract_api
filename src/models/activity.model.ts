@@ -16,6 +16,7 @@ const trackPointSchema = new Schema(
     altitude: { type: Number, default: null },
     speed: { type: Number, default: null },
     accuracy: { type: Number, default: null }, // 水平精度（米，实时定位质量）
+    pauseGap: { type: Boolean, default: false }, // 暂停恢复后首个有效点（渲染时断开连线）
     timestamp: { type: Number, required: true },
   },
   { _id: false },
