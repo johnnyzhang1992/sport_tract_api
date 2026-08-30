@@ -246,7 +246,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const allowedSortFields = ['createdAt', 'lastLoginAt'];
     const sortField = allowedSortFields.includes(sortBy || '') ? sortBy! : 'lastLoginAt';
     const sortOrder = order === 'asc' ? 1 : -1;
-    const [total, users, counts] = await Promise.all([
+    const [total, users, counts, lastLogins] = await Promise.all([
       UserModel.countDocuments(filter),
       UserModel.find(filter)
         .sort({ [sortField]: sortOrder })
@@ -254,22 +254,33 @@ export async function adminRoutes(fastify: FastifyInstance) {
         .limit(ps)
         .lean(),
       ActivityModel.aggregate([{ $group: { _id: '$userId', count: { $sum: 1 } } }]),
+      LoginLogModel.aggregate([
+        { $sort: { createdAt: -1 } },
+        { $group: { _id: '$userId', ip: { $first: '$ip' }, province: { $first: '$province' }, city: { $first: '$city' } } },
+      ]),
     ]);
     const countMap = new Map(counts.map((c) => [String(c._id), c.count]));
+    const loginMap = new Map(lastLogins.map((l) => [String(l._id), l]));
     return success({
       total,
       page: p,
       pageSize: ps,
-      items: users.map((u) => ({
-        id: String(u._id),
-        nickname: u.nickname,
-        openid: u.openid,
-        weightKg: u.weightKg,
-        heightCm: u.heightCm,
-        createdAt: u.createdAt,
-        lastLoginAt: u.lastLoginAt ?? u.createdAt,
-        activityCount: countMap.get(String(u._id)) ?? 0,
-      })),
+      items: users.map((u) => {
+        const log = loginMap.get(String(u._id));
+        return {
+          id: String(u._id),
+          nickname: u.nickname,
+          openid: u.openid,
+          weightKg: u.weightKg,
+          heightCm: u.heightCm,
+          createdAt: u.createdAt,
+          lastLoginAt: u.lastLoginAt ?? u.createdAt,
+          activityCount: countMap.get(String(u._id)) ?? 0,
+          lastLoginIp: log?.ip ?? '',
+          lastLoginProvince: log?.province ?? '',
+          lastLoginCity: log?.city ?? '',
+        };
+      }),
     });
   });
 
