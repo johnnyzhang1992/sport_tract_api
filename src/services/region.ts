@@ -219,19 +219,30 @@ export function getChinaMap() {
   return chinaMapData;
 }
 
-/** 返回指定省份的 GeoJSON（按 adcode 过滤） */
+/** 返回指定省份的城市级 GeoJSON（用于省份下钻展示城市边界） */
 export function getProvinceMap(adcode: number) {
-  const feature = chinaMapData.features.find((f: any) => f.properties.adcode === adcode);
-  if (!feature) {
-    throw new Error(`Province with adcode ${adcode} not found`);
+  // 从 cities geojson 中找出属于该省份的所有城市
+  const provinceCities = citiesData.features.filter((f: any) => {
+    const parent = f.properties?.parent?.adcode;
+    // 直辖市的 parent 是省级 adcode（如 110000），普通城市的 parent 是省级 adcode（如 130000）
+    return parent === adcode || f.properties.adcode === adcode;
+  });
+  
+  if (provinceCities.length === 0) {
+    throw new Error(`No cities found for province with adcode ${adcode}`);
   }
+  
   return {
     type: 'FeatureCollection',
-    features: [feature],
+    features: provinceCities,
   };
 }
 
 const chinaMapData = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../data/provinces.geojson'), 'utf8'),
+);
+
+const citiesData = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../data/cities.geojson'), 'utf8'),
 );
 
