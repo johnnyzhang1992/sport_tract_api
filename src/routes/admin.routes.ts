@@ -284,14 +284,25 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
-  // 用户登录历史（分页，按时间倒序）
+  // 用户登录历史（分页，按时间倒序；支持时间区间筛选）
   fastify.get('/users/:id/login-logs', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    const { page = '1', pageSize = '20' } = request.query as { page?: string; pageSize?: string };
+    const { page = '1', pageSize = '20', startDate, endDate } = request.query as {
+      page?: string;
+      pageSize?: string;
+      startDate?: string;
+      endDate?: string;
+    };
     const p = Math.max(1, Number(page) || 1);
     const ps = Math.min(100, Number(pageSize) || 20);
-    const total = await LoginLogModel.countDocuments({ userId: id });
-    const logs = await LoginLogModel.find({ userId: id })
+    const filter: Record<string, unknown> = { userId: id };
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      if (startDate) (filter.createdAt as any).$gte = new Date(startDate);
+      if (endDate) (filter.createdAt as any).$lte = new Date(endDate);
+    }
+    const total = await LoginLogModel.countDocuments(filter);
+    const logs = await LoginLogModel.find(filter)
       .sort({ createdAt: -1 })
       .skip((p - 1) * ps)
       .limit(ps)
@@ -313,6 +324,24 @@ export async function adminRoutes(fastify: FastifyInstance) {
         appVersion: l.appVersion ?? '',
         createdAt: l.createdAt,
       })),
+    });
+  });
+
+  // 用户登录统计（最近 N 天登录次数）
+  fastify.get('/users/:id/login-stats', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const now = Date.now();
+    const stats = await Promise.all([
+      LoginLogModel.countDocuments({ userId: id, createdAt: { $gte: new Date(now - 7 * 86400000) } }),
+      LoginLogModel.countDocuments({ userId: id, createdAt: { $gte: new Date(now - 30 * 86400000) } }),
+      LoginLogModel.countDocuments({ userId: id, createdAt: { $gte: new Date(now - 180 * 86400000) } }),
+      LoginLogModel.countDocuments({ userId: id }),
+    ]);
+    return success({
+      last7Days: stats[0],
+      last30Days: stats[1],
+      last180Days: stats[2],
+      total: stats[3],
     });
   });
 
