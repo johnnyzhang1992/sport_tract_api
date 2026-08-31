@@ -219,6 +219,18 @@ export function getChinaMap() {
   return chinaMapData;
 }
 
+/** 返回指定省份的 GeoJSON（按 adcode 过滤） */
+export function getProvinceMap(adcode: number) {
+  const feature = chinaMapData.features.find((f: any) => f.properties.adcode === adcode);
+  if (!feature) {
+    throw new Error(`Province with adcode ${adcode} not found`);
+  }
+  return {
+    type: 'FeatureCollection',
+    features: [feature],
+  };
+}
+
 const chinaMapData = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../data/provinces.geojson'), 'utf8'),
 );
