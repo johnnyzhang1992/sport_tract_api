@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import jsonwebtoken from 'jsonwebtoken';
-import { Types } from 'mongoose';
+import { Types, type PipelineStage } from 'mongoose';
 import { AdminModel, hashPassword, verifyPassword } from '../models/admin.model.js';
 import { UserModel } from '../models/user.model.js';
 import { LoginLogModel } from '../models/login-log.model.js';
@@ -210,6 +210,124 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return success({ type, data });
   });
 
+  // 轨迹数据概况：today/week/month/year/all 各范围轨迹数/距离/时长/卡路里/爬升（一次 $facet 聚合）
+  fastify.get('/activity-stats', { onRequest: [adminAuth] }, async () => {
+    const DAY = 86400000;
+    // 北京时间今日 0 点（产品为中国用户，概况口径统一按东八区）
+    const today0 = new Date(new Date().toLocaleDateString('en-CA') + 'T00:00:00+08:00').getTime();
+    const now = Date.now();
+    const ranges: Record<string, number | null> = {
+      today: today0,
+      week: now - 7 * DAY,
+      month: now - 30 * DAY,
+      year: now - 365 * DAY,
+      all: null,
+    };
+    const groupStage = {
+      $group: {
+        _id: null,
+        count: { $sum: 1 },
+        distance: { $sum: '$distance' },
+        duration: { $sum: '$duration' },
+        calories: { $sum: '$calories' },
+        elevationGain: { $sum: '$elevationGain' },
+      },
+    };
+    const facet: Record<string, PipelineStage.FacetPipelineStage[]> = {};
+    for (const [key, since] of Object.entries(ranges)) {
+      facet[key] = since == null ? [groupStage] : [{ $match: { startTime: { $gte: since } } }, groupStage];
+    }
+    const [rows] = await ActivityModel.aggregate([{ $match: { status: 'finished' } }, { $facet: facet }]);
+    const pick = (arr: Array<Record<string, number>>) => {
+      const r = arr?.[0];
+      return {
+        count: r?.count ?? 0,
+        distance: r?.distance ?? 0,
+        duration: r?.duration ?? 0,
+        calories: r?.calories ?? 0,
+        elevationGain: r?.elevationGain ?? 0,
+      };
+    };
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(ranges)) out[key] = pick(rows?.[key]);
+    return success(out);
+  });
+
+  // 轨迹趋势：近 N 天按天轨迹数 + 距离（startTime 按东八区分桶，补零填充）
+  fastify.get('/activity-trend', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { days?: string };
+    const days = Math.min(365, Math.max(7, Number(q.days) || 30));
+    const start = Date.now() - days * 86400000;
+    // 东八区日期桶：JS 用 +8h 后取 UTC 日期，与聚合 timezone 一致
+    const buckets: string[] = [];
+    for (let i = days - 1; i >= 0; i--) {
+      buckets.push(new Date(Date.now() + 8 * 3600000 - i * 86400000).toISOString().slice(0, 10));
+    }
+    const rows = await ActivityModel.aggregate([
+      { $match: { status: 'finished', startTime: { $gte: start } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: { $toDate: '$startTime' }, timezone: '+08:00' } },
+          count: { $sum: 1 },
+          distance: { $sum: '$distance' },
+        },
+      },
+    ]);
+    const rowMap = new Map(rows.map((r) => [r._id, r]));
+    return success({
+      days,
+      data: buckets.map((date) => {
+        const r = rowMap.get(date);
+        return {
+          date,
+          count: r?.count ?? 0,
+          distanceKm: Math.round(((r?.distance ?? 0) / 1000) * 100) / 100,
+        };
+      }),
+    });
+  });
+
+  // 轨迹省份分布（含城市明细）：按落库 startProvince/startCity 聚合，支持时间范围
+  fastify.get('/activity-geo-stats', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { range?: string };
+    const DAY = 86400000;
+    const today0 = new Date(new Date().toLocaleDateString('en-CA') + 'T00:00:00+08:00').getTime();
+    const rangeMap: Record<string, number | null> = {
+      today: today0,
+      week: Date.now() - 7 * DAY,
+      month: Date.now() - 30 * DAY,
+      year: Date.now() - 365 * DAY,
+      all: null,
+    };
+    const since = rangeMap[q.range || 'all'] !== undefined ? rangeMap[q.range || 'all'] : null;
+    const filter: Record<string, unknown> = { status: 'finished' };
+    if (since != null) filter.startTime = { $gte: since };
+    const rows = await ActivityModel.aggregate([
+      { $match: filter },
+      { $group: { _id: { prov: '$startProvince', city: '$startCity' }, count: { $sum: 1 } } },
+    ]);
+    // 组装省 → 市层级（空省份过滤：历史数据可能未落库省市）
+    const provMap = new Map<string, Map<string, number>>();
+    let total = 0;
+    for (const r of rows) {
+      const prov = r._id?.prov;
+      const city = r._id?.city || '未知';
+      if (!prov) continue;
+      total += r.count;
+      if (!provMap.has(prov)) provMap.set(prov, new Map());
+      const cities = provMap.get(prov)!;
+      cities.set(city, (cities.get(city) ?? 0) + r.count);
+    }
+    const provinces = [...provMap.entries()]
+      .map(([province, cities]) => ({
+        province,
+        count: [...cities.values()].reduce((s, c) => s + c, 0),
+        cities: [...cities.entries()].map(([city, count]) => ({ city, count })).sort((a, b) => b.count - a.count),
+      }))
+      .sort((a, b) => b.count - a.count);
+    return success({ range: q.range || 'all', total, provinces });
+  });
+
   // 轨迹省份/城市分布（按轨迹起点定位，离线 GeoJSON）
   fastify.get('/region-stats', { onRequest: [adminAuth] }, async () => {
     const acts = await ActivityModel.find({ status: 'finished' })
@@ -386,7 +504,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const sortOrder = q.order === 'asc' ? 1 : -1;
     const [total, items, users] = await Promise.all([
       ActivityModel.countDocuments(filter),
-      ActivityModel.find(filter).sort({ [sortField]: sortOrder }).skip((p - 1) * ps).limit(ps).lean(),
+      // 列表不下发轨迹点/打点大字段
+      ActivityModel.find(filter)
+        .select('-trackPoints -markers')
+        .sort({ [sortField]: sortOrder })
+        .skip((p - 1) * ps)
+        .limit(ps)
+        .lean(),
       UserModel.find({}).select('_id nickname').lean(),
     ]);
     const nickMap = new Map(users.map((u) => [String(u._id), u.nickname || '微信用户']));
@@ -404,6 +528,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
         duration: a.duration ?? 0,
         calories: a.calories ?? 0,
         elevationGain: a.elevationGain ?? 0,
+        startProvince: a.startProvince ?? '',
+        startCity: a.startCity ?? '',
         startTime: a.startTime,
       })),
     });
