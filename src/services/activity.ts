@@ -313,6 +313,80 @@ export async function cancelActivity(activityId: ObjectIdLike, userId: string): 
 }
 
 /**
+ * 超时活动自动收尾（惰性清理）：in_progress 超过 24h 无更新（用户杀进程/异常退出）
+ * - 有轨迹点 → 自动 finished 保留数据：endTime 以最后轨迹点上报时间为准，重算指标（与 finish 同管线）
+ * - 无轨迹点 → cancelled 作废（无数据可保留，不污染用户列表）
+ * - userId 不传则清理全部用户（admin 列表用）；返回处理条数
+ */
+export async function autoFinishStaleActivities(userId?: string): Promise<number> {
+  const stale = await ActivityModel.find({
+    ...(userId ? { userId: new Types.ObjectId(userId) } : {}),
+    status: 'in_progress',
+    updatedAt: { $lt: new Date(Date.now() - 24 * 3600 * 1000) },
+  })
+    .select('userId type startTime pausedMs trackPoints')
+    .lean();
+
+  for (const activity of stale) {
+    const pts = (activity.trackPoints ?? []) as TrackPointDto[];
+    if (pts.length === 0) {
+      await ActivityModel.updateOne({ _id: activity._id }, { $set: { status: 'cancelled', endTime: Date.now() } });
+      continue;
+    }
+
+    // 最终点集：按 seq 去重排序（与 finish 兜底一致）
+    const seen = new Set<number>();
+    const trackPoints = pts
+      .filter((p) => {
+        if (seen.has(p.seq)) return false;
+        seen.add(p.seq);
+        return true;
+      })
+      .sort((a, b) => a.seq - b.seq);
+
+    // 结束时间：以最后一个轨迹点的上报时间为准（异常中断后自动收尾，不把中断后的空档计入时长）
+    const validTs = trackPoints
+      .map((p) => (typeof p.timestamp === 'number' && Number.isFinite(p.timestamp) ? p.timestamp : 0))
+      .filter((t) => t > 0);
+    const endTime = validTs.length > 0 ? Math.max(...validTs) : Date.now();
+    const durationSec = Math.max(0, (endTime - activity.startTime - (activity.pausedMs ?? 0)) / 1000);
+
+    // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 重算指标
+    const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
+    const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
+    const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
+    const stats = calcStats(smoothedPoints, { type: activity.type, durationSec });
+    const fastestKm = calcFastestKm(smoothedPoints, activity.type);
+    const regions = provincesOfPoints(smoothedPoints);
+
+    await ActivityModel.updateOne(
+      { _id: activity._id },
+      {
+        $set: {
+          status: 'finished',
+          endTime,
+          trackPoints: smoothedPoints,
+          provinces: regions.provinces,
+          startProvince: regions.startProvince,
+          startCity: regions.startCity,
+          duration: Math.round(durationSec),
+          distance: stats.distance,
+          avgPace: stats.avgPace,
+          fastestKm,
+          calories: stats.calories,
+          elevationGain: stats.elevationGain,
+          maxAltitude: stats.maxAltitude,
+          lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
+        },
+      },
+    );
+    await markFootprintDirty(String(activity.userId));
+  }
+
+  return stale.length;
+}
+
+/**
  * 活动列表（分页 + 筛选）
  * 性能：不返回完整轨迹点，用聚合计算 pointsCount / markerCount / 首尾点（缩略图用）
  */
@@ -322,16 +396,10 @@ export async function listActivities(
 ): Promise<{ items: Array<Record<string, any>>; total: number; page: number; pageSize: number }> {
   const { type, month, province, page, pageSize } = query;
 
-  // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动作废，避免堆积
-  // 列表接口是用户活跃入口，天然覆盖所有使用者；updateMany 幂等 + userId/status 索引，开销可控
-  await ActivityModel.updateMany(
-    {
-      userId: new Types.ObjectId(userId),
-      status: 'in_progress',
-      updatedAt: { $lt: new Date(Date.now() - 24 * 3600 * 1000) },
-    },
-    { $set: { status: 'cancelled' } },
-  ).catch(() => {});
+  // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动收尾
+  // 有轨迹点自动 finished 保留数据（endTime 以最后点上报时间为准）；空活动作废
+  // 列表接口是用户活跃入口，天然覆盖所有使用者
+  await autoFinishStaleActivities(userId).catch(() => {});
 
   // aggregate 的 $match 不做 Mongoose 类型转换，userId 需手动转 ObjectId
   const filter: Record<string, any> = { userId: new Types.ObjectId(userId), status: 'finished' };

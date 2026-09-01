@@ -465,8 +465,8 @@ test('best 惰性补算：历史轨迹无 fastestKm 自动补齐', async () => {
   await ActivityModel.deleteOne({ _id: id });
 });
 
-test('列表惰性清理：超时 in_progress 自动作废（cancelled）', async () => {
-  // 创建 in_progress 活动（startTime 25 小时前）
+test('列表惰性清理：超时空活动（无轨迹点）作废 cancelled', async () => {
+  // 创建 in_progress 活动（startTime 25 小时前），无轨迹点
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: Date.now() - 25 * 3600 * 1000 },
@@ -477,7 +477,36 @@ test('列表惰性清理：超时 in_progress 自动作废（cancelled）', asyn
   // 调列表 → 触发惰性清理
   await req('GET', '/sport-track/api/activities?page=1&pageSize=10', { token: tokenA });
   const act = await ActivityModel.findById(id).lean();
-  assert.equal(act?.status, 'cancelled');
+  assert.equal(act?.status, 'cancelled', '空活动无数据可保留，应作废');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
+test('列表惰性清理：超时且有轨迹点 → 自动 finish 保留数据', async () => {
+  // 创建 in_progress 活动并上传 3 个轨迹点（最后点时间 = TEST_NOW - 20000）
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 50000 },
+  });
+  const id = created.json().data.activityId;
+  await req('POST', `/sport-track/api/activities/${id}/points`, {
+    token: tokenA,
+    body: { points: [P(1, 31.2304, 121.4737), P(2, 31.2305, 121.4738), P(3, 31.2306, 121.4739)] },
+  });
+  // 模拟异常退出：updatedAt 置为 25 小时前（无更新）
+  await ActivityModel.updateOne({ _id: id }, { $set: { updatedAt: new Date(Date.now() - 25 * 3600 * 1000) } }, { timestamps: false });
+  // 调列表 → 触发惰性清理
+  const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
+  assert.equal(list.statusCode, 200);
+  const act = await ActivityModel.findById(id).lean();
+  assert.equal(act?.status, 'finished', '有轨迹点应自动 finish 保留数据');
+  assert.equal(act?.endTime, TEST_NOW - 20000, 'endTime 应取最后轨迹点上报时间');
+  assert.equal(act?.duration, 30, '时长 = (最后点 - startTime) / 1000');
+  assert.ok((act?.distance ?? 0) > 0, '距离应被重算 > 0');
+  assert.ok(act?.trackPoints.length === 3, '轨迹点应保留');
+  // 出现在用户列表（用户端只查 finished）
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  assert.ok(item, '自动 finish 的活动应出现在用户列表');
+  assert.ok(item.distance > 0);
   await ActivityModel.deleteOne({ _id: id });
 });
 

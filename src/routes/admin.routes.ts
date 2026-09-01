@@ -11,7 +11,7 @@ import { AppError } from '../utils/app-error.js';
 import { locateRegion } from '../services/region.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
-import { toActivityDto } from '../services/activity.js';
+import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
 import { getSignedUrl } from '../services/oss.js';
 
 /**
@@ -356,15 +356,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const p = Math.max(1, Number(q.page) || 1);
     const ps = Math.min(100, Number(q.pageSize) || 20);
 
-    // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动作废，避免堆积
+    // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动收尾
+    // 有轨迹点自动 finished 保留数据（endTime 以最后点上报时间为准）；空活动作废
     // 与用户端 listActivities 口径一致；admin 跨全部用户，不按 userId 过滤
-    await ActivityModel.updateMany(
-      {
-        status: 'in_progress',
-        updatedAt: { $lt: new Date(Date.now() - 24 * 3600 * 1000) },
-      },
-      { $set: { status: 'cancelled' } },
-    ).catch(() => {});
+    await autoFinishStaleActivities().catch(() => {});
 
     const filter: Record<string, unknown> = {};
     if (q.userId) filter.userId = q.userId;
