@@ -62,7 +62,7 @@ const P = (seq: number, lat: number, lng: number, altitude?: number) => ({
   lng,
   altitude: altitude ?? null,
   speed: null,
-  timestamp: 1700000000000 + seq * 10000,
+  timestamp: TEST_NOW - 50000 + seq * 10000,
 });
 
 test('创建进行中活动', async () => {
@@ -147,6 +147,44 @@ test('finish 对账：以 final 包为准重算指标', async () => {
   assert.ok(data.activity.elevationGain >= 0);
   assert.ok(data.activity.calories > 0, '卡路里应 > 0');
   assert.equal(data.activity.markers.length, 1);
+});
+
+test('finish endTime：以最后一个轨迹点的上报时间为准，忽略传入 endTime', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  const lastTs = TEST_NOW - 20000; // 中断于 20s 前，finish 迟报
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.2304, lng: 121.4737, altitude: null, speed: null, timestamp: TEST_NOW - 40000 },
+        { seq: 2, lat: 31.2314, lng: 121.4738, altitude: null, speed: null, timestamp: lastTs },
+      ],
+      endTime: TEST_NOW + 3600 * 1000, // 迟报 1 小时
+      pausedMs: 0,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const act = res.json().data.activity;
+  assert.equal(act.endTime, lastTs, 'endTime 应取最后轨迹点时间');
+  assert.equal(act.duration, 40, '时长 = (最后点 - startTime) / 1000');
+});
+
+test('finish endTime：空轨迹点回退传入 endTime', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 30000 },
+  });
+  const id = created.json().data.activityId;
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: [], endTime: TEST_NOW },
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().data.activity.endTime, TEST_NOW, '无点时应回退传入 endTime');
 });
 
 test('finish 落库省市：写入经过的省与起点城市', async () => {

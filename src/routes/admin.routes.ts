@@ -355,6 +355,17 @@ export async function adminRoutes(fastify: FastifyInstance) {
     };
     const p = Math.max(1, Number(q.page) || 1);
     const ps = Math.min(100, Number(q.pageSize) || 20);
+
+    // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动作废，避免堆积
+    // 与用户端 listActivities 口径一致；admin 跨全部用户，不按 userId 过滤
+    await ActivityModel.updateMany(
+      {
+        status: 'in_progress',
+        updatedAt: { $lt: new Date(Date.now() - 24 * 3600 * 1000) },
+      },
+      { $set: { status: 'cancelled' } },
+    ).catch(() => {});
+
     const filter: Record<string, unknown> = {};
     if (q.userId) filter.userId = q.userId;
     if (q.type) filter.type = q.type;

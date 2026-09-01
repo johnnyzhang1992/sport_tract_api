@@ -239,7 +239,11 @@ export async function finishActivity(
 
   // 允许空轨迹点（用户随时结束）：指标按 0 处理
 
-  const endTime = input.endTime ?? Date.now();
+  // 结束时间：以最后一个轨迹点的上报时间为准（异常中断后补 finish 时，避免把中断后的空档计入时长）
+  const validTs = trackPoints
+    .map((p) => (typeof p.timestamp === 'number' && Number.isFinite(p.timestamp) ? p.timestamp : 0))
+    .filter((t) => t > 0);
+  const endTime = validTs.length > 0 ? Math.max(...validTs) : (input.endTime ?? Date.now());
   const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs) / 1000);
 
   // 海拔尖刺清洗（GPS 误差：短时间大幅跳变且方向反转 → 海拔置 null）
