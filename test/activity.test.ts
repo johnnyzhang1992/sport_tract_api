@@ -510,6 +510,49 @@ test('列表惰性清理：超时且有轨迹点 → 自动 finish 保留数据'
   await ActivityModel.deleteOne({ _id: id });
 });
 
+test('列表 previewPoints：暂停断点（pauseGap）不被均匀采样丢失', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 201 个点直线，seq=101（中段）标 pauseGap：均匀采样 60 点大概率不含它
+  const pts = [];
+  for (let i = 1; i <= 201; i++) pts.push(P(i, 31.2304 + i * 0.0001, 121.4737));
+  (pts[100] as { pauseGap?: boolean }).pauseGap = true;
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: pts, endTime: TEST_NOW, pausedMs: 0 },
+  });
+  const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  assert.ok(item, 'finished 活动应在列表');
+  const pp = item.previewPoints;
+  assert.ok(pp.length >= 60 && pp.length <= 70, `预览点数异常: ${pp.length}`);
+  const gaps = pp.filter((p: { pauseGap?: boolean }) => p.pauseGap === true);
+  assert.equal(gaps.length, 1, '暂停断点应保留且不重复');
+  assert.ok(gaps[0].lat > 31.234 && gaps[0].lat < 31.252, '断点坐标应来自轨迹中段原点');
+  assert.ok(!('seq' in pp[0]), '响应不应暴露内部 seq 字段');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
+test('列表 previewPoints：空轨迹不产生 (0,0) 填充点', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 30000 },
+  });
+  const id = created.json().data.activityId;
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: [], endTime: TEST_NOW },
+  });
+  const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  assert.ok(item, '空轨迹 finished 活动应在列表');
+  assert.deepEqual(item.previewPoints, [], '空轨迹预览点应为空数组');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('活动详情：返回完整轨迹点与打点', async () => {
   const res = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenA });
   assert.equal(res.statusCode, 200);

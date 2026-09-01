@@ -386,6 +386,25 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
   return stale.length;
 }
 
+/** 预览点合并：均匀采样点 + 暂停断点按 seq 归并排序，断点优先（同 seq 覆盖）并保留 pauseGap 标 */
+function mergePreviewPoints(
+  sampled: Array<Record<string, any>>,
+  gaps: Array<Record<string, any>>,
+): Array<{ lat: number; lng: number; pauseGap?: boolean }> {
+  const bySeq = new Map<number, { lat: number; lng: number; pauseGap?: boolean }>();
+  for (const p of sampled ?? []) {
+    if (p && typeof p.seq === 'number' && Number.isFinite(p.lat) && Number.isFinite(p.lng)) {
+      bySeq.set(p.seq, { lat: p.lat, lng: p.lng });
+    }
+  }
+  for (const g of gaps ?? []) {
+    if (g && typeof g.seq === 'number' && Number.isFinite(g.lat) && Number.isFinite(g.lng)) {
+      bySeq.set(g.seq, { lat: g.lat, lng: g.lng, pauseGap: true });
+    }
+  }
+  return [...bySeq.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+}
+
 /**
  * 活动列表（分页 + 筛选）
  * 性能：不返回完整轨迹点，用聚合计算 pointsCount / markerCount / 首尾点（缩略图用）
@@ -461,17 +480,37 @@ export async function listActivities(
                       vars: {
                         p: { $ifNull: [{ $arrayElemAt: ['$trackPoints', '$$idx'] }, { lat: 0, lng: 0 }] },
                       },
-                      in: { lat: '$$p.lat', lng: '$$p.lng', pauseGap: '$$p.pauseGap' },
+                      in: { seq: '$$p.seq', lat: '$$p.lat', lng: '$$p.lng' },
                     },
                   },
                 },
               },
             },
           },
+          // 暂停断点全量带出（数量少）：均匀采样会丢掉 pauseGap 标，与采样点按 seq 合并后段首重打标
+          gapPoints: {
+            $map: {
+              input: { $filter: { input: '$trackPoints', as: 'tp', cond: { $eq: ['$$tp.pauseGap', true] } } },
+              as: 'g',
+              in: { seq: '$$g.seq', lat: '$$g.lat', lng: '$$g.lng', pauseGap: true },
+            },
+          },
         },
       },
     ]),
   ]);
+
+  // 预览点后处理：
+  // - 空轨迹置空（聚合 $ifNull 兜底会对空数组产生 60 个 (0,0) 填充点）
+  // - 合并暂停断点，保证缩略图暂停间隙断开（与 overview 切段保标口径一致）
+  for (const item of items as Array<Record<string, any>>) {
+    if (!item.pointsCount) {
+      item.previewPoints = [];
+    } else {
+      item.previewPoints = mergePreviewPoints(item.previewPoints ?? [], item.gapPoints ?? []);
+    }
+    delete item.gapPoints;
+  }
 
   return { items, total, page, pageSize };
 }
