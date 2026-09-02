@@ -19,17 +19,17 @@ before(async () => {
   await app.ready();
 
   // 清理历史测试数据
-  const users = await UserModel.find({ openid: /^mock_openid_admin-detail/ }).select('_id');
+  const users = await UserModel.find({ openid: /^admdet_openid/ }).select('_id');
   const ids = users.map((u) => u._id);
   await ActivityModel.deleteMany({ userId: { $in: ids } });
-  await UserModel.deleteMany({ openid: /^mock_openid_admin-detail/ });
+  await UserModel.deleteMany({ openid: /^admdet_openid/ });
 
   // 独立测试管理员（避免依赖库里已有管理员的密码）
   await AdminModel.deleteOne({ username: ADMIN_USER });
   await AdminModel.create({ username: ADMIN_USER, passwordHash: await hashPassword(ADMIN_PASS) });
 
   // 种子数据：一个用户 + 一条已完成轨迹（带轨迹点与打点）
-  const user = await UserModel.create({ openid: 'mock_openid_admin-detail-u1', nickname: '管理详情测试' });
+  const user = await UserModel.create({ openid: 'admdet_openid-u1', nickname: '管理详情测试' });
   userId = String(user._id);
   const now = Date.now();
   const act = await ActivityModel.create({
@@ -79,7 +79,7 @@ before(async () => {
 
 after(async () => {
   await ActivityModel.deleteMany({ userId });
-  await UserModel.deleteMany({ openid: /^mock_openid_admin-detail/ });
+  await UserModel.deleteMany({ openid: /^admdet_openid/ });
   await AdminModel.deleteOne({ username: ADMIN_USER });
   await app.close();
 });
