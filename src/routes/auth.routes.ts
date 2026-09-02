@@ -8,7 +8,7 @@ import { locateByIp } from '../services/ip-locate.js';
 import { LoginSchema, RefreshSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
-import { nextUserUid, backfillUserUids } from '../services/uid.js';
+import { nextUserUid, backfillUsers } from '../services/uid.js';
 import { config } from '../config/index.js';
 import type { JwtPayload } from '../plugins/jwt.js';
 
@@ -45,8 +45,8 @@ export async function authRoutes(fastify: FastifyInstance) {
       fastify.log.info(`新用户注册: ${user._id} uid=${user.uid}`);
     }
     if (!user.uid) {
-      // 老用户缺 UID：按创建时间批量补（含当前用户），保证历史用户按注册顺序编号
-      await backfillUserUids();
+      // 老用户缺 UID：按创建时间批量补（含当前用户），空昵称同步补默认昵称；已有昵称不覆盖
+      await backfillUsers();
       user = await UserModel.findOne({ openid: session.openid });
       if (!user) throw new AppError(500, '用户状态异常');
     }

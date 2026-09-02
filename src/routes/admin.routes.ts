@@ -12,7 +12,7 @@ import { locateRegion } from '../services/region.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
-import { backfillUserUids } from '../services/uid.js';
+import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { getSignedUrl } from '../services/oss.js';
 
 /**
@@ -403,12 +403,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
-  // 老用户 UID 补号（1000 起，按创建时间升序，不动昵称；部署后手动触发一次即可）
-  fastify.post('/users/backfill-uids', { onRequest: [adminAuth] }, async () => {
-    const before = await UserModel.countDocuments({ uid: { $exists: false } });
-    await backfillUserUids();
-    const after = await UserModel.countDocuments({ uid: { $exists: false } });
-    return success({ backfilled: before - after, remaining: after });
+  // 老用户资料补全（部署后手动触发一次即可）：
+  // 1) 缺 UID → 按创建时间补号（1000 起，不动已有昵称）
+  // 2) 空昵称 → 补默认昵称 迹路者{uid}
+  fastify.post('/users/backfill', { onRequest: [adminAuth] }, async () => {
+    const { uidBackfilled } = await backfillUsers();
+    const nicknameBackfilled = await backfillEmptyNicknames();
+    const remaining = await UserModel.countDocuments({ uid: { $exists: false } });
+    return success({ uidBackfilled, nicknameBackfilled, remaining });
   });
 
   // 用户登录历史（分页，按时间倒序；支持时间区间筛选）

@@ -186,7 +186,7 @@ test('users 列表：下发纯数字 uid 不含 openid（敏感字段）', async
   assert.match(item.uid, /^\d+$/, 'uid 应为纯数字字符串');
 });
 
-test('backfill-uids：缺 UID 老用户按创建时间补号（不动昵称）', async () => {
+test('backfill：缺 UID 老用户补号 + 空昵称补默认昵称（有昵称不覆盖）', async () => {
   const hashOf = (code: string) => [...code].reduce((a, c) => a + c.charCodeAt(0), 0) % 10000;
   const openidOf = (code: string) => `mock_openid_${String(hashOf(code)).padStart(4, '0')}`;
   const aOpenid = openidOf('mock-old-uid-a');
@@ -197,11 +197,12 @@ test('backfill-uids：缺 UID 老用户按创建时间补号（不动昵称）',
   await new Promise((r) => setTimeout(r, 5));
   await UserModel.create({ openid: bOpenid, nickname: '', createdAt: new Date(Date.now() - 1800000) });
 
-  const res = await adminReq('POST', '/sport-track/api/admin/users/backfill-uids');
+  const res = await adminReq('POST', '/sport-track/api/admin/users/backfill');
   assert.equal(res.statusCode, 200);
   const body = res.json();
   assert.equal(body.success, true);
-  assert.ok(body.data.backfilled >= 2, `应至少补 2 个，实际 ${body.data.backfilled}`);
+  assert.ok(body.data.uidBackfilled >= 2, `应至少补 2 个 UID，实际 ${body.data.uidBackfilled}`);
+  assert.ok(body.data.nicknameBackfilled >= 1, `应至少补 1 个默认昵称，实际 ${body.data.nicknameBackfilled}`);
   assert.ok(body.data.remaining >= 0);
 
   const a = await UserModel.findOne({ openid: aOpenid });
@@ -209,6 +210,7 @@ test('backfill-uids：缺 UID 老用户按创建时间补号（不动昵称）',
   assert.ok(a && a.uid != null && b && b.uid != null, '老用户应有 UID');
   assert.equal(a.nickname, '小小梦工场', '自定义昵称不被覆盖');
   assert.ok(a.uid < b.uid, `先注册的用户 UID 应更小: ${a.uid} vs ${b.uid}`);
+  assert.equal(b.nickname, `迹路者${b.uid}`, '空昵称老用户应补默认昵称');
 
   // 清理
   await UserModel.deleteMany({ openid: { $in: [aOpenid, bOpenid] } });
