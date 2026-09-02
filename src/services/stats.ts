@@ -23,36 +23,42 @@ function dayRange(daysAgo: number): { start: number; end: number } {
   return { start, end };
 }
 
-export interface OverviewResult {
-  today: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
-  week: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
-  month: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
-  year: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
-  total: { count: number; distance: number; duration: number; elevationGain: number; calories: number };
+interface Section {
+  count: number;
+  distance: number;
+  duration: number;
+  elevationGain: number;
+  calories: number;
 }
 
-/** 概览聚合：今日 / 本周（自然周）/ 本月 / 累计（决策 F18） */
+export interface OverviewResult {
+  today: Section;
+  week: Section;
+  month: Section;
+  year: Section;
+  total: Section;
+  prevWeek: Section; // 上周（近 7 天窗口的前 7 天）
+  prevMonth: Section; // 上月（自然月）
+}
+
+/** 概览聚合：今日 / 本周（近 7 天）/ 本月 / 累计 + 上周期对比（决策 F18） */
 export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
   const finished: Record<string, any> = { userId: toObjectId(userId), status: 'finished' };
+  const DAY = 86400000;
+  const weekStart = dayRange(6).start; // 本周窗口起点（今天往前 6 天的 0 点）
+  const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
 
-  const [today, week, month, year, total] = await Promise.all([
+  const [today, week, month, year, total, prevWeek, prevMonth] = await Promise.all([
     ActivityModel.aggregate([
       { $match: { ...finished, startTime: { $gte: dayStart(Date.now()) } } },
       ...sumAgg,
     ]),
     ActivityModel.aggregate([
-      { $match: { ...finished, startTime: { $gte: dayRange(6).start } } },
+      { $match: { ...finished, startTime: { $gte: weekStart } } },
       ...sumAgg,
     ]),
     ActivityModel.aggregate([
-      {
-        $match: {
-          ...finished,
-          startTime: {
-            $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime(),
-          },
-        },
-      },
+      { $match: { ...finished, startTime: { $gte: monthStart } } },
       ...sumAgg,
     ]),
     ActivityModel.aggregate([
@@ -65,6 +71,22 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
       ...sumAgg,
     ]),
     ActivityModel.aggregate([{ $match: finished }, ...sumAgg]),
+    ActivityModel.aggregate([
+      { $match: { ...finished, startTime: { $gte: weekStart - 7 * DAY, $lt: weekStart } } },
+      ...sumAgg,
+    ]),
+    ActivityModel.aggregate([
+      {
+        $match: {
+          ...finished,
+          startTime: {
+            $gte: new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1).getTime(),
+            $lt: monthStart,
+          },
+        },
+      },
+      ...sumAgg,
+    ]),
   ]);
 
   return {
@@ -73,6 +95,8 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
     month: toSection(month),
     year: toSection(year),
     total: toSection(total),
+    prevWeek: toSection(prevWeek),
+    prevMonth: toSection(prevMonth),
   };
 }
 
