@@ -43,17 +43,22 @@ export interface OverviewResult {
   heat: { lat: number; lng: number; weight: number }[];
 }
 
-/** 查询 + 抽稀 + 热力（轨迹多则每轨迹点少，总量受预算约束） */
+/** 查询 + 抽稀 + 热力（轨迹多则每轨迹点少，总量受预算约束）
+ * 传入 precise（epoch ms 区间）时按精确时间查询（报告页历史周/月/年），否则按 range 滑动窗口
+ */
 export async function getOverview(
   userId: string,
   range: OverviewRange,
+  precise?: { from: number; to: number },
 ): Promise<OverviewResult> {
   const days = RANGE_DAYS[range];
   const query: Record<string, unknown> = {
     userId,
     status: 'finished',
   };
-  if (days != null) {
+  if (precise) {
+    query.startTime = { $gte: precise.from, $lt: precise.to }; // startTime 存的是 Number 时间戳
+  } else if (days != null) {
     query.startTime = { $gte: new Date(Date.now() - days * 86400000) };
   }
 
