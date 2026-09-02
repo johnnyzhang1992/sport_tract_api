@@ -8,6 +8,7 @@ import { locateByIp } from '../services/ip-locate.js';
 import { LoginSchema, RefreshSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
+import { nextUserUid, backfillUserUids } from '../services/uid.js';
 import { config } from '../config/index.js';
 import type { JwtPayload } from '../plugins/jwt.js';
 
@@ -30,16 +31,29 @@ function getClientIp(request: any): string | undefined {
  */
 export async function authRoutes(fastify: FastifyInstance) {
   fastify.post('/login', async (request) => {
-    const { code, platform, system, brand, model, sdkVersion, appVersion } = request.body as Record<string, unknown>;
-    const parsed = LoginSchema.parse({ code });
+    const { code, uid, platform, system, brand, model, sdkVersion, appVersion } = request.body as Record<string, unknown>;
+    const parsed = LoginSchema.parse({ code, uid });
 
     const session = await code2Session(parsed.code);
 
     // 查/建用户（openid 唯一索引幂等）
+    // UID：新用户创建时分配（1000 起，全局唯一）；老用户缺失时按创建时间批量补号（不动昵称）
+    // 默认昵称：空昵称时用 UID（或显式 uid 参数）生成 迹路者{编号}；已有昵称绝不覆盖
     let user = await UserModel.findOne({ openid: session.openid });
     if (!user) {
-      user = await UserModel.create({ openid: session.openid });
-      fastify.log.info(`新用户注册: ${user._id}`);
+      user = await UserModel.create({ openid: session.openid, uid: await nextUserUid(), nickname: '' });
+      fastify.log.info(`新用户注册: ${user._id} uid=${user.uid}`);
+    }
+    if (!user.uid) {
+      // 老用户缺 UID：按创建时间批量补（含当前用户），保证历史用户按注册顺序编号
+      await backfillUserUids();
+      user = await UserModel.findOne({ openid: session.openid });
+      if (!user) throw new AppError(500, '用户状态异常');
+    }
+    if (!user.nickname) {
+      // 空昵称：uid 参数显式优先，否则用自动 UID
+      user.nickname = parsed.uid ? `迹路者${parsed.uid}` : `迹路者${user.uid}`;
+      await UserModel.updateOne({ _id: user._id }, { $set: { nickname: user.nickname } });
     }
 
     const userId = String(user._id);
@@ -72,6 +86,7 @@ export async function authRoutes(fastify: FastifyInstance) {
         refreshToken,
         user: {
           id: userId,
+          uid: user.uid ?? null, // 用户唯一编号
           nickname: user.nickname,
           avatarUrl: user.avatarUrl ? getSignedUrl(user.avatarUrl) : '',
           gender: user.gender,

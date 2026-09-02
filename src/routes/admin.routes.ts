@@ -12,6 +12,7 @@ import { locateRegion } from '../services/region.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
+import { backfillUserUids } from '../services/uid.js';
 import { getSignedUrl } from '../services/oss.js';
 
 /**
@@ -388,7 +389,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         return {
           id: String(u._id),
           nickname: u.nickname,
-          openid: u.openid,
+          uid: u.uid != null ? String(u.uid) : '', // 用户唯一编号（openid 敏感不下发）
           weightKg: u.weightKg,
           heightCm: u.heightCm,
           createdAt: u.createdAt,
@@ -400,6 +401,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
         };
       }),
     });
+  });
+
+  // 老用户 UID 补号（1000 起，按创建时间升序，不动昵称；部署后手动触发一次即可）
+  fastify.post('/users/backfill-uids', { onRequest: [adminAuth] }, async () => {
+    const before = await UserModel.countDocuments({ uid: { $exists: false } });
+    await backfillUserUids();
+    const after = await UserModel.countDocuments({ uid: { $exists: false } });
+    return success({ backfilled: before - after, remaining: after });
   });
 
   // 用户登录历史（分页，按时间倒序；支持时间区间筛选）

@@ -1,8 +1,13 @@
 import { z } from 'zod';
 
-/** 登录：微信 code2session 换取 openid */
+/** 登录：微信 code2session 换取 openid；uid 可选，新用户注册时生成默认昵称（如 迹路者001） */
 export const LoginSchema = z.object({
   code: z.string().min(1, '缺少微信登录 code'),
+  uid: z
+    .string()
+    .trim()
+    .regex(/^[\w\u4e00-\u9fa5-]{1,20}$/, 'uid 仅支持字母/数字/下划线/中文/连字符，1-20 位')
+    .optional(),
 });
 
 /** 刷新 token */

@@ -5,6 +5,7 @@ const { Schema, model, models } = mongoose;
 const userSchema = new Schema(
   {
     openid: { type: String, required: true, unique: true, index: true },
+    uid: { type: Number, sparse: true, unique: true }, // 用户唯一编号（1000 起；sparse 兼容存量用户迁移补号）
     nickname: { type: String, default: '' },
     avatarUrl: { type: String, default: '' },
     gender: { type: Number, enum: [0, 1, 2], default: 0 }, // 0 未知 1 男 2 女

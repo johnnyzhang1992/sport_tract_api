@@ -175,3 +175,41 @@ test('activities 列表：startProvince/startCity 字段 + 不含轨迹点', asy
   assert.equal(item.trackPoints, undefined, '不应下发轨迹点');
   assert.equal(item.markers, undefined, '不应下发打点');
 });
+
+test('users 列表：下发纯数字 uid 不含 openid（敏感字段）', async () => {
+  const res = await adminReq('GET', '/sport-track/api/admin/users?page=1&pageSize=5');
+  assert.equal(res.statusCode, 200);
+  const items = res.json().data.items;
+  assert.ok(items.length >= 1);
+  const item = items[0];
+  assert.equal(item.openid, undefined, '不应下发 openid');
+  assert.match(item.uid, /^\d+$/, 'uid 应为纯数字字符串');
+});
+
+test('backfill-uids：缺 UID 老用户按创建时间补号（不动昵称）', async () => {
+  const hashOf = (code: string) => [...code].reduce((a, c) => a + c.charCodeAt(0), 0) % 10000;
+  const openidOf = (code: string) => `mock_openid_${String(hashOf(code)).padStart(4, '0')}`;
+  const aOpenid = openidOf('mock-old-uid-a');
+  const bOpenid = openidOf('mock-old-uid-b');
+  // 先清残留再构造两个无 uid 老用户（先注册 a：自定义昵称；后注册 b：空昵称）
+  await UserModel.deleteMany({ openid: { $in: [aOpenid, bOpenid] } });
+  await UserModel.create({ openid: aOpenid, nickname: '小小梦工场', createdAt: new Date(Date.now() - 3600000) });
+  await new Promise((r) => setTimeout(r, 5));
+  await UserModel.create({ openid: bOpenid, nickname: '', createdAt: new Date(Date.now() - 1800000) });
+
+  const res = await adminReq('POST', '/sport-track/api/admin/users/backfill-uids');
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.equal(body.success, true);
+  assert.ok(body.data.backfilled >= 2, `应至少补 2 个，实际 ${body.data.backfilled}`);
+  assert.ok(body.data.remaining >= 0);
+
+  const a = await UserModel.findOne({ openid: aOpenid });
+  const b = await UserModel.findOne({ openid: bOpenid });
+  assert.ok(a && a.uid != null && b && b.uid != null, '老用户应有 UID');
+  assert.equal(a.nickname, '小小梦工场', '自定义昵称不被覆盖');
+  assert.ok(a.uid < b.uid, `先注册的用户 UID 应更小: ${a.uid} vs ${b.uid}`);
+
+  // 清理
+  await UserModel.deleteMany({ openid: { $in: [aOpenid, bOpenid] } });
+});
