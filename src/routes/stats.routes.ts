@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { overview, trend, bestRecords } from '../services/stats.js';
+import { overview, trend, bestRecords, yearMilestones } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
 import { success } from '../utils/response.js';
 
@@ -36,5 +36,15 @@ export async function statsRoutes(fastify: FastifyInstance) {
       result = await trend(request.user.userId, 'week');
     }
     return success(result);
+  });
+
+  // 年度里程碑：今年首次点亮的省份/城市、首次尝试的运动类型（年度报告用）
+  fastify.get('/year-milestones', { onRequest: [fastify.authenticate] }, async (request) => {
+    const query = request.query as { year?: string };
+    const year = Math.min(
+      new Date().getFullYear(),
+      Math.max(2015, Number(query.year) || new Date().getFullYear()),
+    );
+    return success(await yearMilestones(request.user.userId, year));
   });
 }

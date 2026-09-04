@@ -1,5 +1,6 @@
 import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
+import { locateRegion } from './region.js';
 import { calcFastestKm } from '../utils/pace.js';
 
 type ObjectIdLike = Types.ObjectId | string;
@@ -351,5 +352,88 @@ export async function bestRecords(userId: ObjectIdLike) {
     minPaceByType: mapByType(paceRows, 'fastestKm', 1), // 配速升序=最快
     maxDurationByType: mapByType(durRows, 'duration', -1),
     maxElevationByType: mapByType(elevRows, 'elevationGain', -1),
+  };
+}
+
+export interface MilestoneItem {
+  name: string;
+  province?: string;
+  firstAt: number; // 首次点亮/尝试时间
+  countInYear?: number; // 该类型今年轨迹数（仅 newTypes）
+}
+
+export interface YearMilestonesResult {
+  year: number;
+  newProvinces: MilestoneItem[];
+  newCities: MilestoneItem[];
+  newTypes: MilestoneItem[];
+}
+
+/**
+ * 年度里程碑：今年首次点亮的省份/城市、首次尝试的运动类型
+ * 遍历用户 finished 轨迹（按 startTime 升序），采样点离线逆地理记录省/市首次出现时间
+ */
+export async function yearMilestones(
+  userId: ObjectIdLike,
+  year: number,
+): Promise<YearMilestonesResult> {
+  const yearStart = new Date(year, 0, 1).getTime();
+  const docs = await ActivityModel.find({ userId: toObjectId(userId), status: 'finished' })
+    .select({ startTime: 1, type: 1, 'trackPoints.lat': 1, 'trackPoints.lng': 1 })
+    .sort({ startTime: 1 })
+    .lean();
+
+  const provFirst = new Map<string, number>();
+  const cityFirst = new Map<string, { province: string; firstAt: number }>();
+  const typeFirst = new Map<string, number>();
+  const typeYearCount = new Map<string, number>();
+
+  for (const act of docs) {
+    const st = Number(act.startTime ?? 0);
+    const type = String(act.type ?? '');
+    if (type && !typeFirst.has(type)) typeFirst.set(type, st);
+    if (st >= yearStart && type) typeYearCount.set(type, (typeYearCount.get(type) ?? 0) + 1);
+
+    const pts = (act.trackPoints ?? []) as Array<{ lat?: number; lng?: number }>;
+    if (pts.length < 2) continue;
+    // 采样与足迹口径一致：首、尾、25%、50%、75%
+    const idxs = new Set<number>([0, pts.length - 1]);
+    for (const r of [0.25, 0.5, 0.75]) idxs.add(Math.floor(pts.length * r));
+    const seenProv = new Set<string>();
+    const seenCity = new Set<string>();
+    for (const i of idxs) {
+      const p = pts[i];
+      if (!p || !Number.isFinite(Number(p.lat)) || !Number.isFinite(Number(p.lng))) continue;
+      const d = locateRegion(Number(p.lat), Number(p.lng));
+      if (!d) continue;
+      const prov = d.province || '未知';
+      const city = d.city || prov;
+      if (!seenProv.has(prov)) {
+        seenProv.add(prov);
+        if (!provFirst.has(prov)) provFirst.set(prov, st);
+      }
+      if (!seenCity.has(city)) {
+        seenCity.add(city);
+        if (!cityFirst.has(city)) cityFirst.set(city, { province: prov, firstAt: st });
+      }
+    }
+  }
+
+  const inYear = (t: number | undefined) => t != null && t >= yearStart;
+  const byFirst = (a: { firstAt: number }, b: { firstAt: number }) => a.firstAt - b.firstAt;
+  return {
+    year,
+    newProvinces: [...provFirst]
+      .filter(([, t]) => inYear(t))
+      .map(([name, t]) => ({ name, firstAt: t }))
+      .sort(byFirst),
+    newCities: [...cityFirst]
+      .filter(([, v]) => inYear(v.firstAt))
+      .map(([name, v]) => ({ name, province: v.province, firstAt: v.firstAt }))
+      .sort(byFirst),
+    newTypes: [...typeFirst]
+      .filter(([name, t]) => inYear(t))
+      .map(([name, t]) => ({ name, firstAt: t, countInYear: typeYearCount.get(name) ?? 0 }))
+      .sort(byFirst),
   };
 }
