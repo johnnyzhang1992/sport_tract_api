@@ -28,6 +28,7 @@ export async function userRoutes(fastify: FastifyInstance) {
       gender: user.gender,
       weightKg: user.weightKg,
       heightCm: user.heightCm,
+      profileCompleted: user.profileCompleted ?? false,
       settings: user.settings,
       createdAt: user.createdAt,
     });
@@ -57,9 +58,16 @@ export async function userRoutes(fastify: FastifyInstance) {
       }
     }
 
+    // 完善资料标记：本次提交包含身高/体重 → 视为已完善（前端引导弹窗不再触发）
+    // 注：不能拿 weight/height 是否有值判断 —— 模型默认值 60/170 对新用户永远非空
+    const patch: Record<string, unknown> = { ...body };
+    if (typeof body.weightKg === 'number' || typeof body.heightCm === 'number') {
+      patch.profileCompleted = true;
+    }
+
     const user = await UserModel.findByIdAndUpdate(
       request.user.userId,
-      { $set: body },
+      { $set: patch },
       { returnDocument: 'after', runValidators: true },
     );
     if (!user) {
@@ -76,6 +84,7 @@ export async function userRoutes(fastify: FastifyInstance) {
         gender: user.gender,
         weightKg: user.weightKg,
         heightCm: user.heightCm,
+        profileCompleted: user.profileCompleted ?? false,
         settings: user.settings,
       },
       '更新成功',

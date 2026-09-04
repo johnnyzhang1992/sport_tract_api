@@ -96,6 +96,7 @@ export async function authRoutes(fastify: FastifyInstance) {
           gender: user.gender,
           weightKg: user.weightKg,
           heightCm: user.heightCm,
+          profileCompleted: user.profileCompleted ?? false,
           settings: user.settings,
         },
       },
