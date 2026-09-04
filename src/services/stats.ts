@@ -23,12 +23,27 @@ function dayRange(daysAgo: number): { start: number; end: number } {
   return { start, end };
 }
 
+export interface StatusCount {
+  status: string;
+  count: number;
+}
+
+export interface TypeStat {
+  type: string;
+  count: number;
+  distance: number;
+  duration: number;
+}
+
 interface Section {
   count: number;
   distance: number;
   duration: number;
   elevationGain: number;
   calories: number;
+  byStatus: StatusCount[]; // 各状态轨迹数（finished/in_progress/cancelled）
+  finishRate: number; // 完成率 %（1 位小数；无轨迹为 0）
+  byType: TypeStat[]; // 各运动类型轨迹数/距离/时长（仅 finished，按轨迹数降序）
 }
 
 export interface OverviewResult {
@@ -89,14 +104,61 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
     ]),
   ]);
 
+  // 各范围的状态/类型细分（进行中/作废不参与距离/时长口径，仅计数）
+  const [exToday, exWeek, exMonth, exYear, exTotal] = await Promise.all(
+    [dayStart(Date.now()), weekStart, monthStart, new Date(new Date().getFullYear(), 0, 1).getTime(), null].map(
+      (since) => extras(userId, since),
+    ),
+  );
+
   return {
-    today: toSection(today),
-    week: toSection(week),
-    month: toSection(month),
-    year: toSection(year),
-    total: toSection(total),
+    today: { ...toSection(today), ...exToday },
+    week: { ...toSection(week), ...exWeek },
+    month: { ...toSection(month), ...exMonth },
+    year: { ...toSection(year), ...exYear },
+    total: { ...toSection(total), ...exTotal },
     prevWeek: toSection(prevWeek),
     prevMonth: toSection(prevMonth),
+  };
+}
+
+/** 状态细分 + 类型细分（type 细分仅 finished 口径） */
+async function extras(
+  userId: ObjectIdLike,
+  since: number | null,
+): Promise<Pick<OverviewResult['today'], 'byStatus' | 'finishRate' | 'byType'>> {
+  const match: Record<string, unknown> = { userId: toObjectId(userId) };
+  if (since != null) match.startTime = { $gte: since };
+  const [statusRows, typeRows] = await Promise.all([
+    ActivityModel.aggregate([{ $match: match }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    ActivityModel.aggregate([
+      { $match: { ...match, status: 'finished' } },
+      {
+        $group: {
+          _id: '$type',
+          count: { $sum: 1 },
+          distance: { $sum: '$distance' },
+          duration: { $sum: '$duration' },
+        },
+      },
+      { $sort: { count: -1 } },
+    ]),
+  ]);
+  const statusMap = new Map(statusRows.map((r) => [String(r._id), Number(r.count)]));
+  const finishedCount = statusMap.get('finished') ?? 0;
+  const totalCount = statusRows.reduce((sum: number, r) => sum + Number(r.count), 0);
+  return {
+    byStatus: ['finished', 'in_progress', 'cancelled'].map((st) => ({
+      status: st,
+      count: statusMap.get(st) ?? 0,
+    })),
+    finishRate: totalCount > 0 ? Math.round((finishedCount / totalCount) * 1000) / 10 : 0,
+    byType: typeRows.map((r) => ({
+      type: String(r._id),
+      count: Number(r.count),
+      distance: Number(r.distance ?? 0),
+      duration: Number(r.duration ?? 0),
+    })),
   };
 }
 
@@ -121,6 +183,9 @@ function toSection(rows: Array<Record<string, any>>): OverviewResult['today'] {
     duration: r?.duration ?? 0,
     elevationGain: r?.elevationGain ?? 0,
     calories: r?.calories ?? 0,
+    byStatus: [],
+    finishRate: 0,
+    byType: [],
   };
 }
 

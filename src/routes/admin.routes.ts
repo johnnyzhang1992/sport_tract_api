@@ -211,7 +211,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return success({ type, data });
   });
 
-  // 轨迹数据概况：today/week/month/year/all 各范围轨迹数/距离/时长/卡路里/爬升（一次 $facet 聚合）
+  // 轨迹数据概况：today/week/month/year/all 各范围指标 + 状态细分 + 类型细分（一次 $facet 聚合）
   fastify.get('/activity-stats', { onRequest: [adminAuth] }, async () => {
     const DAY = 86400000;
     // 北京时间今日 0 点（产品为中国用户，概况口径统一按东八区）
@@ -236,9 +236,24 @@ export async function adminRoutes(fastify: FastifyInstance) {
     };
     const facet: Record<string, PipelineStage.FacetPipelineStage[]> = {};
     for (const [key, since] of Object.entries(ranges)) {
-      facet[key] = since == null ? [groupStage] : [{ $match: { startTime: { $gte: since } } }, groupStage];
+      const timeMatch = since == null ? [] : [{ $match: { startTime: { $gte: since } } }];
+      facet[key] = [...timeMatch, { $match: { status: 'finished' } }, groupStage];
+      facet[`${key}_status`] = [...timeMatch, { $group: { _id: '$status', count: { $sum: 1 } } }];
+      facet[`${key}_type`] = [
+        ...timeMatch,
+        { $match: { status: 'finished' } },
+        {
+          $group: {
+            _id: '$type',
+            count: { $sum: 1 },
+            distance: { $sum: '$distance' },
+            duration: { $sum: '$duration' },
+          },
+        },
+        { $sort: { count: -1 } },
+      ];
     }
-    const [rows] = await ActivityModel.aggregate([{ $match: { status: 'finished' } }, { $facet: facet }]);
+    const [rows] = await ActivityModel.aggregate([{ $facet: facet }]);
     const pick = (arr: Array<Record<string, number>>) => {
       const r = arr?.[0];
       return {
@@ -249,8 +264,25 @@ export async function adminRoutes(fastify: FastifyInstance) {
         elevationGain: r?.elevationGain ?? 0,
       };
     };
+    const STATUS_KEYS = ['finished', 'in_progress', 'cancelled'];
     const out: Record<string, unknown> = {};
-    for (const key of Object.keys(ranges)) out[key] = pick(rows?.[key]);
+    for (const key of Object.keys(ranges)) {
+      const statusRows = (rows?.[`${key}_status`] ?? []) as Array<Record<string, unknown>>;
+      const statusMap = new Map(statusRows.map((r) => [String(r._id), Number(r.count)]));
+      const finishedCount = statusMap.get('finished') ?? 0;
+      const totalCount = statusRows.reduce((sum: number, r) => sum + Number(r.count), 0);
+      out[key] = {
+        ...pick(rows?.[key]),
+        byStatus: STATUS_KEYS.map((st) => ({ status: st, count: statusMap.get(st) ?? 0 })),
+        finishRate: totalCount > 0 ? Math.round((finishedCount / totalCount) * 1000) / 10 : 0,
+        byType: (rows?.[`${key}_type`] ?? []).map((r: Record<string, unknown>) => ({
+          type: String(r._id),
+          count: Number(r.count),
+          distance: Number(r.distance ?? 0),
+          duration: Number(r.duration ?? 0),
+        })),
+      };
+    }
     return success(out);
   });
 
