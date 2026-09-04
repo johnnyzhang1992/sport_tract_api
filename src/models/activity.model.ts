@@ -29,6 +29,8 @@ const markerSchema = new Schema(
     lng: { type: Number, required: true },
     timestamp: { type: Number, required: true },
     type: { type: String, enum: MARKER_TYPES, default: 'checkpoint' },
+    icon: { type: String, default: '' }, // 打点图标（emoji，用户可选）
+    label: { type: String, default: '' }, // 打点文案（用户自定义）
     note: { type: String, default: '' },
     photoUrl: { type: String, default: '' }, // 兼容旧数据（首图）
     photos: { type: [String], default: [] }, // 多图（上限 3，前端约束）
