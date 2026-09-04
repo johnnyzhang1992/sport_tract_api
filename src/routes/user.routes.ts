@@ -21,6 +21,7 @@ export async function userRoutes(fastify: FastifyInstance) {
     }
     return success({
       id: String(user._id),
+      uid: user.uid,
       nickname: user.nickname,
       avatarUrl: signAvatar(user.avatarUrl),
       gender: user.gender,
@@ -67,6 +68,7 @@ export async function userRoutes(fastify: FastifyInstance) {
     return success(
       {
         id: String(user._id),
+        uid: user.uid,
         nickname: user.nickname,
         avatarUrl: signAvatar(user.avatarUrl),
         gender: user.gender,

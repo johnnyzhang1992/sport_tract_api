@@ -29,6 +29,7 @@ export const UpdateMeSchema = z
         defaultType: z.string().optional(),
         highAccuracy: z.boolean().optional(),
         showBodyData: z.boolean().optional(),
+        kmAnnounce: z.boolean().optional(), // 记录中整公里震动+横幅播报开关
       })
       .optional(),
   })
@@ -88,6 +89,8 @@ export const CreateMarkerSchema = z.object({
   lng: z.number().min(-180).max(180),
   timestamp: z.number().positive(),
   type: MarkerTypeSchema.default('checkpoint'),
+  icon: z.string().max(8).optional().default(''),
+  label: z.string().max(20).optional().default(''),
   note: z.string().max(500).default(''),
   photoUrl: PhotoUrlSchema.optional().default(''),
   photos: PhotosSchema.optional(),
@@ -97,6 +100,8 @@ export const CreateMarkerSchema = z.object({
 /** 编辑打点（photos 传入时全量替换） */
 export const UpdateMarkerSchema = z.object({
   type: MarkerTypeSchema.optional(),
+  icon: z.string().max(8).optional(),
+  label: z.string().max(20).optional(),
   note: z.string().max(500).optional(),
   photoUrl: PhotoUrlSchema.optional(),
   photos: PhotosSchema.optional(),

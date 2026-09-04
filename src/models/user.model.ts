@@ -17,6 +17,7 @@ const userSchema = new Schema(
       defaultType: { type: String, default: 'walking' },
       highAccuracy: { type: Boolean, default: true },
       showBodyData: { type: Boolean, default: true }, // 个人中心是否展示身高体重
+      kmAnnounce: { type: Boolean, default: true }, // 记录中整公里震动+横幅播报
     },
     // 足迹点亮缓存（懒重算：写入只置 dirty，读时 dirty 才重算）
     footprintCache: { type: Schema.Types.Mixed, default: null },
