@@ -40,8 +40,10 @@ export async function authRoutes(fastify: FastifyInstance) {
     // UID：新用户创建时分配（1000 起，全局唯一）；老用户缺失时按创建时间批量补号（不动昵称）
     // 默认昵称：空昵称时用 UID（或显式 uid 参数）生成 迹路者{编号}；已有昵称绝不覆盖
     let user = await UserModel.findOne({ openid: session.openid });
+    let isNewUser = false; // 首次注册标记（前端引导完善资料用）
     if (!user) {
       user = await UserModel.create({ openid: session.openid, uid: await nextUserUid(), nickname: '' });
+      isNewUser = true;
       fastify.log.info(`新用户注册: ${user._id} uid=${user.uid}`);
     }
     if (!user.uid) {
@@ -82,6 +84,7 @@ export async function authRoutes(fastify: FastifyInstance) {
     // openid/sessionKey 为敏感字段，不出接口；头像签名（bucket 私有）
     return success(
       {
+        isNewUser,
         accessToken,
         refreshToken,
         user: {
@@ -89,6 +92,7 @@ export async function authRoutes(fastify: FastifyInstance) {
           uid: user.uid ?? null, // 用户唯一编号
           nickname: user.nickname,
           avatarUrl: user.avatarUrl ? getSignedUrl(user.avatarUrl) : '',
+          avatarPreset: user.avatarPreset ?? '',
           gender: user.gender,
           weightKg: user.weightKg,
           heightCm: user.heightCm,
