@@ -15,15 +15,16 @@ function configured(): boolean {
   return Boolean(config.wxAppid && config.wxSecret);
 }
 
-/** 获取小程序 access_token（7200s 有效，提前 5 分钟刷新，40001 时清缓存重试） */
+/** 获取小程序 access_token（stable_token 接口：同 appid 重复获取返回同一 token，不会被其他环境刷新顶掉；缓存提前 1 分钟过期） */
 export async function getAccessToken(): Promise<string | null> {
   if (!configured()) return null;
   if (cachedToken && cachedToken.expireAt > Date.now() + 60_000) return cachedToken.token;
 
-  const res = await axios.get('https://api.weixin.qq.com/cgi-bin/token', {
-    params: { grant_type: 'client_credential', appid: config.wxAppid, secret: config.wxSecret },
-    timeout: 5000,
-  });
+  const res = await axios.post(
+    'https://api.weixin.qq.com/cgi-bin/stable_token',
+    { grant_type: 'client_credential', appid: config.wxAppid, secret: config.wxSecret },
+    { timeout: 5000 },
+  );
   if (res.data?.errcode || !res.data?.access_token) {
     throw new Error(`微信 access_token 获取失败: ${res.data?.errmsg ?? res.data?.errcode ?? 'unknown'}`);
   }
@@ -43,15 +44,17 @@ export interface SecCheckResult {
   skipped?: boolean;
 }
 
-async function callWithRetry<T>(fn: (token: string) => Promise<T>): Promise<T> {
+/** 带 token 失效重试的调用封装：业务回调抛 40001/42001 时清 token 缓存并重试一次（内容安全/小程序码共用） */
+export async function callWithRetry<T>(fn: (token: string) => Promise<T>): Promise<T> {
   try {
     const token = await getAccessToken();
     if (!token) throw new Error('access_token 不可用');
     return await fn(token);
   } catch (err) {
-    // 40001：token 失效，清缓存重试一次
-    const code = (err as { response?: { data?: { errcode?: number } } })?.response?.data?.errcode;
-    if (code === 40001) {
+    // 40001/42001：token 失效（axios 错误或带 extra.errcode 的 AppError），清缓存重试一次
+    const e = err as { response?: { data?: { errcode?: number } }; extra?: { errcode?: number } };
+    const code = e?.response?.data?.errcode ?? e?.extra?.errcode;
+    if (code === 40001 || code === 42001) {
       cachedToken = null;
       const token2 = await getAccessToken();
       if (token2) return await fn(token2);
