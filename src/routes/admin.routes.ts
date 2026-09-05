@@ -367,7 +367,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       .select('trackPoints')
       .lean();
     const provMap = new Map<string, number>();
-    const cityMap = new Map<string, number>();
+    const cityMap = new Map<string, { province: string; count: number }>();
     for (const a of acts) {
       const pts = (a.trackPoints ?? []) as Array<{ lat?: number; lng?: number }>;
       const first = pts.find((p) => typeof p.lat === 'number' && typeof p.lng === 'number');
@@ -375,13 +375,18 @@ export async function adminRoutes(fastify: FastifyInstance) {
       const r = locateRegion(Number(first.lat), Number(first.lng));
       if (!r) continue;
       provMap.set(r.province, (provMap.get(r.province) ?? 0) + 1);
-      cityMap.set(r.city, (cityMap.get(r.city) ?? 0) + 1);
+      const prev = cityMap.get(r.city);
+      if (prev) prev.count += 1;
+      else cityMap.set(r.city, { province: r.province, count: 1 });
     }
     const top = (m: Map<string, number>, n: number) =>
       [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([name, count]) => ({ name, count }));
     return success({
       provinces: top(provMap, 20),
-      cities: top(cityMap, 20),
+      cities: [...cityMap.entries()]
+        .sort((a, b) => b[1].count - a[1].count)
+        .slice(0, 20)
+        .map(([name, v]) => ({ name, province: v.province, count: v.count })),
     });
   });
 
