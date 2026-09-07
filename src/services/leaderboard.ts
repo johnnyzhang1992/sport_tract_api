@@ -8,6 +8,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { ACTIVITY_TYPES } from '../config/constants.js';
+import { getSignedUrl } from './oss.js';
 
 export interface RegionProvince {
   name: string;
@@ -37,10 +38,49 @@ export interface RankRow {
   name: string;
   /** 性别：0 未知 1 男 2 女 */
   gender: number;
+  /** 头像（OSS 签名 URL，可能为空） */
+  avatarUrl: string;
+  /** 预设头像 key（avatarUrl 为空时生效，前端映射本地资源） */
+  avatarPreset: string;
   distanceKm: number;
   /** 轨迹条数 */
   count: number;
 }
+
+/** 本榜最佳指标键 */
+export type BestMetricKey = 'farthest' | 'longest' | 'fastestKm' | 'fastestAvg' | 'maxClimb';
+
+export interface BestRow {
+  key: BestMetricKey;
+  /** 原始值：距离/爬升 米，时长/配速 秒（配速为秒/公里，越小越快） */
+  value: number;
+  /** 纪录保持者昵称 */
+  name: string;
+  gender: number;
+  avatarUrl: string;
+  avatarPreset: string;
+}
+
+/** 各运动类型的本榜最佳指标（顺序即展示顺序；所有类型都有距离/时长，耐力类加专项指标） */
+const BEST_METRICS: Record<string, BestMetricKey[]> = {
+  walking: ['farthest', 'longest'],
+  running: ['farthest', 'longest', 'fastestKm'],
+  hiking: ['farthest', 'longest', 'maxClimb'],
+  mountaineering: ['farthest', 'longest', 'maxClimb'],
+  cycling: ['farthest', 'longest', 'fastestAvg'],
+  swimming: ['farthest', 'longest'],
+  skiing: ['farthest', 'longest'],
+  rowing: ['farthest', 'longest'],
+};
+
+/** 指标 → 活动字段与排序方向（dir=1 越小越好，如配速） */
+const BEST_METRIC_SPEC: Record<BestMetricKey, { field: string; dir: 1 | -1 }> = {
+  farthest: { field: 'distance', dir: -1 }, // 米
+  longest: { field: 'duration', dir: -1 }, // 秒
+  fastestKm: { field: 'fastestKm', dir: 1 }, // 秒/公里
+  fastestAvg: { field: 'avgPace', dir: 1 }, // 秒/公里（全程均速）
+  maxClimb: { field: 'elevationGain', dir: -1 }, // 米
+};
 
 export interface LeaderboardResult {
   type: string;
@@ -52,6 +92,8 @@ export interface LeaderboardResult {
   top: RankRow[];
   /** 当前用户真实排名；无轨迹为 null */
   me: RankRow | null;
+  /** 本榜最佳：当前 类型/省份/周期 筛选下的单项纪录（按类型的指标集） */
+  best: BestRow[];
 }
 
 const LEADERBOARD_PERIODS = ['week', 'month', 'year', 'all'] as const;
@@ -150,14 +192,47 @@ export async function leaderboard(
   const topRows = rows.slice(0, 10);
   const meRow = myIdx >= 0 ? rows[myIdx] : null;
 
+  // 本榜最佳：$facet 一次查出各指标最优活动（>0 过滤掉无意义零值，如 0 爬升/0 配速）
+  type FacetDoc = Record<string, Array<{ userId: unknown } & Record<string, number>>>;
+  const facet: Record<string, unknown> = {};
+  for (const key of BEST_METRICS[type]) {
+    const spec = BEST_METRIC_SPEC[key];
+    facet[key] = [
+      { $match: { [spec.field]: { $gt: 0 } } },
+      { $sort: { [spec.field]: spec.dir } },
+      { $limit: 1 },
+      { $project: { userId: 1, [spec.field]: 1 } },
+    ];
+  }
+  const [facetDoc] = await ActivityModel.aggregate<FacetDoc>([
+    { $match: match },
+    { $facet: facet as never },
+  ]);
+
+  // 本榜最佳中间结果：各指标命中的纪录活动（按类型指标集顺序；无纪录的指标无条目）
+  const bestDocs = BEST_METRICS[type]
+    .map((key) => ({ key, doc: (facetDoc?.[key] || [])[0] }))
+    .filter((b): b is { key: BestMetricKey; doc: { userId: unknown } & Record<string, number> } => !!b.doc);
+
   const involvedIds = new Set<string>([
     ...topRows.map((r) => String(r._id)),
     ...(meRow ? [String(meRow._id)] : []),
+    ...bestDocs.map((b) => String(b.doc.userId)),
   ]);
   const users = await UserModel.find({ _id: { $in: [...involvedIds] } })
-    .select({ nickname: 1, gender: 1 })
+    .select({ nickname: 1, gender: 1, avatarUrl: 1, avatarPreset: 1 })
     .lean();
-  const infoById = new Map(users.map((u) => [String(u._id), { nickname: u.nickname || '', gender: u.gender ?? 0 }]));
+  const infoById = new Map(
+    users.map((u) => [
+      String(u._id),
+      {
+        nickname: u.nickname || '',
+        gender: u.gender ?? 0,
+        avatarUrl: u.avatarUrl ? getSignedUrl(u.avatarUrl) : '',
+        avatarPreset: u.avatarPreset || '',
+      },
+    ]),
+  );
 
   const toRow = (r: { _id: unknown; distance: number; count: number }, rank: number): RankRow => {
     const info = infoById.get(String(r._id));
@@ -165,10 +240,25 @@ export async function leaderboard(
       rank,
       name: (info && info.nickname) || '运动用户',
       gender: (info && info.gender) || 0,
+      avatarUrl: (info && info.avatarUrl) || '',
+      avatarPreset: (info && info.avatarPreset) || '',
       distanceKm: Math.round((r.distance / 1000) * 100) / 100,
       count: r.count,
     };
   };
+
+  // 组装本榜最佳
+  const best: BestRow[] = bestDocs.map(({ key, doc }) => {
+    const info = infoById.get(String(doc.userId));
+    return {
+      key,
+      value: Number(doc[BEST_METRIC_SPEC[key].field]),
+      name: (info && info.nickname) || '运动用户',
+      gender: (info && info.gender) || 0,
+      avatarUrl: (info && info.avatarUrl) || '',
+      avatarPreset: (info && info.avatarPreset) || '',
+    };
+  });
 
   return {
     type,
@@ -177,5 +267,6 @@ export async function leaderboard(
     players: rows.length,
     top: topRows.map((r, i) => toRow(r, i + 1)),
     me: meRow ? toRow(meRow, myIdx + 1) : null,
+    best,
   };
 }
