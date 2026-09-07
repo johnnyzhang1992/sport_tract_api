@@ -54,13 +54,14 @@ export async function statsRoutes(fastify: FastifyInstance) {
     return success(await leaderboardRegions());
   });
 
-  // 运动榜：按 运动类型 > 省份 排行（TOP10 模糊昵称 + 当前用户真实排名）
+  // 运动榜：按 运动类型 > 省份 排行（周期 week/month/year/all；TOP10 昵称完整展示 + 当前用户真实排名）
   fastify.get('/leaderboard', { onRequest: [fastify.authenticate] }, async (request) => {
-    const query = request.query as { type?: string; province?: string };
+    const query = request.query as { type?: string; province?: string; period?: string };
     const result = await leaderboard(
       request.user.userId,
       query.type || 'running',
       query.province || '全国',
+      (query.period || 'all') as 'week' | 'month' | 'year' | 'all',
     );
     return success(result);
   });

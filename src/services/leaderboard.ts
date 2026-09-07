@@ -45,11 +45,29 @@ export interface RankRow {
 export interface LeaderboardResult {
   type: string;
   province: string; // '全国' 或省份名
+  /** 榜单周期：week/month/year/all */
+  period: string;
   /** 参与人数（有该类型轨迹的用户数） */
   players: number;
   top: RankRow[];
   /** 当前用户真实排名；无轨迹为 null */
   me: RankRow | null;
+}
+
+const LEADERBOARD_PERIODS = ['week', 'month', 'year', 'all'] as const;
+export type LeaderboardPeriod = (typeof LEADERBOARD_PERIODS)[number];
+
+/** 周期 → 起始时间戳（毫秒；自然周从周一、自然月、自然年；all 不限） */
+export function periodStartMs(period: LeaderboardPeriod, now = new Date()): number | null {
+  if (period === 'all') return null;
+  if (period === 'week') {
+    const d = new Date(now);
+    d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // 回到本周周一
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  if (period === 'month') return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  return new Date(now.getFullYear(), 0, 1).getTime();
 }
 
 /** 全平台点亮统计（60s 内存缓存：聚合只读历史，短窗口内允许略旧） */
@@ -103,13 +121,19 @@ export async function leaderboard(
   userId: string,
   type: string,
   province = '全国',
+  period: LeaderboardPeriod = 'all',
 ): Promise<LeaderboardResult> {
   if (!ACTIVITY_TYPES.includes(type as never)) {
     throw new AppError(400, '运动类型不合法');
   }
+  if (!LEADERBOARD_PERIODS.includes(period)) {
+    throw new AppError(400, '榜单周期不合法');
+  }
 
   const match: Record<string, unknown> = { status: 'finished', type };
   if (province && province !== '全国') match.provinces = province; // 命中多键索引 { userId, provinces }
+  const startMs = periodStartMs(period);
+  if (startMs !== null) match.startTime = { $gte: startMs };
 
   // 全量分组后内存排序：同时拿到 TOP10 和当前用户名次（量级小，无需 $rank）
   const rows = await ActivityModel.aggregate<{
@@ -149,6 +173,7 @@ export async function leaderboard(
   return {
     type,
     province: province || '全国',
+    period,
     players: rows.length,
     top: topRows.map((r, i) => toRow(r, i + 1)),
     me: meRow ? toRow(meRow, myIdx + 1) : null,
