@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { overview, trend, bestRecords, yearMilestones } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
+import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { success } from '../utils/response.js';
 
 /** 统计路由：/api/stats（决策 F18/F19） */
@@ -46,5 +47,21 @@ export async function statsRoutes(fastify: FastifyInstance) {
       Math.max(2015, Number(query.year) || new Date().getFullYear()),
     );
     return success(await yearMilestones(request.user.userId, year));
+  });
+
+  // 运动榜：全平台点亮地图（60s 缓存）
+  fastify.get('/leaderboard-regions', { onRequest: [fastify.authenticate] }, async () => {
+    return success(await leaderboardRegions());
+  });
+
+  // 运动榜：按 运动类型 > 省份 排行（TOP10 模糊昵称 + 当前用户真实排名）
+  fastify.get('/leaderboard', { onRequest: [fastify.authenticate] }, async (request) => {
+    const query = request.query as { type?: string; province?: string };
+    const result = await leaderboard(
+      request.user.userId,
+      query.type || 'running',
+      query.province || '全国',
+    );
+    return success(result);
   });
 }
