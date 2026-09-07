@@ -45,6 +45,8 @@ export interface RankRow {
   distanceKm: number;
   /** 轨迹条数 */
   count: number;
+  /** 用户 id（仅管理端 includeUserId 时下发，用户端不暴露） */
+  userId?: string;
 }
 
 /** 本榜最佳指标键 */
@@ -160,11 +162,14 @@ export async function leaderboardRegions(): Promise<RegionsResult> {
 }
 
 export async function leaderboard(
-  userId: string,
+  /** 当前用户 id（用户端传，用于返回"我的排名"）；管理端传 null */
+  userId: string | null,
   type: string,
   province = '全国',
   period: LeaderboardPeriod = 'all',
+  opts: { limit?: number; includeUserId?: boolean } = {},
 ): Promise<LeaderboardResult> {
+  const { limit = 10, includeUserId = false } = opts;
   if (!ACTIVITY_TYPES.includes(type as never)) {
     throw new AppError(400, '运动类型不合法');
   }
@@ -177,7 +182,7 @@ export async function leaderboard(
   const startMs = periodStartMs(period);
   if (startMs !== null) match.startTime = { $gte: startMs };
 
-  // 全量分组后内存排序：同时拿到 TOP10 和当前用户名次（量级小，无需 $rank）
+  // 全量分组后内存排序：同时拿到 TOP N 和当前用户名次（量级小，无需 $rank）
   const rows = await ActivityModel.aggregate<{
     _id: unknown;
     distance: number;
@@ -188,8 +193,8 @@ export async function leaderboard(
     { $sort: { distance: -1 } },
   ]);
 
-  const myIdx = rows.findIndex((r) => String(r._id) === String(userId));
-  const topRows = rows.slice(0, 10);
+  const myIdx = userId ? rows.findIndex((r) => String(r._id) === String(userId)) : -1;
+  const topRows = rows.slice(0, limit);
   const meRow = myIdx >= 0 ? rows[myIdx] : null;
 
   // 本榜最佳：$facet 一次查出各指标最优活动（>0 过滤掉无意义零值，如 0 爬升/0 配速）
@@ -244,6 +249,7 @@ export async function leaderboard(
       avatarPreset: (info && info.avatarPreset) || '',
       distanceKm: Math.round((r.distance / 1000) * 100) / 100,
       count: r.count,
+      ...(includeUserId ? { userId: String(r._id) } : {}),
     };
   };
 

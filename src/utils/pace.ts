@@ -27,6 +27,7 @@ export interface TrackPointLike {
   lat: number;
   lng: number;
   altitude?: number | null;
+  pauseGap?: boolean;
   timestamp?: number;
 }
 
@@ -36,29 +37,39 @@ export interface CalcStatsOptions {
   durationSec: number;
   /** 体重（kg），卡路里估算用，默认 60 */
   weightKg?: number;
-  /** 爬升死区阈值（米），海拔误差 ±10~30m，小于该值视为噪声不累计 */
-  climbDeadZoneM?: number;
 }
 
 /** 配速最小有效距离（米）：低于此值配速无意义（如刚起步/静止） */
 const MIN_PACE_DISTANCE_M = 200;
+
+// 爬升算法（与小程序 services/tracker.js 同款，决策 D16 v2）：
+// 旧"单步>死区即累计"缓坡漏计严重（每步差值远小于阈值）而慢噪声单步大跳反被累计；
+// 改为 EMA 平滑 + 滞回确认——噪声上下抵消，缓坡可持续累计达标
+/** 爬升用海拔 EMA 平滑系数（0~1，越小越平滑） */
+const CLIMB_EMA_ALPHA = 0.3;
+/** 爬升确认阈值（米）：待确认累计上升达到该值才计入 */
+const CLIMB_CONFIRM_M = 3;
+/** 爬升确认最少连续上升步数：单点大跳无法凭一步确认 */
+const CLIMB_MIN_UP_STEPS = 2;
 
 export interface CalcStatsResult {
   distance: number; // 米
   avgPace: number | null; // 秒/公里（非跑步类返回 null）
   calories: number; // kcal
   elevationGain: number; // 米
-  maxAltitude: number | null; // 米
+  minAltitude: number | null; // 米（轨迹原始海拔最低）
+  maxAltitude: number | null; // 米（轨迹原始海拔最高）
 }
 
 /**
  * 基于轨迹点序列计算运动指标
  * - 距离：相邻点 Haversine 累加
- * - 爬升：3 点滑动平均滤波 + 死区阈值，只累计上升段
+ * - 爬升：海拔 EMA 平滑 + 滞回确认（下坡抵扣未确认部分），只累计确认的上升段
+ * - 最低/最高海拔：原始海拔点的极值（GPS 参考）
  * - 卡路里：MET × 体重 × 时长（小时）
  */
 export function calcStats(points: TrackPointLike[], opts: CalcStatsOptions): CalcStatsResult {
-  const { type, durationSec, weightKg = 60, climbDeadZoneM = 2 } = opts;
+  const { type, durationSec, weightKg = 60 } = opts;
 
   // 距离
   let distance = 0;
@@ -66,31 +77,41 @@ export function calcStats(points: TrackPointLike[], opts: CalcStatsOptions): Cal
     distance += haversineDistance(points[i - 1], points[i]);
   }
 
-  // 海拔序列：3 点滑动平均滤波
+  // 海拔极值（原始点，GPS 参考）
   const altitudes = points.map((p) => p.altitude).filter((a): a is number => a !== null && a !== undefined);
+
+  // 爬升：EMA 平滑 + 滞回确认；暂停恢复点（pauseGap）海拔可能漂移，重置状态不参与差值
   let elevationGain = 0;
-  let maxAltitude: number | null = null;
-  if (altitudes.length >= 2) {
-    const smoothed = altitudes.map((_, i) => {
-      const lo = Math.max(0, i - 1);
-      const hi = Math.min(altitudes.length - 1, i + 1);
-      let sum = 0;
-      let n = 0;
-      for (let j = lo; j <= hi; j++) {
-        if (altitudes[j] !== undefined) {
-          sum += altitudes[j];
-          n++;
-        }
-      }
-      return n > 0 ? sum / n : 0;
-    });
-    for (let i = 1; i < smoothed.length; i++) {
-      const diff = smoothed[i] - smoothed[i - 1];
-      if (diff > climbDeadZoneM) {
-        elevationGain += diff;
-      }
+  let climbEma: number | null = null;
+  let pendingClimb = 0;
+  let upSteps = 0;
+  for (const p of points) {
+    if (p.altitude === null || p.altitude === undefined) continue;
+    if (p.pauseGap) {
+      climbEma = p.altitude;
+      pendingClimb = 0;
+      upSteps = 0;
+      continue;
     }
-    maxAltitude = Math.max(...smoothed);
+    if (climbEma === null) {
+      climbEma = p.altitude;
+      continue;
+    }
+    const prev: number = climbEma;
+    climbEma = prev + CLIMB_EMA_ALPHA * (p.altitude - prev);
+    const diff = climbEma - prev;
+    if (diff > 0) {
+      pendingClimb += diff;
+      upSteps++;
+      if (pendingClimb >= CLIMB_CONFIRM_M && upSteps >= CLIMB_MIN_UP_STEPS) {
+        elevationGain += pendingClimb;
+        pendingClimb = 0;
+        upSteps = 0;
+      }
+    } else if (diff < 0) {
+      pendingClimb = Math.max(0, pendingClimb + diff);
+      if (pendingClimb === 0) upSteps = 0;
+    }
   }
 
   // 配速（秒/公里）；游泳/骑行不展示；距离过短配速无意义
@@ -110,7 +131,8 @@ export function calcStats(points: TrackPointLike[], opts: CalcStatsOptions): Cal
     avgPace: avgPace === null ? null : Math.round(avgPace),
     calories,
     elevationGain: Math.round(elevationGain),
-    maxAltitude: maxAltitude === null ? null : Math.round(maxAltitude),
+    minAltitude: altitudes.length > 0 ? Math.round(Math.min(...altitudes)) : null,
+    maxAltitude: altitudes.length > 0 ? Math.round(Math.max(...altitudes)) : null,
   };
 }
 

@@ -55,6 +55,7 @@ export interface ActivityDto {
   fastestKm: number | null;
   calories: number;
   elevationGain: number;
+  minAltitude: number | null;
   maxAltitude: number | null;
   startAddress: string;
   endAddress: string;
@@ -83,6 +84,7 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     fastestKm: doc.fastestKm ?? null,
     calories: doc.calories ?? 0,
     elevationGain: doc.elevationGain ?? 0,
+    minAltitude: doc.minAltitude ?? null,
     maxAltitude: doc.maxAltitude ?? null,
     startAddress: doc.startAddress ?? '',
     endAddress: doc.endAddress ?? '',
@@ -284,6 +286,7 @@ export async function finishActivity(
         fastestKm,
         calories: stats.calories,
         elevationGain: stats.elevationGain,
+        minAltitude: stats.minAltitude,
         maxAltitude: stats.maxAltitude,
         lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
       },
@@ -375,6 +378,7 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
           fastestKm,
           calories: stats.calories,
           elevationGain: stats.elevationGain,
+          minAltitude: stats.minAltitude,
           maxAltitude: stats.maxAltitude,
           lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
         },
@@ -449,6 +453,7 @@ export async function listActivities(
           avgPace: 1,
           calories: 1,
           elevationGain: 1,
+          minAltitude: 1,
           maxAltitude: 1,
           startAddress: 1,
           endAddress: 1,
@@ -571,6 +576,7 @@ export async function reprocessActivity(
         fastestKm,
         calories: stats.calories,
         elevationGain: stats.elevationGain,
+        minAltitude: stats.minAltitude,
         maxAltitude: stats.maxAltitude,
         lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
       },

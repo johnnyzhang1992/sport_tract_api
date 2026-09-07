@@ -53,6 +53,7 @@ const activitySchema = new Schema(
     fastestKm: { type: Number, default: null }, // 轨迹内最快 1km 分段（秒/公里）
     calories: { type: Number, default: 0 },
     elevationGain: { type: Number, default: 0 },
+    minAltitude: { type: Number, default: null }, // 轨迹最低海拔（米，GPS 参考）
     maxAltitude: { type: Number, default: null },
     startAddress: { type: String, default: '' },
     endAddress: { type: String, default: '' },

@@ -13,6 +13,8 @@ import { overview as userStatsOverview, bestRecords } from '../services/stats.js
 import { footprint } from '../services/footprint.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
+import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
+import { calcStats, type TrackPointLike } from '../utils/pace.js';
 import { getSignedUrl } from '../services/oss.js';
 
 /**
@@ -639,6 +641,83 @@ export async function adminRoutes(fastify: FastifyInstance) {
       // 抽稀到 ≤600 点：弹窗海拔/速度图用，避免 2 万点全量下发
       trackPoints: samplePoints(dto.trackPoints, 600),
     });
+  });
+
+  // 运动榜（管理端）：与用户端 /stats/leaderboard 同口径；TOP N（默认 20）
+  // 管理端不下发"我的排名"，行数据带 userId 供跳转用户详情
+  fastify.get('/leaderboard', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { type?: string; province?: string; period?: string; limit?: string };
+    const limit = Math.min(50, Math.max(1, Number(q.limit) || 20));
+    const result = await leaderboard(
+      null,
+      q.type || 'walking',
+      q.province || '全国',
+      (q.period || 'all') as 'week' | 'month' | 'year' | 'all',
+      { limit, includeUserId: true },
+    );
+    return success(result);
+  });
+
+  // 运动榜省份选项（管理端）：复用全平台点亮聚合（provinces 用于省份筛选下拉）
+  fastify.get('/leaderboard-regions', { onRequest: [adminAuth] }, async () => {
+    return success(await leaderboardRegions());
+  });
+
+  // 旧数据爬升重算（部署后手动批量触发）：
+  // 用新版爬升算法（海拔 EMA 平滑 + 滞回确认）重算 elevationGain，并回填最低/最高海拔。
+  // 分批处理：带 maxId=上次返回的 lastId 循环调用，直到 remaining=0；dryRun=true 只预览不写库
+  fastify.post('/activities/recompute-elevation', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as { limit?: number | string; maxId?: string; dryRun?: boolean | string };
+    const lim = Math.min(1000, Math.max(1, Number(body.limit) || 200));
+    const dryRun = body.dryRun === true || body.dryRun === 'true';
+    const filter: Record<string, unknown> = { status: 'finished', 'trackPoints.0': { $exists: true } };
+    if (body.maxId && Types.ObjectId.isValid(String(body.maxId))) {
+      filter._id = { $gt: new Types.ObjectId(String(body.maxId)) };
+    }
+    const acts = await ActivityModel.find(filter)
+      .sort({ _id: 1 })
+      .limit(lim)
+      .select('type duration elevationGain minAltitude maxAltitude trackPoints')
+      .lean();
+
+    let updated = 0;
+    const changes: Array<Record<string, unknown>> = [];
+    for (const a of acts) {
+      const stats = calcStats((a.trackPoints ?? []) as TrackPointLike[], {
+        type: a.type,
+        durationSec: a.duration ?? 0,
+      });
+      const before = {
+        elevationGain: a.elevationGain ?? 0,
+        minAltitude: a.minAltitude ?? null,
+        maxAltitude: a.maxAltitude ?? null,
+      };
+      const after = {
+        elevationGain: stats.elevationGain,
+        minAltitude: stats.minAltitude,
+        maxAltitude: stats.maxAltitude,
+      };
+      if (
+        before.elevationGain === after.elevationGain &&
+        before.minAltitude === after.minAltitude &&
+        before.maxAltitude === after.maxAltitude
+      ) {
+        continue;
+      }
+      updated++;
+      if (changes.length < 20) {
+        changes.push({ id: String(a._id), type: a.type, before, after });
+      }
+      if (!dryRun) {
+        await ActivityModel.updateOne({ _id: a._id }, { $set: after });
+      }
+    }
+
+    const lastId = acts.length ? String(acts[acts.length - 1]._id) : String(body.maxId || '');
+    const remaining = lastId
+      ? await ActivityModel.countDocuments({ ...filter, _id: { $gt: new Types.ObjectId(lastId) } })
+      : 0;
+    return success({ dryRun, processed: acts.length, updated, lastId, remaining, changes });
   });
 }
 
