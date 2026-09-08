@@ -562,9 +562,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
         .skip((p - 1) * ps)
         .limit(ps)
         .lean(),
-      UserModel.find({}).select('_id nickname').lean(),
+      UserModel.find({}).select('_id nickname gender').lean(),
     ]);
     const nickMap = new Map(users.map((u) => [String(u._id), u.nickname || '微信用户']));
+    const genderMap = new Map(users.map((u) => [String(u._id), u.gender ?? 0]));
     return success({
       total,
       page: p,
@@ -573,6 +574,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         id: String(a._id),
         userId: String(a.userId),
         userNickname: nickMap.get(String(a.userId)) ?? '微信用户',
+        userGender: genderMap.get(String(a.userId)) ?? 0,
         type: a.type,
         status: a.status,
         distance: a.distance ?? 0,
