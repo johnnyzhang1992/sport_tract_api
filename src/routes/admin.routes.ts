@@ -428,6 +428,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         return {
           id: String(u._id),
           nickname: u.nickname,
+          gender: u.gender ?? 0, // 0 未知 1 男 2 女
           uid: u.uid != null ? String(u.uid) : '', // 用户唯一编号（openid 敏感不下发）
           weightKg: u.weightKg,
           heightCm: u.heightCm,
