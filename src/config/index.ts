@@ -47,6 +47,8 @@ export const config = {
 
   // 腾讯位置服务（WebService API：轨迹纠偏 trace / 逆地理编码等）
   tencentMapKey: process.env.TENCENT_MAP_KEY ?? '',
+  // key 为“域名授权”模式时，服务端调用需带授权域 Referer（否则返回 status 110）
+  tencentMapReferer: process.env.TENCENT_MAP_REFERER ?? 'https://www.historybook.cn/',
 
   // 阿里云 OSS（AK 签名直传，无需 STS/RAM 角色；roleArn 不再需要）
   oss: {
