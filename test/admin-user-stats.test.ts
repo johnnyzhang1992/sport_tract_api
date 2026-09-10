@@ -149,10 +149,12 @@ test('user-trend：month/year 分桶数量 + 非法 range 兜底 week', async ()
   assert.equal(bad.json().data.range, 'week');
 });
 
-test('user-geo-stats：省/市去重用户数', async () => {
+test('user-geo-stats：省/市去重用户数 + 定位失败归入“未知”', async () => {
   await LoginLogModel.deleteMany({ userId: { $in: [userA, userB] } });
   await seedLogins(userA, 1, 3, '广东省', '深圳市'); // 同省同市多次 → 省/市均去重为 1
   await seedLogins(userB, 1, 1, '广东省', '广州市');
+  // 历史脏数据：定位失败落库 "0"/"内网IP"
+  await seedLogins(userB, 1, 1, '0', '内网IP');
 
   const res = await adminReq('GET', '/sport-track/api/admin/user-geo-stats');
   assert.equal(res.statusCode, 200);
@@ -162,6 +164,14 @@ test('user-geo-stats：省/市去重用户数', async () => {
   const sz = d.cities.find((c: { name: string }) => c.name === '深圳市');
   assert.ok(sz && sz.users >= 1, '深圳市应至少 1 个用户');
   assert.equal(sz.province, '广东省');
+  // 定位失败不出现在真实省份里，统一为“未知”
+  assert.equal(
+    d.provinces.some((p: { name: string }) => p.name === '0' || p.name === ''),
+    false,
+    '不应出现 0/空串省份',
+  );
+  const unknown = d.provinces.find((p: { name: string }) => p.name === '未知');
+  assert.ok(unknown && unknown.users >= 1, '定位失败应归入“未知”');
   assert.ok(d.totalUsers >= 2);
   assert.ok(Array.isArray(d.cities) && d.cities.length >= 2);
 });

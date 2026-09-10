@@ -61,6 +61,26 @@ function normalizeProvince(p: string): string {
 }
 
 /**
+ * IP 定位无效/内网占位值：ip2region、whois 兜底可能返回 "0"、"内网IP" 等，
+ * 这些不是真实省市，写入登录日志会让管理端省份分布出现“0”这类脏数据。
+ */
+export const INVALID_REGION_VALUES = ['', '0', '内网IP', '未知', '局域网', '本机地址', '保留地址'];
+const invalidRegionSet = new Set(INVALID_REGION_VALUES);
+
+/** 是否为有效省/市值（过滤 "0"、"内网IP"、空串等占位值） */
+export function isValidRegionValue(v: string | null | undefined): boolean {
+  return !!v && !invalidRegionSet.has(v);
+}
+
+/** 清洗定位结果：无效值一律置空（调用方再按 province/city 是否为空决定是否落库） */
+function sanitizeRegion(loc: IpLocation): IpLocation {
+  return {
+    province: isValidRegionValue(loc.province) ? loc.province : '',
+    city: isValidRegionValue(loc.city) ? loc.city : '',
+  };
+}
+
+/**
  * 解析 ip2region 返回的 region 字符串
  * 格式示例："中国|0|湖北省|武汉市|电信"
  * 返回 { province: "湖北省", city: "武汉市" }
@@ -152,7 +172,7 @@ export async function locateByIp(ip: string): Promise<IpLocation | null> {
 
   const cached = cache.get(ip);
   if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    return { province: cached.province, city: cached.city };
+    return sanitizeRegion({ province: cached.province, city: cached.city });
   }
 
   // 1. 优先 ip2region 离线查询
@@ -160,7 +180,7 @@ export async function locateByIp(ip: string): Promise<IpLocation | null> {
     const searcher = await getSearcher();
     const result = await searcher.search(ip);
     if (result && result.region && result.region !== '0|0|0|0|0') {
-      const loc = parseRegion(result.region);
+      const loc = sanitizeRegion(parseRegion(result.region));
       if (loc.province || loc.city) {
         cache.set(ip, { ...loc, ts: Date.now() });
         return loc;
@@ -174,9 +194,12 @@ export async function locateByIp(ip: string): Promise<IpLocation | null> {
   for (const provider of [locateByPconline, locateByIpApi, locateByTencent]) {
     try {
       const loc = await provider(ip);
-      if (loc && (loc.province || loc.city)) {
-        cache.set(ip, { ...loc, ts: Date.now() });
-        return loc;
+      if (loc) {
+        const clean = sanitizeRegion(loc);
+        if (clean.province || clean.city) {
+          cache.set(ip, { ...clean, ts: Date.now() });
+          return clean;
+        }
       }
     } catch {
       // 该数据源失败（超时/限流/结构变化），继续下一个

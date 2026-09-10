@@ -9,6 +9,7 @@ import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 import { locateRegion } from '../services/region.js';
+import { INVALID_REGION_VALUES, isValidRegionValue } from '../services/ip-locate.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
@@ -319,27 +320,36 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
-  // 用户分布：按最后登录 IP 归属地聚合省/市去重用户数（有登录记录的用户点亮）
+  // 用户分布：按登录 IP 归属地聚合省/市去重用户数（无法定位的归入“未知”，不作为省份上地图）
   fastify.get('/user-geo-stats', { onRequest: [adminAuth] }, async () => {
+    const UNKNOWN = '未知';
+    // 历史脏数据：ip2region/whois 可能落库 "0"、"内网IP"、空串或缺失，统一归到“未知”
+    const provinceExpr = {
+      $cond: [{ $in: [{ $ifNull: ['$province', ''] }, INVALID_REGION_VALUES] }, UNKNOWN, '$province'],
+    };
+    const cityExpr = {
+      $cond: [{ $in: [{ $ifNull: ['$city', ''] }, INVALID_REGION_VALUES] }, UNKNOWN, '$city'],
+    };
     const [provRows, cityRows, totalUsers] = await Promise.all([
       LoginLogModel.aggregate<{ name: string; users: number }>([
-        { $match: { province: { $nin: ['', null] } } },
-        { $group: { _id: '$province', users: { $addToSet: '$userId' } } },
+        { $group: { _id: provinceExpr, users: { $addToSet: '$userId' } } },
         { $project: { _id: 0, name: '$_id', users: { $size: '$users' } } },
         { $sort: { users: -1 } },
       ]),
       LoginLogModel.aggregate<{ name: string; province: string; users: number }>([
-        { $match: { province: { $nin: ['', null] } } },
-        { $group: { _id: { province: '$province', city: { $ifNull: ['$city', ''] } }, users: { $addToSet: '$userId' } } },
+        {
+          $group: {
+            _id: { province: provinceExpr, city: cityExpr },
+            users: { $addToSet: '$userId' },
+          },
+        },
         { $project: { _id: 0, name: '$_id.city', province: '$_id.province', users: { $size: '$users' } } },
         { $sort: { users: -1 } },
       ]),
       UserModel.countDocuments({}),
     ]);
-    // 城市名兜底：历史日志可能只有省份无城市
-    const cities = cityRows.map((c) => ({ ...c, name: c.name || '未知' }));
     const totalLocated = provRows.reduce((s, p) => s + p.users, 0);
-    return success({ totalUsers, totalLocated, provinces: provRows, cities });
+    return success({ totalUsers, totalLocated, provinces: provRows, cities: cityRows });
   });
 
   // 轨迹数据概况：today/week/month/year/all 各范围指标 + 状态细分 + 类型细分（一次 $facet 聚合）
@@ -565,8 +575,9 @@ export async function adminRoutes(fastify: FastifyInstance) {
           lastLoginAt: u.lastLoginAt ?? u.createdAt,
           activityCount: countMap.get(String(u._id)) ?? 0,
           lastLoginIp: log?.ip ?? '',
-          lastLoginProvince: log?.province ?? '',
-          lastLoginCity: log?.city ?? '',
+          // 定位失败的历史脏值（"0"/"内网IP"/空）统一显示“未知”
+          lastLoginProvince: isValidRegionValue(log?.province) ? log!.province : '未知',
+          lastLoginCity: isValidRegionValue(log?.city) ? log!.city : '未知',
         };
       }),
     });
