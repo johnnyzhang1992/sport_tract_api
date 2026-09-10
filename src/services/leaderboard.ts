@@ -8,6 +8,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { ACTIVITY_TYPES } from '../config/constants.js';
+import type { ActivityType } from '../config/constants.js';
 import { getSignedUrl } from './oss.js';
 
 export interface RegionProvince {
@@ -274,5 +275,86 @@ export async function leaderboard(
     top: topRows.map((r, i) => toRow(r, i + 1)),
     me: meRow ? toRow(meRow, myIdx + 1) : null,
     best,
+  };
+}
+
+/** 当前用户在某类型榜的名次行 */
+export interface MeRankRow {
+  type: ActivityType;
+  rank: number;
+  distanceKm: number;
+  /** 轨迹条数 */
+  count: number;
+}
+
+export interface LeaderboardMeResult {
+  province: string;
+  period: string;
+  /** 上榜类型的名次（按 rank 升序，同名词次距离远者在前） */
+  ranks: MeRankRow[];
+  /** 名次最靠前的上榜类型；各类型均未上榜为 null */
+  best: MeRankRow | null;
+}
+
+/**
+ * 当前用户在 指定周期/省份 下各运动类型榜的名次（单次聚合替代逐类型查询）
+ * 口径与 leaderboard() 一致：周期内 finished 轨迹总距离降序；全量分组内存排序（量级小）
+ */
+export async function leaderboardMe(
+  userId: string,
+  province = '全国',
+  period: LeaderboardPeriod = 'week',
+): Promise<LeaderboardMeResult> {
+  if (!LEADERBOARD_PERIODS.includes(period)) {
+    throw new AppError(400, '榜单周期不合法');
+  }
+
+  const match: Record<string, unknown> = { status: 'finished' };
+  if (province && province !== '全国') match.provinces = province;
+  const startMs = periodStartMs(period);
+  if (startMs !== null) match.startTime = { $gte: startMs };
+
+  const rows = await ActivityModel.aggregate<{
+    _id: { type: string; userId: unknown };
+    distance: number;
+    count: number;
+  }>([
+    { $match: match },
+    {
+      $group: {
+        _id: { type: '$type', userId: '$userId' },
+        distance: { $sum: '$distance' },
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+
+  // 按类型分桶、总距离降序，取当前用户位次
+  const byType = new Map<string, Array<{ userId: unknown; distance: number; count: number }>>();
+  for (const r of rows) {
+    const bucket = byType.get(r._id.type) || [];
+    bucket.push({ userId: r._id.userId, distance: r.distance, count: r.count });
+    byType.set(r._id.type, bucket);
+  }
+  const ranks: MeRankRow[] = [];
+  for (const [type, bucket] of byType) {
+    bucket.sort((a, b) => b.distance - a.distance);
+    const idx = bucket.findIndex((r) => String(r.userId) === String(userId));
+    if (idx >= 0) {
+      ranks.push({
+        type: type as ActivityType,
+        rank: idx + 1,
+        distanceKm: Math.round((bucket[idx].distance / 1000) * 100) / 100,
+        count: bucket[idx].count,
+      });
+    }
+  }
+  ranks.sort((a, b) => a.rank - b.rank || b.distanceKm - a.distanceKm);
+
+  return {
+    province: province || '全国',
+    period,
+    ranks,
+    best: ranks.length > 0 ? ranks[0] : null,
   };
 }

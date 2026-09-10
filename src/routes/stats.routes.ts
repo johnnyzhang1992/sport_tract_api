@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { overview, trend, bestRecords, yearMilestones } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
-import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
+import { leaderboard, leaderboardMe, leaderboardRegions } from '../services/leaderboard.js';
 import { success } from '../utils/response.js';
 
 /** 统计路由：/api/stats（决策 F18/F19） */
@@ -62,6 +62,17 @@ export async function statsRoutes(fastify: FastifyInstance) {
       query.type || 'running',
       query.province || '全国',
       (query.period || 'all') as 'week' | 'month' | 'year' | 'all',
+    );
+    return success(result);
+  });
+
+  // 运动榜：当前用户各类型榜名次一览（单次聚合；首页摘要按 周榜→月榜→年榜→总榜 回退取最优展示）
+  fastify.get('/leaderboard/me', { onRequest: [fastify.authenticate] }, async (request) => {
+    const query = request.query as { province?: string; period?: string };
+    const result = await leaderboardMe(
+      request.user.userId,
+      query.province || '全国',
+      (query.period || 'week') as 'week' | 'month' | 'year' | 'all',
     );
     return success(result);
   });
