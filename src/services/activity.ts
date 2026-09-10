@@ -7,6 +7,7 @@ import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { cleanTrajectory } from '../utils/trajectory-clean.js';
 import { markFootprintDirty } from './footprint.js';
 import { provincesOfPoints } from './region.js';
+import { monthlyAggForMonths, type ActivityMonthlyRow } from './stats.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
 import type {
   AppendPointsInput,
@@ -416,7 +417,14 @@ function mergePreviewPoints(
 export async function listActivities(
   userId: string,
   query: ListActivitiesQueryInput,
-): Promise<{ items: Array<Record<string, any>>; total: number; page: number; pageSize: number }> {
+): Promise<{
+  items: Array<Record<string, any>>;
+  total: number;
+  page: number;
+  pageSize: number;
+  /** 选中类型时附带：页内出现月份的全量聚合（轨迹列表月度统计） */
+  monthlyStats: ActivityMonthlyRow[];
+}> {
   const { type, month, province, page, pageSize } = query;
 
   // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动收尾
@@ -517,7 +525,19 @@ export async function listActivities(
     delete item.gapPoints;
   }
 
-  return { items, total, page, pageSize };
+  // 附带月度全量聚合：选中类型时，页内出现哪些月份就返回哪些月的整月汇总（省去前端额外拉全量）
+  // 月份切分用固定 +08:00（Asia/Shanghai 无夏令时），与月度聚合管道同口径
+  let monthlyStats: ActivityMonthlyRow[] = [];
+  if (type && items.length > 0) {
+    const wanted = new Set<string>();
+    for (const item of items as Array<Record<string, any>>) {
+      const d = new Date(item.startTime + 8 * 3600 * 1000);
+      wanted.add(`${d.getUTCFullYear()}-${d.getUTCMonth() + 1}`);
+    }
+    monthlyStats = await monthlyAggForMonths(userId, type, province, wanted);
+  }
+
+  return { items, total, page, pageSize, monthlyStats };
 }
 
 /** 活动详情（含完整轨迹点与打点） */

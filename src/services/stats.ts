@@ -2,6 +2,8 @@ import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { locateRegion } from './region.js';
 import { calcFastestKm } from '../utils/pace.js';
+import { ACTIVITY_TYPES } from '../config/constants.js';
+import { AppError } from '../utils/app-error.js';
 
 type ObjectIdLike = Types.ObjectId | string;
 
@@ -436,4 +438,84 @@ export async function yearMilestones(
       .map(([name, t]) => ({ name, firstAt: t, countInYear: typeYearCount.get(name) ?? 0 }))
       .sort(byFirst),
   };
+}
+
+/** 按月聚合行：某运动类型单月的全量汇总 */
+export interface ActivityMonthlyRow {
+  year: number;
+  month: number;
+  /** 轨迹条数 */
+  count: number;
+  /** 总距离（米） */
+  distance: number;
+  /** 总时长（秒） */
+  duration: number;
+  /** 总千卡 */
+  calories: number;
+}
+
+export interface ActivityMonthlyResult {
+  type: string;
+  /** 按月倒序 */
+  months: ActivityMonthlyRow[];
+}
+
+/**
+ * 当前用户某运动类型的按月全量聚合（轨迹列表月度统计用）
+ * 口径：finished 轨迹；月份按 Asia/Shanghai 切分（前端分组同口径，产品面向国内）
+ */
+export async function activityMonthly(userId: ObjectIdLike, type: string): Promise<ActivityMonthlyResult> {
+  if (!ACTIVITY_TYPES.includes(type as never)) {
+    throw new AppError(400, '运动类型不合法');
+  }
+  const months = await ActivityModel.aggregate<ActivityMonthlyRow>(monthlyPipeline(userId, { type }));
+  return { type, months };
+}
+
+/** 月度聚合共用管道：baseMatch 需含业务筛选（userId/status 在此统一补齐） */
+function monthlyPipeline(userId: ObjectIdLike, baseMatch: Record<string, unknown>) {
+  return [
+    { $match: { ...baseMatch, userId: toObjectId(userId), status: 'finished' } },
+    {
+      $group: {
+        _id: {
+          year: { $year: { date: { $toDate: '$startTime' }, timezone: 'Asia/Shanghai' } },
+          month: { $month: { date: { $toDate: '$startTime' }, timezone: 'Asia/Shanghai' } },
+        },
+        count: { $sum: 1 },
+        distance: { $sum: '$distance' },
+        duration: { $sum: '$duration' },
+        calories: { $sum: '$calories' },
+      },
+    },
+    { $sort: { '_id.year': -1, '_id.month': -1 } as Record<string, 1 | -1> },
+    {
+      $project: {
+        _id: 0,
+        year: '$_id.year',
+        month: '$_id.month',
+        count: 1,
+        distance: 1,
+        duration: 1,
+        calories: 1,
+      },
+    },
+  ];
+}
+
+/**
+ * 列表接口附带：页内出现月份的全量聚合（轨迹列表月度统计，避免前端额外拉全量月份）
+ * - type 必传（统计块仅在选中类型时展示）；province 可选（与列表浏览范围同口径）
+ * - wanted 为 'year-month' 集合，仅返回命中的月份
+ */
+export async function monthlyAggForMonths(
+  userId: ObjectIdLike,
+  type: string,
+  province: string | undefined,
+  wanted: Set<string>,
+): Promise<ActivityMonthlyRow[]> {
+  const baseMatch: Record<string, unknown> = { type };
+  if (province) baseMatch.provinces = province;
+  const rows = await ActivityModel.aggregate<ActivityMonthlyRow>(monthlyPipeline(userId, baseMatch));
+  return rows.filter((r) => wanted.has(`${r.year}-${r.month}`));
 }
