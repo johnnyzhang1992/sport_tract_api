@@ -29,7 +29,8 @@ export interface OverviewTrack {
   avgPace: number | null;
   elevationGain: number;
   calories: number;
-  points: OverviewPoint[];
+  /** 抽稀后的轨迹点；lean 模式不下发 */
+  points?: OverviewPoint[];
 }
 
 export interface OverviewResult {
@@ -45,12 +46,15 @@ export interface OverviewResult {
 
 /** 查询 + 抽稀 + 热力（轨迹多则每轨迹点少，总量受预算约束）
  * 传入 precise（epoch ms 区间）时按精确时间查询（报告页历史周/月/年），否则按 range 滑动窗口
+ * opts.lean：精简模式（报告页/年度报告用）——不查 trackPoints、不算抽稀与热力，tracks 只回元数据
  */
 export async function getOverview(
   userId: string,
   range: OverviewRange,
   precise?: { from: number; to: number },
+  opts: { lean?: boolean } = {},
 ): Promise<OverviewResult> {
+  const { lean = false } = opts;
   const days = RANGE_DAYS[range];
   const query: Record<string, unknown> = {
     userId,
@@ -63,21 +67,46 @@ export async function getOverview(
   }
 
   // 只取必要字段，避免大文档传输（trackPoints 仅 lat/lng/pauseGap，抽稀不需要海拔/时间）
+  // lean 模式连 trackPoints 都不查：报告类页面只用元数据，省掉大文档读取
+  const select: Record<string, number> = {
+    _id: 1,
+    type: 1,
+    startTime: 1,
+    distance: 1,
+    duration: 1,
+    elevationGain: 1,
+    calories: 1,
+  };
+  if (!lean) {
+    select['trackPoints.lat'] = 1;
+    select['trackPoints.lng'] = 1;
+    select['trackPoints.pauseGap'] = 1;
+  }
   const activities = await ActivityModel.find(query)
-    .select({
-      _id: 1,
-      type: 1,
-      startTime: 1,
-      distance: 1,
-      duration: 1,
-      elevationGain: 1,
-      calories: 1,
-      'trackPoints.lat': 1,
-      'trackPoints.lng': 1,
-      'trackPoints.pauseGap': 1,
-    })
+    .select(select)
     .sort({ startTime: -1 })
     .lean();
+
+  const totals = {
+    count: activities.length,
+    totalDistanceKm: Math.round(activities.reduce((s, a) => s + (a.distance || 0), 0) / 10) / 100,
+    totalDurationSec: activities.reduce((s, a) => s + (a.duration || 0), 0),
+    totalElevationGain: Math.round(activities.reduce((s, a) => s + (a.elevationGain || 0), 0)),
+    totalCalories: Math.round(activities.reduce((s, a) => s + (a.calories || 0), 0)),
+  };
+  const metaTracks = activities.map((a) => ({
+    id: String(a._id),
+    type: a.type,
+    startTime: new Date(a.startTime).toISOString(), // startTime 存的是 Number 时间戳
+    distance: a.distance || 0,
+    duration: a.duration || 0,
+    avgPace: a.avgPace ?? null,
+    elevationGain: a.elevationGain || 0,
+    calories: a.calories || 0,
+  }));
+  if (lean) {
+    return { range, ...totals, tracks: metaTracks, heat: [] };
+  }
 
   // 按轨迹抽稀：轨迹越多，每轨迹点越少（全局预算 3000）
   const rawTracks: OverviewPoint[][] = activities.map(
@@ -122,22 +151,8 @@ export async function getOverview(
 
   return {
     range,
-    count: activities.length,
-    totalDistanceKm: Math.round(activities.reduce((s, a) => s + (a.distance || 0), 0) / 10) / 100,
-    totalDurationSec: activities.reduce((s, a) => s + (a.duration || 0), 0),
-    totalElevationGain: Math.round(activities.reduce((s, a) => s + (a.elevationGain || 0), 0)),
-    totalCalories: Math.round(activities.reduce((s, a) => s + (a.calories || 0), 0)),
-    tracks: activities.map((a, i) => ({
-      id: String(a._id),
-      type: a.type,
-      startTime: new Date(a.startTime).toISOString(), // startTime 存的是 Number 时间戳
-      distance: a.distance || 0,
-      duration: a.duration || 0,
-      avgPace: a.avgPace ?? null,
-      elevationGain: a.elevationGain || 0,
-      calories: a.calories || 0,
-      points: tracks[i] || [],
-    })),
+    ...totals,
+    tracks: activities.map((a, i) => ({ ...metaTracks[i], points: tracks[i] || [] })),
     heat,
   };
 }
