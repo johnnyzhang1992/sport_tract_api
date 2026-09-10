@@ -23,6 +23,46 @@ import { getSignedUrl } from '../services/oss.js';
  * - 其余接口需 admin token（独立 JWT secret，普通用户 token 无效）
  */
 
+const DAY_MS = 86400000;
+
+/** 东八区今日 0 点（epoch ms），与服务器时区无关 */
+function bjToday0(): number {
+  const bj = new Date(Date.now() + 8 * 3600000);
+  return Date.UTC(bj.getUTCFullYear(), bj.getUTCMonth(), bj.getUTCDate()) - 8 * 3600000;
+}
+
+/** 东八区日期串（YYYY-MM-DD） */
+function bjDateStr(ms: number): string {
+  return new Date(ms + 8 * 3600000).toISOString().slice(0, 10);
+}
+
+/**
+ * 生成趋势图时间桶：range=week（近 7 天按天）/ month（近 30 天按天）/ year（近 12 个月按月）
+ * 返回时间桶标签 + 查询起始时间 + MongoDB 分组格式（均按东八区）
+ */
+function buildUserTrendBuckets(range: string): {
+  labels: string[];
+  start: number;
+  bucketFmt: string;
+} {
+  if (range === 'year') {
+    const bj = new Date(Date.now() + 8 * 3600000);
+    const y = bj.getUTCFullYear();
+    const m = bj.getUTCMonth();
+    const labels: string[] = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(Date.UTC(y, m - i, 1));
+      labels.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`);
+    }
+    return { labels, start: Date.UTC(y, m - 11, 1) - 8 * 3600000, bucketFmt: '%Y-%m' };
+  }
+  const days = range === 'month' ? 30 : 7;
+  const today0 = bjToday0();
+  const labels: string[] = [];
+  for (let i = days - 1; i >= 0; i--) labels.push(bjDateStr(today0 - i * DAY_MS));
+  return { labels, start: today0 - (days - 1) * DAY_MS, bucketFmt: '%Y-%m-%d' };
+}
+
 /** admin token 校验 */
 async function adminAuth(request: FastifyRequest, reply: FastifyReply) {
   const auth = request.headers.authorization ?? '';
@@ -211,6 +251,95 @@ export async function adminRoutes(fastify: FastifyInstance) {
       newActivities: aMap.get(key) ?? 0,
     }));
     return success({ type, data });
+  });
+
+  // 用户概况：用户总量 + 今日/近 7 天/近 30 天 注册数 + 登录 UV（去重）/ PV（登录次数），按东八区口径
+  fastify.get('/user-stats', { onRequest: [adminAuth] }, async () => {
+    const today0 = bjToday0();
+    const weekStart = today0 - 6 * DAY_MS; // 近 7 天（含今日）
+    const monthStart = today0 - 29 * DAY_MS; // 近 30 天（含今日）
+    const sinceToday = new Date(today0);
+    const sinceWeek = new Date(weekStart);
+    const sinceMonth = new Date(monthStart);
+    // UV 用 $group 去重，避免 distinct 全量拉取
+    const uvCount = (since: Date) =>
+      LoginLogModel.aggregate<{ n: number }>([
+        { $match: { createdAt: { $gte: since } } },
+        { $group: { _id: '$userId' } },
+        { $count: 'n' },
+      ]).then((r) => r[0]?.n ?? 0);
+    const [totalUsers, todayNewUsers, weekNewUsers, monthNewUsers, todayPv, todayUv, weekPv, weekUv, monthPv, monthUv] =
+      await Promise.all([
+        UserModel.countDocuments({}),
+        UserModel.countDocuments({ createdAt: { $gte: sinceToday } }),
+        UserModel.countDocuments({ createdAt: { $gte: sinceWeek } }),
+        UserModel.countDocuments({ createdAt: { $gte: sinceMonth } }),
+        LoginLogModel.countDocuments({ createdAt: { $gte: sinceToday } }),
+        uvCount(sinceToday),
+        LoginLogModel.countDocuments({ createdAt: { $gte: sinceWeek } }),
+        uvCount(sinceWeek),
+        LoginLogModel.countDocuments({ createdAt: { $gte: sinceMonth } }),
+        uvCount(sinceMonth),
+      ]);
+    return success({
+      totalUsers,
+      today: { newUsers: todayNewUsers, uv: todayUv, pv: todayPv },
+      week: { newUsers: weekNewUsers, uv: weekUv, pv: weekPv },
+      month: { newUsers: monthNewUsers, uv: monthUv, pv: monthPv },
+    });
+  });
+
+  // 用户趋势：注册用户量 + 登录 UV/PV（range=week|month|year，按东八区分桶补零）
+  fastify.get('/user-trend', { onRequest: [adminAuth] }, async (request) => {
+    const raw = String((request.query as { range?: string }).range || 'week');
+    const range = ['week', 'month', 'year'].includes(raw) ? raw : 'week';
+    const { labels, start, bucketFmt } = buildUserTrendBuckets(range);
+    const bucketExpr = { $dateToString: { format: bucketFmt, date: '$createdAt', timezone: '+08:00' } };
+    const [userRows, loginRows] = await Promise.all([
+      UserModel.aggregate<{ _id: string; count: number }>([
+        { $match: { createdAt: { $gte: new Date(start) } } },
+        { $group: { _id: bucketExpr, count: { $sum: 1 } } },
+      ]),
+      LoginLogModel.aggregate<{ _id: string; pv: number; uv: number }>([
+        { $match: { createdAt: { $gte: new Date(start) } } },
+        { $group: { _id: bucketExpr, pv: { $sum: 1 }, users: { $addToSet: '$userId' } } },
+        { $project: { pv: 1, uv: { $size: '$users' } } },
+      ]),
+    ]);
+    const userMap = new Map(userRows.map((r) => [r._id, r.count]));
+    const loginMap = new Map(loginRows.map((r) => [r._id, r]));
+    return success({
+      range,
+      data: labels.map((date) => ({
+        date,
+        newUsers: userMap.get(date) ?? 0,
+        uv: loginMap.get(date)?.uv ?? 0,
+        pv: loginMap.get(date)?.pv ?? 0,
+      })),
+    });
+  });
+
+  // 用户分布：按最后登录 IP 归属地聚合省/市去重用户数（有登录记录的用户点亮）
+  fastify.get('/user-geo-stats', { onRequest: [adminAuth] }, async () => {
+    const [provRows, cityRows, totalUsers] = await Promise.all([
+      LoginLogModel.aggregate<{ name: string; users: number }>([
+        { $match: { province: { $nin: ['', null] } } },
+        { $group: { _id: '$province', users: { $addToSet: '$userId' } } },
+        { $project: { _id: 0, name: '$_id', users: { $size: '$users' } } },
+        { $sort: { users: -1 } },
+      ]),
+      LoginLogModel.aggregate<{ name: string; province: string; users: number }>([
+        { $match: { province: { $nin: ['', null] } } },
+        { $group: { _id: { province: '$province', city: { $ifNull: ['$city', ''] } }, users: { $addToSet: '$userId' } } },
+        { $project: { _id: 0, name: '$_id.city', province: '$_id.province', users: { $size: '$users' } } },
+        { $sort: { users: -1 } },
+      ]),
+      UserModel.countDocuments({}),
+    ]);
+    // 城市名兜底：历史日志可能只有省份无城市
+    const cities = cityRows.map((c) => ({ ...c, name: c.name || '未知' }));
+    const totalLocated = provRows.reduce((s, p) => s + p.users, 0);
+    return success({ totalUsers, totalLocated, provinces: provRows, cities });
   });
 
   // 轨迹数据概况：today/week/month/year/all 各范围指标 + 状态细分 + 类型细分（一次 $facet 聚合）
