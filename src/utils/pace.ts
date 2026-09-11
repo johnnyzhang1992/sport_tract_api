@@ -144,13 +144,18 @@ export function formatPace(secPerKm: number): string {
 }
 
 /** 轨迹内最快 1 公里分段（秒/公里）
- * - 1km 分段：从起点起每累计 1000m 记一段，尾段不足 1km 剔除
- * - 纯运动时间：段内相邻点时间戳差累加；相邻点间隔 > 60s 视为暂停/空档，不计入
- * - 返回 null：轨迹不足 1km 或点缺少 timestamp
+ * - 1km 分段：从起点起每累计 1000m 记一段（不足 1km 的尾段剔除），段内按实际距离归一化到 1km
+ * - 纯运动时间：段内相邻点时间戳差累加
+ * - 暂停/断档不跨段：
+ *   a) 带 pauseGap 标记的恢复点：跨暂停的距离与时间都不计入，新段从该点重新开始
+ *   b) 相邻点间隔 > 60s（丢点/暂停未标记）：同样断段（旧实现只把时间置 0、距离仍累加，会刷出假 PR）
+ * - 返回 null：轨迹不足 1km 或点缺少 timestamp；即「最快配速」必须是真实跑满 1km 的分段
  */
 /** 无配速概念的运动类型（与 calcStats 一致） */
 const NO_PACE_TYPES = ['swimming', 'cycling'];
 const GAP_MS = 60000;
+/** 最快配速分段长度（米）：必须跑满此距离才计一段 */
+const PACE_SEGMENT_M = 1000;
 export function calcFastestKm(points: TrackPointLike[], type?: string): number | null {
   if (type && NO_PACE_TYPES.includes(type)) return null; // 游泳/骑行不统计配速
   const sorted = [...points]
@@ -163,17 +168,20 @@ export function calcFastestKm(points: TrackPointLike[], type?: string): number |
   let prev = sorted[0];
   for (let i = 1; i < sorted.length; i++) {
     const cur = sorted[i];
-    const d = haversineDistance(prev, cur);
-    let dt = ((cur.timestamp ?? 0) - (prev.timestamp ?? 0)) / 1000; // 秒
-    if (!Number.isFinite(dt) || dt < 0) dt = 0;
-    if (dt > GAP_MS / 1000) dt = 0; // 暂停/空档不计
-    segDist += d;
+    const dt = ((cur.timestamp ?? 0) - (prev.timestamp ?? 0)) / 1000; // 秒
+    // 暂停恢复点 / 丢点断档：跨档距离不计，段从当前点重新开始
+    if (cur.pauseGap || !Number.isFinite(dt) || dt < 0 || dt > GAP_MS / 1000) {
+      prev = cur;
+      segDist = 0;
+      segSec = 0;
+      continue;
+    }
+    segDist += haversineDistance(prev, cur);
     segSec += dt;
-    if (segDist >= 1000) {
-      // 段完成：按比例归一化到 1km
+    if (segDist >= PACE_SEGMENT_M) {
+      // 段完成（≥ 1km）：按实际距离归一化到 1km；尾段不足 1km 自然剔除
       const pace = segSec / (segDist / 1000);
       if (fastest === null || pace < fastest) fastest = pace;
-      // 下一段从当前点重新开始（尾段不足 1km 自然剔除）
       segDist = 0;
       segSec = 0;
     }

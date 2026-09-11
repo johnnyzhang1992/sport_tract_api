@@ -28,6 +28,8 @@ export interface OverviewTrack {
   distance: number;
   duration: number;
   avgPace: number | null;
+  /** 轨迹内最快 1km 分段（秒/公里），不足 1km 为 null（年度报告「最佳配速」用） */
+  fastestKm: number | null;
   elevationGain: number;
   calories: number;
   /** 抽稀后的轨迹点；lean 模式不下发 */
@@ -78,6 +80,8 @@ export async function getOverview(
     startTime: 1,
     distance: 1,
     duration: 1,
+    avgPace: 1,
+    fastestKm: 1,
     elevationGain: 1,
     calories: 1,
   };
@@ -108,6 +112,7 @@ export async function getOverview(
     distance: a.distance || 0,
     duration: a.duration || 0,
     avgPace: a.avgPace ?? null,
+    fastestKm: a.fastestKm ?? null,
     elevationGain: a.elevationGain || 0,
     calories: a.calories || 0,
   }));

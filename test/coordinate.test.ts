@@ -61,19 +61,17 @@ test('calcFastestKm：1km 分段取最快，尾段不足 1km 剔除', async () =
   assert.ok(Math.abs(r - 100) < 2, `最快段应约 100s/km，实际 ${r}`);
 });
 
-test('calcFastestKm：暂停空档（>60s）不计入运动时间', async () => {
+test('calcFastestKm：跨暂停空档（>60s）的 1km 不成立（不忽略空档时间刷假配速）', async () => {
   const { calcFastestKm } = await import('../src/utils/pace.js');
   const mk = (lat: number, lng: number, t: number) => ({ lat, lng, timestamp: t });
   const d1 = 1000 / 111000;
   const pts: any[] = [];
-  let t = 1700000000000;
-  // 1km：4 个 250m 间隔，正常 3 个 10s，1 个 120s 空档 → 运动时间 30s，空档剔除
+  const t = 1700000000000;
+  // 全程 1km，但中段有 120s 空档：旧实现把空档时间置 0、距离照算，会得到 30s/km 的假最快配速
   pts.push(mk(31, 121, t));
   pts.push(mk(31 + 0.25 * d1, 121, t + 10000));
   pts.push(mk(31 + 0.5 * d1, 121, t + 20000));
-  pts.push(mk(31 + 0.75 * d1, 121, t + 140000)); // 间隔 120s > 60s：空档剔除
+  pts.push(mk(31 + 0.75 * d1, 121, t + 140000)); // 间隔 120s > 60s：断档，段从此点重开
   pts.push(mk(31 + d1, 121, t + 150000));
-  const r = calcFastestKm(pts);
-  assert.ok(r !== null, '有分段');
-  assert.ok(Math.abs(r - 30) < 2, `运动时间 30s，实际 ${r}`);
+  assert.equal(calcFastestKm(pts), null, '含断档的 1km 不应算作有效分段');
 });

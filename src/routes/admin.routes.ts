@@ -15,7 +15,7 @@ import { footprint } from '../services/footprint.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
-import { calcStats, type TrackPointLike } from '../utils/pace.js';
+import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
 import { getSignedUrl } from '../services/oss.js';
 
 /**
@@ -806,8 +806,9 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return success(await leaderboardRegions());
   });
 
-  // 旧数据爬升重算（部署后手动批量触发）：
-  // 用新版爬升算法（海拔 EMA 平滑 + 滞回确认）重算 elevationGain，并回填最低/最高海拔。
+  // 旧数据重算（部署后手动批量触发）：
+  // 1) 用新版爬升算法（海拔 EMA 平滑 + 滞回确认）重算 elevationGain，并回填最低/最高海拔
+  // 2) 用新版最快配速算法（暂停/断档不跨段，必须跑满 1km）重算 fastestKm
   // 分批处理：带 maxId=上次返回的 lastId 循环调用，直到 remaining=0；dryRun=true 只预览不写库
   fastify.post('/activities/recompute-elevation', { onRequest: [adminAuth] }, async (request) => {
     const body = (request.body ?? {}) as { limit?: number | string; maxId?: string; dryRun?: boolean | string };
@@ -820,13 +821,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const acts = await ActivityModel.find(filter)
       .sort({ _id: 1 })
       .limit(lim)
-      .select('type duration elevationGain minAltitude maxAltitude trackPoints')
+      .select('type duration elevationGain minAltitude maxAltitude fastestKm trackPoints')
       .lean();
 
     let updated = 0;
     const changes: Array<Record<string, unknown>> = [];
     for (const a of acts) {
-      const stats = calcStats((a.trackPoints ?? []) as TrackPointLike[], {
+      const points = (a.trackPoints ?? []) as TrackPointLike[];
+      const stats = calcStats(points, {
         type: a.type,
         durationSec: a.duration ?? 0,
       });
@@ -834,16 +836,19 @@ export async function adminRoutes(fastify: FastifyInstance) {
         elevationGain: a.elevationGain ?? 0,
         minAltitude: a.minAltitude ?? null,
         maxAltitude: a.maxAltitude ?? null,
+        fastestKm: a.fastestKm ?? null,
       };
       const after = {
         elevationGain: stats.elevationGain,
         minAltitude: stats.minAltitude,
         maxAltitude: stats.maxAltitude,
+        fastestKm: calcFastestKm(points, a.type),
       };
       if (
         before.elevationGain === after.elevationGain &&
         before.minAltitude === after.minAltitude &&
-        before.maxAltitude === after.maxAltitude
+        before.maxAltitude === after.maxAltitude &&
+        before.fastestKm === after.fastestKm
       ) {
         continue;
       }
