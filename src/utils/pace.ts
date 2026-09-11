@@ -144,17 +144,15 @@ export function formatPace(secPerKm: number): string {
 }
 
 /** 轨迹内最快 1 公里分段（秒/公里）
- * - 1km 分段：从起点起每累计 1000m 记一段（不足 1km 的尾段剔除），段内按实际距离归一化到 1km
- * - 纯运动时间：段内相邻点时间戳差累加
- * - 暂停/断档不跨段：
- *   a) 带 pauseGap 标记的恢复点：跨暂停的距离与时间都不计入，新段从该点重新开始
- *   b) 相邻点间隔 > 60s（丢点/暂停未标记）：同样断段（旧实现只把时间置 0、距离仍累加，会刷出假 PR）
- * - 返回 null：轨迹不足 1km 或点缺少 timestamp；即「最快配速」必须是真实跑满 1km 的分段
+ * - 只统计「无暂停」的连续区间：带 pauseGap 标记的恢复点、相邻点间隔 > 60s 的丢点断档，都把轨迹切成多段，窗口不跨段
+ * - 滑动窗口：在每个连续区间内，以每个点为起点向前累计到 ≥ 1000m，取用时最短者（不再从起点固定切刀，避免漏掉跨切点的更快 1km）
+ * - 段内按实际距离（≥1000m）归一化到 1km；不足 1km 返回 null
+ * - 返回 null：无任一连续区间累积达到 1km，或点缺少 timestamp；游泳/骑行无配速概念
  */
 /** 无配速概念的运动类型（与 calcStats 一致） */
 const NO_PACE_TYPES = ['swimming', 'cycling'];
 const GAP_MS = 60000;
-/** 最快配速分段长度（米）：必须跑满此距离才计一段 */
+/** 最快配速窗口长度（米）：必须跑满此距离才计一段 */
 const PACE_SEGMENT_M = 1000;
 export function calcFastestKm(points: TrackPointLike[], type?: string): number | null {
   if (type && NO_PACE_TYPES.includes(type)) return null; // 游泳/骑行不统计配速
@@ -162,30 +160,46 @@ export function calcFastestKm(points: TrackPointLike[], type?: string): number |
     .filter((p) => p.timestamp != null)
     .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
   if (sorted.length < 2) return null;
+
+  const gapSec = GAP_MS / 1000;
   let fastest: number | null = null;
-  let segDist = 0;
-  let segSec = 0;
-  let prev = sorted[0];
-  for (let i = 1; i < sorted.length; i++) {
-    const cur = sorted[i];
-    const dt = ((cur.timestamp ?? 0) - (prev.timestamp ?? 0)) / 1000; // 秒
-    // 暂停恢复点 / 丢点断档：跨档距离不计，段从当前点重新开始
-    if (cur.pauseGap || !Number.isFinite(dt) || dt < 0 || dt > GAP_MS / 1000) {
-      prev = cur;
-      segDist = 0;
-      segSec = 0;
-      continue;
+  let start = 0;
+  while (start < sorted.length - 1) {
+    // 切出无暂停连续区间 [start, end)：区间内相邻点间隔有效（0~60s），且不含 pauseGap 恢复点
+    let end = start + 1;
+    while (end < sorted.length) {
+      const dt = ((sorted[end].timestamp ?? 0) - (sorted[end - 1].timestamp ?? 0)) / 1000;
+      if (sorted[end].pauseGap || !Number.isFinite(dt) || dt < 0 || dt > gapSec) break;
+      end++;
     }
-    segDist += haversineDistance(prev, cur);
-    segSec += dt;
-    if (segDist >= PACE_SEGMENT_M) {
-      // 段完成（≥ 1km）：按实际距离归一化到 1km；尾段不足 1km 自然剔除
-      const pace = segSec / (segDist / 1000);
-      if (fastest === null || pace < fastest) fastest = pace;
-      segDist = 0;
-      segSec = 0;
+    // 区间内滑动窗口：对每个起点取“刚满 1km”的窗口（双指针 O(n)），用时最短者为最快
+    let j = start + 1;
+    let dist = 0;
+    let sec = 0;
+    for (let s = start; s < end - 1; s++) {
+      if (j <= s) {
+        j = s + 1;
+        dist = 0;
+        sec = 0;
+      }
+      while (j < end && dist < PACE_SEGMENT_M) {
+        const dt = ((sorted[j].timestamp ?? 0) - (sorted[j - 1].timestamp ?? 0)) / 1000;
+        dist += haversineDistance(sorted[j - 1], sorted[j]);
+        sec += dt;
+        j++;
+      }
+      if (dist >= PACE_SEGMENT_M) {
+        const pace = sec / (dist / 1000);
+        if (fastest === null || pace < fastest) fastest = pace;
+      }
+      // 窗口起点前移一位：从窗口里扣掉 s → s+1 这一步
+      if (j > s + 1) {
+        const dt = ((sorted[s + 1].timestamp ?? 0) - (sorted[s].timestamp ?? 0)) / 1000;
+        dist -= haversineDistance(sorted[s], sorted[s + 1]);
+        sec -= dt;
+      }
     }
-    prev = cur;
+    start = end; // 断档点作为下一段起点（pauseGap 语义：该点之后是新的一段）
   }
   return fastest === null ? null : Math.round(fastest * 10) / 10;
 }
