@@ -13,10 +13,17 @@ import { INVALID_REGION_VALUES, isValidRegionValue } from '../services/ip-locate
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
+import {
+  adminListTopics,
+  createTopic,
+  updateTopic,
+  deleteTopic,
+  type TopicInput,
+} from '../services/topic.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
-import { getSignedUrl } from '../services/oss.js';
+import { getSignedUrl, uploadBuffer } from '../services/oss.js';
 
 /**
  * 管理后台路由：/api/admin/*（与小程序用户接口隔离）
@@ -866,6 +873,45 @@ export async function adminRoutes(fastify: FastifyInstance) {
       ? await ActivityModel.countDocuments({ ...filter, _id: { $gt: new Types.ObjectId(lastId) } })
       : 0;
     return success({ dryRun, processed: acts.length, updated, lastId, remaining, changes });
+  });
+
+  // ==================== 专题管理（官方信息页，小程序首页入口） ====================
+
+  // 专题列表（含未发布/未生效/已过期）
+  fastify.get('/topics', { onRequest: [adminAuth] }, async () => {
+    return success(await adminListTopics());
+  });
+
+  // 新建专题
+  fastify.post('/topics', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    return success(await createTopic(body as TopicInput), '已创建');
+  });
+
+  // 更新专题
+  fastify.put('/topics/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    return success(await updateTopic(id, body as TopicInput), '已保存');
+  });
+
+  // 删除专题
+  fastify.delete('/topics/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    await deleteTopic(id);
+    return success(null, '已删除');
+  });
+
+  // 专题图片上传（multipart，≤2MB，存 OSS topics/ 目录）
+  fastify.post('/topics/upload', { onRequest: [adminAuth] }, async (request) => {
+    const file = await request.file();
+    if (!file) throw new AppError(400, '请选择图片文件');
+    const buf = await file.toBuffer();
+    if (buf.length > 2 * 1024 * 1024) throw new AppError(400, '图片不能超过 2MB', { code: 'IMAGE_TOO_LARGE' });
+    const ext = (file.mimetype || 'image/png').split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+    const key = `${config.oss.baseDir}/topics/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const url = await uploadBuffer(buf, key, file.mimetype || 'image/png');
+    return success({ url });
   });
 }
 

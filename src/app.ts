@@ -14,6 +14,7 @@ import { statsRoutes } from './routes/stats.routes.js';
 import { shareRoutes } from './routes/share.routes.js';
 import { geoRoutes } from './routes/geo.routes.js';
 import { overviewRoutes } from './routes/overview.routes.js';
+import { topicRoutes } from './routes/topic.routes.js';
 import { adminRoutes } from './routes/admin.routes.js';
 import { AdminModel, hashPassword } from './models/admin.model.js';
 
@@ -78,6 +79,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(shareRoutes, { prefix: `${config.apiPrefix}/share` });
   await fastify.register(geoRoutes, { prefix: `${config.apiPrefix}/geo` });
   await fastify.register(overviewRoutes, { prefix: `${config.apiPrefix}/overview` });
+  await fastify.register(topicRoutes, { prefix: `${config.apiPrefix}/topics` });
   await fastify.register(adminRoutes, { prefix: `${config.apiPrefix}/admin` });
 
   // 初始管理员 seed：Admin 集合为空时用环境变量创建
