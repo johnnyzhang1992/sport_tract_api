@@ -4,6 +4,7 @@
  */
 import { ActivityModel } from '../models/activity.model.js';
 import { simplifyTracks, gridHeat, type LatLng } from '../utils/simplify.js';
+import { buildDateSummary, type DateSummary } from './report.js';
 
 export const OVERVIEW_RANGES = ['week', 'month', 'year', 'all'] as const;
 export type OverviewRange = (typeof OVERVIEW_RANGES)[number];
@@ -42,19 +43,22 @@ export interface OverviewResult {
   totalCalories: number;
   tracks: OverviewTrack[];
   heat: { lat: number; lng: number; weight: number }[];
+  /** 报告页日期汇总（仅 opts.dateSummary=true 时下发，后端按东八区分桶） */
+  dateSummary?: DateSummary;
 }
 
 /** 查询 + 抽稀 + 热力（轨迹多则每轨迹点少，总量受预算约束）
  * 传入 precise（epoch ms 区间）时按精确时间查询（报告页历史周/月/年），否则按 range 滑动窗口
  * opts.lean：精简模式（报告页/年度报告用）——不查 trackPoints、不算抽稀与热力，tracks 只回元数据
+ * opts.dateSummary：额外返回报告页「日期汇总」桶（后端分桶，range 决定粒度）
  */
 export async function getOverview(
   userId: string,
   range: OverviewRange,
   precise?: { from: number; to: number },
-  opts: { lean?: boolean } = {},
+  opts: { lean?: boolean; dateSummary?: boolean } = {},
 ): Promise<OverviewResult> {
-  const { lean = false } = opts;
+  const { lean = false, dateSummary = false } = opts;
   const days = RANGE_DAYS[range];
   const query: Record<string, unknown> = {
     userId,
@@ -87,6 +91,9 @@ export async function getOverview(
     .sort({ startTime: -1 })
     .lean();
 
+  // 日期汇总（仅报告页需要）：与轨迹查询并行，少一次串行往返
+  const dateSummaryData = dateSummary ? await buildDateSummary(userId, range, precise) : undefined;
+
   const totals = {
     count: activities.length,
     totalDistanceKm: Math.round(activities.reduce((s, a) => s + (a.distance || 0), 0) / 10) / 100,
@@ -105,7 +112,7 @@ export async function getOverview(
     calories: a.calories || 0,
   }));
   if (lean) {
-    return { range, ...totals, tracks: metaTracks, heat: [] };
+    return { range, ...totals, tracks: metaTracks, heat: [], ...(dateSummaryData ? { dateSummary: dateSummaryData } : {}) };
   }
 
   // 按轨迹抽稀：轨迹越多，每轨迹点越少（全局预算 3000）
@@ -154,5 +161,6 @@ export async function getOverview(
     ...totals,
     tracks: activities.map((a, i) => ({ ...metaTracks[i], points: tracks[i] || [] })),
     heat,
+    ...(dateSummaryData ? { dateSummary: dateSummaryData } : {}),
   };
 }
