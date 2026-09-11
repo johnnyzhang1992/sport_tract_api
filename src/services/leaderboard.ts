@@ -55,7 +55,7 @@ export type BestMetricKey = 'farthest' | 'longest' | 'fastestKm' | 'fastestAvg' 
 
 export interface BestRow {
   key: BestMetricKey;
-  /** 原始值：距离/爬升 米，时长/配速 秒（配速为秒/公里，越小越快） */
+  /** 原始值：距离/爬升 米，时长/配速 秒；fastestAvg 为 km/h（后端直接回均速） */
   value: number;
   /** 纪录保持者昵称 */
   name: string;
@@ -202,6 +202,17 @@ export async function leaderboard(
   type FacetDoc = Record<string, Array<{ userId: unknown } & Record<string, number>>>;
   const facet: Record<string, unknown> = {};
   for (const key of BEST_METRICS[type]) {
+    if (key === 'fastestAvg') {
+      // 最快均速 = distance/duration（km/h）：骑行/游泳 avgPace 为 null，不能用 avgPace
+      facet[key] = [
+        { $match: { distance: { $gt: 0 }, duration: { $gt: 0 } } },
+        { $addFields: { speedKmh: { $divide: [{ $multiply: ['$distance', 3.6] }, '$duration'] } } },
+        { $sort: { speedKmh: -1 } },
+        { $limit: 1 },
+        { $project: { userId: 1, speedKmh: 1 } },
+      ];
+      continue;
+    }
     const spec = BEST_METRIC_SPEC[key];
     facet[key] = [
       { $match: { [spec.field]: { $gt: 0 } } },
@@ -259,7 +270,8 @@ export async function leaderboard(
     const info = infoById.get(String(doc.userId));
     return {
       key,
-      value: Number(doc[BEST_METRIC_SPEC[key].field]),
+      // fastestAvg 为 km/h；其余直接取原始字段（米 / 秒 / 秒每公里）
+      value: key === 'fastestAvg' ? Number(doc.speedKmh) : Number(doc[BEST_METRIC_SPEC[key].field]),
       name: (info && info.nickname) || '运动用户',
       gender: (info && info.gender) || 0,
       avatarUrl: (info && info.avatarUrl) || '',

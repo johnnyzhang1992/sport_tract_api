@@ -132,6 +132,36 @@ test('无活动用户 ranks 为空、best 为 null', async () => {
   assert.equal(data.best, null);
 });
 
+test('本榜最佳：骑行最快均速按 distance/duration 计算（avgPace 为 null 也能出）', async () => {
+  await seedActivity(userTokens[1].userId, { type: 'cycling', distance: 30000, duration: 7200 }); // 15 km/h
+  await seedActivity(userTokens[2].userId, { type: 'cycling', distance: 20000, duration: 3600 }); // 20 km/h
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/sport-track/api/stats/leaderboard?type=cycling&period=all',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const bestRows = res.json().data.best as Array<{ key: string; value: number }>;
+  const avg = bestRows.find((b) => b.key === 'fastestAvg');
+  assert.ok(avg, '骑行应返回 fastestAvg 最佳（旧口径用 avgPace，恒为空）');
+
+  // 与库内同口径计算的最快均速比对
+  const [expected] = await ActivityModel.aggregate<{ speedKmh: number }>([
+    { $match: { status: 'finished', type: 'cycling', duration: { $gt: 0 }, distance: { $gt: 0 } } },
+    { $addFields: { speedKmh: { $divide: [{ $multiply: ['$distance', 3.6] }, '$duration'] } } },
+    { $sort: { speedKmh: -1 } },
+    { $limit: 1 },
+    { $project: { speedKmh: 1 } },
+  ]);
+  assert.ok(expected, '应有骑行数据');
+  assert.ok(
+    Math.abs(avg!.value - expected.speedKmh) < 1e-6,
+    `最快均速应为 ${expected.speedKmh} km/h，实际 ${avg!.value}`,
+  );
+  assert.ok(avg!.value > 0, '均速应大于 0');
+});
+
 test('非法 period 返回 400', async () => {
   const res = await app.inject({
     method: 'GET',
