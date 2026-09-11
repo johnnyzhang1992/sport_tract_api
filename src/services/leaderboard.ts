@@ -66,14 +66,14 @@ export interface BestRow {
 
 /** 各运动类型的本榜最佳指标（顺序即展示顺序；所有类型都有距离/时长，耐力类加专项指标） */
 const BEST_METRICS: Record<string, BestMetricKey[]> = {
-  walking: ['farthest', 'longest'],
-  running: ['farthest', 'longest', 'fastestKm'],
-  hiking: ['farthest', 'longest', 'maxClimb'],
-  mountaineering: ['farthest', 'longest', 'maxClimb'],
-  cycling: ['farthest', 'longest', 'fastestAvg'],
-  swimming: ['farthest', 'longest'],
-  skiing: ['farthest', 'longest'],
-  rowing: ['farthest', 'longest'],
+  walking: ['farthest'],
+  running: ['farthest', 'fastestKm'],
+  hiking: ['farthest', 'maxClimb'],
+  mountaineering: ['farthest', 'maxClimb'],
+  cycling: ['farthest', 'fastestAvg'],
+  swimming: ['farthest'],
+  skiing: ['farthest'],
+  rowing: ['farthest'],
 };
 
 /** 指标 → 活动字段与排序方向（dir=1 越小越好，如配速） */
