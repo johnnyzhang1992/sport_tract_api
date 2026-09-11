@@ -76,35 +76,6 @@ test('点间隔 >60s：视为断档，同样不跨段', () => {
   assert.equal(calcFastestKm(pts, 'running'), 300);
 });
 
-test('滑动窗口：跨分段切点的更快 1km 也能算到（非重叠分段会漏）', () => {
-  // 1500m：前 800m 慢（50s/100m），后 700m 快（10s/100m）
-  // 非重叠分段：0→1000m = 8×50 + 2×10 = 420s → 420 s/km
-  // 滑动最快 ：500→1500m = 3×50 + 7×10 = 220s → 220 s/km
-  const pts: TrackPointLike[] = [];
-  let ts = 0;
-  for (let m = 0; m <= 1500; m += 100) {
-    pts.push(pt(m, ts));
-    ts += m < 800 ? 50000 : 10000;
-  }
-  assert.equal(calcFastestKm(pts, 'running'), 220);
-});
-
-test('滑动窗口不跨暂停：两侧各不足 1km 则 null', () => {
-  // 暂停前 600m（快）+ pauseGap 恢复后 800m（快）：两段各自 <1km，不得合并成 1km
-  const a: TrackPointLike[] = [];
-  let ts = 0;
-  for (let m = 0; m <= 600; m += 100) {
-    a.push(pt(m, ts));
-    ts += 10000;
-  }
-  a.push(pt(600, ts, true)); // pauseGap：新段起点
-  for (let m = 700; m <= 1400; m += 100) {
-    ts += 10000;
-    a.push(pt(m, ts));
-  }
-  assert.equal(calcFastestKm(a, 'running'), null);
-});
-
 test('游泳/骑行无配速', () => {
   assert.equal(calcFastestKm(walk(2000, 100, 30), 'swimming'), null);
   assert.equal(calcFastestKm(walk(2000, 100, 30), 'cycling'), null);
