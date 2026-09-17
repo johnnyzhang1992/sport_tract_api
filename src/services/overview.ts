@@ -148,7 +148,8 @@ export async function getOverview(
   });
   const simplifiedSegs = simplifyTracks(
     segments.map((s) => s.pts),
-    { maxPoints: 3000, maxPerTrack: 100 },
+    // 轨迹多时按预算均摊；上限放宽 + 保形降点，避免缩略图过于抽象
+    { maxPoints: 5000, maxPerTrack: 150 },
   );
   const tracks: OverviewPoint[][] = activities.map(() => []);
   simplifiedSegs.forEach((segRaw, k) => {

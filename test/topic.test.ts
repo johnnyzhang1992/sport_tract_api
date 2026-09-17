@@ -64,7 +64,8 @@ before(async () => {
 });
 
 after(async () => {
-  await TopicModel.deleteMany({}).catch(() => {});
+  // 只清测试标题，避免误删本地库里的真实专题
+  await TopicModel.deleteMany({ title: { $in: ['测试专题', '未发布专题', '未来专题', '过期专题', '原始标题', '更新后标题'] } }).catch(() => {});
   await app.close();
   const mongoose = (await import('mongoose')).default;
   await mongoose.disconnect().catch(() => {});

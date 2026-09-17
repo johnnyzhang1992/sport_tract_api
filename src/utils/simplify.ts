@@ -77,6 +77,22 @@ export interface SimplifyOptions {
   maxPerTrack?: number;
 }
 
+/** 保形降点：二分 DP 容差把点数压到 ≤ max（拐点优先保留，比均匀采样保形得多） */
+function dpToMax(t: LatLng[], max: number): LatLng[] {
+  if (t.length <= max) return t.slice();
+  const need = Math.max(2, max);
+  const diag = bboxDiagonal(t);
+  // hi 取对角线：DP 在此容差下必然只剩首尾两点（可行），二分逼近最小可行容差
+  let lo = 0;
+  let hi = Math.max(diag, 50);
+  for (let i = 0; i < 14; i++) {
+    const mid = (lo + hi) / 2;
+    if (douglasPeucker(t, mid).length > need) lo = mid;
+    else hi = mid;
+  }
+  return douglasPeucker(t, hi);
+}
+
 /**
  * 多轨迹抽稀：DP 保形 + 全局预算 + 单轨迹上限
  * @returns 抽稀后的轨迹数组（每条至少 2 点）
@@ -106,11 +122,9 @@ export function simplifyTracks(
         pts = douglasPeucker(t, Math.max(2, diag * 0.004));
       }
     }
-    // 单轨迹硬上限：均匀采样降点
+    // 单轨迹硬上限：保形降点（均匀采样会丢拐点，缩略图变抽象）
     if (pts.length > maxPerTrack) {
-      const step = Math.ceil(pts.length / maxPerTrack);
-      pts = pts.filter((_, i) => i % step === 0);
-      if (pts.length < 2) pts = [pts[0], pts[pts.length - 1]];
+      pts = dpToMax(pts, maxPerTrack);
     }
     return pts;
   });
@@ -123,13 +137,7 @@ export function simplifyTracks(
       if (t.length < 2) return t;
       const target = Math.max(2, Math.floor(t.length * ratio));
       if (t.length <= target) return t;
-      const step = t.length / target;
-      const out: LatLng[] = [];
-      for (let i = 0; i < target; i++) {
-        out.push(t[Math.min(t.length - 1, Math.floor(i * step))]);
-      }
-      out[out.length - 1] = t[t.length - 1]; // 保终点
-      return out;
+      return dpToMax(t, target); // 保形降点，DP 自带保首尾
     });
   }
   return result;
