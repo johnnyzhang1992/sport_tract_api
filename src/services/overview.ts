@@ -162,10 +162,33 @@ export async function getOverview(
   });
   const heat = gridHeat(rawTracks, 150, 200);
 
+  // 卡片缩略图点：与 /activities 列表 previewPoints 同口径（均匀采样 60 点 + 暂停断点全量补回），
+  // 保证轨迹列表与轨迹合集两处缩略图形状一致；地图渲染仍用上面的保形抽稀点
+  const previewPointsOf = (raw: OverviewPoint[]) => {
+    const n = raw.length;
+    if (n === 0) return [];
+    const step = n / 60;
+    const byIdx = new Map<number, OverviewPoint>();
+    for (let i = 0; i < 60; i++) {
+      const idx = Math.min(n - 1, Math.floor(i * step));
+      const p = raw[idx];
+      byIdx.set(idx, { lat: p.lat, lng: p.lng, ...(p.pauseGap ? { pauseGap: true } : {}) });
+    }
+    // 断点全量补回（数量少）：采样会丢 pauseGap 标，同 idx 时断点优先
+    raw.forEach((p, idx) => {
+      if (p.pauseGap) byIdx.set(idx, { lat: p.lat, lng: p.lng, pauseGap: true });
+    });
+    return [...byIdx.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+  };
+
   return {
     range,
     ...totals,
-    tracks: activities.map((a, i) => ({ ...metaTracks[i], points: tracks[i] || [] })),
+    tracks: activities.map((a, i) => ({
+      ...metaTracks[i],
+      points: tracks[i] || [],
+      previewPoints: previewPointsOf(rawTracks[i] || []),
+    })),
     heat,
     ...(dateSummaryData ? { dateSummary: dateSummaryData } : {}),
   };
