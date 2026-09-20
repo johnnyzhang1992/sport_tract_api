@@ -135,6 +135,42 @@ export const ListActivitiesQuery = z.object({
   pageSize: z.coerce.number().int().positive().max(100).default(20),
 });
 
+// ==================== 足迹记录（footprint-records） ====================
+
+const VisitDateSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, '日期格式应为 YYYY-MM-DD');
+
+/** 照片 URL（裸地址或带签名参数均可，服务层 cleanUrl 归一） */
+const FootprintPhotoSchema = z.string().url('照片地址不合法').max(600);
+
+/** 创建/编辑足迹（编辑为整体替换，两 schema 相同） */
+export const CreateFootprintRecordSchema = z.object({
+  visitDate: VisitDateSchema,
+  title: z.string().trim().min(1, '标题不能为空').max(50, '标题最长 50 字'),
+  people: z
+    .array(z.string().trim().min(1, '人名不能为空').max(20, '人名最长 20 字'))
+    .max(10, '人物最多 10 个')
+    .default([]),
+  description: z.string().max(500, '描述最长 500 字').optional().default(''),
+  location: z.object({
+    name: z.string().max(100).optional().default(''),
+    address: z.string().max(200).optional().default(''),
+    latitude: z.number().min(-90, '纬度不合法').max(90, '纬度不合法'),
+    longitude: z.number().min(-180, '经度不合法').max(180, '经度不合法'),
+  }),
+  photos: z.array(FootprintPhotoSchema).max(3, '每条足迹最多 3 张图片').optional(),
+});
+
+export const UpdateFootprintRecordSchema = CreateFootprintRecordSchema;
+
+/** 足迹列表查询 */
+export const ListFootprintQuery = z.object({
+  keyword: z.string().trim().max(50).optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(100).default(20),
+});
+
 export type LoginInput = z.infer<typeof LoginSchema>;
 export type RefreshInput = z.infer<typeof RefreshSchema>;
 export type UpdateMeInput = z.infer<typeof UpdateMeSchema>;
@@ -144,3 +180,5 @@ export type CreateMarkerInput = z.infer<typeof CreateMarkerSchema>;
 export type UpdateMarkerInput = z.infer<typeof UpdateMarkerSchema>;
 export type FinishActivityInput = z.infer<typeof FinishActivitySchema>;
 export type ListActivitiesQueryInput = z.infer<typeof ListActivitiesQuery>;
+export type CreateFootprintRecordInput = z.infer<typeof CreateFootprintRecordSchema>;
+export type ListFootprintQueryInput = z.infer<typeof ListFootprintQuery>;
