@@ -13,10 +13,11 @@ import {
 } from '../src/services/geo.js';
 
 /**
- * /geo/search 腾讯 place 代理：1h 缓存 + 每用户 10 次/分限流 + 测试注入点
- * 注意：无 TENCENT_MAP_KEY 环境（CI/.env 缺失）时 searchPlaces 直接返回 []，
- * 下面用例对"返回空"与"fetcher 命中"两种情况都容忍，只断言不抛错 + 缓存不重复请求。
- * 全部用例经 __setPlaceFetcherForTest 走假上游，绝不真调腾讯（省额度、CI 无网也能跑）。
+ * /geo/search 腾讯 place 代理：仅成功响应进 1h 缓存 + 每用户 10 次/分限流 + 测试注入点
+ *
+ * 环境无关：无 TENCENT_MAP_KEY 时在 before 里临时塞一个假 key（after 还原），
+ * 因此下面所有断言都是硬断言，不再有 `if (config.tencentMapKey)` 之类的环境分支。
+ * 全部上游访问都经 __setPlaceFetcherForTest 走假 fetcher，绝不真调腾讯（零真实额度、CI 无网也能跑）。
  */
 
 let app: FastifyInstance;
@@ -45,7 +46,15 @@ const fakePlaceResponse = () => ({
   },
 });
 
+let originalTencentMapKey: string | null = null;
+
 before(async () => {
+  // 断言与本机是否配了 TENCENT_MAP_KEY 无关：缺失时临时塞一个假 key，
+  // 让 searchPlaces 走进 fetcher 分支（fetcher 已被假实现接管，不会真调腾讯）
+  if (!config.tencentMapKey) {
+    originalTencentMapKey = config.tencentMapKey;
+    (config as any).tencentMapKey = 'test-fake-key';
+  }
   app = await buildApp({ logger: false });
   await app.ready();
   token = (await loginAs('geo-search-user')).accessToken;
@@ -64,6 +73,10 @@ beforeEach(() => {
 
 after(async () => {
   __setPlaceFetcherForTest(null);
+  if (originalTencentMapKey !== null) {
+    (config as any).tencentMapKey = originalTencentMapKey;
+    originalTencentMapKey = null;
+  }
   await app.close();
   await mongoose.disconnect().catch(() => {});
 });
@@ -77,13 +90,8 @@ test('searchPlaces：空 keyword 返回 []；fetcher 不被重复调用（缓存
   });
   const r1 = await searchPlaces('西湖');
   const r2 = await searchPlaces('西湖');
-  if (r1.length === 0) {
-    // 无 key 环境：短路返回，fetcher 不应被调用
-    assert.equal(calls, 0);
-  } else {
-    assert.equal(r1[0].name, '西湖');
-    assert.equal(calls, 1); // 第二次命中缓存
-  }
+  assert.equal(r1[0].name, '西湖');
+  assert.equal(calls, 1); // 第二次命中缓存，上游只被调 1 次
   assert.deepEqual(r1, r2);
   __setPlaceFetcherForTest(null);
 });
@@ -110,24 +118,65 @@ test('route：未登录 401；带 token 缺 keyword 400（均不触达腾讯）'
 });
 
 test('route：200 返回 success(PlaceItem[])，字段名与前端契约一致', async () => {
-  const res = await search('keyword=%E8%A5%BF%E6%B9%96&latitude=30.24&longitude=120.15');
+  const res = await search(`keyword=${encodeURIComponent('西湖')}&latitude=30.24&longitude=120.15`);
   assert.equal(res.statusCode, 200, res.body);
   const body = res.json();
   assert.equal(body.success, true);
   assert.equal(body.code, 200);
   const items = body.data as PlaceItem[];
+  // 假上游命中（地址文案仅存在于假响应里 = 未真调腾讯的证据），逐项硬断言下游小程序依赖的字段形状
   assert.ok(Array.isArray(items));
-  if (config.tencentMapKey) {
-    // 有 key（本地 .env.local）：走假上游，逐项断言下游小程序依赖的字段形状
-    assert.equal(items.length, 1);
-    assert.deepEqual(Object.keys(items[0]).sort(), ['address', 'latitude', 'longitude', 'name']);
-    assert.equal(items[0].name, '西湖');
-    assert.equal(items[0].address, '杭州市西湖区');
-    assert.equal(items[0].latitude, 30.24);
-    assert.equal(items[0].longitude, 120.15);
-  } else {
-    assert.equal(items.length, 0); // 无 key 环境：短路空数组，不请求上游
-  }
+  assert.equal(items.length, 1);
+  assert.deepEqual(Object.keys(items[0]).sort(), ['address', 'latitude', 'longitude', 'name']);
+  assert.equal(items[0].name, '西湖');
+  assert.equal(items[0].address, '杭州市西湖区');
+  assert.equal(items[0].latitude, 30.24);
+  assert.equal(items[0].longitude, 120.15);
+});
+
+test('降级：上游抛异常（网络/超时）→ searchPlaces 返回 []、route 不 5xx', async () => {
+  __clearPlaceCacheForTest();
+  __setPlaceFetcherForTest(async () => {
+    throw new Error('ETIMEDOUT at apis.map.qq.com');
+  });
+  const kw = '异常关键词';
+  const items = await searchPlaces(kw);
+  assert.deepEqual(items, []);
+
+  // 路由层同样不冒泡成 5xx：仍是 success([]) —— 前端按"搜不到"降级
+  const res = await search(`keyword=${encodeURIComponent(kw)}&latitude=30.24&longitude=120.15`);
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().success, true);
+  assert.deepEqual(res.json().data, []);
+
+  // 异常路径不进缓存：换个正常上游后同 keyword 立即能搜到（不会被空结果锁 1 小时）
+  let calls = 0;
+  __setPlaceFetcherForTest(async () => {
+    calls += 1;
+    return fakePlaceResponse();
+  });
+  const retry = await searchPlaces(kw);
+  assert.equal(calls, 1);
+  assert.equal(retry.length, 1);
+  assert.equal(retry[0].name, '西湖');
+});
+
+test('截断：上游返回 25 条时结果只留 20 条', async () => {
+  __clearPlaceCacheForTest();
+  __setPlaceFetcherForTest(async () => ({
+    data: {
+      status: 0,
+      data: Array.from({ length: 25 }, (_, i) => ({
+        title: `地点${i}`,
+        address: `地址${i}`,
+        location: { lat: 30 + i / 100, lng: 120 + i / 100 },
+      })),
+    },
+  }));
+  const items = await searchPlaces('很多结果');
+  assert.equal(items.length, 20);
+  assert.equal(items[0].name, '地点0');
+  assert.equal(items[19].name, '地点19');
 });
 
 test('route：限流真的生效——同一用户当分钟第 11 次搜索返回 429', async () => {

@@ -100,8 +100,13 @@ export async function searchPlaces(keyword: string, latitude?: number, longitude
 
   try {
     const res = await fetcher();
-    const list = res.data?.status === 0 ? res.data.data ?? [] : [];
-    const items: PlaceItem[] = list
+    if (res.data?.status !== 0) {
+      // 上游业务失败（如 status 121 额度耗尽 / 当日配额用尽）不写缓存：
+      // 否则空结果被缓存 1 小时，同关键词期间一律"搜不到"
+      console.warn('[geo] place 搜索 status=', res.data?.status);
+      return [];
+    }
+    const items: PlaceItem[] = (res.data.data ?? [])
       .filter((p) => p.title && p.location)
       .slice(0, 20)
       .map((p) => ({
@@ -110,10 +115,12 @@ export async function searchPlaces(keyword: string, latitude?: number, longitude
         latitude: Number(p.location!.lat),
         longitude: Number(p.location!.lng),
       }));
+    // 仅成功响应进缓存
     if (placeCache.size >= PLACE_CACHE_MAX) placeCache.delete(placeCache.keys().next().value as string);
     placeCache.set(cacheKey, { at: Date.now(), items });
     return items;
   } catch (err) {
+    // 网络/超时异常：不写缓存，下次请求可重试
     console.warn('[geo] place 搜索失败:', (err as Error).message);
     return [];
   }
