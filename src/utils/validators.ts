@@ -137,9 +137,14 @@ export const ListActivitiesQuery = z.object({
 
 // ==================== 足迹记录（footprint-records） ====================
 
+/** 访问日期：格式 + 日历有效性（visitDate 是列表排序键，须防 '2024-13-45' 这类脏数据） */
 const VisitDateSchema = z
   .string()
-  .regex(/^\d{4}-\d{2}-\d{2}$/, '日期格式应为 YYYY-MM-DD');
+  .regex(/^\d{4}-\d{2}-\d{2}$/, '日期格式应为 YYYY-MM-DD')
+  .refine((v) => {
+    const d = new Date(`${v}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
+  }, '日期不是有效日历日');
 
 /** 照片 URL（裸地址或带签名参数均可，服务层 cleanUrl 归一） */
 const FootprintPhotoSchema = z.string().url('照片地址不合法').max(600);

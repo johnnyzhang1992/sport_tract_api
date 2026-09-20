@@ -47,7 +47,11 @@ test('zod：visitDate 必须 YYYY-MM-DD；people≤10 每项≤20 字；photos�
     photos: [],
   });
   assert.equal(ok.people.length, 2);
+  assert.equal(ok.visitDate, '2024-05-01'); // 合法日历日通过
+  assert.equal(CreateFootprintRecordSchema.parse({ ...ok, visitDate: '2024-02-29' }).visitDate, '2024-02-29'); // 闰日合法
   assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, visitDate: '2024-5-1' }));
+  assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, visitDate: '2024-13-45' })); // 格式对但日历不存在
+  assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, visitDate: '2023-02-29' })); // 非闰年 2 月 29
   assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, title: '' }));
   assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, title: 'a'.repeat(51) }));
   assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, people: Array(11).fill('甲') }));
