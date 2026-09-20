@@ -21,9 +21,9 @@ let adminToken = '';
 
 const NOW = Date.now();
 
-async function adminReq(method: string, url: string, body?: unknown) {
+async function adminReq(method: string, url: string, body?: Record<string, unknown>) {
   return app.inject({
-    method,
+    method: method as 'GET',
     url: `/sport-track/api/admin${url}`,
     headers: { authorization: `Bearer ${adminToken}` },
     payload: body,
