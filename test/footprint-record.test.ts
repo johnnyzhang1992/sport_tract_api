@@ -1,21 +1,47 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { Types } from 'mongoose';
+import mongoose, { Types } from 'mongoose';
+import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
 import { CreateFootprintRecordSchema } from '../src/utils/validators.js';
 
 // 模型用例要真实落库，沿用仓库惯例用 buildApp 建 Mongo 连接（Task 2 的接口用例复用同一 app）
-let app: Awaited<ReturnType<typeof buildApp>>;
+let app: FastifyInstance;
+let tokenA = '';
+let tokenB = '';
+
+async function loginAs(code: string): Promise<string> {
+  const res = await app.inject({ method: 'POST', url: '/sport-track/api/auth/login', payload: { code } });
+  assert.equal(res.statusCode, 200, res.body);
+  // mock 登录同一 code 幂等返回同一用户
+  return res.json().data.accessToken as string;
+}
+function req(method: string, url: string, token: string, payload?: Record<string, unknown>) {
+  return app.inject({
+    method: method as 'GET',
+    url: `/sport-track/api/footprint-records${url}`,
+    headers: { authorization: `Bearer ${token}` },
+    payload,
+  });
+}
+const fp = (over: Record<string, unknown> = {}) => ({
+  visitDate: '2024-05-01', title: '足迹测试A',
+  location: { name: '西湖', address: '杭州市西湖区', latitude: 30.24, longitude: 120.15 },
+  ...over,
+});
 
 before(async () => {
   app = await buildApp({ logger: false });
   await app.ready();
+  tokenA = await loginAs('fp-user-a');
+  tokenB = await loginAs('fp-user-b');
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试/ });
 });
 
 after(async () => {
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试/ });
   await app.close();
-  const mongoose = (await import('mongoose')).default;
   await mongoose.disconnect().catch(() => {});
 });
 
@@ -59,4 +85,77 @@ test('zod：visitDate 必须 YYYY-MM-DD；people≤10 每项≤20 字；photos�
   assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, photos: ['u?1', 'u?2', 'u?3', 'u?4'].map((s) => `https://e.com/${s}.jpg`) }));
   assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, description: 'x'.repeat(501) }));
   assert.throws(() => CreateFootprintRecordSchema.parse({ ...ok, location: { ...ok.location, latitude: 91 } }));
+});
+
+// ==================== Task 2：/footprint-records 接口集成测试 ====================
+
+test('CRUD：创建→列表→详情→更新→删除', async () => {
+  const created = await req('POST', '', tokenA, fp({ people: ['张三'], description: '春天', photos: ['https://example.com/a.jpg'] }));
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data.record.id as string;
+  assert.equal(created.json().data.record.photos[0], 'https://example.com/a.jpg'); // OSS 未配置时 getSignedUrl 原样返回
+
+  const list = await req('GET', '?page=1&pageSize=20', tokenA);
+  assert.ok(list.json().data.items.some((r: any) => r.id === id));
+
+  const kw = await req('GET', '?keyword=西湖', tokenA);
+  assert.equal(kw.json().data.items.length, 1);
+  const kwMiss = await req('GET', '?keyword=不存在词xyz', tokenA);
+  assert.equal(kwMiss.json().data.items.length, 0);
+
+  const upd = await req('PUT', `/${id}`, tokenA, fp({ title: '足迹测试A-更新', people: [] }));
+  assert.equal(upd.statusCode, 200, upd.body);
+  assert.equal(upd.json().data.record.title, '足迹测试A-更新');
+
+  const del = await req('DELETE', `/${id}`, tokenA);
+  assert.equal(del.statusCode, 200);
+  const gone = await req('GET', `/${id}`, tokenA);
+  assert.equal(gone.statusCode, 404);
+});
+
+test('归属隔离：B 不可读写 A 的记录（404）；未登录 401', async () => {
+  const id = (await req('POST', '', tokenA, fp({ title: '足迹测试B' }))).json().data.record.id as string;
+  assert.equal((await req('GET', `/${id}`, tokenB)).statusCode === 200, false);
+  assert.equal((await req('GET', `/${id}`, tokenB)).json().code, 404);
+  assert.equal((await req('PUT', `/${id}`, tokenB, fp())).json().code, 404);
+  assert.equal((await req('DELETE', `/${id}`, tokenB)).json().code, 404);
+  assert.equal((await app.inject({ method: 'GET', url: '/sport-track/api/footprint-records' })).statusCode, 401);
+  await req('DELETE', `/${id}`, tokenA);
+});
+
+test('校验与排序：坏日期 400；列表按 visitDate 倒序同日按创建倒序', async () => {
+  const bad = await req('POST', '', tokenA, fp({ visitDate: '2024-5-1', title: '足迹测试C' }));
+  assert.equal(bad.statusCode, 400);
+  await req('POST', '', tokenA, fp({ visitDate: '2023-01-01', title: '足迹测试C-旧' }));
+  const r1 = (await req('POST', '', tokenA, fp({ visitDate: '2024-06-01', title: '足迹测试C-新1' }))).json().data.record.id;
+  const r2 = (await req('POST', '', tokenA, fp({ visitDate: '2024-06-01', title: '足迹测试C-新2' }))).json().data.record.id;
+  const items = (await req('GET', '?keyword=足迹测试C', tokenA)).json().data.items;
+  assert.equal(items[0].id, r2); // 同日：后创建的在前
+  assert.equal(items[1].id, r1);
+  assert.equal(items[2].visitDate, '2023-01-01'); // 跨日：visitDate 倒序
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试C/ });
+});
+
+test('geo 端点：轻量字段 + coverPhoto，不分页', async () => {
+  await req('POST', '', tokenA, fp({ title: '足迹测试D', photos: ['https://example.com/d.jpg'] }));
+  const items = (await req('GET', '/geo', tokenA)).json().data.items;
+  const d = items.find((r: any) => r.title === '足迹测试D');
+  assert.ok(d);
+  assert.equal(d.coverPhoto, 'https://example.com/d.jpg');
+  assert.equal('description' in d, false);
+  await FootprintRecordModel.deleteMany({ title: '足迹测试D' });
+});
+
+test('防刷：1 小时第 31 条创建返回 429', async () => {
+  // 专属用户，避免污染其他用例计数
+  const tokenC = await loginAs('fp-user-rate');
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试E/ }); // 重跑残留清零
+  for (let i = 0; i < 30; i++) {
+    const ok = await req('POST', '', tokenC, fp({ title: `足迹测试E${i}` }));
+    assert.equal(ok.statusCode, 200, `第 ${i + 1} 条应成功: ${ok.body}`);
+  }
+  const blocked = await req('POST', '', tokenC, fp({ title: '足迹测试E30' }));
+  assert.equal(blocked.statusCode, 429);
+  assert.ok(blocked.json().message.includes('30'));
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试E/ });
 });
