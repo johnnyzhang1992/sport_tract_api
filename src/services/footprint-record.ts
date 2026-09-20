@@ -1,6 +1,7 @@
 import { cleanUrl, deleteOssObjects, getSignedUrl } from './oss.js';
 import { locateRegion } from './region.js';
 import { AppError } from '../utils/app-error.js';
+import { config } from '../config/index.js';
 import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import type { CreateFootprintRecordInput, ListFootprintQueryInput } from '../utils/validators.js';
 
@@ -60,6 +61,34 @@ export function removedPhotos(oldList: string[], newList: string[]): string[] {
   return oldList.filter((p) => !newList.includes(p));
 }
 
+/**
+ * 照片 URL 归属闸门（spec §5 第二道闸）
+ *
+ * 直传 policy 只约束"允许往哪个前缀上传"，约束不了"提交接口时回传哪个 URL"——
+ * 入参可被伪造成他人对象，故落库前再校验一次归属。
+ * 口径与 extractKeyFromUrl 一致：URL 以 config.oss.endpoint 开头即视为本 bucket 对象，
+ * key 必须落在自己的 {baseDir}/users/{userId}/ 前缀下。
+ * 非 bucket URL（外链、测试桩）与 endpoint 未配置时原样放行。
+ * @param photos 已 cleanUrl 归一的照片列表
+ */
+function assertPhotosOwnedBy(userId: string, photos: string[]) {
+  const base = config.oss.endpoint.replace(/\/$/, '');
+  if (!base) return;
+  const ownPrefix = `${config.oss.baseDir}/users/${userId}/`;
+  for (const url of photos) {
+    if (!url.startsWith(base)) continue; // 外链：不归本 bucket 管
+    const key = url.slice(base.length).replace(/^\//, '');
+    if (!key.startsWith(ownPrefix)) throw new AppError(400, '照片地址不属于当前用户');
+  }
+}
+
+/** cleanUrl + 归属闸门：创建/更新共用的照片入口 */
+function normalizePhotos(userId: string, photos: string[] | undefined): string[] {
+  const cleaned = (photos ?? []).map(cleanUrl);
+  assertPhotosOwnedBy(userId, cleaned);
+  return cleaned;
+}
+
 export async function createFootprint(userId: string, input: CreateFootprintRecordInput) {
   const doc = await FootprintRecordModel.create({
     userId,
@@ -68,7 +97,7 @@ export async function createFootprint(userId: string, input: CreateFootprintReco
     people: input.people,
     description: input.description,
     location: buildLocation(input),
-    photos: (input.photos ?? []).map(cleanUrl),
+    photos: normalizePhotos(userId, input.photos),
   });
   return toDto(doc);
 }
@@ -116,7 +145,7 @@ export async function getFootprint(id: string, userId: string) {
 
 export async function updateFootprint(id: string, userId: string, input: CreateFootprintRecordInput) {
   const old = await findOwnedRecord(id, userId);
-  const nextPhotos = (input.photos ?? []).map(cleanUrl);
+  const nextPhotos = normalizePhotos(userId, input.photos);
   const doc = await FootprintRecordModel.findOneAndUpdate(
     { _id: id, userId },
     {
@@ -129,6 +158,8 @@ export async function updateFootprint(id: string, userId: string, input: CreateF
     },
     { new: true },
   ).lean();
+  // 并发删除兜底：findOwnedRecord 之后文档仍可能被删，findOneAndUpdate 会返回 null
+  if (!doc) throw new AppError(404, '足迹不存在');
   // 被移除的旧图清理 OSS 文件；失败不阻塞更新（与 markers 一致）
   const stale = removedPhotos(old.photos ?? [], nextPhotos);
   if (stale.length > 0) await deleteOssObjects(stale).catch(() => {});

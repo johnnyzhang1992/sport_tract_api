@@ -7,6 +7,7 @@ import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
 import { CreateFootprintRecordSchema } from '../src/utils/validators.js';
 import { cleanUrl } from '../src/services/oss.js';
 import { removedPhotos } from '../src/services/footprint-record.js';
+import { config } from '../src/config/index.js';
 
 // 模型用例要真实落库，沿用仓库惯例用 buildApp 建 Mongo 连接（Task 2 的接口用例复用同一 app）
 let app: FastifyInstance;
@@ -231,4 +232,71 @@ test('PUT 差集清理：回传只保留一张图后，被移除的图不再出�
 
   await req('DELETE', `/${id}`, tokenA);
   await FootprintRecordModel.deleteMany({ title: '足迹测试G-图片差集' });
+});
+
+// ==================== Final fix wave：照片 URL 归属闸门（spec §5 第二道闸）====================
+
+/** 闸门口径要拼自己的 {baseDir}/users/{userId}/ 前缀：从 accessToken 解出 userId */
+function userIdFromToken(token: string): string {
+  const [, payload] = token.split('.');
+  return JSON.parse(Buffer.from(payload, 'base64url').toString()).userId as string;
+}
+
+/** 本 bucket 下某用户的对象 URL；endpoint 未配置时返回 '' —— 用例据此走放行分支 */
+function bucketUrl(userId: string, name: string): string {
+  const base = config.oss.endpoint.replace(/\/$/, '');
+  return base ? `${base}/${config.oss.baseDir}/users/${userId}/${name}` : '';
+}
+
+test('照片归属闸门（POST）：他人前缀 bucket URL 400 且不落库；自己前缀正常放行', async () => {
+  const myId = userIdFromToken(tokenA);
+  const own = bucketUrl(myId, 'ok.jpg');
+  if (!own) {
+    // endpoint 未配置：无 bucket 可比对，任意 URL 原样放行（保持 156 条存量用例口径）
+    const lax = await req('POST', '', tokenA, fp({ title: '足迹测试H-放行', photos: ['https://example.com/x.jpg'] }));
+    assert.equal(lax.statusCode, 200, lax.body);
+    assert.deepEqual(lax.json().data.record.photos, ['https://example.com/x.jpg']);
+    await FootprintRecordModel.deleteMany({ title: '足迹测试H-放行' });
+    return;
+  }
+
+  // 自己前缀必须放行：否则"直传成功后提交 URL"的正常链路会被误杀
+  // POST 不触发 deleteOssObjects，且 signatureUrl 为本地计算 —— 用例不外呼 OSS
+  const ok = await req('POST', '', tokenA, fp({ title: '足迹测试H-归属', photos: [own] }));
+  assert.equal(ok.statusCode, 200, ok.body);
+  const id = ok.json().data.record.id as string;
+  assert.deepEqual((await FootprintRecordModel.findById(id).lean())?.photos, [own]);
+
+  // 伪造他人前缀：400，且闸门在写库之前 —— 无任何残留
+  const foreign = bucketUrl(new Types.ObjectId().toString(), 'steal.jpg');
+  const bad = await req('POST', '', tokenA, fp({ title: '足迹测试H-越权', photos: [foreign] }));
+  assert.equal(bad.statusCode, 400, bad.body);
+  assert.equal(bad.json().message, '照片地址不属于当前用户');
+  assert.equal(await FootprintRecordModel.countDocuments({ title: '足迹测试H-越权' }), 0);
+
+  // 库层清理：API DELETE 会对 bucket URL 发起真实 OSS 删除，测试不外呼
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试H/ });
+});
+
+test('照片归属闸门（PUT）：他人前缀 bucket URL 400 且原照片不被覆盖；自己前缀可写入', async () => {
+  const created = await req('POST', '', tokenA, fp({ title: '足迹测试I-闸门', photos: [] }));
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data.record.id as string;
+
+  // 越权 URL 先试：闸门若写在 findOneAndUpdate 之后，库内照片会被覆盖成 foreign
+  const foreign = bucketUrl(new Types.ObjectId().toString(), 'steal.jpg');
+  if (foreign) {
+    const bad = await req('PUT', `/${id}`, tokenA, fp({ title: '足迹测试I-闸门', photos: [foreign] }));
+    assert.equal(bad.statusCode, 400, bad.body);
+    assert.equal(bad.json().message, '照片地址不属于当前用户');
+    assert.deepEqual((await FootprintRecordModel.findById(id).lean())?.photos, []);
+  }
+
+  const own = bucketUrl(userIdFromToken(tokenA), 'edit.jpg');
+  const next = own || 'https://example.com/edit.jpg'; // endpoint 未配置时验放行分支
+  const upd = await req('PUT', `/${id}`, tokenA, fp({ title: '足迹测试I-闸门', photos: [next] }));
+  assert.equal(upd.statusCode, 200, upd.body);
+  // 旧列表为空 → 无被移除项 → 不触发 deleteOssObjects
+  assert.deepEqual((await FootprintRecordModel.findById(id).lean())?.photos, [next]);
+  await FootprintRecordModel.deleteMany({ title: '足迹测试I-闸门' });
 });
