@@ -1,8 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { reverseGeocode } from '../services/geo.js';
+import { reverseGeocode, searchPlaces, assertSearchQuota } from '../services/geo.js';
 import { getChinaMap, getProvinceMap } from '../services/region.js';
 import { success } from '../utils/response.js';
+import { AppError } from '../utils/app-error.js';
 
 const ReverseQuery = z.object({
   lat: z.coerce.number().min(-90).max(90),
@@ -31,5 +32,18 @@ export async function geoRoutes(fastify: FastifyInstance) {
     const query = request.query as Record<string, unknown>;
     const { adcode } = ProvinceQuery.parse(query);
     return success(getProvinceMap(adcode));
+  });
+
+  // 地点关键词搜索（足迹编辑页自建选点用；额度敏感 → auth + 限流 + 服务端缓存）
+  fastify.get('/search', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { keyword, latitude, longitude } = request.query as {
+      keyword?: string; latitude?: string; longitude?: string;
+    };
+    const kw = (keyword ?? '').trim();
+    if (!kw) throw new AppError(400, '缺少搜索关键词 keyword');
+    assertSearchQuota(request.user.userId);
+    const lat = latitude != null ? Number(latitude) : undefined;
+    const lng = longitude != null ? Number(longitude) : undefined;
+    return success(await searchPlaces(kw, Number.isFinite(lat) ? lat : undefined, Number.isFinite(lng) ? lng : undefined));
   });
 }
