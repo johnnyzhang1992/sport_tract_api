@@ -5,6 +5,8 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
 import { CreateFootprintRecordSchema } from '../src/utils/validators.js';
+import { cleanUrl } from '../src/services/oss.js';
+import { removedPhotos } from '../src/services/footprint-record.js';
 
 // 模型用例要真实落库，沿用仓库惯例用 buildApp 建 Mongo 连接（Task 2 的接口用例复用同一 app）
 let app: FastifyInstance;
@@ -158,4 +160,75 @@ test('防刷：1 小时第 31 条创建返回 429', async () => {
   assert.equal(blocked.statusCode, 429);
   assert.ok(blocked.json().message.includes('30'));
   await FootprintRecordModel.deleteMany({ title: /^足迹测试E/ });
+});
+
+// ==================== Fix round 1：两条硬约束补测（省市离线补全 / PUT 差集清理）====================
+
+test('省市离线补全：buildLocation 用 locateRegion 写 province/city，POST 与 PUT 响应均可见', async () => {
+  const created = await req('POST', '', tokenA, fp({
+    title: '足迹测试F-省市补全',
+    // 入参不含 province/city：由服务层按坐标离线补全（不依赖逆地理编码）
+    location: { name: '苏堤', address: '杭州市西湖区', latitude: 30.24, longitude: 120.15 },
+  }));
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data.record.id as string;
+  const loc = created.json().data.record.location;
+  // 杭州坐标 (30.24, 120.15) 离线落在杭州市多边形内
+  // 期望值为先跑打印确认后固化的字面断言（非"非空即可"弱断言）
+  assert.equal(loc.province, '浙江省');
+  assert.equal(loc.city, '杭州市');
+  assert.equal(loc.name, '苏堤'); // 补全不覆盖入参字段
+  assert.equal(loc.latitude, 30.24);
+  assert.equal(loc.longitude, 120.15);
+
+  // 编辑同样走 buildLocation：换坐标即换省市
+  const upd = await req('PUT', `/${id}`, tokenA, fp({
+    title: '足迹测试F-省市补全',
+    location: { name: '苏堤', address: '杭州市西湖区', latitude: 39.90, longitude: 116.40 },
+  }));
+  assert.equal(upd.statusCode, 200, upd.body);
+  assert.equal(upd.json().data.record.location.province, '北京市');
+  assert.equal(upd.json().data.record.location.city, '北京市');
+
+  // 落库复核（DTO 只是映射，真实值在文档上）
+  const stored = await FootprintRecordModel.findById(id).lean();
+  assert.equal(stored?.location.province, '北京市');
+  assert.equal(stored?.location.city, '北京市');
+
+  await req('DELETE', `/${id}`, tokenA);
+  await FootprintRecordModel.deleteMany({ title: '足迹测试F-省市补全' });
+});
+
+test('removedPhotos 差集纯函数：编辑时被移除的旧图 = 旧列表 − 新列表', () => {
+  const a = 'https://bucket.oss.example.com/sport-track/users/u1/a.jpg';
+  const b = 'https://bucket.oss.example.com/sport-track/users/u1/b.jpg';
+  assert.deepEqual(removedPhotos([a, b], [a]), [b]); // 移除 b
+  assert.deepEqual(removedPhotos([a, b], [a, b]), []); // 全保留：不误删
+  assert.deepEqual(removedPhotos([a, b], []), [a, b]); // 全移除
+  assert.deepEqual(removedPhotos([], [a]), []); // 新增图不在清理范围
+  // 签名回传的 URL 先 cleanUrl 归一才能对上（前端把详情里的签名 URL 原样回传的场景）
+  assert.deepEqual(removedPhotos([a], [`${a}?Expires=1&Signature=x`].map(cleanUrl)), []);
+});
+
+test('PUT 差集清理：回传只保留一张图后，被移除的图不再出现在详情里（行为层复核）', async () => {
+  const a = 'https://example.com/sport-track/users/fp-a/a.jpg';
+  const b = 'https://example.com/sport-track/users/fp-a/b.jpg';
+  const created = await req('POST', '', tokenA, fp({ title: '足迹测试G-图片差集', photos: [a, b] }));
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data.record.id as string;
+  assert.deepEqual(created.json().data.record.photos, [a, b]); // 测试环境 OSS 未配置：getSignedUrl 原样返回
+
+  // 只回传 a：b 属于被移除项，走 deleteOssObjects（失败不阻塞），响应与库内均只剩 a
+  const upd = await req('PUT', `/${id}`, tokenA, fp({ title: '足迹测试G-图片差集', photos: [a] }));
+  assert.equal(upd.statusCode, 200, upd.body);
+  assert.deepEqual(upd.json().data.record.photos, [a]);
+
+  const got = await req('GET', `/${id}`, tokenA);
+  assert.equal(got.statusCode, 200, got.body);
+  const photos = got.json().data.photos as string[];
+  assert.equal(photos.length, 1);
+  assert.deepEqual(photos, [a]);
+
+  await req('DELETE', `/${id}`, tokenA);
+  await FootprintRecordModel.deleteMany({ title: '足迹测试G-图片差集' });
 });

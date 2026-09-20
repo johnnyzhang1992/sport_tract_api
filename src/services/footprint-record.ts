@@ -55,8 +55,8 @@ function buildLocation(input: CreateFootprintRecordInput) {
   return { ...input.location, province: region?.province ?? '', city: region?.city ?? '' };
 }
 
-/** 编辑时清理被移除的旧图（入参已 cleanUrl；签名回传的 URL 归一后才能对上） */
-function removedPhotos(oldList: string[], newList: string[]): string[] {
+/** 编辑时清理被移除的旧图（入参已 cleanUrl；签名回传的 URL 归一后才能对上）。导出供差集口径单测 */
+export function removedPhotos(oldList: string[], newList: string[]): string[] {
   return oldList.filter((p) => !newList.includes(p));
 }
 
