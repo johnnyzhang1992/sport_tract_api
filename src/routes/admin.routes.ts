@@ -558,13 +558,22 @@ export async function adminRoutes(fastify: FastifyInstance) {
         .skip((p - 1) * ps)
         .limit(ps)
         .lean(),
-      ActivityModel.aggregate([{ $group: { _id: '$userId', count: { $sum: 1 } } }]),
+      // 按 status 双计数：finished 单列（列表展示 {已完成}/{总}），in_progress/abandoned 归入总数
+      ActivityModel.aggregate([
+        {
+          $group: {
+            _id: '$userId',
+            count: { $sum: 1 },
+            finishedCount: { $sum: { $cond: [{ $eq: ['$status', 'finished'] }, 1, 0] } },
+          },
+        },
+      ]),
       LoginLogModel.aggregate([
         { $sort: { createdAt: -1 } },
         { $group: { _id: '$userId', ip: { $first: '$ip' }, province: { $first: '$province' }, city: { $first: '$city' } } },
       ]),
     ]);
-    const countMap = new Map(counts.map((c) => [String(c._id), c.count]));
+    const countMap = new Map(counts.map((c) => [String(c._id), { count: c.count, finished: c.finishedCount }]));
     const loginMap = new Map(lastLogins.map((l) => [String(l._id), l]));
     return success({
       total,
@@ -572,6 +581,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       pageSize: ps,
       items: users.map((u) => {
         const log = loginMap.get(String(u._id));
+        const uc = countMap.get(String(u._id));
         return {
           id: String(u._id),
           nickname: u.nickname,
@@ -581,7 +591,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
           heightCm: u.heightCm,
           createdAt: u.createdAt,
           lastLoginAt: u.lastLoginAt ?? u.createdAt,
-          activityCount: countMap.get(String(u._id)) ?? 0,
+          activityCount: uc?.count ?? 0, // 全部轨迹数
+          finishedCount: uc?.finished ?? 0, // 已完成轨迹数
           note: u.note ?? '', // 管理员备注（仅管理端可见）
           lastLoginIp: log?.ip ?? '',
           // 定位失败的历史脏值（"0"/"内网IP"/空）统一显示“未知”
