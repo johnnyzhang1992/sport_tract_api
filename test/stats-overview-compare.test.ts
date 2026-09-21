@@ -69,21 +69,19 @@ after(async () => {
 });
 
 async function createFinishedAt(startTs: number) {
-  const createdRes = await app.inject({
-    method: 'POST',
-    url: '/sport-track/api/activities',
-    headers: { authorization: `Bearer ${token}` },
-    payload: { type: 'walking', startTime: startTs },
+  // 注：finish 现在会作废空轨迹（点数/距离守卫），本文件测的是统计聚合，
+  // 直接在库内造 finished 记录（时长 60s 与原 finish 流程一致）
+  await ActivityModel.create({
+    userId,
+    type: 'walking',
+    status: 'finished',
+    startTime: startTs,
+    endTime: startTs + 60000,
+    duration: 60,
+    distance: 1000,
+    trackPoints: [],
+    markers: [],
   });
-  assert.equal(createdRes.statusCode, 200, `创建活动失败: ${createdRes.body}`);
-  const id = createdRes.json().data.activityId;
-  const fin = await app.inject({
-    method: 'PUT',
-    url: `/sport-track/api/activities/${id}/finish`,
-    headers: { authorization: `Bearer ${token}` },
-    payload: { trackPoints: [], endTime: startTs + 60000, pausedMs: 0 },
-  });
-  assert.equal(fin.statusCode, 200);
   created.push(startTs);
 }
 

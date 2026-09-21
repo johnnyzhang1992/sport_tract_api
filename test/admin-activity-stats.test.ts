@@ -81,31 +81,25 @@ async function adminReq(method: string, url: string): Promise<LightMyRequestResp
   return app.inject({ method: method as 'GET', url, headers: { authorization: `Bearer ${adminToken}` } });
 }
 
-/** 创建一条 finished 活动（上海起点） */
+/** 创建一条 finished 活动（上海起点）
+ *  注：finish 现在会作废空轨迹（点数/距离守卫），本文件测的是管理端统计聚合，
+ *  直接在库内造 finished 记录 */
 async function createFinished(opts: { daysAgo: number; province?: string; city?: string; distance?: number }) {
   const startTs = Date.now() - opts.daysAgo * 86400000;
-  const created = await app.inject({
-    method: 'POST',
-    url: '/sport-track/api/activities',
-    headers: { authorization: `Bearer ${userToken}` },
-    payload: { type: 'walking', startTime: startTs },
+  const doc = await ActivityModel.create({
+    userId,
+    type: 'walking',
+    status: 'finished',
+    startTime: startTs,
+    endTime: startTs + 60000,
+    duration: 60,
+    distance: opts.distance ?? 1000,
+    startProvince: opts.province ?? '上海市',
+    startCity: opts.city ?? '上海市',
+    trackPoints: [],
+    markers: [],
   });
-  assert.equal(created.statusCode, 200, `创建活动失败: ${created.body}`);
-  const id = created.json().data.activityId;
-  const fin = await app.inject({
-    method: 'PUT',
-    url: `/sport-track/api/activities/${id}/finish`,
-    headers: { authorization: `Bearer ${userToken}` },
-    payload: { trackPoints: [], endTime: startTs + 60000, pausedMs: 0 },
-  });
-  assert.equal(fin.statusCode, 200);
-  // 直接回填省市/距离（模拟 finish 已落库省市的活动）
-  await ActivityModel.updateOne(
-    { _id: id },
-    { $set: { startProvince: opts.province ?? '上海市', startCity: opts.city ?? '上海市', distance: opts.distance ?? 1000 } },
-    { timestamps: false },
-  );
-  return String(id);
+  return String(doc._id);
 }
 
 test('activity-stats：多范围概况', async () => {

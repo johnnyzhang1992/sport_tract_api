@@ -17,7 +17,7 @@ import type {
   ListActivitiesQueryInput,
   UpdateMarkerInput,
 } from '../utils/validators.js';
-import { ACTIVITY_TYPES, MAX_TRACK_POINTS } from '../config/constants.js';
+import { ACTIVITY_TYPES, MAX_TRACK_POINTS, MIN_EFFECTIVE_DISTANCE_M, MIN_EFFECTIVE_POINTS } from '../config/constants.js';
 
 type ObjectIdLike = Types.ObjectId | string;
 
@@ -210,13 +210,25 @@ export async function addMarker(
  * 结束活动（finish 对账，核心同步协议）
  * - 以客户端 final 包为准：全量替换 trackPoints + markers
  * - 服务端重算指标（距离/配速/卡路里/爬升）复核
+ * - 轨迹无效（点数 < MIN_EFFECTIVE_POINTS 或重算距离 < MIN_EFFECTIVE_DISTANCE_M）→
+ *   自动作废（cancelled）不保存，返回 reason=TOO_FEW_POINTS / DISTANCE_TOO_SHORT
  * - 幂等：已 finished 直接返回当前活动（防客户端重试）
  */
+export type FinishInvalidReason = 'TOO_FEW_POINTS' | 'DISTANCE_TOO_SHORT';
+
+export interface FinishActivityResult {
+  status: string;
+  lastPointSeq: number;
+  activity: ActivityDto;
+  /** 轨迹无效作废原因（status=cancelled 时存在） */
+  reason?: FinishInvalidReason;
+}
+
 export async function finishActivity(
   activityId: ObjectIdLike,
   userId: string,
   input: FinishActivityInput,
-): Promise<{ status: string; lastPointSeq: number; activity: ActivityDto }> {
+): Promise<FinishActivityResult> {
   const activity = await ActivityModel.findOne({ _id: activityId, userId }).lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
@@ -225,6 +237,21 @@ export async function finishActivity(
   // 幂等返回（重复 finish）
   if (activity.status === 'finished') {
     return { status: activity.status, lastPointSeq: activity.lastPointSeq, activity: toActivityDto(activity) };
+  }
+  // 重复 finish 一条已因轨迹无效作废的活动：同样返回作废结果（防客户端重试报 409）
+  if (activity.status === 'cancelled') {
+    const pts = (activity.trackPoints ?? []) as TrackPointDto[];
+    const looksInvalid =
+      (activity.distance ?? 0) < MIN_EFFECTIVE_DISTANCE_M || pts.length < MIN_EFFECTIVE_POINTS;
+    if (!looksInvalid) {
+      throw new AppError(409, '活动已取消，无法结束', { code: 'ACTIVITY_CANCELLED' });
+    }
+    return {
+      status: activity.status,
+      lastPointSeq: activity.lastPointSeq,
+      activity: toActivityDto(activity),
+      reason: pts.length < MIN_EFFECTIVE_POINTS ? 'TOO_FEW_POINTS' : 'DISTANCE_TOO_SHORT',
+    };
   }
   if (activity.status !== 'in_progress') {
     throw new AppError(409, '活动已取消，无法结束', { code: 'ACTIVITY_CANCELLED' });
@@ -239,8 +266,6 @@ export async function finishActivity(
       return true;
     })
     .sort((a, b) => a.seq - b.seq);
-
-  // 允许空轨迹点（用户随时结束）：指标按 0 处理
 
   // 结束时间：以最后一个轨迹点的上报时间为准（异常中断后补 finish 时，避免把中断后的空档计入时长）
   const validTs = trackPoints
@@ -262,6 +287,35 @@ export async function finishActivity(
     durationSec,
     weightKg: input.weightKg,
   });
+
+  // 无效运动守卫：点数过少（单点无位移/两点成假直线）或重算距离过短
+  // （原地不动结束/漂移点全被清洗）→ 自动作废不保存，
+  // 避免无意义轨迹进入列表与统计（原始点仍入库留底，仅状态不可见）
+  const tooFewPoints = trackPoints.length < MIN_EFFECTIVE_POINTS;
+  if (tooFewPoints || stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
+    const cancelled = await ActivityModel.findByIdAndUpdate(
+      activityId,
+      {
+        $set: {
+          status: 'cancelled',
+          endTime,
+          trackPoints,
+          markers: input.markers ?? activity.markers ?? [],
+          pausedMs: input.pausedMs,
+          duration: Math.round(durationSec),
+          distance: stats.distance,
+        },
+      },
+      { returnDocument: 'after' },
+    );
+    return {
+      status: 'cancelled',
+      lastPointSeq: cancelled!.lastPointSeq,
+      activity: toActivityDto(cancelled!.toObject()),
+      reason: tooFewPoints ? 'TOO_FEW_POINTS' : 'DISTANCE_TOO_SHORT',
+    };
+  }
+
   // 轨迹内最快 1km 分段（个人最佳"最快配速"口径：分段最快，非全程平均）
   const fastestKm = calcFastestKm(smoothedPoints, activity.type);
   // 落库省市（按省查询轨迹 + 点亮地图省下钻）
@@ -318,7 +372,8 @@ export async function cancelActivity(activityId: ObjectIdLike, userId: string): 
 
 /**
  * 超时活动自动收尾（惰性清理）：in_progress 超过 24h 无更新（用户杀进程/异常退出）
- * - 有轨迹点 → 自动 finished 保留数据：endTime 以最后轨迹点上报时间为准，重算指标（与 finish 同管线）
+ * - 有轨迹点 → 重算指标：距离达标 → finished 保留数据（endTime 以最后轨迹点上报时间为准，与 finish 同管线）；
+ *   距离过短（漂移点全被清洗）→ cancelled 作废，不产生无意义轨迹
  * - 无轨迹点 → cancelled 作废（无数据可保留，不污染用户列表）
  * - userId 不传则清理全部用户（admin 列表用）；返回处理条数
  */
@@ -360,6 +415,16 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
     const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
     const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
     const stats = calcStats(smoothedPoints, { type: activity.type, durationSec });
+
+    // 无效运动守卫：点数过少或重算距离过短（漂移点全被清洗）→ 自动作废，与 finish 同口径
+    if (trackPoints.length < MIN_EFFECTIVE_POINTS || stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
+      await ActivityModel.updateOne(
+        { _id: activity._id },
+        { $set: { status: 'cancelled', endTime } },
+      );
+      continue;
+    }
+
     const fastestKm = calcFastestKm(smoothedPoints, activity.type);
     const regions = provincesOfPoints(smoothedPoints);
 

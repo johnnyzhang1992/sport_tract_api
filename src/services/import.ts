@@ -12,7 +12,7 @@ import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { wgs84ToGcj02 } from '../utils/coordinate.js';
 import { markFootprintDirty } from './footprint.js';
 import { provincesOfPoints } from './region.js';
-import { ACTIVITY_TYPES, MAX_TRACK_POINTS } from '../config/constants.js';
+import { ACTIVITY_TYPES, MAX_TRACK_POINTS, MIN_EFFECTIVE_DISTANCE_M, MIN_EFFECTIVE_POINTS } from '../config/constants.js';
 
 export interface ImportedPoint {
   lat: number;
@@ -276,8 +276,8 @@ export async function importActivity(
     if (last && haversineDistance(last, p) < 1) continue;
     deduped.push(p);
   }
-  if (deduped.length < 2) {
-    throw new AppError(400, '解析后有效轨迹点不足');
+  if (deduped.length < MIN_EFFECTIVE_POINTS) {
+    throw new AppError(400, `解析后有效轨迹点不足（至少 ${MIN_EFFECTIVE_POINTS} 个）`);
   }
   points = deduped;
 
@@ -285,6 +285,11 @@ export async function importActivity(
   const endTime = points[points.length - 1].timestamp;
   const durationSec = Math.max(1, Math.round((endTime - startTime) / 1000));
   const stats = calcStats(points, { type: type as never, durationSec });
+
+  // 无效轨迹守卫：导入文件重算距离过短（静止/漂移）→ 拒绝导入，与 finish 作废口径一致
+  if (stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
+    throw new AppError(400, '轨迹距离过短（不足 10 米），未导入');
+  }
 
   const trackPoints = points.map((p, i) => ({
     seq: i + 1,

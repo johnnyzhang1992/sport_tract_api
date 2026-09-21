@@ -173,7 +173,7 @@ test('finish endTime：以最后一个轨迹点的上报时间为准，忽略传
   assert.equal(act.duration, 40, '时长 = (最后点 - startTime) / 1000');
 });
 
-test('finish endTime：空轨迹点回退传入 endTime', async () => {
+test('finish：空轨迹点 → 自动作废（点数过少），endTime 回退传入 endTime', async () => {
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: TEST_NOW - 30000 },
@@ -184,7 +184,73 @@ test('finish endTime：空轨迹点回退传入 endTime', async () => {
     body: { trackPoints: [], endTime: TEST_NOW },
   });
   assert.equal(res.statusCode, 200);
-  assert.equal(res.json().data.activity.endTime, TEST_NOW, '无点时应回退传入 endTime');
+  const data = res.json().data;
+  assert.equal(data.status, 'cancelled', '空轨迹应自动作废');
+  assert.equal(data.reason, 'TOO_FEW_POINTS');
+  assert.equal(data.activity.endTime, TEST_NOW, '作废时 endTime 仍应回退传入 endTime');
+});
+
+test('finish：点数过少（<3，即使距离达标）→ 自动作废，不进列表', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 30000 },
+  });
+  const id = created.json().data.activityId;
+  // 2 个点相距 ~111m：距离达标但只有 2 点（GPS 长时间丢点会画出假直线）→ 作废
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [P(1, 31.2304, 121.4737), P(2, 31.2314, 121.4737)],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const data = res.json().data;
+  assert.equal(data.status, 'cancelled', '点数 < 3 应自动作废');
+  assert.equal(data.reason, 'TOO_FEW_POINTS');
+  // 列表（只查 finished）不应出现
+  const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  assert.ok(!item, '作废活动不应出现在用户列表');
+  // 重复 finish → 幂等返回作废结果（不报 409）
+  const retry = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [P(1, 31.2304, 121.4737), P(2, 31.2314, 121.4737)],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+  assert.equal(retry.statusCode, 200);
+  assert.equal(retry.json().data.status, 'cancelled');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
+test('finish：点数多但距离过短（原地不动）→ 自动作废，不进列表', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 6 个点在 ~1m 范围内抖动（站 50s 的采点节奏）：点数达标但重算距离 ≈ 0 → 作废
+  const jitter = [0, 0.000005, -0.000005, 0.000008, -0.000008, 0.000003];
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: jitter.map((d, i) => P(i + 1, 31.2304 + d, 121.4737 + d)),
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const data = res.json().data;
+  assert.equal(data.status, 'cancelled', '距离 < 10m 应自动作废');
+  assert.equal(data.reason, 'DISTANCE_TOO_SHORT');
+  const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  assert.ok(!item, '作废活动不应出现在用户列表');
+  await ActivityModel.deleteOne({ _id: id });
 });
 
 test('finish 落库省市：写入经过的省与起点城市', async () => {
@@ -302,7 +368,7 @@ test('重复 finish → 幂等返回', async () => {
   assert.equal(res.json().data.status, 'finished');
 });
 
-test('空轨迹点直接结束（随时可结束）', async () => {
+test('空轨迹点直接结束 → 自动作废不保存', async () => {
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: TEST_NOW - 30000 },
@@ -315,10 +381,9 @@ test('空轨迹点直接结束（随时可结束）', async () => {
   });
   assert.equal(res.statusCode, 200);
   const data = res.json().data;
-  assert.equal(data.status, 'finished');
+  assert.equal(data.status, 'cancelled');
   assert.equal(data.lastPointSeq, 0);
-  assert.equal(data.activity.distance, 0);
-  assert.equal(data.activity.trackPoints.length, 0);
+  await ActivityModel.deleteOne({ _id: id });
 });
 
 test('分享查看：B 用户读取 A 的 finished 主活动 → 200 + isOwner=false', async () => {
@@ -510,6 +575,32 @@ test('列表惰性清理：超时且有轨迹点 → 自动 finish 保留数据'
   await ActivityModel.deleteOne({ _id: id });
 });
 
+test('列表惰性清理：超时但点数过少/距离过短 → 自动作废', async () => {
+  // 原地不动产生的一堆漂移点：点数达标但重算距离 ≈ 0 → 不应保留为 finished
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 50000 },
+  });
+  const id = created.json().data.activityId;
+  const jitter = [0, 0.000004, -0.000004, 0.000006];
+  await req('POST', `/sport-track/api/activities/${id}/points`, {
+    token: tokenA,
+    body: { points: jitter.map((d, i) => P(i + 1, 31.2304 + d, 121.4737 + d)) },
+  });
+  await ActivityModel.updateOne(
+    { _id: id },
+    { $set: { updatedAt: new Date(Date.now() - 25 * 3600 * 1000) } },
+    { timestamps: false },
+  );
+  const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
+  assert.equal(list.statusCode, 200);
+  const act = await ActivityModel.findById(id).lean();
+  assert.equal(act?.status, 'cancelled', '重算距离过短应自动作废');
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  assert.ok(!item, '作废活动不应出现在用户列表');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('列表 previewPoints：暂停断点（pauseGap）不被均匀采样丢失', async () => {
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
@@ -537,20 +628,25 @@ test('列表 previewPoints：暂停断点（pauseGap）不被均匀采样丢失'
 });
 
 test('列表 previewPoints：空轨迹不产生 (0,0) 填充点', async () => {
-  const created = await req('POST', '/sport-track/api/activities', {
-    token: tokenA,
-    body: { type: 'walking', startTime: TEST_NOW - 30000 },
-  });
-  const id = created.json().data.activityId;
-  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
-    token: tokenA,
-    body: { trackPoints: [], endTime: TEST_NOW },
+  // 注：finish 现在会作废空轨迹（点数守卫），这里直接在库内造 finished 空轨迹
+  //（覆盖列表聚合对异常存量数据的防御分支）
+  const mine = await ActivityModel.findById(activityId).select('userId').lean();
+  const doc = await ActivityModel.create({
+    userId: mine!.userId,
+    type: 'walking',
+    status: 'finished',
+    startTime: TEST_NOW - 30000,
+    endTime: TEST_NOW,
+    duration: 30,
+    distance: 0,
+    trackPoints: [],
+    markers: [],
   });
   const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
-  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === String(doc._id));
   assert.ok(item, '空轨迹 finished 活动应在列表');
   assert.deepEqual(item.previewPoints, [], '空轨迹预览点应为空数组');
-  await ActivityModel.deleteOne({ _id: id });
+  await ActivityModel.deleteOne({ _id: doc._id });
 });
 
 test('活动详情：返回完整轨迹点与打点', async () => {

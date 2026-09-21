@@ -100,12 +100,12 @@ export async function activityRoutes(fastify: FastifyInstance) {
     return success(null, '打点已删除');
   });
 
-  // 结束活动（final 包对账）
+  // 结束活动（final 包对账；轨迹无效〔点数过少/距离过短〕会被服务端自动作废，不产生 finished 记录）
   fastify.put('/:id/finish', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id } = request.params as { id: string };
     const input = FinishActivitySchema.parse(request.body);
     const result = await finishActivity(id, request.user.userId, input);
-    return success(result, '运动已保存');
+    return success(result, result.status === 'cancelled' ? '轨迹无效，未保存本次运动' : '运动已保存');
   });
 
   // 放弃活动

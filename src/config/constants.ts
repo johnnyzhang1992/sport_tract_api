@@ -44,6 +44,19 @@ export const ACTIVITY_TYPE_META: Record<ActivityType, ActivityTypeMeta> = {
 /** 轨迹点数组保护上限（超出提示客户端抽稀） */
 export const MAX_TRACK_POINTS = 20_000;
 
+/**
+ * 有效运动最小距离（米）：finish/惰性清理重算距离低于该值视为无效运动
+ * （原地不动结束、GPS 漂移点全被过滤），自动作废（cancelled）不产生 finished 记录，
+ * 避免距离为 0 的"无意义轨迹"污染列表与统计
+ */
+export const MIN_EFFECTIVE_DISTANCE_M = 10;
+
+/**
+ * 有效运动最小轨迹点数：少于该值无法构成轨迹（单点无位移，两点只是直线段，
+ * GPS 长时间丢点时会画出假直线），即使距离达标也作废
+ */
+export const MIN_EFFECTIVE_POINTS = 3;
+
 /** 列表分页默认值 */
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
