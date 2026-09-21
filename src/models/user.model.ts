@@ -21,6 +21,7 @@ const userSchema = new Schema(
       kmAnnounce: { type: Boolean, default: true }, // 记录中整公里震动+横幅播报
     },
     avatarPreset: { type: String, default: '' }, // 默认头像预设 key（assets/avatars/default-N，avatarUrl 为空时生效）
+    note: { type: String, default: '', maxlength: 200 }, // 管理员备注（仅管理后台可见/编辑）
     // 足迹点亮缓存（懒重算：写入只置 dirty，读时 dirty 才重算）
     footprintCache: { type: Schema.Types.Mixed, default: null },
     footprintDirty: { type: Boolean, default: true },

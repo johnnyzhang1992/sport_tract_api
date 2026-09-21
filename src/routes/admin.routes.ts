@@ -11,7 +11,7 @@ import { AppError } from '../utils/app-error.js';
 import { locateRegion } from '../services/region.js';
 import { INVALID_REGION_VALUES, isValidRegionValue } from '../services/ip-locate.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
-import { footprint } from '../services/footprint.js';
+import { footprint, markFootprintDirty } from '../services/footprint.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
 import {
   adminListTopics,
@@ -545,7 +545,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const ps = Math.min(100, Number(pageSize) || 20);
     const filter: Record<string, unknown> = {};
     if (keyword && String(keyword).trim()) {
-      filter.nickname = { $regex: String(keyword).trim(), $options: 'i' };
+      const kw = { $regex: String(keyword).trim(), $options: 'i' };
+      filter.$or = [{ nickname: kw }, { note: kw }]; // 昵称或管理员备注匹配
     }
     const allowedSortFields = ['createdAt', 'lastLoginAt'];
     const sortField = allowedSortFields.includes(sortBy || '') ? sortBy! : 'lastLoginAt';
@@ -581,6 +582,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
           createdAt: u.createdAt,
           lastLoginAt: u.lastLoginAt ?? u.createdAt,
           activityCount: countMap.get(String(u._id)) ?? 0,
+          note: u.note ?? '', // 管理员备注（仅管理端可见）
           lastLoginIp: log?.ip ?? '',
           // 定位失败的历史脏值（"0"/"内网IP"/空）统一显示“未知”
           lastLoginProvince: isValidRegionValue(log?.province) ? log!.province : '未知',
@@ -598,6 +600,45 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const nicknameBackfilled = await backfillEmptyNicknames();
     const remaining = await UserModel.countDocuments({ uid: { $exists: false } });
     return success({ uidBackfilled, nicknameBackfilled, remaining });
+  });
+
+  // 设置用户备注（仅管理后台可见/编辑）
+  fastify.put('/users/:id/note', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '用户不存在');
+    const { note } = (request.body ?? {}) as { note?: string };
+    const raw = String(note ?? '').trim();
+    if (raw.length > 200) throw new AppError(400, '备注最多 200 字');
+    const user = await UserModel.findById(id).select('_id').lean();
+    if (!user) throw new AppError(404, '用户不存在');
+    await UserModel.updateOne({ _id: id }, { $set: { note: raw } });
+    return success({ id, note: raw }, '备注已保存');
+  });
+
+  // 修改轨迹状态（管理端手动纠错：已完成↔已作废互转；不提供删除）
+  // - in_progress 是进行中的同步会话，不允许干预（超过 24h 惰性清理自动收尾）
+  // - 状态变化影响用户端列表/统计/足迹 → markFootprintDirty
+  fastify.put('/activities/:id/status', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '轨迹不存在');
+    const { status } = (request.body ?? {}) as { status?: string };
+    if (status !== 'finished' && status !== 'cancelled') {
+      throw new AppError(400, 'status 仅支持 finished / cancelled');
+    }
+    const activity = await ActivityModel.findById(id).select('status userId').lean();
+    if (!activity) throw new AppError(404, '轨迹不存在');
+    if (activity.status === 'in_progress') {
+      throw new AppError(400, '进行中的活动不能手动改状态（超过 24h 会自动收尾）');
+    }
+    if (activity.status === status) {
+      return success({ id, status, changed: false }, '状态未变化');
+    }
+    await ActivityModel.updateOne({ _id: id }, { $set: { status } });
+    await markFootprintDirty(String(activity.userId));
+    return success(
+      { id, status, changed: true },
+      status === 'cancelled' ? '已作废该轨迹' : '已恢复为有效',
+    );
   });
 
   // 用户登录历史（分页，按时间倒序；支持时间区间筛选）
@@ -756,6 +797,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         openid: user.openid,
         weightKg: user.weightKg ?? null,
         heightCm: user.heightCm ?? null,
+        note: user.note ?? '',
         createdAt: user.createdAt,
         lastLoginAt: user.lastLoginAt ?? user.createdAt,
       },
