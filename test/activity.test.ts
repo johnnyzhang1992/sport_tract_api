@@ -173,6 +173,39 @@ test('finish endTime：以最后一个轨迹点的上报时间为准，忽略传
   assert.equal(act.duration, 40, '时长 = (最后点 - startTime) / 1000');
 });
 
+test('总时长：含暂停的墙钟时长（= 运动时长 + 暂停时长）', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.2304, lng: 121.4737, altitude: null, speed: null, timestamp: TEST_NOW - 50000 },
+        { seq: 2, lat: 31.2314, lng: 121.4738, altitude: null, speed: null, timestamp: TEST_NOW - 30000 },
+        { seq: 3, lat: 31.2324, lng: 121.4739, altitude: null, speed: null, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+      pausedMs: 10000, // 中途暂停 10s
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const act = res.json().data.activity;
+  assert.equal(act.endTime, TEST_NOW);
+  assert.equal(act.duration, 50, '运动时长 = 墙钟 60s − 暂停 10s');
+  assert.equal(act.totalDuration, 60, '总时长 = endTime − startTime（含暂停）');
+});
+
+test('总时长：列表/详情接口同样下发（含旧数据 pausedMs 缺失）', async () => {
+  const detail = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenA });
+  assert.equal(detail.statusCode, 200);
+  const act = detail.json().data;
+  assert.equal(typeof act.totalDuration, 'number');
+  assert.ok(act.totalDuration >= act.duration, '总时长不小于运动时长');
+});
+
 test('finish：空轨迹点 → 自动作废（点数过少），endTime 回退传入 endTime', async () => {
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,

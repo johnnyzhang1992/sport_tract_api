@@ -51,6 +51,7 @@ export interface ActivityDto {
   startTime: number;
   endTime: number | null;
   duration: number;
+  totalDuration: number;
   distance: number;
   avgPace: number | null;
   fastestKm: number | null;
@@ -72,6 +73,19 @@ export interface ActivityDto {
   updatedAt: string;
 }
 
+/**
+ * 总时长（秒，含暂停的墙钟时长）= endTime − startTime
+ * - duration 是运动时长（扣除暂停），两者差值即暂停总时长
+ * - endTime 缺失（异常中断等）回退为 运动时长 + pausedMs，保证总时长 ≥ 运动时长
+ */
+function totalDurationOf(doc: Record<string, any>): number {
+  const duration = doc.duration ?? 0;
+  if (doc.endTime) {
+    return Math.max(duration, Math.round((doc.endTime - doc.startTime) / 1000));
+  }
+  return duration + Math.round((doc.pausedMs ?? 0) / 1000);
+}
+
 export function toActivityDto(doc: Record<string, any>): ActivityDto {
   return {
     id: String(doc._id),
@@ -80,6 +94,7 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     startTime: doc.startTime,
     endTime: doc.endTime ?? null,
     duration: doc.duration ?? 0,
+    totalDuration: totalDurationOf(doc),
     distance: doc.distance ?? 0,
     avgPace: doc.avgPace ?? null,
     fastestKm: doc.fastestKm ?? null,
