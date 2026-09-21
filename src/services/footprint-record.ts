@@ -1,3 +1,4 @@
+import { Types } from 'mongoose';
 import { cleanUrl, deleteOssObjects, getSignedUrl } from './oss.js';
 import { locateRegion } from './region.js';
 import { AppError } from '../utils/app-error.js';
@@ -137,6 +138,51 @@ export async function listFootprintGeo(userId: string) {
       coverPhoto: d.photos?.[0] ? getSignedUrl(d.photos[0]) : '',
     })),
   };
+}
+
+export interface FootprintStats {
+  total: number;
+  provinceCount: number;
+  cityCount: number;
+  provinces: Array<{ name: string; count: number }>;
+}
+
+/**
+ * 统计页聚合：total / 省份数 / 城市数 / 分省计数（点亮地图上色用）
+ * 一次按 province+city 分组后在 Node 侧汇总——单用户私有数据，分组行数 ≤ 省市组合数，
+ * 不值得上 $facet 两次查询。userId 必须先转 ObjectId：aggregate 的 $match 不像 find 那样按 schema 自动转型。
+ * @param range from 含 / to 不含（YYYY-MM-DD，与 visitDate 字符串同构，字典序即日期序）；不传 = 全部
+ */
+export async function footprintStats(
+  userId: string,
+  range: { from?: string; to?: string } = {},
+): Promise<FootprintStats> {
+  const match: Record<string, unknown> = { userId: new Types.ObjectId(userId) };
+  if (range.from || range.to) {
+    const visitDate: Record<string, string> = {};
+    if (range.from) visitDate.$gte = range.from;
+    if (range.to) visitDate.$lt = range.to;
+    match.visitDate = visitDate;
+  }
+  const rows = await FootprintRecordModel.aggregate<{ _id: { province?: string; city?: string }; count: number }>([
+    { $match: match },
+    { $group: { _id: { province: '$location.province', city: '$location.city' }, count: { $sum: 1 } } },
+  ]);
+
+  let total = 0;
+  const provMap = new Map<string, number>();
+  const citySet = new Set<string>();
+  for (const row of rows) {
+    total += row.count;
+    const province = (row._id?.province ?? '').trim();
+    const city = (row._id?.city ?? '').trim();
+    if (province) provMap.set(province, (provMap.get(province) ?? 0) + row.count);
+    if (city) citySet.add(`${province}|${city}`);
+  }
+  const provinces = [...provMap.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  return { total, provinceCount: provinces.length, cityCount: citySet.size, provinces };
 }
 
 export async function getFootprint(id: string, userId: string) {

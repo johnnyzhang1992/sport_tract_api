@@ -300,3 +300,51 @@ test('照片归属闸门（PUT）：他人前缀 bucket URL 400 且原照片不�
   assert.deepEqual((await FootprintRecordModel.findById(id).lean())?.photos, [next]);
   await FootprintRecordModel.deleteMany({ title: '足迹测试I-闸门' });
 });
+
+test('stats：省/市/总数聚合 + from/to 区间（含 from 不含 to）+ 非法入参 400', async () => {
+  // 独立用户，避免与 tokenA/B 的历史数据串扰
+  const token = await loginAs('fp-user-stats');
+  const mk = (visitDate: string, latitude: number, longitude: number, title: string) =>
+    req('POST', '', token, fp({ visitDate, title, location: { name: 'x', address: 'y', latitude, longitude } }));
+  // 坐标的省市结果沿用既有用例固化的离线区域值：杭州(30.24,120.15)=浙江省/杭州市、北京(39.90,116.40)=北京市/北京市
+  assert.equal((await mk('2026-01-10', 30.24, 120.15, '足迹测试-统计-1')).statusCode, 200);
+  assert.equal((await mk('2026-02-15', 30.24, 120.15, '足迹测试-统计-2')).statusCode, 200);
+  assert.equal((await mk('2026-03-20', 39.9, 116.4, '足迹测试-统计-3')).statusCode, 200);
+  assert.equal((await mk('2027-01-05', 30.24, 120.15, '足迹测试-统计-4')).statusCode, 200); // 跨年
+
+  // 全部：4 条、2 省、2 市；分省计数按次数倒序
+  let res = await req('GET', '/stats', token);
+  assert.equal(res.statusCode, 200, res.body);
+  let d = res.json().data;
+  assert.equal(d.total, 4);
+  assert.equal(d.provinceCount, 2);
+  assert.equal(d.cityCount, 2);
+  assert.deepEqual(d.provinces, [
+    { name: '浙江省', count: 3 },
+    { name: '北京市', count: 1 },
+  ]);
+
+  // 2026 自然年（to 不含 2027-01-01）：跨年那条被排除
+  d = (await req('GET', '/stats?from=2026-01-01&to=2027-01-01', token)).json().data;
+  assert.equal(d.total, 3);
+  assert.equal(d.provinceCount, 2);
+  assert.equal(d.cityCount, 2);
+
+  // 单月窗口：只剩 1 条
+  d = (await req('GET', '/stats?from=2026-02-01&to=2026-03-01', token)).json().data;
+  assert.equal(d.total, 1);
+  assert.deepEqual(d.provinces, [{ name: '浙江省', count: 1 }]);
+
+  // 空窗口：零值形态稳定（前端直接渲染）
+  d = (await req('GET', '/stats?from=2020-01-01&to=2020-02-01', token)).json().data;
+  assert.equal(d.total, 0);
+  assert.equal(d.provinceCount, 0);
+  assert.equal(d.cityCount, 0);
+  assert.deepEqual(d.provinces, []);
+
+  // 非法日期 / 倒置区间 400；未登录 401
+  assert.equal((await req('GET', '/stats?from=2026/01/01', token)).statusCode, 400);
+  assert.equal((await req('GET', '/stats?to=2026-1-1', token)).statusCode, 400);
+  assert.equal((await req('GET', '/stats?from=2026-04-01&to=2026-01-01', token)).statusCode, 400);
+  assert.equal((await app.inject({ method: 'GET', url: '/sport-track/api/footprint-records/stats' })).statusCode, 401);
+});
