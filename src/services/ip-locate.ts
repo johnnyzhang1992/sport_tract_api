@@ -28,6 +28,7 @@ interface TencentIpResult {
 
 const cache = new Map<string, { province: string; city: string; ts: number }>();
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
+const NEG_CACHE_TTL = 10 * 60 * 1000; // 失败负缓存：10 分钟内不重试在线链
 
 export interface IpLocation {
   province: string;
@@ -167,12 +168,30 @@ async function locateByTencent(ip: string): Promise<IpLocation | null> {
   return { province: normalizeProvince(province || ''), city: city || '' };
 }
 
+/**
+ * 内网/保留地址判定：这类 IP 没有公网归属地，不值得也不允许送外部服务查询
+ * （曾导致局域网联调时每次登录都走满三级在线兜底超时，登录耗时 3s+）
+ */
+export function isPrivateOrReserved(ip: string): boolean {
+  if (!ip) return true;
+  const s = ip.startsWith('::ffff:') ? ip.slice(7) : ip; // IPv4-mapped IPv6
+  if (s === '::1' || s === '0.0.0.0' || s === 'unknown') return true;
+  if (s.startsWith('127.') || s.startsWith('10.') || s.startsWith('192.168.') || s.startsWith('169.254.')) return true;
+  if (s.startsWith('172.')) {
+    const second = Number(s.split('.')[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  if (s.startsWith('fc') || s.startsWith('fd') || s.startsWith('fe80')) return true; // IPv6 ULA / 链路本地
+  return false;
+}
+
 export async function locateByIp(ip: string): Promise<IpLocation | null> {
-  if (!ip || ip === '::1' || ip.startsWith('127.')) return null;
+  if (isPrivateOrReserved(ip)) return null;
 
   const cached = cache.get(ip);
   if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    return sanitizeRegion({ province: cached.province, city: cached.city });
+    const clean = sanitizeRegion({ province: cached.province, city: cached.city });
+    return clean.province || clean.city ? clean : null;
   }
 
   // 1. 优先 ip2region 离线查询
@@ -205,5 +224,7 @@ export async function locateByIp(ip: string): Promise<IpLocation | null> {
       // 该数据源失败（超时/限流/结构变化），继续下一个
     }
   }
+  // 全链失败：负缓存（ts 回拨使剩余新鲜度只有 NEG_TTL），避免同一 IP 每次登录都重跑三级超时
+  cache.set(ip, { province: '', city: '', ts: Date.now() - CACHE_TTL + NEG_CACHE_TTL });
   return null;
 }

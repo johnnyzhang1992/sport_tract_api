@@ -62,21 +62,25 @@ export async function authRoutes(fastify: FastifyInstance) {
     // 更新最后登录时间（管理后台排序/展示用，不阻塞）
     UserModel.updateOne({ _id: user._id }, { $set: { lastLoginAt: Date.now() } }).catch(() => {});
 
-    // 登录日志：IP + 设备信息（不阻塞）
+    // 登录日志：IP + 设备信息（定位 + 落库整体后置，不阻塞登录响应；
+    // 曾因内网 IP 走满三级在线兜底超时把登录拖到 3s+，现先返回结果再慢慢解析）
     const ip = getClientIp(request);
-    const loc = ip ? await locateByIp(ip).catch(() => null) : null;
-    LoginLogModel.create({
-      userId: user._id,
-      ip,
-      province: loc?.province,
-      city: loc?.city,
-      platform: typeof platform === 'string' ? platform : undefined,
-      system: typeof system === 'string' ? system : undefined,
-      brand: typeof brand === 'string' ? brand : undefined,
-      model: typeof model === 'string' ? model : undefined,
-      sdkVersion: typeof sdkVersion === 'string' ? sdkVersion : undefined,
-      appVersion: typeof appVersion === 'string' ? appVersion : undefined,
-    }).catch(() => {});
+    void Promise.resolve(ip ? locateByIp(ip) : null)
+      .then((loc) =>
+        LoginLogModel.create({
+          userId: user._id,
+          ip,
+          province: loc?.province,
+          city: loc?.city,
+          platform: typeof platform === 'string' ? platform : undefined,
+          system: typeof system === 'string' ? system : undefined,
+          brand: typeof brand === 'string' ? brand : undefined,
+          model: typeof model === 'string' ? model : undefined,
+          sdkVersion: typeof sdkVersion === 'string' ? sdkVersion : undefined,
+          appVersion: typeof appVersion === 'string' ? appVersion : undefined,
+        }),
+      )
+      .catch(() => {});
 
     const accessToken = fastify.signAccessToken(userId);
     const refreshToken = fastify.signRefreshToken(userId);
