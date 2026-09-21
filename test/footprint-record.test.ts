@@ -6,7 +6,7 @@ import { buildApp } from '../src/app.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
 import { CreateFootprintRecordSchema } from '../src/utils/validators.js';
 import { cleanUrl } from '../src/services/oss.js';
-import { removedPhotos } from '../src/services/footprint-record.js';
+import { removedPhotos, searchScore } from '../src/services/footprint-record.js';
 import { config } from '../src/config/index.js';
 
 // 模型用例要真实落库，沿用仓库惯例用 buildApp 建 Mongo 连接（Task 2 的接口用例复用同一 app）
@@ -347,4 +347,83 @@ test('stats：省/市/总数聚合 + from/to 区间（含 from 不含 to）+ 非
   assert.equal((await req('GET', '/stats?to=2026-1-1', token)).statusCode, 400);
   assert.equal((await req('GET', '/stats?from=2026-04-01&to=2026-01-01', token)).statusCode, 400);
   assert.equal((await app.inject({ method: 'GET', url: '/sport-track/api/footprint-records/stats' })).statusCode, 401);
+});
+
+test('searchScore：标题 3 / 同行的人 2 / 描述、地点名、地址、日期各 1；未命中 0', () => {
+  assert.equal(searchScore({ title: '西湖漫步' }, '西湖'), 3);
+  assert.equal(searchScore({ people: ['张三', '西湖友'] }, '西湖'), 2, '数组任一元素命中即算');
+  assert.equal(searchScore({ description: '西湖春色' }, '西湖'), 1);
+  assert.equal(searchScore({ location: { name: '西湖' } }, '西湖'), 1);
+  assert.equal(searchScore({ location: { address: '杭州西湖区' } }, '西湖'), 1);
+  assert.equal(searchScore({ visitDate: '2024-05-01' }, '2024-05'), 1, '日期串可搜');
+  assert.equal(searchScore({ title: 'XIHU' }, 'xihu'), 3, '大小写不敏感');
+  assert.equal(searchScore({ title: '别的' }, '西湖'), 0);
+  // 多字段叠加：标题 3 + 同行 2 + 描述 1 + 地点名 1 + 地址 1（日期不含关键词）
+  assert.equal(
+    searchScore(
+      { title: '西湖漫步', people: ['西湖友'], description: '西湖春色', location: { name: '西湖', address: '杭州西湖区' }, visitDate: '2024-05-01' },
+      '西湖',
+    ),
+    8,
+  );
+});
+
+test('列表加权搜索：标题 > 同行的人 > 描述；同分按 visitDate 倒序；分页按相关度切片', async () => {
+  const token = await loginAs('fp-user-list-search');
+  const mk = (over: Record<string, unknown>) => req('POST', '', token, fp(over));
+  // 唯一关键词「权重词」，避免与历史数据串扰；四条分数依次 5 / 3 / 2 / 1，日期故意与分数反向
+  assert.equal((await mk({ visitDate: '2024-01-01', title: '足迹测试-权重词-双', people: ['权重词'] })).statusCode, 200);
+  assert.equal((await mk({ visitDate: '2024-03-01', title: '足迹测试-权重词-标题' })).statusCode, 200);
+  assert.equal((await mk({ visitDate: '2024-03-02', title: '足迹测试-权重人', people: ['权重词'] })).statusCode, 200);
+  assert.equal((await mk({ visitDate: '2024-03-03', title: '足迹测试-权重述', description: '关于权重词' })).statusCode, 200);
+
+  const d = (await req('GET', '?keyword=权重词&pageSize=20', token)).json().data;
+  assert.equal(d.total, 4, 'total 为匹配总数');
+  assert.deepEqual(
+    d.items.map((r: any) => r.title),
+    ['足迹测试-权重词-双', '足迹测试-权重词-标题', '足迹测试-权重人', '足迹测试-权重述'],
+    '标题+同行（5 分）排最前，即使它的 visitDate 最老；同行（2）压过描述（1）',
+  );
+
+  // 分页按相关度顺序切片（而非日期）：两页拼起来应与整页顺序一致
+  const p1 = (await req('GET', '?keyword=权重词&pageSize=2&page=1', token)).json().data;
+  const p2 = (await req('GET', '?keyword=权重词&pageSize=2&page=2', token)).json().data;
+  assert.deepEqual(
+    [...p1.items, ...p2.items].map((r: any) => r.title),
+    ['足迹测试-权重词-双', '足迹测试-权重词-标题', '足迹测试-权重人', '足迹测试-权重述'],
+  );
+
+  // 同分（都是标题命中 3 分）按 visitDate 倒序
+  assert.equal((await mk({ visitDate: '2024-04-01', title: '足迹测试-平局旧' })).statusCode, 200);
+  assert.equal((await mk({ visitDate: '2024-04-10', title: '足迹测试-平局新' })).statusCode, 200);
+  assert.deepEqual(
+    (await req('GET', '?keyword=平局', token)).json().data.items.map((r: any) => r.title),
+    ['足迹测试-平局新', '足迹测试-平局旧'],
+  );
+});
+
+test('列表时间区间：from 含、to 不含；非法日期/倒置区间 400；可与 keyword 组合', async () => {
+  const token = await loginAs('fp-user-list-range');
+  const mk = (visitDate: string, title: string) => req('POST', '', token, fp({ visitDate, title }));
+  assert.equal((await mk('2024-06-10', '足迹测试-区间A')).statusCode, 200);
+  assert.equal((await mk('2024-06-15', '足迹测试-区间B')).statusCode, 200);
+  assert.equal((await mk('2024-07-01', '足迹测试-区间C')).statusCode, 200);
+
+  let d = (await req('GET', '?from=2024-06-01&to=2024-07-01', token)).json().data;
+  assert.equal(d.total, 2, 'to 当天（07-01）不含');
+  assert.deepEqual(d.items.map((r: any) => r.title), ['足迹测试-区间B', '足迹测试-区间A'], '区间内仍按 visitDate 倒序');
+
+  d = (await req('GET', '?from=2024-06-01&to=2024-06-15', token)).json().data;
+  assert.equal(d.total, 1, 'to 不含：06-15 那条被排除');
+
+  d = (await req('GET', '?from=2024-06-15', token)).json().data;
+  assert.equal(d.total, 2, 'from 含：06-15 那条在内（B + C）');
+
+  d = (await req('GET', '?keyword=区间&from=2024-06-01&to=2024-06-20', token)).json().data;
+  assert.equal(d.total, 2, 'keyword 与区间同时生效');
+
+  assert.equal((await req('GET', '?from=2024/06/01', token)).statusCode, 400, '格式错 400');
+  assert.equal((await req('GET', '?from=2024-13-01', token)).statusCode, 400, '日历日不存在 400');
+  assert.equal((await req('GET', '?from=2024-07-01&to=2024-06-01', token)).statusCode, 400, '倒置区间 400');
+  assert.equal((await req('GET', '?from=2024-06-01&to=2024-06-01', token)).statusCode, 400, 'from 等于 to 是空区间');
 });

@@ -103,14 +103,58 @@ export async function createFootprint(userId: string, input: CreateFootprintReco
   return toDto(doc);
 }
 
+/**
+ * 搜索命中得分（权重：标题 3 / 同行的人 2 / 描述、地点名、地址、日期 各 1）
+ * 口径与列表 $or 的四路 + people/visitDate 一致，只是「先排序后分页」需要显式分值。导出供单测
+ */
+export function searchScore(doc: any, keyword: string): number {
+  const k = keyword.toLowerCase();
+  const has = (s: unknown) => typeof s === 'string' && s.toLowerCase().includes(k);
+  let score = 0;
+  if (has(doc.title)) score += 3;
+  if ((doc.people ?? []).some((p: string) => has(p))) score += 2;
+  if (has(doc.description)) score += 1;
+  if (has(doc.location?.name)) score += 1;
+  if (has(doc.location?.address)) score += 1;
+  if (has(doc.visitDate)) score += 1;
+  return score;
+}
+
+/** 同分时按 visitDate 降序、createdAt 降序（与无关键词时的列表排序一致） */
+function byRecency(a: any, b: any): number {
+  if (a.visitDate !== b.visitDate) return a.visitDate < b.visitDate ? 1 : -1;
+  return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+}
+
 export async function listFootprints(userId: string, query: ListFootprintQueryInput) {
   const filter: Record<string, unknown> = { userId };
-  if (query.keyword) {
-    const rx = new RegExp(escapeRegex(query.keyword), 'i');
+  const keyword = query.keyword?.trim();
+  if (keyword) {
+    const rx = new RegExp(escapeRegex(keyword), 'i');
     filter.$or = [
-      { title: rx }, { description: rx },
-      { 'location.name': rx }, { 'location.address': rx },
+      { title: rx },
+      { description: rx },
+      { 'location.name': rx },
+      { 'location.address': rx },
+      { people: rx },
+      { visitDate: rx },
     ];
+  }
+  if (query.from || query.to) {
+    filter.visitDate = {
+      ...(query.from ? { $gte: query.from } : {}),
+      ...(query.to ? { $lt: query.to } : {}),
+    };
+  }
+  // 带关键词：先按相关度排序（标题/同行的人权重高），再内存切片分页——个人级数据量可控
+  if (keyword) {
+    const docs = await FootprintRecordModel.find(filter).lean();
+    const ranked = docs
+      .map((d) => ({ d, score: searchScore(d, keyword) }))
+      .sort((a, b) => b.score - a.score || byRecency(a.d, b.d))
+      .map((x) => x.d);
+    const items = ranked.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
+    return { items: items.map((d) => toDto(d)), total: ranked.length, page: query.page, pageSize: query.pageSize };
   }
   const [total, docs] = await Promise.all([
     FootprintRecordModel.countDocuments(filter),

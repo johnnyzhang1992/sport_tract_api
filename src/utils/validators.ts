@@ -169,12 +169,19 @@ export const CreateFootprintRecordSchema = z.object({
 
 export const UpdateFootprintRecordSchema = CreateFootprintRecordSchema;
 
-/** 足迹列表查询 */
-export const ListFootprintQuery = z.object({
-  keyword: z.string().trim().max(50).optional(),
-  page: z.coerce.number().int().positive().default(1),
-  pageSize: z.coerce.number().int().positive().max(100).default(20),
-});
+/** 足迹列表查询：keyword 模糊搜索；from/to 为 visitDate 区间（含 from 不含 to，省略即不限） */
+export const ListFootprintQuery = z
+  .object({
+    keyword: z.string().trim().max(50).optional(),
+    from: VisitDateSchema.optional(),
+    to: VisitDateSchema.optional(),
+    page: z.coerce.number().int().positive().default(1),
+    pageSize: z.coerce.number().int().positive().max(100).default(20),
+  })
+  .refine((q) => !q.from || !q.to || q.from < q.to, {
+    message: '日期区间不合法（from 需早于 to）',
+    path: ['from'],
+  });
 
 export type LoginInput = z.infer<typeof LoginSchema>;
 export type RefreshInput = z.infer<typeof RefreshSchema>;
