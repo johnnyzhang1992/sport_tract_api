@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 import { TopicModel } from '../models/topic.model.js';
 import { AppError } from '../utils/app-error.js';
+import { assertObjectIdLike } from '../utils/object-id.js';
 import { getSignedUrl } from './oss.js';
 
 type ObjectIdLike = Types.ObjectId | string;
@@ -14,8 +15,6 @@ export type TopicInput = {
   effectiveAt?: unknown;
   expiresAt?: unknown;
 };
-
-const OBJECT_ID_RE = /^[a-f\d]{24}$/i;
 
 /** 正文/封面里的 OSS 图片换成签名 URL（bucket 私有；getSignedUrl 对外部 URL 原样返回） */
 function signContentImages(content: string): string {
@@ -56,7 +55,7 @@ export async function listActiveTopics(): Promise<ActiveTopic[]> {
 
 /** 生效中专题详情（过期/下架/未发布对外 404），正文图片签名为可访问 URL */
 export async function getActiveTopicDetail(id: string) {
-  if (!OBJECT_ID_RE.test(String(id))) throw new AppError(404, '专题不存在');
+  assertObjectIdLike(id, '专题不存在');
   const now = Date.now();
   const r = await TopicModel.findOne({
     _id: id,
@@ -143,7 +142,7 @@ export async function createTopic(input: TopicInput): Promise<AdminTopic> {
 }
 
 export async function updateTopic(id: string, input: TopicInput): Promise<AdminTopic> {
-  if (!OBJECT_ID_RE.test(String(id))) throw new AppError(404, '专题不存在');
+  assertObjectIdLike(id, '专题不存在');
   const data = validateInput(input, { partial: true });
   const doc = await TopicModel.findByIdAndUpdate(id, { $set: data }, { new: true }).lean();
   if (!doc) throw new AppError(404, '专题不存在');
@@ -151,7 +150,7 @@ export async function updateTopic(id: string, input: TopicInput): Promise<AdminT
 }
 
 export async function deleteTopic(id: string): Promise<void> {
-  if (!OBJECT_ID_RE.test(String(id))) throw new AppError(404, '专题不存在');
+  assertObjectIdLike(id, '专题不存在');
   const doc = await TopicModel.findByIdAndDelete(id).lean();
   if (!doc) throw new AppError(404, '专题不存在');
 }

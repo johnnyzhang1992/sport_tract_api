@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
+import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
@@ -119,6 +120,7 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
 
 /** 校验活动归属并返回（无则 404） */
 async function findOwnedActivity(activityId: ObjectIdLike, userId: ObjectIdLike) {
+  assertObjectIdLike(activityId, '活动不存在');
   const activity = await ActivityModel.findOne({ _id: activityId, userId }).lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
@@ -149,6 +151,7 @@ export async function appendPoints(
   userId: string,
   input: AppendPointsInput,
 ): Promise<{ lastPointSeq: number; added: number }> {
+  assertObjectIdLike(activityId, '活动不存在');
   const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status lastPointSeq trackPoints').lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
@@ -189,6 +192,7 @@ export async function addMarker(
   userId: string,
   input: CreateMarkerInput,
 ): Promise<{ marker: MarkerDto }> {
+  assertObjectIdLike(activityId, '活动不存在');
   const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status').lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
@@ -244,6 +248,7 @@ export async function finishActivity(
   userId: string,
   input: FinishActivityInput,
 ): Promise<FinishActivityResult> {
+  assertObjectIdLike(activityId, '活动不存在');
   const activity = await ActivityModel.findOne({ _id: activityId, userId }).lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
@@ -375,6 +380,7 @@ export async function finishActivity(
 
 /** 放弃活动 */
 export async function cancelActivity(activityId: ObjectIdLike, userId: string): Promise<void> {
+  assertObjectIdLike(activityId, '活动不存在');
   const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status').lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
@@ -632,6 +638,7 @@ export async function getActivityDetailView(
   activityId: ObjectIdLike,
   userId?: string | null,
 ): Promise<ActivityDetailView> {
+  assertObjectIdLike(activityId, '活动不存在');
   const activity = await ActivityModel.findOne({ _id: activityId }).lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');

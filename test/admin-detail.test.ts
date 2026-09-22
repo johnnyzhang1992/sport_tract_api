@@ -118,6 +118,35 @@ test('用户详情：无效或不存在的用户返回 404', async () => {
   );
 });
 
+test('登录历史/登录概况：非法 userId 同样 404，不冒 500（这两个接口此前无闸门）', async () => {
+  for (const url of [
+    '/sport-track/api/admin/users/not-an-id/login-logs',
+    '/sport-track/api/admin/users/not-an-id/login-stats',
+  ]) {
+    const res = await req(url);
+    assert.equal(res.statusCode, 404, `${url} 应 404，实际 ${res.statusCode}：${res.body}`);
+    assert.equal(res.json().message, '用户不存在');
+  }
+  // 合法 id 的正常形态不受影响
+  assert.equal((await req(`/sport-track/api/admin/users/${userId}/login-logs`)).statusCode, 200);
+  assert.equal((await req(`/sport-track/api/admin/users/${userId}/login-stats`)).statusCode, 200);
+});
+
+test('旧数据重算：maxId 游标非法直接 400（空结果时它会回落进 new ObjectId 抛 500），合法游标照常跑', async () => {
+  const post = (payload: Record<string, unknown>) =>
+    app.inject({
+      method: 'POST',
+      url: '/sport-track/api/admin/activities/recompute-elevation',
+      headers: { authorization: `Bearer ${adminToken}` },
+      payload,
+    });
+  const bad = await post({ maxId: 'not-an-id', dryRun: true });
+  assert.equal(bad.statusCode, 400, bad.body);
+  assert.ok(bad.json().message.includes('maxId'), `文案要点名是哪个参数：${bad.json().message}`);
+  const ok = await post({ maxId: '000000000000000000000000', limit: 1, dryRun: true });
+  assert.equal(ok.statusCode, 200, ok.body);
+});
+
 test('轨迹详情：返回完整字段、用户昵称与打点', async () => {
   const res = await req(`/sport-track/api/admin/activities/${activityId}`);
   assert.equal(res.statusCode, 200);

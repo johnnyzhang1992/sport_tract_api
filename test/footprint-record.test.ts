@@ -427,3 +427,77 @@ test('列表时间区间：from 含、to 不含；非法日期/倒置区间 400�
   assert.equal((await req('GET', '?from=2024-07-01&to=2024-06-01', token)).statusCode, 400, '倒置区间 400');
   assert.equal((await req('GET', '?from=2024-06-01&to=2024-06-01', token)).statusCode, 400, 'from 等于 to 是空区间');
 });
+
+// ==================== 日历形态：GET /footprint-records/calendar ====================
+
+test('calendar：days 按 visitDate 倒序计数；total/photoCount 全局累加；placeCount 按地点名去重且空名不计', async () => {
+  const token = await loginAs('fp-user-calendar');
+  const mk = (over: Record<string, unknown>) => req('POST', '', token, fp(over));
+  const P = (n: number) => Array.from({ length: n }, (_, i) => `https://example.com/cal-${i}.jpg`);
+  assert.equal((await mk({ visitDate: '2026-09-20', title: '足迹测试-日历-长陵1', location: { name: '长陵', address: 'a', latitude: 34.4, longitude: 109.0 }, photos: P(2) })).statusCode, 200);
+  assert.equal((await mk({ visitDate: '2026-09-20', title: '足迹测试-日历-长陵2', location: { name: '长陵', address: 'a', latitude: 34.4, longitude: 109.0 }, photos: P(1) })).statusCode, 200);
+  assert.equal((await mk({ visitDate: '2026-09-19', title: '足迹测试-日历-杜陵', location: { name: '杜陵', address: 'b', latitude: 34.4, longitude: 108.9 } })).statusCode, 200);
+  assert.equal((await mk({ visitDate: '2026-08-05', title: '足迹测试-日历-无地名', location: { name: '', address: 'c', latitude: 30.24, longitude: 120.15 }, photos: P(1) })).statusCode, 200);
+
+  const d = (await req('GET', '/calendar', token)).json().data;
+  assert.equal(d.total, 4, '总条数');
+  assert.equal(d.photoCount, 4, '照片数 = 各条 photos 之和');
+  assert.equal(d.placeCount, 2, '长陵跨两条只算一个地方，空地点名不计');
+  assert.deepEqual(
+    d.days,
+    [
+      { date: '2026-09-20', count: 2 },
+      { date: '2026-09-19', count: 1 },
+      { date: '2026-08-05', count: 1 },
+    ],
+    'days 按日期倒序，前端切月只在本地过滤',
+  );
+
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试-日历/ });
+});
+
+test('calendar 归属隔离：只含自己的记录（他人同日足迹不进 days/汇总）', async () => {
+  const mine = await loginAs('fp-user-cal-own');
+  const other = await loginAs('fp-user-cal-other');
+  assert.equal((await req('POST', '', mine, fp({ visitDate: '2026-07-07', title: '足迹测试-日历-我', location: { name: '我的地点', address: 'a', latitude: 30.24, longitude: 120.15 }, photos: ['https://example.com/cal-own.jpg'] }))).statusCode, 200);
+  // 同一天、同一地点名各塞一条：若 $match 漏了 userId，这些数字会被顶上去
+  await req('POST', '', other, fp({ visitDate: '2026-07-07', title: '足迹测试-日历-他人', location: { name: '我的地点', address: 'a', latitude: 30.24, longitude: 120.15 }, photos: ['https://example.com/cal-o1.jpg', 'https://example.com/cal-o2.jpg'] }));
+  await req('POST', '', other, fp({ visitDate: '2026-07-06', title: '足迹测试-日历-他人2', location: { name: '他人地点', address: 'b', latitude: 30.24, longitude: 120.15 } }));
+
+  const d = (await req('GET', '/calendar', mine)).json().data;
+  assert.deepEqual(d, { total: 1, placeCount: 1, photoCount: 1, days: [{ date: '2026-07-07', count: 1 }] });
+
+  const otherSummary = (await req('GET', '/calendar', other)).json().data;
+  assert.equal(otherSummary.total, 2, '他人视角只看到自己那两条');
+  assert.equal(otherSummary.photoCount, 2);
+  assert.deepEqual(otherSummary.days.map((x: any) => x.count), [1, 1]);
+
+  await FootprintRecordModel.deleteMany({ title: /^足迹测试-日历/ });
+});
+
+test('calendar 空态与鉴权：无足迹返回全零 + 空 days；未登录 401', async () => {
+  // before 钩子已清掉所有「足迹测试」前缀文档，这个专属用户必然为空态
+  const fresh = await loginAs('fp-user-cal-empty');
+  const res = await req('GET', '/calendar', fresh);
+  assert.equal(res.statusCode, 200, res.body);
+  assert.deepEqual(res.json().data, { total: 0, placeCount: 0, photoCount: 0, days: [] }, '形态稳定，前端可直接渲染');
+  assert.equal((await app.inject({ method: 'GET', url: '/sport-track/api/footprint-records/calendar' })).statusCode, 401);
+});
+
+// ==================== 非法 id：CastError 不该冒 500 ====================
+
+test('非法 id：非 ObjectId 字符串的 GET/PUT/DELETE 返回 404「足迹不存在」而不是 500', async () => {
+  // 这些串在 mongoose 里会在 `_id` 上抛 CastError（错误处理器不认识它 → 500 并泄露内部文案）；
+  // 对客户端来说「这个 id 不可能存在」就是 404
+  for (const bad of ['not-an-objectid', 'abc', '1', '2024-05-01', 'ffffffffffffffffffffffffx']) {
+    const got = await req('GET', `/${bad}`, tokenA);
+    assert.equal(got.statusCode, 404, `GET /${bad} 应 404，实际 ${got.statusCode}：${got.body}`);
+    assert.equal(got.json().message, '足迹不存在');
+    assert.equal((await req('PUT', `/${bad}`, tokenA, fp({ title: '足迹测试-非法id' }))).statusCode, 404, `PUT /${bad} 应 404`);
+    assert.equal((await req('DELETE', `/${bad}`, tokenA)).statusCode, 404, `DELETE /${bad} 应 404`);
+  }
+  // 形态合法但不存在的 id 行为不变（仍 404，且不能被误判成 400）
+  const ghost = new Types.ObjectId().toString();
+  assert.equal((await req('GET', `/${ghost}`, tokenA)).statusCode, 404);
+  assert.equal(await FootprintRecordModel.countDocuments({ title: '足迹测试-非法id' }), 0, '非法 id 的写入不落库');
+});

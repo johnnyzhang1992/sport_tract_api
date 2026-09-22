@@ -8,6 +8,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
+import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
 import { locateRegion } from '../services/region.js';
 import { INVALID_REGION_VALUES, isValidRegionValue } from '../services/ip-locate.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
@@ -616,7 +617,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 设置用户备注（仅管理后台可见/编辑）
   fastify.put('/users/:id/note', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '用户不存在');
+    assertObjectIdLike(id, '用户不存在');
     const { note } = (request.body ?? {}) as { note?: string };
     const raw = String(note ?? '').trim();
     if (raw.length > 200) throw new AppError(400, '备注最多 200 字');
@@ -631,7 +632,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // - 状态变化影响用户端列表/统计/足迹 → markFootprintDirty
   fastify.put('/activities/:id/status', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '轨迹不存在');
+    assertObjectIdLike(id, '轨迹不存在');
     const { status } = (request.body ?? {}) as { status?: string };
     if (status !== 'finished' && status !== 'cancelled') {
       throw new AppError(400, 'status 仅支持 finished / cancelled');
@@ -655,6 +656,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 用户登录历史（分页，按时间倒序；支持时间区间筛选）
   fastify.get('/users/:id/login-logs', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
+    assertObjectIdLike(id, '用户不存在');
     const { page = '1', pageSize = '20', startDate, endDate } = request.query as {
       page?: string;
       pageSize?: string;
@@ -698,6 +700,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 用户登录统计（最近 N 天登录次数）
   fastify.get('/users/:id/login-stats', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
+    assertObjectIdLike(id, '用户不存在');
     const now = Date.now();
     const stats = await Promise.all([
       LoginLogModel.countDocuments({ userId: id, createdAt: { $gte: new Date(now - 7 * 86400000) } }),
@@ -790,7 +793,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 用户详情（管理后台用户页聚合：资料 + 周/月/年/总概况 + 个人最佳 + 点亮城市）
   fastify.get('/users/:id', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '用户不存在');
+    assertObjectIdLike(id, '用户不存在');
     const user = await UserModel.findById(id).lean();
     if (!user) throw new AppError(404, '用户不存在');
     const [stats, best, fp, activityCount] = await Promise.all([
@@ -822,7 +825,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 轨迹详情（管理后台弹窗：完整字段 + 打点照片签名 + 抽稀轨迹点供图）
   fastify.get('/activities/:id', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    if (!Types.ObjectId.isValid(id)) throw new AppError(404, '轨迹不存在');
+    assertObjectIdLike(id, '轨迹不存在');
     const activity = await ActivityModel.findById(id).lean();
     if (!activity) throw new AppError(404, '轨迹不存在');
     const owner = await UserModel.findById(activity.userId).select('nickname').lean();
@@ -875,7 +878,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const lim = Math.min(1000, Math.max(1, Number(body.limit) || 200));
     const dryRun = body.dryRun === true || body.dryRun === 'true';
     const filter: Record<string, unknown> = { status: 'finished', 'trackPoints.0': { $exists: true } };
-    if (body.maxId && Types.ObjectId.isValid(String(body.maxId))) {
+    if (body.maxId) {
+      // 游标形态不合法要当场拒：静默忽略的话，空结果时下面的 lastId 会回落成同一个非法串，
+      // 再进 `new Types.ObjectId(lastId)` 直接抛 500
+      if (!isObjectIdLike(String(body.maxId))) {
+        throw new AppError(400, `maxId 不合法（需 24 位 ObjectId，收到 "${String(body.maxId).slice(0, 32)}"）`);
+      }
       filter._id = { $gt: new Types.ObjectId(String(body.maxId)) };
     }
     const acts = await ActivityModel.find(filter)

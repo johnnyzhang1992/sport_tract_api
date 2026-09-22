@@ -2,6 +2,7 @@ import { Types } from 'mongoose';
 import { cleanUrl, deleteOssObjects, getSignedUrl } from './oss.js';
 import { locateRegion } from './region.js';
 import { AppError } from '../utils/app-error.js';
+import { assertObjectIdLike } from '../utils/object-id.js';
 import { config } from '../config/index.js';
 import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import type { CreateFootprintRecordInput, ListFootprintQueryInput } from '../utils/validators.js';
@@ -47,6 +48,8 @@ function toDto(doc: any, sign = true): any {
 }
 
 async function findOwnedRecord(id: string, userId: string) {
+  // 非 ObjectId 串会在 `_id` 上抛 CastError → 500 并泄露内部文案；GET/PUT/DELETE 三链都走这里，一处拦住
+  assertObjectIdLike(id, '足迹不存在');
   const doc = await FootprintRecordModel.findOne({ _id: id, userId }).lean();
   if (!doc) throw new AppError(404, '足迹不存在');
   return doc;
@@ -227,6 +230,58 @@ export async function footprintStats(
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
   return { total, provinceCount: provinces.length, cityCount: citySet.size, provinces };
+}
+
+export interface FootprintCalendarDay {
+  date: string;
+  count: number;
+}
+
+export interface FootprintCalendar {
+  total: number;
+  placeCount: number;
+  photoCount: number;
+  days: FootprintCalendarDay[];
+}
+
+/**
+ * 日历形态聚合：按天打点（days）+「N 条记录 · N 个地方 · N 张照片」总览
+ * 全量返回、不按月份过滤，与 /geo 同一先例（私有数据量级可控）——前端 ‹ › 换月只在本地筛 days。
+ * placeCount 是 distinct location.name（"个地方"按地点名口径，城市数在 /stats），空地点名不计。
+ */
+export async function footprintCalendar(userId: string): Promise<FootprintCalendar> {
+  const rows = await FootprintRecordModel.aggregate<{
+    _id: string;
+    count: number;
+    photos: number;
+    names: (string | undefined)[];
+  }>([
+    { $match: { userId: new Types.ObjectId(userId) } },
+    {
+      $group: {
+        _id: '$visitDate',
+        count: { $sum: 1 },
+        photos: { $sum: { $size: { $ifNull: ['$photos', []] } } },
+        names: { $addToSet: '$location.name' },
+      },
+    },
+  ]);
+
+  let total = 0;
+  let photoCount = 0;
+  const places = new Set<string>();
+  const days: FootprintCalendarDay[] = [];
+  for (const row of rows) {
+    total += row.count;
+    photoCount += row.photos ?? 0;
+    for (const raw of row.names ?? []) {
+      const name = (raw ?? '').trim();
+      if (name) places.add(name);
+    }
+    days.push({ date: row._id, count: row.count });
+  }
+  days.sort((a, b) => (a.date < b.date ? 1 : -1));
+  return { total, placeCount: places.size, photoCount, days };
 }
 
 export async function getFootprint(id: string, userId: string) {

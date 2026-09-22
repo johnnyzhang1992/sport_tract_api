@@ -997,3 +997,36 @@ test('数据隔离：B 用户不能读取/修改 A 用户的轨迹', async () =>
   });
   assert.equal(meta.statusCode, 404, 'B 改 A 轨迹应 404');
 });
+
+// ==================== 非法 id 闸门：非 ObjectId 串不该冒 500 ====================
+
+test('非法 id：11 条活动路由传非 ObjectId 串一律 404「活动不存在」，不再 500 泄露 CastError 文案', async () => {
+  const BAD = 'not-an-objectid';
+  const base = '/sport-track/api/activities';
+  // 请求体都按各接口 schema 给合法值：闸门若写在 body 校验之后，400 会先于 404 把断言带偏
+  const cases: Array<[string, string, Record<string, unknown> | undefined]> = [
+    ['GET', `${base}/${BAD}`, undefined],
+    ['GET', `${base}/${BAD}/gpx`, undefined],
+    ['POST', `${base}/${BAD}/points`, { points: [P(1, 31.2305, 121.4737)] }],
+    ['POST', `${base}/${BAD}/markers`, { id: 'm1', lat: 31.2305, lng: 121.4737, timestamp: Date.now() }],
+    ['PUT', `${base}/${BAD}/markers/m1`, { note: 'x' }],
+    ['DELETE', `${base}/${BAD}/markers/m1`, undefined],
+    ['PUT', `${base}/${BAD}/finish`, { trackPoints: [] }],
+    ['PUT', `${base}/${BAD}/cancel`, undefined],
+    ['POST', `${base}/${BAD}/reprocess`, undefined],
+    ['PUT', `${base}/${BAD}/meta`, { note: 'x' }],
+    ['DELETE', `${base}/${BAD}`, undefined],
+  ];
+  for (const [method, url, body] of cases) {
+    const res = await req(method, url, { token: tokenA, body });
+    assert.equal(res.statusCode, 404, `${method} ${url} 应 404，实际 ${res.statusCode}：${res.body}`);
+    assert.equal(res.json().message, '活动不存在', `${method} ${url} 应给资源级文案`);
+  }
+
+  // 形态合法但不存在的 id（24 位 hex）行为不变：同样 404，不能被误判成 400
+  const GHOST = 'ffffffffffffffffffffffff';
+  assert.equal((await req('GET', `${base}/${GHOST}`, { token: tokenA })).statusCode, 404);
+  assert.equal((await req('DELETE', `${base}/${GHOST}`, { token: tokenA })).statusCode, 404);
+  // 写类接口被闸门拦下后不得留下任何副作用（探针本身也得用合法形态的 id，否则它自己就抛 CastError）
+  assert.equal(await ActivityModel.countDocuments({ _id: GHOST }), 0);
+});

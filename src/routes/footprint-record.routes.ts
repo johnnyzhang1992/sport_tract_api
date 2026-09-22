@@ -10,6 +10,7 @@ import {
   assertCanCreateFootprint,
   createFootprint,
   deleteFootprint,
+  footprintCalendar,
   footprintStats,
   getFootprint,
   listFootprintGeo,
@@ -47,6 +48,11 @@ export async function footprintRecordRoutes(fastify: FastifyInstance) {
     if (q.to && !DATE_RX.test(q.to)) throw new AppError(400, 'to 需为 YYYY-MM-DD');
     if (q.from && q.to && q.from >= q.to) throw new AppError(400, '日期区间不合法（from 需早于 to）');
     return success(await footprintStats(request.user.userId, { from: q.from, to: q.to }));
+  });
+
+  // 日历形态：按天打点 + 总览汇总（全量不分页，前端切月在本地过滤 days）
+  fastify.get('/calendar', { onRequest: [fastify.authenticate] }, async (request) => {
+    return success(await footprintCalendar(request.user.userId));
   });
 
   fastify.get('/:id', { onRequest: [fastify.authenticate] }, async (request) => {
