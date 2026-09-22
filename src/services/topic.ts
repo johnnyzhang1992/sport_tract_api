@@ -2,7 +2,18 @@ import { Types } from 'mongoose';
 import { TopicModel } from '../models/topic.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
-import { getSignedUrl } from './oss.js';
+import { cleanUrl, getMediumUrl, getSignedUrl, getThumbUrl } from './oss.js';
+
+const MD_IMG = /!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g;
+
+/** 签名 URL 只用于展示，入库一律剥回裸链（有效期 24h，存进去就是定时炸弹） */
+function stripSignedUrl(url: string): string {
+  return cleanUrl(String(url || ''));
+}
+
+/** 正文里的内联图同理：读时签名，写时还原 */
+const stripContentImages = (content: string) =>
+  String(content || '').replace(MD_IMG, (_m, alt: string, url: string) => `![${alt}](${stripSignedUrl(url)})`);
 
 type ObjectIdLike = Types.ObjectId | string;
 
@@ -16,11 +27,13 @@ export type TopicInput = {
   expiresAt?: unknown;
 };
 
-/** 正文/封面里的 OSS 图片换成签名 URL（bucket 私有；getSignedUrl 对外部 URL 原样返回） */
-function signContentImages(content: string): string {
+/** 正文/封面里的 OSS 图片换成签名 URL（bucket 私有；getSignedUrl 对外部 URL 原样返回）
+ * @param sign 用哪一档：小程序详情全宽展示走 medium，后台预览同理
+ */
+function signContentImages(content: string, sign: (url: string) => string = getSignedUrl): string {
   return String(content || '').replace(
-    /!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g,
-    (_m, alt: string, url: string) => `![${alt}](${getSignedUrl(url)})`,
+    MD_IMG,
+    (_m, alt: string, url: string) => `![${alt}](${sign(url)})`,
   );
 }
 
@@ -47,7 +60,7 @@ export async function listActiveTopics(): Promise<ActiveTopic[]> {
   return rows.map((r) => ({
     id: String(r._id),
     title: r.title,
-    coverUrl: r.coverUrl ? getSignedUrl(r.coverUrl) : '',
+    coverUrl: r.coverUrl ? getThumbUrl(r.coverUrl) : '',
     effectiveAt: r.effectiveAt,
     expiresAt: r.expiresAt ?? null,
   }));
@@ -68,8 +81,8 @@ export async function getActiveTopicDetail(id: string) {
   return {
     id: String(r._id),
     title: r.title,
-    coverUrl: r.coverUrl ? getSignedUrl(r.coverUrl) : '',
-    content: signContentImages(r.content || ''),
+    coverUrl: r.coverUrl ? getMediumUrl(r.coverUrl) : '',
+    content: signContentImages(r.content || '', getMediumUrl),
     effectiveAt: r.effectiveAt,
     expiresAt: r.expiresAt ?? null,
   };
@@ -93,8 +106,8 @@ function toAdminTopic(r: Record<string, unknown> & { _id: unknown }): AdminTopic
   return {
     id: String(r._id),
     title: String(r.title || ''),
-    coverUrl: r.coverUrl ? getSignedUrl(String(r.coverUrl)) : '',
-    content: String(r.content || ''),
+    coverUrl: r.coverUrl ? getThumbUrl(String(r.coverUrl)) : '',
+    content: signContentImages(String(r.content || ''), getMediumUrl),
     published: Boolean(r.published),
     effectiveAt: Number(r.effectiveAt || 0),
     expiresAt: (r.expiresAt as number | null) ?? null,
@@ -118,9 +131,9 @@ function validateInput(input: TopicInput, { partial }: { partial: boolean }) {
     out.title = title;
   }
   if (input.content !== undefined || !partial) {
-    out.content = String(input.content ?? '');
+    out.content = stripContentImages(String(input.content ?? ''));
   }
-  if (input.coverUrl !== undefined) out.coverUrl = String(input.coverUrl || '');
+  if (input.coverUrl !== undefined) out.coverUrl = stripSignedUrl(String(input.coverUrl || ''));
   if (input.published !== undefined) out.published = Boolean(input.published);
   if (input.effectiveAt !== undefined || !partial) {
     const effectiveAt = Number(input.effectiveAt ?? Date.now());

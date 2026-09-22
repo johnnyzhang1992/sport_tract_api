@@ -42,6 +42,8 @@ export interface MarkerDto {
   note: string;
   photoUrl: string;
   photos: string[];
+  /** 与 photos 同序的缩略图档（端上格子渲染用；photos 留给点开看大图） */
+  photoThumbs?: string[];
   address: string;
 }
 

@@ -5,6 +5,7 @@ import { AdminModel, hashPassword, verifyPassword } from '../models/admin.model.
 import { UserModel } from '../models/user.model.js';
 import { LoginLogModel } from '../models/login-log.model.js';
 import { ActivityModel } from '../models/activity.model.js';
+import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
@@ -13,6 +14,11 @@ import { locateRegion } from '../services/region.js';
 import { INVALID_REGION_VALUES, isValidRegionValue } from '../services/ip-locate.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
 import { footprint, markFootprintDirty } from '../services/footprint.js';
+import {
+  adminListFootprintRecords,
+  adminGetFootprintById,
+  deleteFootprintById,
+} from '../services/footprint-record.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
 import {
   adminListTopics,
@@ -24,7 +30,27 @@ import {
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
-import { getSignedUrl, uploadBuffer } from '../services/oss.js';
+import { getSignedUrl, cleanUrl, getThumbUrl, uploadBuffer } from '../services/oss.js';
+
+/**
+ * 一条轨迹的图片数与首图（列表缩略图用）
+ * photoUrl 与 photos[0] 是同一张图的两份记录，跨 markers 也可能重复挂同一文件 → 按裸链去重；
+ * 老数据只有 photoUrl 没有 photos，按 1 张算。库里可能混着历史上写入的签名链，去重前先剥参数。
+ */
+function photoSummary(markers: Array<{ photoUrl?: string; photos?: string[] }> | undefined) {
+  const seen = new Set<string>();
+  let cover = '';
+  for (const m of markers ?? []) {
+    const urls = m.photos && m.photos.length ? m.photos : m.photoUrl ? [m.photoUrl] : [];
+    for (const p of urls) {
+      const bare = cleanUrl(p);
+      if (!bare || seen.has(bare)) continue;
+      seen.add(bare);
+      if (!cover) cover = bare;
+    }
+  }
+  return { photoCount: seen.size, coverPhoto: cover ? getThumbUrl(cover) : '' };
+}
 
 /**
  * 管理后台路由：/api/admin/*（与小程序用户接口隔离）
@@ -130,24 +156,33 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
   // 概览统计
   fastify.get('/overview', { onRequest: [adminAuth] }, async () => {
-    const [userCount, activityCount, finishedCount, distAgg] = await Promise.all([
-      UserModel.countDocuments({}),
-      ActivityModel.countDocuments({}),
-      ActivityModel.countDocuments({ status: 'finished' }),
-      ActivityModel.aggregate([
-        { $match: { status: 'finished' } },
-        { $group: { _id: null, total: { $sum: '$distance' } } },
-      ]),
-    ]);
+    const [userCount, activityCount, finishedCount, distAgg, footprintCount, footprintUsers, photoAgg] =
+      await Promise.all([
+        UserModel.countDocuments({}),
+        ActivityModel.countDocuments({}),
+        ActivityModel.countDocuments({ status: 'finished' }),
+        ActivityModel.aggregate([
+          { $match: { status: 'finished' } },
+          { $group: { _id: null, total: { $sum: '$distance' } } },
+        ]),
+        FootprintRecordModel.countDocuments({}),
+        FootprintRecordModel.distinct('userId'),
+        FootprintRecordModel.aggregate([
+          { $group: { _id: null, total: { $sum: { $size: { $ifNull: ['$photos', []] } } } } },
+        ]),
+      ]);
     return success({
       userCount,
       activityCount,
       finishedCount,
       totalDistanceKm: Math.round(((distAgg[0]?.total as number) ?? 0) / 10) / 100,
+      footprintCount,
+      footprintUserCount: footprintUsers.length,
+      footprintPhotoCount: (photoAgg[0]?.total as number) ?? 0,
     });
   });
 
-  // 时间维度数据量：新增用户/新增轨迹（today/week/month）
+  // 时间维度数据量：新增用户/新增轨迹/新增足迹 + 登录 UV·PV（today/week/month）
   fastify.get('/stats', { onRequest: [adminAuth] }, async (request) => {
     const DAY = 86400000;
     const now = Date.now();
@@ -156,25 +191,26 @@ export async function adminRoutes(fastify: FastifyInstance) {
       week: now - 7 * DAY,
       month: now - 30 * DAY,
     };
-    const out: Record<string, { newUsers: number; newActivities: number; uv: number; pv: number }> = {};
+    const out: Record<string, { newUsers: number; newActivities: number; newFootprints: number; uv: number; pv: number }> = {};
     for (const [k, start] of Object.entries(ranges)) {
       const since = new Date(start);
       // 登录 UV/PV：PV = 登录次数，UV = 周期内登录过的去重用户数
-      const [newUsers, newActivities, pv, uvRows] = await Promise.all([
+      const [newUsers, newActivities, newFootprints, pv, uvRows] = await Promise.all([
         UserModel.countDocuments({ createdAt: { $gte: since } }),
         ActivityModel.countDocuments({ createdAt: { $gte: since } }),
+        FootprintRecordModel.countDocuments({ createdAt: { $gte: since } }),
         LoginLogModel.countDocuments({ createdAt: { $gte: since } }),
         LoginLogModel.aggregate([
           { $match: { createdAt: { $gte: since } } },
           { $group: { _id: '$userId' } },
         ]),
       ]);
-      out[k] = { newUsers, newActivities, uv: uvRows.length, pv };
+      out[k] = { newUsers, newActivities, newFootprints, uv: uvRows.length, pv };
     }
     return success(out);
   });
 
-  // 数据趋势：新增用户/轨迹（折线图），维度 type=day|week|month|year
+  // 数据趋势：新增用户/轨迹/足迹（折线图），维度 type=day|week|month|year
   // day：近 30 天按天；week：近 25 周按周；month：近 12 个月按月；year：近 6 年按半年（12 个点）
   fastify.get('/trend', { onRequest: [adminAuth] }, async (request) => {
     const type = String((request.query as { type?: string }).type || 'day');
@@ -242,7 +278,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
             ],
           }
         : { $dateToString: { format: fmt, date: '$createdAt' } };
-    const [uRows, aRows] = await Promise.all([
+    const [uRows, aRows, fRows] = await Promise.all([
       UserModel.aggregate([
         { $match: { createdAt: { $gte: start } } },
         { $group: { _id: idExpr, count: { $sum: 1 } } },
@@ -251,14 +287,22 @@ export async function adminRoutes(fastify: FastifyInstance) {
         { $match: { createdAt: { $gte: start } } },
         { $group: { _id: idExpr, count: { $sum: 1 } } },
       ]),
+      FootprintRecordModel.aggregate([
+        { $match: { createdAt: { $gte: start } } },
+        { $group: { _id: idExpr, count: { $sum: 1 } } },
+      ]),
     ]);
     const uMap = new Map(uRows.map((r) => [r._id, r.count]));
     const aMap = new Map(aRows.map((r) => [r._id, r.count]));
-    const data: { date: string; newUsers: number; newActivities: number }[] = buckets.map((key) => ({
-      date: key,
-      newUsers: uMap.get(key) ?? 0,
-      newActivities: aMap.get(key) ?? 0,
-    }));
+    const fMap = new Map(fRows.map((r) => [r._id, r.count]));
+    const data: { date: string; newUsers: number; newActivities: number; newFootprints: number }[] = buckets.map(
+      (key) => ({
+        date: key,
+        newUsers: uMap.get(key) ?? 0,
+        newActivities: aMap.get(key) ?? 0,
+        newFootprints: fMap.get(key) ?? 0,
+      }),
+    );
     return success({ type, data });
   });
 
@@ -766,6 +810,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
         .lean(),
       UserModel.find({}).select('_id nickname gender').lean(),
     ]);
+    // 图片列要数图：只回表捞这一页的 markers 照片字段（不放开头条的 -markers，避免整坨打点下发）
+    const photoRows = items.length
+      ? await ActivityModel.find({ _id: { $in: items.map((a) => a._id) } })
+          .select('markers.photos markers.photoUrl')
+          .lean()
+      : [];
+    const photoMap = new Map(photoRows.map((r) => [String(r._id), photoSummary(r.markers)]));
     const nickMap = new Map(users.map((u) => [String(u._id), u.nickname || '微信用户']));
     const genderMap = new Map(users.map((u) => [String(u._id), u.gender ?? 0]));
     return success({
@@ -786,8 +837,190 @@ export async function adminRoutes(fastify: FastifyInstance) {
         startProvince: a.startProvince ?? '',
         startCity: a.startCity ?? '',
         startTime: a.startTime,
+        ...photoMap.get(String(a._id)) ?? { photoCount: 0, coverPhoto: '' },
       })),
     });
+  });
+
+  // 足迹数据概况：today/week/month/year/all 五档一次给全（前端切档不再请求）
+  // 时间一律按「记录创建时间 createdAt」——到访日期是用户手填的，可以填三年前，讲不清「这段时间进了多少数据」
+  // 传 userId 则收口到单个用户（用户详情页的个人足迹概况用），不传是全站
+  fastify.get('/footprint-stats', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { userId?: string };
+    const scope: Record<string, unknown> = {};
+    if (q.userId?.trim()) {
+      // aggregate 的 $match 不按 schema 转型，字符串 userId 必须先转 ObjectId（否则恒不命中、静默给 0）
+      const raw = assertObjectIdLike(q.userId.trim(), '用户不存在');
+      scope.userId = new Types.ObjectId(String(raw));
+    }
+    const DAY = 86400000;
+    const now = Date.now();
+    const ranges: Record<string, number | null> = {
+      today: bjToday0(),
+      week: now - 7 * DAY,
+      month: now - 30 * DAY,
+      year: now - 365 * DAY,
+      all: null,
+    };
+    const groupStage: PipelineStage.FacetPipelineStage = {
+      $group: {
+        _id: null,
+        total: { $sum: 1 },
+        users: { $addToSet: '$userId' },
+        provinces: { $addToSet: { $ifNull: ['$location.province', ''] } },
+        // 城市按「省|市」组合去重：同名市跨省时不能合并（两个 测试市己 是两个地方）
+        cities: {
+          $addToSet: {
+            $concat: [{ $ifNull: ['$location.province', ''] }, '|', { $ifNull: ['$location.city', ''] }],
+          },
+        },
+        photos: { $sum: { $size: { $ifNull: ['$photos', []] } } },
+        withPhoto: { $sum: { $cond: [{ $gt: [{ $size: { $ifNull: ['$photos', []] } }, 0] }, 1, 0] } },
+      },
+    };
+    const facet: Record<string, PipelineStage.FacetPipelineStage[]> = {};
+    for (const [key, since] of Object.entries(ranges)) {
+      const match: Record<string, unknown> = { ...scope };
+      if (since != null) match.createdAt = { $gte: new Date(since) };
+      facet[key] = [
+        { $match: match } as PipelineStage.FacetPipelineStage,
+        groupStage,
+      ];
+    }
+    const [rows] = await FootprintRecordModel.aggregate([{ $facet: facet }]);
+    const out: Record<
+      string,
+      {
+        total: number;
+        userCount: number;
+        provinceCount: number;
+        cityCount: number;
+        photoCount: number;
+        withPhotoCount: number;
+      }
+    > = {};
+    for (const key of Object.keys(ranges)) {
+      const r = (rows?.[key] as Array<Record<string, unknown>> | undefined)?.[0];
+      const provinces = (r?.provinces as string[] | undefined) ?? [];
+      const cities = (r?.cities as string[] | undefined) ?? [];
+      const hasText = (s: string | undefined) => !!s && !!s.trim();
+      out[key] = {
+        total: Number(r?.total ?? 0),
+        userCount: ((r?.users as unknown[] | undefined) ?? []).length,
+        provinceCount: provinces.filter(hasText).length,
+        cityCount: cities.filter((c) => {
+          const [p, ci] = String(c).split('|');
+          return hasText(p) || hasText(ci);
+        }).length,
+        photoCount: Number(r?.photos ?? 0),
+        withPhotoCount: Number(r?.withPhoto ?? 0),
+      };
+    }
+    return success(out);
+  });
+
+  // 足迹省份分布（含城市明细）：按落库 location.province/city 聚合，range 同概况五档
+  // 空省市的记录在地图上没有位置 → 不入分布，只体现在概况总数里（与 activity-geo-stats 同处理）
+  fastify.get('/footprint-geo-stats', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { range?: string };
+    const rangeMap: Record<string, number | null> = {
+      today: bjToday0(),
+      week: Date.now() - 7 * DAY_MS,
+      month: Date.now() - 30 * DAY_MS,
+      year: Date.now() - 365 * DAY_MS,
+      all: null,
+    };
+    const since = rangeMap[q.range || 'all'] !== undefined ? rangeMap[q.range || 'all'] : null;
+    const filter: Record<string, unknown> = {};
+    if (since != null) filter.createdAt = { $gte: new Date(since) };
+    const rows = await FootprintRecordModel.aggregate([
+      { $match: filter },
+      { $group: { _id: { prov: '$location.province', city: '$location.city' }, count: { $sum: 1 } } },
+    ]);
+    const provMap = new Map<string, Map<string, number>>();
+    let total = 0;
+    for (const r of rows) {
+      const prov = String(r._id?.prov ?? '').trim();
+      if (!prov) continue;
+      const city = String(r._id?.city ?? '').trim() || '未知';
+      total += r.count;
+      if (!provMap.has(prov)) provMap.set(prov, new Map());
+      const cities = provMap.get(prov)!;
+      cities.set(city, (cities.get(city) ?? 0) + r.count);
+    }
+    const provinces = [...provMap.entries()]
+      .map(([province, cities]) => ({
+        province,
+        count: [...cities.values()].reduce((s, c) => s + c, 0),
+        cities: [...cities.entries()].map(([city, count]) => ({ city, count })).sort((a, b) => b.count - a.count),
+      }))
+      .sort((a, b) => b.count - a.count);
+    return success({ range: q.range || 'all', total, provinces });
+  });
+
+  // 足迹趋势：近 N 天按天「新增足迹条数 + 新增照片数」（createdAt 按东八区分桶，缺数据的桶补 0）
+  fastify.get('/footprint-trend', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { days?: string };
+    const days = Math.min(365, Math.max(7, Number(q.days) || 30));
+    const start = Date.now() - days * 86400000;
+    const buckets: string[] = [];
+    for (let i = days - 1; i >= 0; i--) {
+      buckets.push(new Date(Date.now() + 8 * 3600000 - i * 86400000).toISOString().slice(0, 10));
+    }
+    // aggregate 的 $match 不像 find 那样按 schema 自动转型，Date 字段必须显式 new Date
+    const rows = await FootprintRecordModel.aggregate([
+      { $match: { createdAt: { $gte: new Date(start) } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: '+08:00' } },
+          count: { $sum: 1 },
+          photos: { $sum: { $size: { $ifNull: ['$photos', []] } } },
+        },
+      },
+    ]);
+    const rowMap = new Map(rows.map((r) => [r._id, r]));
+    return success({
+      days,
+      data: buckets.map((date) => ({
+        date,
+        count: rowMap.get(date)?.count ?? 0,
+        photos: rowMap.get(date)?.photos ?? 0,
+      })),
+    });
+  });
+
+  // 足迹列表（全站；回填归属人昵称/UID，不下发照片数组）
+  fastify.get('/footprint-records', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as {
+      page?: string; pageSize?: string; userId?: string; keyword?: string; province?: string;
+      minPhotos?: string; visitFrom?: string; visitTo?: string;
+    };
+    const minPhotos = Number(q.minPhotos);
+    return success(
+      await adminListFootprintRecords({
+        page: Math.max(1, Number(q.page) || 1),
+        pageSize: Math.min(100, Number(q.pageSize) || 20),
+        userId: q.userId?.trim() || undefined,
+        keyword: q.keyword?.trim() || undefined,
+        province: q.province?.trim() || undefined,
+        minPhotos: Number.isFinite(minPhotos) && minPhotos > 0 ? Math.floor(minPhotos) : undefined,
+        visitFrom: q.visitFrom?.trim() || undefined,
+        visitTo: q.visitTo?.trim() || undefined,
+      }),
+    );
+  });
+
+  // 足迹详情（含照片签名 URL 与归属人）
+  fastify.get('/footprint-records/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await adminGetFootprintById(id));
+  });
+
+  // 删除足迹（合规图误放行 / 违规内容处置；硬删并清理 OSS 照片）
+  fastify.delete('/footprint-records/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    await deleteFootprintById(id);
+    return success(null);
   });
 
   // 用户详情（管理后台用户页聚合：资料 + 周/月/年/总概况 + 个人最佳 + 点亮城市）
@@ -806,7 +1039,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       user: {
         id,
         nickname: user.nickname ?? '',
-        avatarUrl: user.avatarUrl ?? '',
+        avatarUrl: user.avatarUrl ? getSignedUrl(user.avatarUrl) : '',
         gender: user.gender ?? 0,
         openid: user.openid,
         weightKg: user.weightKg ?? null,
@@ -972,7 +1205,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const ext = (file.mimetype || 'image/png').split('/')[1]?.replace('jpeg', 'jpg') || 'png';
     const key = `${config.oss.baseDir}/topics/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const url = await uploadBuffer(buf, key, file.mimetype || 'image/png');
-    return success({ url });
+    // url 入库用（裸链），previewUrl 只给后台展示（私有桶裸链 403）；正文内联图同理取 previewUrl
+    return success({ url, previewUrl: getSignedUrl(url) });
   });
 }
 

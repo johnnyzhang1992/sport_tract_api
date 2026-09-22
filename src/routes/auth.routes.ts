@@ -3,7 +3,7 @@ import jsonwebtoken from 'jsonwebtoken';
 import { UserModel } from '../models/user.model.js';
 import { LoginLogModel } from '../models/login-log.model.js';
 import { code2Session } from '../services/wechat.js';
-import { getSignedUrl } from '../services/oss.js';
+import { getAvatarUrl } from '../services/oss.js';
 import { locateByIp } from '../services/ip-locate.js';
 import { LoginSchema, RefreshSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
@@ -95,7 +95,7 @@ export async function authRoutes(fastify: FastifyInstance) {
           id: userId,
           uid: user.uid ?? null, // 用户唯一编号
           nickname: user.nickname,
-          avatarUrl: user.avatarUrl ? getSignedUrl(user.avatarUrl) : '',
+          avatarUrl: user.avatarUrl ? getAvatarUrl(user.avatarUrl) : '',
           avatarPreset: user.avatarPreset ?? '',
           gender: user.gender,
           weightKg: user.weightKg,

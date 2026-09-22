@@ -9,7 +9,7 @@ import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { ACTIVITY_TYPES } from '../config/constants.js';
 import type { ActivityType } from '../config/constants.js';
-import { getSignedUrl } from './oss.js';
+import { getAvatarUrl } from './oss.js';
 
 export interface RegionProvince {
   name: string;
@@ -245,7 +245,7 @@ export async function leaderboard(
       {
         nickname: u.nickname || '',
         gender: u.gender ?? 0,
-        avatarUrl: u.avatarUrl ? getSignedUrl(u.avatarUrl) : '',
+        avatarUrl: u.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
         avatarPreset: u.avatarPreset || '',
       },
     ]),

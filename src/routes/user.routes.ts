@@ -2,14 +2,15 @@ import type { FastifyInstance } from 'fastify';
 import { UserModel } from '../models/user.model.js';
 import { WeightLogModel } from '../models/weight-log.model.js';
 import { checkImage, checkText } from '../services/wechat-sec.js';
-import { getSignedUrl } from '../services/oss.js';
+import { getAvatarUrl } from '../services/oss.js';
 import { UpdateMeSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 
-/** 头像 URL 签名（bucket 私有，展示需签名 URL；未配置 OSS 时原样返回） */
+/** 头像 URL 签名（bucket 私有，展示需签名 URL；未配置 OSS 时原样返回）
+ * 一律走方图缩略档：端上最大展示位是个人页 200rpx 圆头像，原图是几百倍流量 */
 function signAvatar(url: string): string {
-  return url ? getSignedUrl(url) : '';
+  return url ? getAvatarUrl(url) : '';
 }
 
 /** 用户资料路由：GET/PUT /api/users/me（仅本人）+ 图片合规检测 */

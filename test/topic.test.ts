@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { TopicModel } from '../src/models/topic.model.js';
+import { config, isOssConfigured } from '../src/config/index.js';
 
 /**
  * 专题接口测试：
@@ -60,12 +61,12 @@ before(async () => {
   });
   adminToken = login.json().data.token;
   assert.ok(adminToken);
-  await TopicModel.deleteMany({ title: { $in: ['测试专题', '未发布专题', '未来专题', '过期专题'] } });
+  await TopicModel.deleteMany({ title: { $in: ['测试专题', '未发布专题', '未来专题', '过期专题', '签名链路专题'] } });
 });
 
 after(async () => {
   // 只清测试标题，避免误删本地库里的真实专题
-  await TopicModel.deleteMany({ title: { $in: ['测试专题', '未发布专题', '未来专题', '过期专题', '原始标题', '更新后标题'] } }).catch(() => {});
+  await TopicModel.deleteMany({ title: { $in: ['测试专题', '未发布专题', '未来专题', '过期专题', '原始标题', '更新后标题', '签名链路专题'] } }).catch(() => {});
   await app.close();
   const mongoose = (await import('mongoose')).default;
   await mongoose.disconnect().catch(() => {});
@@ -126,4 +127,49 @@ test('校验：标题为空 400；无 token 访问 admin 401', async () => {
 
   const res = await app.inject({ method: 'GET', url: '/sport-track/api/admin/topics' });
   assert.equal(res.statusCode, 401);
+});
+
+// ==================== 管理端图片签名链路 ====================
+const OSS_KEY = `${config.oss.endpoint.replace(/\/$/, '')}/${config.oss.baseDir}/topics/bare.png`;
+const SIGNED_LIKE = `${OSS_KEY}?OSSAccessKeyId=TESTID&Expires=1700000000&Signature=TESTSIG`;
+
+test('管理端写入的 coverUrl 必须剥掉签名参数入库（签名链有效期 24h，进库就是定时炸弹）', async () => {
+  const id = await createTopic({ title: '签名链路专题', coverUrl: SIGNED_LIKE });
+  const doc = await TopicModel.findById(id).lean();
+  assert.equal(doc!.coverUrl, OSS_KEY, '库里只能存裸链');
+
+  const row = (await (await adminReq('GET', '/topics')).json()).data.find((t: { id: string }) => t.id === id);
+  if (isOssConfigured()) {
+    assert.ok(row.coverUrl.startsWith(`${OSS_KEY}?`), `列表应下发签名链，实际 ${row.coverUrl}`);
+    assert.match(row.coverUrl, /[?&]Signature=/);
+  } else {
+    assert.equal(row.coverUrl, OSS_KEY);
+  }
+
+  // 编辑保存（表单里回填的正是列表下发的签名链）同样要净化
+  await adminReq('PUT', `/topics/${id}`, { coverUrl: row.coverUrl });
+  const again = await TopicModel.findById(id).lean();
+  assert.equal(again!.coverUrl, OSS_KEY, 'PUT 回来不能把签名串写进库');
+});
+
+test('管理端专题列表：正文内联图也签名（后台 markdown 预览与小程序详情同口径，否则全是裂图）', async () => {
+  const id = await createTopic({ title: '签名链路专题', content: `![封面](${OSS_KEY})` });
+  const row = (await (await adminReq('GET', '/topics')).json()).data.find((t: { id: string }) => t.id === id);
+  if (isOssConfigured()) {
+    assert.ok(row.content.includes(`${OSS_KEY}?OSSAccessKeyId`) || /[?&]Signature=/.test(row.content), row.content);
+    assert.ok(row.content.includes(OSS_KEY), '正文里仍是同一张图');
+    assert.ok(!row.content.includes(`${OSS_KEY})`), '内联图不该还是裸链');
+  } else {
+    assert.equal(row.content, `![封面](${OSS_KEY})`);
+  }
+});
+
+test('管理端保存正文：内联图签名参数入库前剥掉（编辑回填的是签名链，不剥就是自我污染）', async () => {
+  const id = await createTopic({ title: '签名链路专题', content: `![图](${OSS_KEY})` });
+  const row = (await (await adminReq('GET', '/topics')).json()).data.find((t: { id: string }) => t.id === id);
+  // 后台编辑器里点保存，提交的 content 带着列表下发的签名链
+  await adminReq('PUT', `/topics/${id}`, { content: row.content });
+  const doc = await TopicModel.findById(id).lean();
+  assert.equal(doc!.content, `![图](${OSS_KEY})`, '库里只存裸链');
+  assert.ok(!String(doc!.content).includes('Expires='), doc!.content);
 });

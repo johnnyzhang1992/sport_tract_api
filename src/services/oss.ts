@@ -119,15 +119,36 @@ export function cleanUrl(url: string): string {
 }
 
 /**
- * 生成 OSS 签名访问 URL（bucket 私有时前端加载图片用）
- * 库内只存裸 URL，展示时签发；签名 URL 过期后需重新签发
- * @returns 签名 URL；OSS 未配置/无法提取 key 时返回原 URL
+ * OSS 图片处理档位（x-oss-process 参与签名，前端拼不出来，只能后端按档签发）
+ * 实测样本：996KB 原图 → thumb 9.4KB / avatar 5.2KB / medium 45.7KB
+ * 统一转 jpg：小程序 iOS 的 webp 支持不打包票，jpg 到处能渲染
  */
-export function getSignedUrl(url: string, expiresSec = 86400): string {
+export const IMAGE_PROCESS = {
+  /** 卡片/气泡/宫格缩略图：长边 240（端上最大展示位 200rpx ≈ 100 CSS px × 3 倍图） */
+  thumb: 'image/resize,w_240/quality,q_80/format,jpg',
+  /** 头像：圆形展示位一律方图裁切 */
+  avatar: 'image/resize,m_fill,w_160,h_160/quality,q_80/format,jpg',
+  /** 全宽封面 / 正文大图位：再大会糊，原图留给点开预览 */
+  medium: 'image/resize,w_800/quality,q_80/format,jpg',
+} as const;
+
+let cachedClient: OSS | null = null;
+
+/**
+ * 签发访问 URL
+ * @param process x-oss-process 图片处理参数（缩略图/头像/中图）；不传即原图
+ * 非本桶地址（微信头像等）原样返回，签名逻辑不接管第三方域名。
+ */
+export function getSignedUrl(url: string, expiresSec = 86400, process?: string): string {
   if (!isOssConfigured()) return url;
   const key = extractKeyFromUrl(url);
   if (!key) return url;
   const { region, bucket, accessKeyId, accessKeySecret } = config.oss;
-  const client = new OSS({ region, accessKeyId, accessKeySecret, bucket, secure: true });
-  return client.signatureUrl(key, { expires: expiresSec, method: 'GET' });
+  // 一次详情要签十几条，client 建一次复用（构造里有凭证解析，别按张数重复付）
+  cachedClient ??= new OSS({ region, accessKeyId, accessKeySecret, bucket, secure: true });
+  return cachedClient.signatureUrl(key, { expires: expiresSec, method: 'GET', ...(process ? { process } : {}) });
 }
+
+export const getThumbUrl = (url: string) => getSignedUrl(url, 86400, IMAGE_PROCESS.thumb);
+export const getAvatarUrl = (url: string) => getSignedUrl(url, 86400, IMAGE_PROCESS.avatar);
+export const getMediumUrl = (url: string) => getSignedUrl(url, 86400, IMAGE_PROCESS.medium);

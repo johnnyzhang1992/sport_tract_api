@@ -1,10 +1,11 @@
 import { Types } from 'mongoose';
-import { cleanUrl, deleteOssObjects, getSignedUrl } from './oss.js';
+import { cleanUrl, deleteOssObjects, getSignedUrl, getThumbUrl } from './oss.js';
 import { locateRegion } from './region.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { config } from '../config/index.js';
 import { FootprintRecordModel } from '../models/footprint-record.model.js';
+import { UserModel } from '../models/user.model.js';
 import type { CreateFootprintRecordInput, ListFootprintQueryInput } from '../utils/validators.js';
 
 /** 足迹新增防刷：1 小时滑动窗口最多 30 条（低于 activities 强度：足迹是静态记录） */
@@ -42,6 +43,9 @@ function toDto(doc: any, sign = true): any {
       longitude: doc.location?.longitude,
     },
     photos: (doc.photos ?? []).map((p: string) => (sign ? getSignedUrl(p) : p)),
+    // 与 photos 同序的缩略图档：端上渲染缩略图、点开 previewImage 用原图，一次页面少拉 100 倍流量。
+    // 原图仍一并下发——已发布的老版本小程序读的是 photos，不能靠发版顺序赌客户端升级。
+    photoThumbs: (doc.photos ?? []).map((p: string) => (sign ? getThumbUrl(p) : p)),
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
@@ -183,6 +187,8 @@ export async function listFootprintGeo(userId: string) {
       latitude: d.location?.latitude,
       longitude: d.location?.longitude,
       coverPhoto: d.photos?.[0] ? getSignedUrl(d.photos[0]) : '',
+      // 地图气泡照片卡只有 108×64，canvas 画原图是白拉流量
+      coverPhotoThumb: d.photos?.[0] ? getThumbUrl(d.photos[0]) : '',
     })),
   };
 }
@@ -311,8 +317,126 @@ export async function updateFootprint(id: string, userId: string, input: CreateF
   return toDto(doc);
 }
 
+/**
+ * 按 id 硬删 + 清理 OSS 照片（不校验归属）。
+ * 导出给管理后台用；用户端 deleteFootprint 必须先过归属再委托到这里，OSS 清理口径只留这一份。
+ */
+export async function deleteFootprintById(id: string) {
+  assertObjectIdLike(id, '足迹不存在');
+  const doc = await FootprintRecordModel.findById(id).lean();
+  if (!doc) throw new AppError(404, '足迹不存在');
+  await FootprintRecordModel.deleteOne({ _id: id });
+  await deleteOssObjects(doc.photos ?? []).catch(() => {});
+}
+
 export async function deleteFootprint(id: string, userId: string) {
-  const old = await findOwnedRecord(id, userId);
-  await FootprintRecordModel.deleteOne({ _id: id, userId });
-  await deleteOssObjects(old.photos ?? []).catch(() => {});
+  // 归属校验在委托前：越权请求不能进到删除/OSS 清理那一步
+  await findOwnedRecord(id, userId);
+  await deleteFootprintById(id);
+}
+
+export interface AdminFootprintListQuery {
+  page: number;
+  pageSize: number;
+  userId?: string;
+  keyword?: string;
+  province?: string;
+  minPhotos?: number;
+  visitFrom?: string;
+  visitTo?: string;
+}
+
+/**
+ * 管理后台足迹详情：正文 + 照片（签名 URL）+ 归属人昵称/UID
+ * 不走 findOwnedRecord（那是用户端的归属闸门），后台按 id 直查。
+ */
+export async function adminGetFootprintById(id: string) {
+  assertObjectIdLike(id, '足迹不存在');
+  const doc = await FootprintRecordModel.findById(id).lean();
+  if (!doc) throw new AppError(404, '足迹不存在');
+  const user = await UserModel.findById(doc.userId).select('nickname uid').lean();
+  return {
+    ...toDto(doc),
+    userId: String(doc.userId),
+    userNickname: user?.nickname || '微信用户',
+    userUid: user?.uid != null ? String(user.uid) : '',
+  };
+}
+
+/**
+ * 管理后台全站足迹列表（只读视角：带记录归属人信息，不下发照片数组）
+ *
+ * 与用户端 listFootprints 的两处口径差异：
+ * - 排序固定 createdAt 倒序（后台按「什么时候进来的」排查，用户端按到访时间浏览）
+ * - keyword 除文本命中外，还整体纳入昵称命中的用户的全部足迹（后台常按人找记录）
+ * 照片只在详情弹窗按需取，列表不下发：一次 100 条 × 3 图 = 300 个签名 URL，白烧 CPU。
+ */
+export async function adminListFootprintRecords(query: AdminFootprintListQuery) {
+  const filter: Record<string, unknown> = {};
+  if (query.userId) filter.userId = assertObjectIdLike(query.userId, '用户不存在');
+  if (query.province) filter['location.province'] = query.province;
+  if (query.visitFrom || query.visitTo) {
+    const visitDate: Record<string, string> = {};
+    if (query.visitFrom) visitDate.$gte = query.visitFrom;
+    if (query.visitTo) visitDate.$lt = query.visitTo;
+    filter.visitDate = visitDate;
+  }
+  if (query.minPhotos && query.minPhotos > 0) {
+    // 数组字段不能用 photos: { $gte: n }（那是「元素值 ≥ n」）；照片数只能进表达式比较
+    filter.$expr = { $gte: [{ $size: { $ifNull: ['$photos', []] } }, query.minPhotos] };
+  }
+  const keyword = query.keyword?.trim();
+  if (keyword) {
+    const rx = new RegExp(escapeRegex(keyword), 'i');
+    const or: Record<string, unknown>[] = [
+      { title: rx },
+      { description: rx },
+      { 'location.name': rx },
+      { 'location.address': rx },
+      { people: rx },
+    ];
+    const byNickname = await UserModel.find({ nickname: rx }).select('_id').lean();
+    if (byNickname.length > 0) or.push({ userId: { $in: byNickname.map((u) => u._id) } });
+    filter.$or = or;
+  }
+
+  const [total, docs] = await Promise.all([
+    FootprintRecordModel.countDocuments(filter),
+    FootprintRecordModel.find(filter)
+      .select('userId title visitDate location people photos createdAt updatedAt')
+      .sort({ createdAt: -1 })
+      .skip((query.page - 1) * query.pageSize)
+      .limit(query.pageSize)
+      .lean(),
+  ]);
+
+  // 昵称/UID 只回填本页涉及的用户，不整表捞
+  const ids = [...new Set(docs.map((d) => String(d.userId)))];
+  const users = await UserModel.find({ _id: { $in: ids } }).select('_id nickname uid').lean();
+  const nickMap = new Map(users.map((u) => [String(u._id), u.nickname || '微信用户']));
+  const uidMap = new Map(users.map((u) => [String(u._id), u.uid != null ? String(u.uid) : '']));
+
+  return {
+    total,
+    page: query.page,
+    pageSize: query.pageSize,
+    items: docs.map((d) => ({
+      id: String(d._id),
+      userId: String(d.userId),
+      userNickname: nickMap.get(String(d.userId)) ?? '微信用户',
+      userUid: uidMap.get(String(d.userId)) ?? '',
+      title: d.title,
+      visitDate: d.visitDate,
+      placeName: d.location?.name ?? '',
+      address: d.location?.address ?? '',
+      province: d.location?.province ?? '',
+      city: d.location?.city ?? '',
+      people: d.people ?? [],
+      peopleCount: (d.people ?? []).length,
+      photoCount: d.photos?.length ?? 0,
+      // 列表缩略图只给首图的缩略档；整组原图仍留给详情按需签（一页 100 行 × 3 图 = 300 个签名）
+      coverPhoto: d.photos?.[0] ? getThumbUrl(d.photos[0]) : '',
+      createdAt: d.createdAt,
+    })),
+  };
 }

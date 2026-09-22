@@ -16,7 +16,7 @@ import {
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import { ActivityModel } from '../models/activity.model.js';
-import { deleteOssObjects, getSignedUrl } from '../services/oss.js';
+import { deleteOssObjects, getSignedUrl, getThumbUrl } from '../services/oss.js';
 import { importActivity } from '../services/import.js';
 import { z } from 'zod';
 import { success } from '../utils/response.js';
@@ -128,7 +128,10 @@ export async function activityRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     const activity = await getActivityDetailView(id, request.user?.userId);
     // 私有 bucket：给打点照片签发访问签名 URL（库内仍存裸 URL）
+    // photos 留原图（点开看大图 / 分享合图），photoThumbs 给端上 140rpx 格子渲染
     for (const m of activity.markers) {
+      const raw = m.photos && m.photos.length ? m.photos : m.photoUrl ? [m.photoUrl] : [];
+      m.photoThumbs = raw.map((p) => getThumbUrl(p));
       if (m.photos && m.photos.length > 0) {
         m.photos = m.photos.map((p) => getSignedUrl(p));
         // photoUrl 复用首图签名（同一 URL，避免前端按地址去重失效）
