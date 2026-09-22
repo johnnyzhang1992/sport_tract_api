@@ -6,7 +6,7 @@ import { assertObjectIdLike } from '../utils/object-id.js';
 import { config } from '../config/index.js';
 import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import { UserModel } from '../models/user.model.js';
-import type { CreateFootprintRecordInput, ListFootprintQueryInput } from '../utils/validators.js';
+import type { CreateFootprintRecordInput, ListFootprintQueryInput, FootprintGeoQueryInput } from '../utils/validators.js';
 
 /** 足迹新增防刷：1 小时滑动窗口最多 30 条（低于 activities 强度：足迹是静态记录） */
 const FP_CREATE_LIMIT = 30;
@@ -26,11 +26,32 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * 关键词过滤条件（列表与地图 geo 共用一份口径，避免两处 $or 漂移）
+ * 命中面：标题/描述/地点名/地址/省份/城市/同行人/到访日期。省市是地图页搜索框要求的「搜省份城市」。
+ */
+function keywordFilter(keyword: string): Record<string, unknown> {
+  const rx = new RegExp(escapeRegex(keyword), 'i');
+  return {
+    $or: [
+      { title: rx },
+      { description: rx },
+      { 'location.name': rx },
+      { 'location.address': rx },
+      { 'location.province': rx },
+      { 'location.city': rx },
+      { people: rx },
+      { visitDate: rx },
+    ],
+  };
+}
+
 function toDto(doc: any, sign = true): any {
   return {
     id: String(doc._id),
     visitDate: doc.visitDate,
     title: doc.title,
+    category: doc.category ?? '',
     people: doc.people ?? [],
     description: doc.description ?? '',
     location: {
@@ -102,6 +123,7 @@ export async function createFootprint(userId: string, input: CreateFootprintReco
     userId,
     visitDate: input.visitDate,
     title: input.title,
+    category: input.category ?? '',
     people: input.people,
     description: input.description,
     location: buildLocation(input),
@@ -111,8 +133,8 @@ export async function createFootprint(userId: string, input: CreateFootprintReco
 }
 
 /**
- * 搜索命中得分（权重：标题 3 / 同行的人 2 / 描述、地点名、地址、日期 各 1）
- * 口径与列表 $or 的四路 + people/visitDate 一致，只是「先排序后分页」需要显式分值。导出供单测
+ * 搜索命中得分（权重：标题 3 / 同行的人 2 / 描述、地点名、地址、省份、城市、日期 各 1）
+ * 命中面与 keywordFilter 的 $or 逐字段对齐，只是「先排序后分页」需要显式分值。导出供单测
  */
 export function searchScore(doc: any, keyword: string): number {
   const k = keyword.toLowerCase();
@@ -123,6 +145,8 @@ export function searchScore(doc: any, keyword: string): number {
   if (has(doc.description)) score += 1;
   if (has(doc.location?.name)) score += 1;
   if (has(doc.location?.address)) score += 1;
+  if (has(doc.location?.province)) score += 1;
+  if (has(doc.location?.city)) score += 1;
   if (has(doc.visitDate)) score += 1;
   return score;
 }
@@ -136,17 +160,7 @@ function byRecency(a: any, b: any): number {
 export async function listFootprints(userId: string, query: ListFootprintQueryInput) {
   const filter: Record<string, unknown> = { userId };
   const keyword = query.keyword?.trim();
-  if (keyword) {
-    const rx = new RegExp(escapeRegex(keyword), 'i');
-    filter.$or = [
-      { title: rx },
-      { description: rx },
-      { 'location.name': rx },
-      { 'location.address': rx },
-      { people: rx },
-      { visitDate: rx },
-    ];
-  }
+  if (keyword) Object.assign(filter, keywordFilter(keyword));
   if (query.from || query.to) {
     filter.visitDate = {
       ...(query.from ? { $gte: query.from } : {}),
@@ -174,16 +188,34 @@ export async function listFootprints(userId: string, query: ListFootprintQueryIn
   return { items: docs.map((d) => toDto(d)), total, page: query.page, pageSize: query.pageSize };
 }
 
-export async function listFootprintGeo(userId: string) {
-  const docs = await FootprintRecordModel.find({ userId })
+/**
+ * 地图页打点数据：全量（或按 省/年/分类/关键词 过滤后）返回，不分页
+ * 不带 query 时行为与历史一致，老版本小程序不受影响。
+ * 下发 province/city/category 是给筛选弹窗本地算选项用的：省份与年份候选直接从首次全量快照去重，
+ * 省一个聚合接口，代价是一次字符串拷贝。
+ */
+export async function listFootprintGeo(userId: string, query: FootprintGeoQueryInput = {}) {
+  const filter: Record<string, unknown> = { userId };
+  const keyword = query.keyword?.trim();
+  if (keyword) Object.assign(filter, keywordFilter(keyword));
+  if (query.province) filter['location.province'] = query.province;
+  if (query.category) filter.category = query.category;
+  if (query.year) {
+    // visitDate 是 YYYY-MM-DD 字符串，字典序即日期序，左含右不含
+    filter.visitDate = { $gte: `${query.year}-01-01`, $lt: `${Number(query.year) + 1}-01-01` };
+  }
+  const docs = await FootprintRecordModel.find(filter)
     .sort({ visitDate: -1 })
-    .select('title visitDate location.photos location.latitude location.longitude photos')
+    .select('title visitDate category location.photos location.province location.city location.latitude location.longitude photos')
     .lean();
   return {
     items: docs.map((d) => ({
       id: String(d._id),
       title: d.title,
       visitDate: d.visitDate,
+      category: d.category ?? '',
+      province: d.location?.province ?? '',
+      city: d.location?.city ?? '',
       latitude: d.location?.latitude,
       longitude: d.location?.longitude,
       coverPhoto: d.photos?.[0] ? getSignedUrl(d.photos[0]) : '',
@@ -197,7 +229,8 @@ export interface FootprintStats {
   total: number;
   provinceCount: number;
   cityCount: number;
-  provinces: Array<{ name: string; count: number }>;
+  /** 分省计数（次数倒序、同数按名称），每省带城市明细；省为空或城市为空的脏数据不进 cities */
+  provinces: Array<{ name: string; count: number; cities: Array<{ name: string; count: number }> }>;
 }
 
 /**
@@ -223,17 +256,29 @@ export async function footprintStats(
   ]);
 
   let total = 0;
-  const provMap = new Map<string, number>();
+  const provMap = new Map<string, { count: number; cities: Map<string, number> }>();
   const citySet = new Set<string>();
   for (const row of rows) {
     total += row.count;
     const province = (row._id?.province ?? '').trim();
     const city = (row._id?.city ?? '').trim();
-    if (province) provMap.set(province, (provMap.get(province) ?? 0) + row.count);
+    if (province) {
+      const entry = provMap.get(province) ?? { count: 0, cities: new Map<string, number>() };
+      entry.count += row.count;
+      // 城市挂在省下：早期直连库灌的数据只有省没有市，这类行计省不计市，不能凭空造一个空城市项
+      if (city) entry.cities.set(city, (entry.cities.get(city) ?? 0) + row.count);
+      provMap.set(province, entry);
+    }
     if (city) citySet.add(`${province}|${city}`);
   }
   const provinces = [...provMap.entries()]
-    .map(([name, count]) => ({ name, count }))
+    .map(([name, v]) => ({
+      name,
+      count: v.count,
+      cities: [...v.cities.entries()]
+        .map(([cityName, count]) => ({ name: cityName, count }))
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
+    }))
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
   return { total, provinceCount: provinces.length, cityCount: citySet.size, provinces };
 }
@@ -302,6 +347,7 @@ export async function updateFootprint(id: string, userId: string, input: CreateF
     {
       visitDate: input.visitDate,
       title: input.title,
+      category: input.category ?? '',
       people: input.people,
       description: input.description,
       location: buildLocation(input),
@@ -403,7 +449,7 @@ export async function adminListFootprintRecords(query: AdminFootprintListQuery) 
   const [total, docs] = await Promise.all([
     FootprintRecordModel.countDocuments(filter),
     FootprintRecordModel.find(filter)
-      .select('userId title visitDate location people photos createdAt updatedAt')
+      .select('userId title visitDate category location people photos createdAt updatedAt')
       .sort({ createdAt: -1 })
       .skip((query.page - 1) * query.pageSize)
       .limit(query.pageSize)
@@ -427,6 +473,7 @@ export async function adminListFootprintRecords(query: AdminFootprintListQuery) 
       userUid: uidMap.get(String(d.userId)) ?? '',
       title: d.title,
       visitDate: d.visitDate,
+      category: d.category ?? '',
       placeName: d.location?.name ?? '',
       address: d.location?.address ?? '',
       province: d.location?.province ?? '',

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { FOOTPRINT_CATEGORY_OPTIONS, invalidCategoryMessage } from './footprint-category.js';
 
 /** 登录：微信 code2session 换取 openid；uid 可选，新用户注册时生成默认昵称（如 迹路者001） */
 export const LoginSchema = z.object({
@@ -149,6 +150,27 @@ const VisitDateSchema = z
 /** 照片 URL（裸地址或带签名参数均可，服务层 cleanUrl 归一） */
 const FootprintPhotoSchema = z.string().url('照片地址不合法').max(600);
 
+/** 足迹分类：9 个 key 或 ''（未分类）。创建/编辑/geo 过滤共用同一闸门 */
+const FootprintCategorySchema = z
+  .string()
+  .max(20)
+  .superRefine((v, ctx) => {
+    if (!FOOTPRINT_CATEGORY_OPTIONS.includes(v)) {
+      ctx.addIssue({ code: 'custom', message: invalidCategoryMessage(v) });
+    }
+  });
+
+/** 到访年份：4 位数字，避免 '20xx' / '20241' 进到 visitDate 区间比较里 */
+const VisitYearSchema = z.preprocess(
+  (v) => (typeof v === 'number' ? String(v) : v),
+  z
+    .string()
+    .trim()
+    .regex(/^\d{4}$/, '年份应为 4 位数字，如 2024')
+    .transform(Number)
+    .refine((y) => y >= 1970 && y <= 2100, '年份超出合理范围（1970-2100）'),
+);
+
 /** 创建/编辑足迹（编辑为整体替换，两 schema 相同） */
 export const CreateFootprintRecordSchema = z.object({
   visitDate: VisitDateSchema,
@@ -165,6 +187,7 @@ export const CreateFootprintRecordSchema = z.object({
     longitude: z.number().min(-180, '经度不合法').max(180, '经度不合法'),
   }),
   photos: z.array(FootprintPhotoSchema).max(3, '每条足迹最多 3 张图片').optional(),
+  category: FootprintCategorySchema.optional().default(''),
 });
 
 export const UpdateFootprintRecordSchema = CreateFootprintRecordSchema;
@@ -183,6 +206,17 @@ export const ListFootprintQuery = z
     path: ['from'],
   });
 
+/**
+ * 地图页 /geo 过滤：省份、年份、分类、关键词（四者可叠加，全不传即全量，老客户端行为不变）
+ * 与列表接口不同，这里不分页——地图要一次拿全筛选结果才能算聚合与 fitBounds。
+ */
+export const FootprintGeoQuery = z.object({
+  keyword: z.string().trim().max(50).optional(),
+  province: z.string().trim().max(20).optional(),
+  year: VisitYearSchema.optional(),
+  category: FootprintCategorySchema.optional(),
+});
+
 export type LoginInput = z.infer<typeof LoginSchema>;
 export type RefreshInput = z.infer<typeof RefreshSchema>;
 export type UpdateMeInput = z.infer<typeof UpdateMeSchema>;
@@ -194,3 +228,4 @@ export type FinishActivityInput = z.infer<typeof FinishActivitySchema>;
 export type ListActivitiesQueryInput = z.infer<typeof ListActivitiesQuery>;
 export type CreateFootprintRecordInput = z.infer<typeof CreateFootprintRecordSchema>;
 export type ListFootprintQueryInput = z.infer<typeof ListFootprintQuery>;
+export type FootprintGeoQueryInput = z.infer<typeof FootprintGeoQuery>;

@@ -3,6 +3,7 @@ import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 import {
   CreateFootprintRecordSchema,
+  FootprintGeoQuery,
   ListFootprintQuery,
   UpdateFootprintRecordSchema,
 } from '../utils/validators.js';
@@ -35,9 +36,10 @@ export async function footprintRecordRoutes(fastify: FastifyInstance) {
     return success(await listFootprints(request.user.userId, query));
   });
 
-  // 地图专用：全量轻量点（私有数据量级可控，不分页）
+  // 地图专用：轻量点集（私有数据量级可控，不分页）；可带 省/年/分类/关键词 过滤，不带即全量
   fastify.get('/geo', { onRequest: [fastify.authenticate] }, async (request) => {
-    return success(await listFootprintGeo(request.user.userId));
+    const query = FootprintGeoQuery.parse(request.query);
+    return success(await listFootprintGeo(request.user.userId, query));
   });
 
   // 统计页：按省/市聚合（from/to 为 YYYY-MM-DD，含 from 不含 to；省略即全部）

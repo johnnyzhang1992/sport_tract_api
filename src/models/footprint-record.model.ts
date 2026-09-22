@@ -24,6 +24,7 @@ const footprintRecordSchema = new Schema(
     description: { type: String, default: '' },
     location: { type: locationSchema, required: true },
     photos: { type: [String], default: [] }, // 裸 OSS URL（上限 3，zod 层约束），读时签名
+    category: { type: String, default: '' }, // 分类 key，'' = 未分类；取值范围在 zod 层闸门
   },
   { timestamps: true, versionKey: false },
 );

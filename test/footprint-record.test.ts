@@ -306,34 +306,49 @@ test('stats：省/市/总数聚合 + from/to 区间（含 from 不含 to）+ 非
   const token = await loginAs('fp-user-stats');
   const mk = (visitDate: string, latitude: number, longitude: number, title: string) =>
     req('POST', '', token, fp({ visitDate, title, location: { name: 'x', address: 'y', latitude, longitude } }));
-  // 坐标的省市结果沿用既有用例固化的离线区域值：杭州(30.24,120.15)=浙江省/杭州市、北京(39.90,116.40)=北京市/北京市
+  // 坐标的省市结果沿用既有用例固化的离线区域值：杭州(30.24,120.15)=浙江省/杭州市、北京(39.90,116.40)=北京市/北京市、舟山(30.0,122.39)=浙江省/舟山市
   assert.equal((await mk('2026-01-10', 30.24, 120.15, '足迹测试-统计-1')).statusCode, 200);
   assert.equal((await mk('2026-02-15', 30.24, 120.15, '足迹测试-统计-2')).statusCode, 200);
   assert.equal((await mk('2026-03-20', 39.9, 116.4, '足迹测试-统计-3')).statusCode, 200);
   assert.equal((await mk('2027-01-05', 30.24, 120.15, '足迹测试-统计-4')).statusCode, 200); // 跨年
+  assert.equal((await mk('2026-05-05', 30.0, 122.39, '足迹测试-统计-5')).statusCode, 200); // 同省不同市
+  // 「有省无城市」的历史脏数据（早期脚本直连库灌的，没走 locateRegion）：接口创建不出来，只能直插
+  const uid = (await app.inject({ method: 'GET', url: '/sport-track/api/users/me', headers: { authorization: `Bearer ${token}` } })).json().data.id;
+  await FootprintRecordModel.create({
+    userId: uid,
+    visitDate: '2026-06-06',
+    title: '足迹测试-统计-6',
+    location: { name: '某村', address: '某村', province: '广东省', city: '', latitude: 23.1, longitude: 113.1 },
+  });
 
-  // 全部：4 条、2 省、2 市；分省计数按次数倒序
+  // 全部：6 条、3 省、3 市；分省按次数倒序，每省带城市明细（城市也按次数倒序）
   let res = await req('GET', '/stats', token);
   assert.equal(res.statusCode, 200, res.body);
   let d = res.json().data;
-  assert.equal(d.total, 4);
-  assert.equal(d.provinceCount, 2);
-  assert.equal(d.cityCount, 2);
+  assert.equal(d.total, 6);
+  assert.equal(d.provinceCount, 3);
+  assert.equal(d.cityCount, 3);
   assert.deepEqual(d.provinces, [
-    { name: '浙江省', count: 3 },
-    { name: '北京市', count: 1 },
+    { name: '浙江省', count: 4, cities: [{ name: '杭州市', count: 3 }, { name: '舟山市', count: 1 }] },
+    { name: '北京市', count: 1, cities: [{ name: '北京市', count: 1 }] },
+    { name: '广东省', count: 1, cities: [] }, // 无城市不伪造占位项，前端据此判定「不可展开」
   ]);
 
-  // 2026 自然年（to 不含 2027-01-01）：跨年那条被排除
+  // 2026 自然年（to 不含 2027-01-01）：跨年那条被排除，城市明细同步收窄
   d = (await req('GET', '/stats?from=2026-01-01&to=2027-01-01', token)).json().data;
-  assert.equal(d.total, 3);
-  assert.equal(d.provinceCount, 2);
-  assert.equal(d.cityCount, 2);
+  assert.equal(d.total, 5);
+  assert.equal(d.provinceCount, 3);
+  assert.equal(d.cityCount, 3);
+  assert.deepEqual(d.provinces[0], {
+    name: '浙江省',
+    count: 3,
+    cities: [{ name: '杭州市', count: 2 }, { name: '舟山市', count: 1 }],
+  });
 
   // 单月窗口：只剩 1 条
   d = (await req('GET', '/stats?from=2026-02-01&to=2026-03-01', token)).json().data;
   assert.equal(d.total, 1);
-  assert.deepEqual(d.provinces, [{ name: '浙江省', count: 1 }]);
+  assert.deepEqual(d.provinces, [{ name: '浙江省', count: 1, cities: [{ name: '杭州市', count: 1 }] }]);
 
   // 空窗口：零值形态稳定（前端直接渲染）
   d = (await req('GET', '/stats?from=2020-01-01&to=2020-02-01', token)).json().data;
