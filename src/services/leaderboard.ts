@@ -162,6 +162,25 @@ export async function leaderboardRegions(): Promise<RegionsResult> {
   return data;
 }
 
+export interface TypeCount {
+  type: string;
+  /** 该类型上榜轨迹数（与榜单同口径：status finished） */
+  count: number;
+}
+
+/**
+ * 运动榜分类 chips 的排序依据：各运动类型上榜轨迹数
+ * 零填充全部类型，前端才能区分「真没人玩」和「接口没返回这项」
+ */
+export async function leaderboardTypeCounts(): Promise<{ types: TypeCount[] }> {
+  const rows = await ActivityModel.aggregate<{ _id: string; n: number }>([
+    { $match: { status: 'finished', type: { $in: [...ACTIVITY_TYPES] } } },
+    { $group: { _id: '$type', n: { $sum: 1 } } },
+  ]);
+  const map = new Map(rows.map((r) => [r._id, r.n]));
+  return { types: ACTIVITY_TYPES.map((type) => ({ type, count: map.get(type) ?? 0 })) };
+}
+
 export async function leaderboard(
   /** 当前用户 id（用户端传，用于返回"我的排名"）；管理端传 null */
   userId: string | null,

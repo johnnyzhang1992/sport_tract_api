@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { overview, trend, bestRecords, yearMilestones, activityMonthly } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
-import { leaderboard, leaderboardMe, leaderboardRegions } from '../services/leaderboard.js';
+import { leaderboard, leaderboardMe, leaderboardRegions, leaderboardTypeCounts } from '../services/leaderboard.js';
 import { success } from '../utils/response.js';
 
 /** 统计路由：/api/stats（决策 F18/F19） */
@@ -70,6 +70,11 @@ export async function statsRoutes(fastify: FastifyInstance) {
       (query.period || 'all') as 'week' | 'month' | 'year' | 'all',
     );
     return success(result);
+  });
+
+  // 运动榜：各运动类型上榜轨迹数（前端 chips 按「有数据的排前面」排序）
+  fastify.get('/leaderboard-type-counts', { onRequest: [fastify.authenticate] }, async () => {
+    return success(await leaderboardTypeCounts());
   });
 
   // 运动榜：当前用户各类型榜名次一览（单次聚合；首页摘要按 周榜→月榜→年榜→总榜 回退取最优展示）
