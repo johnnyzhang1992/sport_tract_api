@@ -75,3 +75,26 @@ test('calcFastestKm：跨暂停空档（>60s）的 1km 不成立（不忽略空�
   pts.push(mk(31 + d1, 121, t + 150000));
   assert.equal(calcFastestKm(pts), null, '含断档的 1km 不应算作有效分段');
 });
+
+test('GCJ-02 → WGS-84：逆变换往返误差 < 1m（导出 GPX 用）', async () => {
+  const { gcj02ToWgs84 } = await import('../src/utils/coordinate.js');
+  const { haversineDistance } = await import('../src/utils/pace.js');
+  const pts = [
+    [31.2304, 121.4737], // 上海
+    [30.507991, 114.486967], // 武汉
+    [39.9091, 116.3975], // 北京天安门
+    [22.54, 113.934], // 深圳
+  ];
+  for (const [lat, lng] of pts) {
+    // 真值链路：文件里的 WGS-84 → 转成 GCJ-02 入库；导出时再反算回 WGS-84
+    const gcj = wgs84ToGcj02(lat, lng);
+    const back = gcj02ToWgs84(gcj.lat, gcj.lng);
+    const d = haversineDistance({ lat: back.lat, lng: back.lng }, { lat, lng });
+    assert.ok(d < 1, `${lat},${lng} 往返误差 ${d.toFixed(2)}m`);
+  }
+});
+
+test('GCJ-02 → WGS-84：境外坐标原样返回', async () => {
+  const { gcj02ToWgs84 } = await import('../src/utils/coordinate.js');
+  assert.deepEqual(gcj02ToWgs84(35.6762, 139.6503), { lat: 35.6762, lng: 139.6503 });
+});

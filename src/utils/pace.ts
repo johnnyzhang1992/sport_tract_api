@@ -28,6 +28,8 @@ export interface TrackPointLike {
   lng: number;
   altitude?: number | null;
   pauseGap?: boolean;
+  /** finish 时标出的静止时段点（自动暂停口径，见 utils/standstill.ts） */
+  still?: boolean;
   timestamp?: number;
 }
 
@@ -177,7 +179,9 @@ export function calcFastestKm(points: TrackPointLike[], type?: string): number |
       continue;
     }
     segDist += haversineDistance(prev, cur);
-    segSec += dt;
+    // 静止时段（still）：人没移动，时间不计（距离照计，抖动位移≈0）——与 duration/standstillMs 同口径，
+    // 否则单段明细的用时之和会大于头部「运动时长」
+    if (!cur.still) segSec += dt;
     if (segDist >= PACE_SEGMENT_M) {
       // 段完成（≥ 1km）：按实际距离归一化到 1km；尾段不足 1km 自然剔除
       const pace = segSec / (segDist / 1000);

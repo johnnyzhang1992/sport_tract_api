@@ -76,6 +76,27 @@ test('点间隔 >60s：视为断档，同样不跨段', () => {
   assert.equal(calcFastestKm(pts, 'running'), 300);
 });
 
+test('still：静止时段不计时（距离照计，人没移动），与不打标记的对照可证', () => {
+  // 同一几何两版：中间在 500m 处站 40s。边界用 dt=0 消除歧义，只让静止段本身的 40s 有区别
+  const build = (markStill: boolean): TrackPointLike[] => {
+    const pts = walk(500, 100, 30); // 0..500m，5 段 × 30s = 150s
+    let ts = (pts[pts.length - 1].timestamp ?? 0) + 0;
+    for (let k = 0; k < 9; k++) {
+      pts.push({ ...pt(500, ts), still: markStill });
+      ts += 5000;
+    }
+    // 继续跑：600..1000m，正常 30s 采样节奏
+    let t = (pts[pts.length - 1].timestamp ?? 0) + 30000;
+    for (let m = 600; m <= 1000; m += 100) {
+      pts.push(pt(m, t));
+      t += 30000;
+    }
+    return pts;
+  };
+  assert.equal(calcFastestKm(build(true), 'running'), 300, '静止 40s 应从最快 1km 里剔掉');
+  assert.equal(calcFastestKm(build(false), 'running'), 340, '同一轨迹不打标记时应含这 40s');
+});
+
 test('游泳/骑行无配速', () => {
   assert.equal(calcFastestKm(walk(2000, 100, 30), 'swimming'), null);
   assert.equal(calcFastestKm(walk(2000, 100, 30), 'cycling'), null);

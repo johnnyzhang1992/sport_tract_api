@@ -3,6 +3,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
+import { markStandstill } from '../utils/standstill.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { cleanTrajectory } from '../utils/trajectory-clean.js';
@@ -69,6 +70,8 @@ export interface ActivityDto {
   startCity: string;
   lastPointSeq: number;
   pausedMs: number;
+  /** 自动暂停：本次判出的静止时段总时长（毫秒），运动时长 = 墙钟 − pausedMs − standstillMs */
+  standstillMs: number;
   note: string;
   trackPoints: TrackPointDto[];
   markers: MarkerDto[];
@@ -112,6 +115,7 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     startCity: doc.startCity ?? '',
     lastPointSeq: doc.lastPointSeq ?? 0,
     pausedMs: doc.pausedMs ?? 0,
+    standstillMs: doc.standstillMs ?? 0,
     note: doc.note ?? '',
     trackPoints: doc.trackPoints ?? [],
     markers: doc.markers ?? [],
@@ -294,7 +298,6 @@ export async function finishActivity(
     .map((p) => (typeof p.timestamp === 'number' && Number.isFinite(p.timestamp) ? p.timestamp : 0))
     .filter((t) => t > 0);
   const endTime = validTs.length > 0 ? Math.max(...validTs) : (input.endTime ?? Date.now());
-  const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs) / 1000);
 
   // 海拔尖刺清洗（GPS 误差：短时间大幅跳变且方向反转 → 海拔置 null）
   const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
@@ -304,7 +307,13 @@ export async function finishActivity(
 
   // 轨迹平滑（滑动平均 + 位移守卫）：抑制 GPS 抖动，端点保持，位移过大回退原值
   const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-  const stats = calcStats(smoothedPoints, {
+
+  // 静止时段检测（自动暂停口径）：用户在原地没动但没点暂停的时间也不该计入运动时长。
+  // 只在这里算一次并入库（duration / standstillMs / 点上的 still 标记），读接口不再重算。
+  const { points: markedPoints, standstillMs } = markStandstill(smoothedPoints);
+  // 运动时长 = 墙钟 − 手动暂停 − 判出的静止（下限 0）
+  const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs - standstillMs) / 1000);
+  const stats = calcStats(markedPoints, {
     type: activity.type,
     durationSec,
     weightKg: input.weightKg,
@@ -339,9 +348,9 @@ export async function finishActivity(
   }
 
   // 轨迹内最快 1km 分段（个人最佳"最快配速"口径：分段最快，非全程平均）
-  const fastestKm = calcFastestKm(smoothedPoints, activity.type);
+  const fastestKm = calcFastestKm(markedPoints, activity.type);
   // 落库省市（按省查询轨迹 + 点亮地图省下钻）
-  const regions = provincesOfPoints(smoothedPoints);
+  const regions = provincesOfPoints(markedPoints);
 
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
@@ -349,7 +358,7 @@ export async function finishActivity(
       $set: {
         status: 'finished',
         endTime,
-        trackPoints: smoothedPoints,
+        trackPoints: markedPoints,
         markers: input.markers ?? activity.markers ?? [],
         startAddress: input.startAddress,
         endAddress: input.endAddress,
@@ -358,6 +367,7 @@ export async function finishActivity(
         startCity: regions.startCity,
         pausedMs: input.pausedMs,
         duration: Math.round(durationSec),
+        standstillMs: Math.round(standstillMs),
         distance: stats.distance,
         avgPace: stats.avgPace,
         fastestKm,
@@ -431,13 +441,17 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
       .map((p) => (typeof p.timestamp === 'number' && Number.isFinite(p.timestamp) ? p.timestamp : 0))
       .filter((t) => t > 0);
     const endTime = validTs.length > 0 ? Math.max(...validTs) : Date.now();
-    const durationSec = Math.max(0, (endTime - activity.startTime - (activity.pausedMs ?? 0)) / 1000);
 
-    // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 重算指标
+    // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 静止检测 → 重算指标
     const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
     const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
     const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-    const stats = calcStats(smoothedPoints, { type: activity.type, durationSec });
+    const { points: markedPoints, standstillMs } = markStandstill(smoothedPoints);
+    const durationSec = Math.max(
+      0,
+      (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs) / 1000,
+    );
+    const stats = calcStats(markedPoints, { type: activity.type, durationSec });
 
     // 无效运动守卫：点数过少或重算距离过短（漂移点全被清洗）→ 自动作废，与 finish 同口径
     if (trackPoints.length < MIN_EFFECTIVE_POINTS || stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
@@ -448,8 +462,8 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
       continue;
     }
 
-    const fastestKm = calcFastestKm(smoothedPoints, activity.type);
-    const regions = provincesOfPoints(smoothedPoints);
+    const fastestKm = calcFastestKm(markedPoints, activity.type);
+    const regions = provincesOfPoints(markedPoints);
 
     await ActivityModel.updateOne(
       { _id: activity._id },
@@ -457,11 +471,12 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
         $set: {
           status: 'finished',
           endTime,
-          trackPoints: smoothedPoints,
+          trackPoints: markedPoints,
           provinces: regions.provinces,
           startProvince: regions.startProvince,
           startCity: regions.startCity,
           duration: Math.round(durationSec),
+          standstillMs: Math.round(standstillMs),
           distance: stats.distance,
           avgPace: stats.avgPace,
           fastestKm,

@@ -198,6 +198,76 @@ test('总时长：含暂停的墙钟时长（= 运动时长 + 暂停时长）', 
   assert.equal(act.totalDuration, 60, '总时长 = endTime − startTime（含暂停）');
 });
 
+test('静止剔除：停留 ≥60s 的时段从运动时长里剔掉，standstillMs 与点标记入库', async () => {
+  // 用独立用户：创建接口有「同一用户 1 小时最多 10 条」防刷，别占用 tokenA 的额度
+  const tokenS = (await login('m2-standstill')).accessToken;
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenS,
+    body: { type: 'hiking', startTime: TEST_NOW - 270000 },
+  });
+  const id = created.json().data.activityId;
+  const LAT0 = 31.23;
+  const STEP_DEG = 0.000135; // ≈15m/点，5s 一采 ≈3 m/s，正常行进
+  const points: Array<Record<string, unknown>> = [];
+  let seq = 0;
+  let ts = TEST_NOW - 270000;
+  for (let k = 0; k <= 16; k++) {
+    points.push({ seq: ++seq, lat: LAT0 + STEP_DEG * k, lng: 121.4737, altitude: null, speed: null, timestamp: ts });
+    ts += 5000;
+  }
+  const latEnd = LAT0 + STEP_DEG * 16;
+  for (let k = 1; k <= 16; k++) {
+    // 到终点后原地站住，16 个点跨 80s
+    points.push({ seq: ++seq, lat: latEnd, lng: 121.4737, altitude: null, speed: null, timestamp: ts });
+    ts += 5000;
+  }
+
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenS,
+    body: { trackPoints: points, endTime: ts, pausedMs: 0 },
+  });
+  assert.equal(res.statusCode, 200);
+  const act = res.json().data.activity;
+  assert.equal(act.totalDuration, 160, '总时长 = 墙钟（含静止）');
+  // 80s 而不是 75s：跑动段最后一个点就落在终点位置上，静止段从它开始算（人一到达就在原地不动了）
+  assert.equal(act.standstillMs, 80000, '静止 80s 应入库');
+  assert.equal(act.duration, 80, '运动时长 = 墙钟 160s − 静止 80s');
+  const stillPts = (act.trackPoints as Array<{ still?: boolean }>).filter((p) => p.still === true);
+  assert.ok(stillPts.length >= 3, '静止时段的点应带 still 标记落库');
+});
+
+test('静止剔除：只停 55s 不足门槛 → 不剔（1 分钟内的短停照算）', async () => {
+  const tokenS = (await login('m2-standstill')).accessToken;
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenS,
+    body: { type: 'hiking', startTime: TEST_NOW - 240000 },
+  });
+  const id = created.json().data.activityId;
+  const LAT0 = 31.23;
+  const STEP_DEG = 0.000135;
+  const points: Array<Record<string, unknown>> = [];
+  let seq = 0;
+  let ts = TEST_NOW - 240000;
+  for (let k = 0; k <= 16; k++) {
+    points.push({ seq: ++seq, lat: LAT0 + STEP_DEG * k, lng: 121.4737, altitude: null, speed: null, timestamp: ts });
+    ts += 5000;
+  }
+  const latEnd = LAT0 + STEP_DEG * 16;
+  for (let k = 1; k <= 11; k++) {
+    points.push({ seq: ++seq, lat: latEnd, lng: 121.4737, altitude: null, speed: null, timestamp: ts });
+    ts += 5000; // 只跨 55s
+  }
+
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenS,
+    body: { trackPoints: points, endTime: ts, pausedMs: 0 },
+  });
+  assert.equal(res.statusCode, 200);
+  const act = res.json().data.activity;
+  assert.equal(act.standstillMs, 0);
+  assert.equal(act.duration, act.totalDuration, '不足门槛时不剔，运动时长 = 墙钟');
+});
+
 test('总时长：列表/详情接口同样下发（含旧数据 pausedMs 缺失）', async () => {
   const detail = await req('GET', `/sport-track/api/activities/${activityId}`, { token: tokenA });
   assert.equal(detail.statusCode, 200);
@@ -691,14 +761,33 @@ test('活动详情：返回完整轨迹点与打点', async () => {
   assert.equal(data.distance, data.distance);
 });
 
-test('GPX 导出', async () => {
+test('GPX 导出：坐标按标准协议 WGS-84 反算（不是库内 GCJ-02 原值）', async () => {
   const res = await req('GET', `/sport-track/api/activities/${activityId}/gpx`, { token: tokenA });
   assert.equal(res.statusCode, 200);
   assert.match(res.headers['content-type'] ?? '', /application\/gpx\+xml/);
   const xml = res.body;
   assert.match(xml, /<gpx/);
-  assert.match(xml, /<trkpt lat="31\.2304"/);
-  assert.match(xml, /<wpt lat="31\.2305"/);
+
+  const { gcj02ToWgs84 } = await import('../src/utils/coordinate.js');
+  const { haversineDistance } = await import('../src/utils/pace.js');
+  const pick = (tag: 'trkpt' | 'wpt', lat: number, lng: number) => {
+    const m = xml.match(new RegExp(`<${tag} lat="([-\\d.]+)" lon="([-\\d.]+)"`));
+    assert.ok(m, `${tag} 应存在`);
+    return { exported: { lat: Number(m![1]), lng: Number(m![2]) }, gcj: { lat, lng } };
+  };
+
+  // 轨迹点：导出值 == GCJ→WGS 反算值，且与库内 GCJ 原值差数百米（否则外部工具读到偏位坐标）
+  const trk = pick('trkpt', 31.2304, 121.4737);
+  assert.ok(
+    haversineDistance(trk.exported, gcj02ToWgs84(trk.gcj.lat, trk.gcj.lng)) < 1,
+    'trkpt 应为 GCJ-02 反算后的 WGS-84',
+  );
+  assert.ok(haversineDistance(trk.exported, trk.gcj) > 100, 'trkpt 不能是库内 GCJ-02 原值');
+
+  // 航点同理
+  const wpt = pick('wpt', 31.2305, 121.4738);
+  assert.ok(haversineDistance(wpt.exported, gcj02ToWgs84(wpt.gcj.lat, wpt.gcj.lng)) < 1, 'wpt 应为 WGS-84');
+  assert.ok(haversineDistance(wpt.exported, wpt.gcj) > 100, 'wpt 不能是库内 GCJ-02 原值');
 });
 
 test('统计 overview：今日/本周/本月/累计', async () => {
@@ -1029,4 +1118,108 @@ test('非法 id：11 条活动路由传非 ObjectId 串一律 404「活动不存
   assert.equal((await req('DELETE', `${base}/${GHOST}`, { token: tokenA })).statusCode, 404);
   // 写类接口被闸门拦下后不得留下任何副作用（探针本身也得用合法形态的 id，否则它自己就抛 CastError）
   assert.equal(await ActivityModel.countDocuments({ _id: GHOST }), 0);
+});
+
+test('导入轨迹：与 finish 共用口径——静止时段同样剔除，standstillMs 与 still 标记入库', async () => {
+  // 独立用户：导入也算新增，会占用「同一用户 1 小时最多 10 条」的额度
+  const tokenI = (await login('m2-import')).accessToken;
+
+  // GPX（WGS-84）：走 200m（20s 一采）→ 原地站 80s → 再走 200m
+  const LAT0 = 31.23;
+  const D = (m: number) => LAT0 + m / 111320;
+  const rows: string[] = [];
+  let ts = TEST_NOW - 600000;
+  const iso = (t: number) => new Date(t).toISOString();
+  for (let m = 0; m <= 200; m += 20) rows.push(`    <trkpt lat="${D(m)}" lon="114.4"><time>${iso(ts)}</time></trkpt>`), (ts += 20000);
+  // 原地站 100s（带 3m 抖动，否则导入的「<1m 重复点合并」会把这段点吃掉）
+  for (let k = 1; k <= 6; k++)
+    rows.push(`    <trkpt lat="${D(200 + (k % 2 === 0 ? 3 : 0))}" lon="114.4"><time>${iso(ts)}</time></trkpt>`), (ts += 20000);
+  for (let m = 20; m <= 200; m += 20) rows.push(`    <trkpt lat="${D(200 + m)}" lon="114.4"><time>${iso(ts)}</time></trkpt>`), (ts += 20000);
+  const gpx = `<?xml version="1.0"?>\n<gpx version="1.1" creator="test"><trk><trkseg>\n${rows.join('\n')}\n</trkseg></trk></gpx>`;
+
+  const boundary = '----sporttracktest';
+  const payload = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="t.gpx"\r\nContent-Type: application/gpx+xml\r\n\r\n`,
+    ),
+    Buffer.from(gpx),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const imported = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/activities/import',
+    payload,
+    headers: { authorization: `Bearer ${tokenI}`, 'content-type': `multipart/form-data; boundary=${boundary}` },
+  });
+  assert.equal(imported.statusCode, 200, imported.body);
+  const id = imported.json().data.id;
+  assert.ok(id, '导入应返回活动 id');
+
+  const detail = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenI });
+  assert.equal(detail.statusCode, 200);
+  const act = detail.json().data;
+  const wall = Math.round((act.endTime - act.startTime) / 1000);
+  assert.ok(act.standstillMs >= 60000, `导入轨迹的静止时段应入库，实际 ${act.standstillMs}ms`);
+  assert.equal(
+    act.duration + Math.round(act.standstillMs / 1000),
+    wall,
+    '口径自洽：运动时长 + 静止 = 墙钟（导入没有手动暂停）',
+  );
+  assert.equal(act.duration, imported.json().data.duration, '导入接口返回的 duration 应是净时长');
+  const stillPts = (act.trackPoints as Array<{ still?: boolean }>).filter((p) => p.still === true);
+  assert.ok(stillPts.length >= 3, '静止时段的点应带 still 标记落库');
+});
+
+test('导出 GPX → 再导入：经纬度往返一致（GPX 标准是 WGS-84，导出必须反算 GCJ-02）', async () => {
+  const tokenR = (await login('m2-gpx-roundtrip')).accessToken;
+
+  // 造一条活动：武汉附近 5 个点，每点间隔 ~110m（避免导入的去重合并）
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenR,
+    body: { type: 'running', startTime: TEST_NOW - 300000 },
+  });
+  const id = created.json().data.activityId;
+  const LAT0 = 30.507991;
+  const pts = Array.from({ length: 6 }, (_, i) => ({
+    seq: i + 1,
+    lat: LAT0 + i * 0.001,
+    lng: 114.486967 + i * 0.001,
+    altitude: 30 + i,
+    speed: null,
+    timestamp: TEST_NOW - 300000 + i * 20000,
+  }));
+  const fin = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenR,
+    body: { trackPoints: pts, endTime: pts[pts.length - 1].timestamp, pausedMs: 0 },
+  });
+  assert.equal(fin.statusCode, 200);
+
+  // 导出 → 把文件原样再导入（模拟「手机端导出 → 开发者工具导入」）
+  const exported = await req('GET', `/sport-track/api/activities/${id}/gpx`, { token: tokenR });
+  assert.equal(exported.statusCode, 200);
+  const gpx = exported.body;
+
+  const boundary = '----sporttrackroundtrip';
+  const payload = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="roundtrip.gpx"\r\nContent-Type: application/gpx+xml\r\n\r\n`,
+    ),
+    Buffer.from(gpx),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const imported = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/activities/import',
+    payload,
+    headers: { authorization: `Bearer ${tokenR}`, 'content-type': `multipart/form-data; boundary=${boundary}` },
+  });
+  assert.equal(imported.statusCode, 200, imported.body);
+
+  const back = (await req('GET', `/sport-track/api/activities/${imported.json().data.id}`, { token: tokenR })).json().data;
+  const { haversineDistance } = await import('../src/utils/pace.js');
+  const d0 = haversineDistance(pts[0], back.trackPoints[0]);
+  const dLast = haversineDistance(pts[pts.length - 1], back.trackPoints[back.trackPoints.length - 1]);
+  assert.ok(d0 < 1, `首点往返偏移应 <1m，实际 ${d0.toFixed(1)}m（导出没按 WGS-84 反算就会偏数百米）`);
+  assert.ok(dLast < 1, `末点往返偏移应 <1m，实际 ${dLast.toFixed(1)}m`);
+  assert.ok(Math.abs(back.distance - fin.json().data.activity.distance) < 1, '距离也应一致');
 });

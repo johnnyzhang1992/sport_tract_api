@@ -29,8 +29,7 @@ function transformLng(x: number, y: number): number {
  * WGS-84 → GCJ-02（火星坐标）
  * 中国境内平移数百米级纠偏；境外返回原值
  */
-export function wgs84ToGcj02(lat: number, lng: number): { lat: number; lng: number } {
-  if (!inChina(lng, lat)) return { lat, lng };
+export function wgs84ToGcj02(lat: number, lng: number): { lat: number; lng: number } {  if (!inChina(lng, lat)) return { lat, lng };
 
   const a = 6378245.0;
   const ee = 0.00669342162296594323;
@@ -43,4 +42,25 @@ export function wgs84ToGcj02(lat: number, lng: number): { lat: number; lng: numb
   dLat = (dLat * 180.0) / (((a * (1 - ee)) / (magic * sqrtMagic)) * Math.PI);
   dLng = (dLng * 180.0) / ((a / sqrtMagic) * Math.cos(radLat) * Math.PI);
   return { lat: lat + dLat, lng: lng + dLng };
+}
+
+/**
+ * GCJ-02 → WGS-84（导出 GPX/对外分享用）
+ *
+ * 标准协议（GPX / GeoJSON / 地图服务）都是 WGS-84，而 App 内部与微信地图是 GCJ-02。
+ * 导出时若原样写出，外部工具打开会偏数百米，而且「导出→再导入」会被二次偏移
+ * （`importActivity` 按 WGS-84 再转一次，实测 588.7m）。这里做逆变换，让往返闭合。
+ * 没有解析解，用不动点迭代逼近：3 次即收敛到厘米级。境外原样返回。
+ */
+export function gcj02ToWgs84(lat: number, lng: number): { lat: number; lng: number } {
+  if (!inChina(lng, lat)) return { lat, lng };
+
+  let wgsLat = lat;
+  let wgsLng = lng;
+  for (let i = 0; i < 3; i++) {
+    const gcj = wgs84ToGcj02(wgsLat, wgsLng);
+    wgsLat += lat - gcj.lat;
+    wgsLng += lng - gcj.lng;
+  }
+  return { lat: wgsLat, lng: wgsLng };
 }

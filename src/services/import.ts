@@ -8,6 +8,7 @@ import { XMLParser } from 'fast-xml-parser';
 import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance, type TrackPointLike } from '../utils/pace.js';
+import { markStandstill } from '../utils/standstill.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { wgs84ToGcj02 } from '../utils/coordinate.js';
 import { markFootprintDirty } from './footprint.js';
@@ -283,21 +284,26 @@ export async function importActivity(
 
   const startTime = points[0].timestamp;
   const endTime = points[points.length - 1].timestamp;
-  const durationSec = Math.max(1, Math.round((endTime - startTime) / 1000));
-  const stats = calcStats(points, { type: type as never, durationSec });
+  // 与 finish 共用静止剔除口径（见 utils/standstill.ts）：导入文件没有暂停语义，
+  // 若不剔，同一条徒步「导进来 = 墙钟、App 里录 = 净时长」两条路径永远对不上。
+  const { points: markedPoints, standstillMs } = markStandstill(points);
+  const wallSec = (endTime - startTime) / 1000;
+  const durationSec = Math.max(1, Math.round(wallSec - standstillMs / 1000));
+  const stats = calcStats(markedPoints, { type: type as never, durationSec });
 
   // 无效轨迹守卫：导入文件重算距离过短（静止/漂移）→ 拒绝导入，与 finish 作废口径一致
   if (stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
     throw new AppError(400, '轨迹距离过短（不足 10 米），未导入');
   }
 
-  const trackPoints = points.map((p, i) => ({
+  const trackPoints = markedPoints.map((p, i) => ({
     seq: i + 1,
     lat: p.lat,
     lng: p.lng,
     altitude: p.altitude,
     speed: null,
     timestamp: p.timestamp,
+    ...(p.still ? { still: true } : {}),
   }));
   // 落库省市（按省查询轨迹用）
   const regions = provincesOfPoints(trackPoints);
@@ -309,6 +315,7 @@ export async function importActivity(
     startTime,
     endTime,
     duration: durationSec,
+    standstillMs: Math.round(standstillMs),
     distance: stats.distance,
     avgPace: stats.avgPace,
     calories: stats.calories,
