@@ -57,6 +57,8 @@ export interface BestRow {
   key: BestMetricKey;
   /** 原始值：距离/爬升 米，时长/配速 秒；fastestAvg 为 km/h（后端直接回均速） */
   value: number;
+  /** 该纪录的运动时长（秒）：只有 longest 类条目需要展示，0/缺失则不下发 */
+  durationSec?: number;
   /** 纪录保持者昵称 */
   name: string;
   gender: number;
@@ -237,7 +239,8 @@ export async function leaderboard(
       { $match: { [spec.field]: { $gt: 0 } } },
       { $sort: { [spec.field]: spec.dir } },
       { $limit: 1 },
-      { $project: { userId: 1, [spec.field]: 1 } },
+      // 最长距离要连它的运动时长一起下发（前端同排展示「12.34 km · 1:23:45」）；其它指标不带
+      { $project: { userId: 1, [spec.field]: 1, ...(key === 'farthest' ? { duration: 1 } : {}) } },
     ];
   }
   const [facetDoc] = await ActivityModel.aggregate<FacetDoc>([
@@ -291,6 +294,8 @@ export async function leaderboard(
       key,
       // fastestAvg 为 km/h；其余直接取原始字段（米 / 秒 / 秒每公里）
       value: key === 'fastestAvg' ? Number(doc.speedKmh) : Number(doc[BEST_METRIC_SPEC[key].field]),
+      // 最长距离附带该纪录时长；0/未记录视为没有可信时长，不下发（前端别显示 0:00）
+      ...(key === 'farthest' && Number(doc.duration) > 0 ? { durationSec: Number(doc.duration) } : {}),
       name: (info && info.nickname) || '运动用户',
       gender: (info && info.gender) || 0,
       avatarUrl: (info && info.avatarUrl) || '',
