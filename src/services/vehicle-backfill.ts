@@ -15,14 +15,18 @@
  *   - vehicleMs / vehicleM / standstillMs / duration / avgPace：净时长与随之修正的平均配速
  *   - distance：剔掉车速段位移（只在「库里 distance 与重算几何总位移对得上」时才写）
  *   - fastestKm：车速步会断开 1km 窗口，必须重算，否则榜上仍是那条 3'41"
- * 不动：elevationGain / minAltitude / maxAltitude（与时长无关）、
- *       calories（= MET × 体重 × 时长，历史体重没落库，用默认体重回算会把口径带偏）。
+ *   - calories：时长被本次改写就要跟着重算（与 finish 同一个式子 MET × 档案体重 × 净时长）。
+ *     2026-09-24 第一次线上执行时这一项漏了，36 条的消耗停在墙钟口径上偏高，
+ *     所以另开 syncCalories 档补正（见下）。库里没有消耗记录（0/未落值）一律不新造。
+ * 不动：elevationGain / minAltitude / maxAltitude（与时长无关）。
  *
- * 两道防误伤闸门（都只统计、不达标就跳过该字段并列出来）：
+ * 三道防误伤闸门（都只统计、不达标就跳过该字段并列出来）：
  *   1) 时长闸门用不变量 `duration + standstillMs + vehicleMs ≈ 墙钟`，而不是 `duration ≈ 墙钟`
  *      —— 后者跑过一次就不再成立，重跑会把该改的挡掉。
  *   2) fastestKm **只降不升**：回填不该顺手把人刷到更好的名次上；重算值比库里更快
  *      说明差异不是本次口径能解释的（库里那条另有来源，见 docs/04），只标记不写值。
+ *   3) syncCalories **必须配 id**：库里没有任何字段记着「这条的 calories 是按墙钟还是按
+ *      净时长结算的」，全量刷会把新录入的记录再折一次。只有按 id 点名（=已知被回填改过时长的行）才安全。
  */
 import mongoose from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
@@ -30,6 +34,7 @@ import { markVehicle } from '../utils/vehicle.js';
 import { markStandstill } from '../utils/standstill.js';
 import { calcFastestKm, calcStats, haversineDistance, formatPace, type TrackPointLike } from '../utils/pace.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
+import { resolveWeightKg } from './weight.js';
 
 /** 报告里每个清单只回前 N 条（接口要过 HTTP，全量可能几十 KB），总数另给 xxxCount 字段 */
 const LIST_CAP = 50;
@@ -41,6 +46,8 @@ export interface BackfillVehicleOptions {
   id?: string;
   /** 限量，0/省略 = 不限 */
   limit?: number;
+  /** 只补卡路里：时长已按新口径落库、但消耗还停在墙钟口径的行（须配 id 点名） */
+  syncCalories?: boolean;
 }
 
 /** 一条记录回填前后的快照（只放会被这个口径动到的字段；after 是「闸门放行后真正会写进去的值」） */
@@ -49,6 +56,7 @@ export interface BackfillSnapshot {
   distance: number;
   avgPace: number | null;
   fastestKm: number | null;
+  calories: number | null;
   standstillMs: number;
   vehicleMs: number;
   stillPts: number;
@@ -58,8 +66,9 @@ export interface BackfillSnapshot {
 export interface BackfillChangeRow {
   id: string;
   type: string;
-  /** 这条的改动是谁带来的：线上核账要用它把「车速段」和「首次静止剔除」分开算 */
-  reason: 'vehicle' | 'standstill' | 'both';
+  /** 这条的改动是谁带来的：线上核账要用它把「车速段」和「首次静止剔除」分开算。
+   *  'calories' = 时长没动、只有消耗要补正（syncCalories 档专属） */
+  reason: 'vehicle' | 'standstill' | 'both' | 'calories';
   before: BackfillSnapshot;
   after: BackfillSnapshot;
 }
@@ -76,6 +85,10 @@ export interface BackfillVehicleReport {
   vehicleCount: number;
   standstillCount: number;
   bothCount: number;
+  /** 卡路里被改写的条数（与其他来源重叠，不参与上面三类相加） */
+  caloriesCount: number;
+  /** 只动卡路里、时长一字未动的条数（reason === 'calories'，与三类一起加回 changed） */
+  caloriesOnlyCount: number;
   hits: string[];
   fastSlower: string[];
   distSkipped: string[];
@@ -98,6 +111,7 @@ const pace = (sec: number | null | undefined) => (sec == null ? '—' : formatPa
 
 export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promise<BackfillVehicleReport> {
   const apply = opts.apply === true;
+  const syncCalories = opts.syncCalories === true;
   const limit = Number(opts.limit ?? 0);
   // 不在这里建连接：接口侧 app 启动时已连好，CLI 侧自己 connect(config.mongodbUri)。
   // 服务里再 connect 一次会把 URI 口径分裂成两份（一份走 config、一份走环境变量默认值）。
@@ -105,7 +119,7 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
   const filter: Record<string, unknown> = { status: 'finished', 'trackPoints.20': { $exists: true } };
   if (opts.id) filter._id = assertObjectIdLike(opts.id, '轨迹不存在');
   let q = ActivityModel.find(filter)
-    .select('type startTime endTime pausedMs duration standstillMs vehicleMs vehicleM avgPace fastestKm distance trackPoints')
+    .select('userId type startTime endTime pausedMs duration standstillMs vehicleMs vehicleM avgPace fastestKm distance calories trackPoints')
     .sort({ startTime: -1 });
   if (limit > 0) q = q.limit(limit);
   const acts = (await q.lean()) as any[];
@@ -200,6 +214,16 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
       }
     }
 
+    // 卡路里与净时长同源（MET × 档案体重 × 时长，和 finish 用的是同一个 calcStats）：
+    // 时长被本次改写就必须跟着重算，否则等于按墙钟发消耗。syncCalories 档专门用来补正
+    // 「上一轮 build 只改了时长、没改卡路里」的行（线上那 36 条就停在那个状态）。
+    // 库里没有消耗记录（0 / 未落值）不新造——线上 100 条里 47 条是 0。
+    if (a.calories != null && a.calories > 0 && (set.duration != null || syncCalories)) {
+      const weightKg = await resolveWeightKg(a.userId);
+      const newCalories = calcStats(marked, { type: a.type, durationSec: newDuration, weightKg }).calories;
+      if (newCalories !== a.calories) set.calories = newCalories;
+    }
+
     if (newVehicleMs > 0) {
       hits.push(
         `${a._id} ${a.type} ${(stats.distance / 1000).toFixed(2)}km 车速段 ${veh.spans} 段 ${Math.round(newVehicleMs / 1000)}s/${Math.round(veh.vehicleM)}m ` +
@@ -214,6 +238,7 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
       distance: Math.round(a.distance ?? 0),
       avgPace: a.avgPace ?? null,
       fastestKm: a.fastestKm ?? null,
+      calories: a.calories ?? null,
       standstillMs: prevStandstillMs,
       vehicleMs: prevVehicleMs,
       stillPts: prevStillPts,
@@ -225,6 +250,7 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
       distance: (set.distance as number) ?? before.distance,
       avgPace: 'avgPace' in set ? ((set.avgPace as number | null) ?? null) : before.avgPace,
       fastestKm: (set.fastestKm as number | null) ?? before.fastestKm,
+      calories: 'calories' in set ? (set.calories as number) : before.calories,
       standstillMs: (set.standstillMs as number) ?? before.standstillMs,
       vehicleMs: (set.vehicleMs as number) ?? before.vehicleMs,
       stillPts: 'trackPoints' in set ? newStillPts : before.stillPts,
@@ -232,10 +258,20 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
     };
     const vehMoved = after.vehicleMs !== before.vehicleMs;
     const stillMoved = after.standstillMs !== before.standstillMs || after.stillPts !== before.stillPts;
+    // 时长与标记一起动 = 本次回填带来的口径变化；只动卡路里 = syncCalories 补正上一轮的漏项，
+    // 单列一类，免得把「消耗修了 300 kcal」混进「剔了车速段」里去数来源
+    const calMoved = after.calories !== before.calories;
     changes.push({
       id: String(a._id),
       type: a.type,
-      reason: vehMoved && stillMoved ? 'both' : vehMoved ? 'vehicle' : 'standstill',
+      reason:
+        !('trackPoints' in set) && calMoved
+          ? 'calories'
+          : vehMoved && stillMoved
+            ? 'both'
+            : vehMoved
+              ? 'vehicle'
+              : 'standstill',
       before,
       after,
     });
@@ -254,6 +290,8 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
     vehicleCount: changes.filter((c) => c.reason === 'vehicle').length,
     standstillCount: changes.filter((c) => c.reason === 'standstill').length,
     bothCount: changes.filter((c) => c.reason === 'both').length,
+    caloriesCount: changes.filter((c) => c.before.calories !== c.after.calories).length,
+    caloriesOnlyCount: changes.filter((c) => c.reason === 'calories').length,
     hits: clip(hits),
     fastSlower: clip(fastSlower),
     distSkipped: clip(distSkipped),

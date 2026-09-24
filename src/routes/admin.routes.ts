@@ -1189,13 +1189,26 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 车速段回填（历史数据按新口径重算，换判据门槛后可重跑）：
   // 与上面的 recompute-elevation 相反，这里默认**只算不写**、必须显式 apply:true 才落库——
   // 它会重写整条 trackPoints，误触的代价不是一次重算那么小
+  // syncCalories 是「只补消耗、不动时长」的补救档：库里没有任何字段记着某条的 calories
+  // 是按墙钟还是按净时长结算的，全量刷会把新录入的记录再折一次，所以只允许按 id 点名。
   fastify.post('/activities/backfill-vehicle', { onRequest: [adminAuth] }, async (request) => {
-    const body = (request.body ?? {}) as { apply?: boolean | string; id?: string; limit?: number | string };
+    const body = (request.body ?? {}) as {
+      apply?: boolean | string;
+      id?: string;
+      limit?: number | string;
+      syncCalories?: boolean | string;
+    };
+    const id = body.id ? String(body.id) : '';
+    const syncCalories = body.syncCalories === true || body.syncCalories === 'true';
+    if (syncCalories && !id) {
+      throw new AppError(400, 'syncCalories=true 必须同时指定 id（一次一条）；不给 id 就是全库刷卡路里，会把已按净时长结算的新记录再折一次');
+    }
     return success(
       await backfillVehicle({
         apply: body.apply === true || body.apply === 'true',
-        id: body.id ? String(body.id) : '',
+        id,
         limit: Math.max(0, Number(body.limit) || 0),
+        syncCalories,
       }),
     );
   });

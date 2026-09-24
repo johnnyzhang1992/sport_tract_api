@@ -6,8 +6,12 @@
  * 这里验的是接口这侧的行为契约：
  *   1) 默认干跑 —— 库里一字未动，但报告已经把该改的都算出来了；
  *   2) apply 才落库，且落的是新口径（时长/距离/配速/点标记）；
- *   3) calories 一律不动（历史体重没落库，回算会把卡路里口径带偏）；
- *   4) fastestKm 只降不升 —— 回填不该顺手把人刷到更好的名次上。
+ *   3) calories 跟着新时长重算（= MET × 档案体重 × 净时长，与 finish 同一个式子）——
+ *      时长砍了卡路里不动，就是在按「墙钟」发消耗，36 条线上记录已经这么漂了；
+ *      库里本来没有卡路里的行不新造；
+ *   4) fastestKm 只降不升 —— 回填不该顺手把人刷到更好的名次上；
+ *   5) syncCalories 是「只补卡路里、不动别的」的补救档，必须配 id（库里分不清
+ *      某条的 calories 是按墙钟还是按净时长结算的，全量刷会把新记录再折一次）。
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,6 +30,8 @@ const ADMIN_PASS = 'test123456';
 const OPENID_PREFIX = /^vbf_openid/;
 /** 采样间隔（秒）：10s 一步，第三方 GPX 也常是这个量级 */
 const STEP_SEC = 10;
+/** finish 同款式子的结果：MET(running)=9.8 × 档案体重 60kg（测试用户没填体重，走默认值）× 140s/3600 */
+const CALORIES_AT_140S = 23;
 const BASE = Date.parse('2026-08-01T00:00:00Z');
 
 /** 沿纬线按「每步若干米」铺点：距离由 haversineDistance 反算，测试里不手写坐标差 */
@@ -126,6 +132,16 @@ before(async () => {
   );
   // C：中间原地停 80s（8 步 0m）→ 只该有静止剔除，没有车速段。线上那 41 条就是这个形态
   ids.add((await seedActivity('standstill', [...Array(6).fill(30), ...Array(8).fill(0), ...Array(6).fill(30)])).id);
+  // D：与 A 同形（夹 6 步车速段），但库里 calories=0（线上 100 条里 47 条这样）—— 回填不许凭空造一个消耗出来
+  ids.add(
+    (
+      await seedActivity(
+        'no-calories',
+        [30, 30, 30, 30, 30, 30, 30, 100, 100, 100, 100, 100, 100, 30, 30, 30, 30, 30, 30, 30],
+        { calories: 0 },
+      )
+    ).id,
+  );
 });
 
 after(async () => {
@@ -163,6 +179,8 @@ test('changes 明细：每条要写的记录带 reason 归类与逐字段 before
   assert.equal(rowA.after.duration, 140);
   assert.ok(rowA.after.distance < rowA.before.distance, '距离要变小');
   assert.equal(rowA.before.standstillMs, rowA.after.standstillMs, '静止不该被顺手动到');
+  assert.equal(rowA.before.calories, 500, '报告要带卡路里前值，好核这次折了多少');
+  assert.equal(rowA.after.calories, CALORIES_AT_140S, '库里 500 kcal 是按 200s 发的，净时长只剩 140s');
 
   const c = (await call({ id: [...ids][2] })).json().data;
   const rowC = c.changes[0];
@@ -171,14 +189,15 @@ test('changes 明细：每条要写的记录带 reason 归类与逐字段 before
   assert.ok(rowC.after.standstillMs >= 60000, `原地 8 步应剔出 ≥60s，实为 ${rowC.after.standstillMs}`);
   assert.ok(rowC.after.duration < rowC.before.duration, '运动时长要变短');
 
-  // 汇总口径：三类 reason 的条数要能加回 changed，别让人自己去数数组
+  // 汇总口径：各类 reason 的条数要能加回 changed，别让人自己去数数组
   const all = (await call({})).json().data;
   assert.equal(all.changesCount, all.changed);
-  assert.equal(all.vehicleCount + all.standstillCount + all.bothCount, all.changed);
+  assert.equal(all.vehicleCount + all.standstillCount + all.bothCount + all.caloriesOnlyCount, all.changed);
+  assert.ok(all.caloriesCount >= 1, '有卡路里要改写时得单独给一个计数，别混进来源分类');
   assert.ok(all.changes.length <= 50);
 });
 
-test('apply：按新口径落库（时长/距离/配速/点标记），calories 不动', async () => {
+test('apply：按新口径落库（时长/距离/配速/点标记），卡路里跟着净时长重算', async () => {
   const vehicleId = [...ids][0];
   const res = await call({ id: vehicleId, apply: true });
   assert.equal(res.statusCode, 200);
@@ -187,7 +206,7 @@ test('apply：按新口径落库（时长/距离/配速/点标记），calories 
   assert.equal(d.changed, 1);
 
   const a = await ActivityModel.findById(vehicleId)
-    .select('duration distance avgPace vehicleMs vehicleM calories trackPoints')
+    .select('duration distance avgPace standstillMs vehicleMs vehicleM calories trackPoints')
     .lean();
   const marked = (a!.trackPoints as any[]).filter((p) => p.vehicle === true);
   assert.equal(marked.length, 6, '6 步 100m/10s 该被标成车速段');
@@ -199,7 +218,13 @@ test('apply：按新口径落库（时长/距离/配速/点标记），calories 
     Math.abs(a!.avgPace! - a!.duration / (a!.distance / 1000)) <= 1,
     '平均配速要与新的时长/距离自洽',
   );
-  assert.equal(a!.calories, 500, '卡路里不参与回填');
+  assert.equal(a!.calories, CALORIES_AT_140S, '卡路里要按净时长重算，不能留在墙钟口径上');
+  assert.ok(a!.calories < 500, '净时长比墙钟短，消耗只能变小');
+  assert.equal(
+    a!.duration + Math.round(((a!.standstillMs ?? 0) + a!.vehicleMs) / 1000),
+    200,
+    '时长闸门：净时长 + 车速 + 静止 = 墙钟 200s',
+  );
 });
 
 test('apply 可重跑：第二次不再产生改动（标记与汇总已对齐）', async () => {
@@ -208,6 +233,45 @@ test('apply 可重跑：第二次不再产生改动（标记与汇总已对齐�
   const res = await call({ id: vehicleId, apply: true });
   assert.equal(res.json().data.changed, 0);
   assert.equal(await snapshot(vehicleId), beforeJson, '复跑不该抖出假差异');
+});
+
+test('syncCalories：把「时长已改、卡路里没跟上」的行补正（线上那 36 条就是这个状态）', async () => {
+  const vehicleId = [...ids][0];
+  // 造出现状：duration 已是净时长 140，卡路里还停在墙钟口径的 500
+  await ActivityModel.updateOne({ _id: vehicleId }, { $set: { calories: 500 } });
+  const beforeJson = await snapshot(vehicleId);
+
+  const dry = (await call({ id: vehicleId, syncCalories: true })).json().data;
+  assert.equal(dry.changed, 1, '只有卡路里一项要动，也算一次改动，否则我从报告里看不到它');
+  assert.equal(dry.caloriesOnlyCount, 1);
+  assert.equal(dry.caloriesCount, 1);
+  const row = dry.changes[0];
+  assert.equal(row.reason, 'calories', '来源既不是车速也不是静止，别混进那三类里');
+  assert.equal(row.before.calories, 500);
+  assert.equal(row.after.calories, CALORIES_AT_140S);
+  assert.equal(row.before.duration, row.after.duration, '这一档不动时长');
+  assert.equal(await snapshot(vehicleId), beforeJson, '干跑不能写库');
+
+  const applied = (await call({ id: vehicleId, syncCalories: true, apply: true })).json().data;
+  assert.equal(applied.changed, 1);
+  const a = await ActivityModel.findById(vehicleId).select('calories duration').lean();
+  assert.equal(a!.calories, CALORIES_AT_140S, 'apply 才落库');
+  assert.equal(a!.duration, 140, '时长维持上一轮的结果');
+
+  // 幂等：这条决定我敢不敢在线上补跑，复跑不能再折一遍
+  const again = (await call({ id: vehicleId, syncCalories: true })).json().data;
+  assert.equal(again.changed, 0, 'syncCalories 必须幂等，否则复跑会把卡路里再砍一次');
+});
+
+test('库里 calories=0 的行：回填不新造消耗', async () => {
+  const noCalId = [...ids][3];
+  const res = await call({ id: noCalId, apply: true });
+  const d = res.json().data;
+  assert.equal(d.changed, 1, '这条仍要写时长与车速标记');
+  assert.equal(d.caloriesCount, 0, '但卡路里不参与');
+  const a = await ActivityModel.findById(noCalId).select('calories duration vehicleMs').lean();
+  assert.equal(a!.vehicleMs, 60000, '车速段该照旧剔');
+  assert.equal(a!.calories, 0, '库里没有消耗记录，就别凭空造一个');
 });
 
 test('fastestKm 只降不升：重算更快时不写值、只列进 fastSkipped', async () => {
@@ -224,6 +288,12 @@ test('fastestKm 只降不升：重算更快时不写值、只列进 fastSkipped'
   assert.equal(a!.fastestKm, 999, '更快的重算值不写库');
   assert.equal(a!.vehicleMs, 0);
   assert.equal(a!.duration, 693, '干净轨迹的时长不该被回填动过');
+});
+
+test('syncCalories 不给 id → 400：库里分不清哪条的卡路里还是墙钟口径，不许全量刷', async () => {
+  const res = await call({ syncCalories: true });
+  assert.equal(res.statusCode, 400);
+  assert.match(res.json().message, /id/, '报错要点名缺的是哪个参数');
 });
 
 test('缺管理员凭证 → 401', async () => {
