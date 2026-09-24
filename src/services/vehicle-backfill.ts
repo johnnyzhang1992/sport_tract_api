@@ -43,12 +43,39 @@ export interface BackfillVehicleOptions {
   limit?: number;
 }
 
+/** 一条记录回填前后的快照（只放会被这个口径动到的字段；after 是「闸门放行后真正会写进去的值」） */
+export interface BackfillSnapshot {
+  duration: number;
+  distance: number;
+  avgPace: number | null;
+  fastestKm: number | null;
+  standstillMs: number;
+  vehicleMs: number;
+  stillPts: number;
+  vehiclePts: number;
+}
+
+export interface BackfillChangeRow {
+  id: string;
+  type: string;
+  /** 这条的改动是谁带来的：线上核账要用它把「车速段」和「首次静止剔除」分开算 */
+  reason: 'vehicle' | 'standstill' | 'both';
+  before: BackfillSnapshot;
+  after: BackfillSnapshot;
+}
+
 export interface BackfillVehicleReport {
   /** 连的是哪个库：干跑也要看清自己打到了哪 */
   db: string;
   apply: boolean;
   scanned: number;
   changed: number;
+  /** 会被改写的记录逐条列出（含前后快照），最多 LIST_CAP 条，总数看 changesCount */
+  changes: BackfillChangeRow[];
+  changesCount: number;
+  vehicleCount: number;
+  standstillCount: number;
+  bothCount: number;
   hits: string[];
   fastSlower: string[];
   distSkipped: string[];
@@ -84,6 +111,7 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
   const acts = (await q.lean()) as any[];
 
   let changed = 0;
+  const changes: BackfillChangeRow[] = [];
   const timeGateSkipped: string[] = [];
   const distSkipped: string[] = [];
   const fastSkipped: string[] = [];
@@ -181,15 +209,51 @@ export async function backfillVehicle(opts: BackfillVehicleOptions = {}): Promis
     if (Object.keys(set).length === 0) continue;
     changed++;
 
+    const before: BackfillSnapshot = {
+      duration: Math.round(a.duration ?? 0),
+      distance: Math.round(a.distance ?? 0),
+      avgPace: a.avgPace ?? null,
+      fastestKm: a.fastestKm ?? null,
+      standstillMs: prevStandstillMs,
+      vehicleMs: prevVehicleMs,
+      stillPts: prevStillPts,
+      vehiclePts: prevVehiclePts,
+    };
+    // after 取「闸门真正放行的值」：距离/最快 1km 被闸门挡掉时，快照里就不该出现它们的假差异
+    const after: BackfillSnapshot = {
+      duration: (set.duration as number) ?? before.duration,
+      distance: (set.distance as number) ?? before.distance,
+      avgPace: 'avgPace' in set ? ((set.avgPace as number | null) ?? null) : before.avgPace,
+      fastestKm: (set.fastestKm as number | null) ?? before.fastestKm,
+      standstillMs: (set.standstillMs as number) ?? before.standstillMs,
+      vehicleMs: (set.vehicleMs as number) ?? before.vehicleMs,
+      stillPts: 'trackPoints' in set ? newStillPts : before.stillPts,
+      vehiclePts: 'trackPoints' in set ? newVehiclePts : before.vehiclePts,
+    };
+    const vehMoved = after.vehicleMs !== before.vehicleMs;
+    const stillMoved = after.standstillMs !== before.standstillMs || after.stillPts !== before.stillPts;
+    changes.push({
+      id: String(a._id),
+      type: a.type,
+      reason: vehMoved && stillMoved ? 'both' : vehMoved ? 'vehicle' : 'standstill',
+      before,
+      after,
+    });
+
     if (apply) await ActivityModel.updateOne({ _id: a._id }, { $set: set });
   }
 
-  const clip = (arr: string[]) => arr.slice(0, LIST_CAP);
+  const clip = <T,>(arr: T[]) => arr.slice(0, LIST_CAP);
   return {
     db: `${mongoose.connection.name} / ${mongoose.connection.host}:${mongoose.connection.port}`,
     apply,
     scanned: acts.length,
     changed,
+    changes: clip(changes),
+    changesCount: changes.length,
+    vehicleCount: changes.filter((c) => c.reason === 'vehicle').length,
+    standstillCount: changes.filter((c) => c.reason === 'standstill').length,
+    bothCount: changes.filter((c) => c.reason === 'both').length,
     hits: clip(hits),
     fastSlower: clip(fastSlower),
     distSkipped: clip(distSkipped),

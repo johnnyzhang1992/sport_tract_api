@@ -124,6 +124,8 @@ before(async () => {
   ids.add(
     (await seedActivity('clean', Array.from({ length: 21 }, () => 100), { fastestKm: 999 }, 33)).id,
   );
+  // C：中间原地停 80s（8 步 0m）→ 只该有静止剔除，没有车速段。线上那 41 条就是这个形态
+  ids.add((await seedActivity('standstill', [...Array(6).fill(30), ...Array(8).fill(0), ...Array(6).fill(30)])).id);
 });
 
 after(async () => {
@@ -146,6 +148,34 @@ test('干跑：报告算出车速段，但库里一字未动', async () => {
   assert.equal(d.hitCount, 1, '这条应被判出车速段');
   assert.ok(d.hits[0].includes(vehicleId));
   assert.equal(await snapshot(vehicleId), beforeJson, '干跑不能写库');
+});
+
+test('changes 明细：每条要写的记录带 reason 归类与逐字段 before/after', async () => {
+  // 逐条查（不按全量数组取）：changes 有 50 条上限，全量清单里未必有我要看的那两条
+  const a = (await call({ id: [...ids][0] })).json().data;
+  assert.equal(a.changed, 1);
+  const rowA = a.changes[0];
+  assert.equal(rowA.id, [...ids][0]);
+  assert.equal(rowA.reason, 'vehicle', '这条没有原地停留，只该归车速段');
+  assert.equal(rowA.before.vehicleMs, 0);
+  assert.equal(rowA.after.vehicleMs, 60000);
+  assert.equal(rowA.before.duration, 200);
+  assert.equal(rowA.after.duration, 140);
+  assert.ok(rowA.after.distance < rowA.before.distance, '距离要变小');
+  assert.equal(rowA.before.standstillMs, rowA.after.standstillMs, '静止不该被顺手动到');
+
+  const c = (await call({ id: [...ids][2] })).json().data;
+  const rowC = c.changes[0];
+  assert.equal(rowC.reason, 'standstill', '只扣原地停留、没有车速段（线上那 41 条就是这个形态）');
+  assert.equal(rowC.after.vehicleMs, 0);
+  assert.ok(rowC.after.standstillMs >= 60000, `原地 8 步应剔出 ≥60s，实为 ${rowC.after.standstillMs}`);
+  assert.ok(rowC.after.duration < rowC.before.duration, '运动时长要变短');
+
+  // 汇总口径：三类 reason 的条数要能加回 changed，别让人自己去数数组
+  const all = (await call({})).json().data;
+  assert.equal(all.changesCount, all.changed);
+  assert.equal(all.vehicleCount + all.standstillCount + all.bothCount, all.changed);
+  assert.ok(all.changes.length <= 50);
 });
 
 test('apply：按新口径落库（时长/距离/配速/点标记），calories 不动', async () => {
