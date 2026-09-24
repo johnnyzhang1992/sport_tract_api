@@ -76,8 +76,9 @@ test('点间隔 >60s：视为断档，同样不跨段', () => {
   assert.equal(calcFastestKm(pts, 'running'), 300);
 });
 
-test('still：静止时段不计时（距离照计，人没移动），与不打标记的对照可证', () => {
-  // 同一几何两版：中间在 500m 处站 40s。边界用 dt=0 消除歧义，只让静止段本身的 40s 有区别
+test('still：静止段照计入分段用时（跑 1km 中途停下休息，那一公里就是更慢）', () => {
+  // 同一几何两版：中间在 500m 处站 40s。行业口径（Keep/华为的分段）按经过时间算，
+  // 把静止时间剔掉会奖励"km 中途停车"——线上那条因此从 3'41" 变成 2'32"，方向是反的。
   const build = (markStill: boolean): TrackPointLike[] => {
     const pts = walk(500, 100, 30); // 0..500m，5 段 × 30s = 150s
     let ts = (pts[pts.length - 1].timestamp ?? 0) + 0;
@@ -93,8 +94,27 @@ test('still：静止时段不计时（距离照计，人没移动），与不打
     }
     return pts;
   };
-  assert.equal(calcFastestKm(build(true), 'running'), 300, '静止 40s 应从最快 1km 里剔掉');
-  assert.equal(calcFastestKm(build(false), 'running'), 340, '同一轨迹不打标记时应含这 40s');
+  assert.equal(calcFastestKm(build(false), 'running'), 340, '不打标记时含这 40s');
+  assert.equal(calcFastestKm(build(true), 'running'), 340, '打了 still 也照样含——静止照计时间');
+});
+
+test('vehicle：车速段的位移与时间一律不计，且断段（"坐车 1km"绝不能成分段配速）', () => {
+  // 第 1 个 1km 真跑（400 s/km）；第 2 个 1km 是 12 m/s 的车速段（200 s/km）
+  const run = walk(1000, 100, 40);
+  const car = walk(900, 100, 20, 1100, 420000).map((p) => ({ ...p, vehicle: true }));
+  assert.equal(
+    calcFastestKm([...run, ...car], 'running'),
+    400,
+    '车速段要断段：剩下的真跑段才是最快 1km',
+  );
+  // 对照：同样几何不打标记时，那段就是刷出来的假 PR
+  assert.equal(
+    calcFastestKm([...run, ...car.map((p) => ({ ...p, vehicle: undefined }))], 'running'),
+    200,
+    '不打 vehicle 时车速段会占据最快 1km',
+  );
+  // 只有车速段时：没有任何真实 1km 可算
+  assert.equal(calcFastestKm(car, 'running'), null);
 });
 
 test('游泳/骑行无配速', () => {

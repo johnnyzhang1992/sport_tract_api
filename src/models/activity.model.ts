@@ -18,6 +18,7 @@ const trackPointSchema = new Schema(
     accuracy: { type: Number, default: null }, // 水平精度（米，实时定位质量）
     pauseGap: { type: Boolean, default: false }, // 暂停恢复后首个有效点（渲染时断开连线）
     still: { type: Boolean, default: false }, // 静止时段检测标出的点（finish 时算，见 utils/standstill.ts）
+    vehicle: { type: Boolean, default: false }, // 非运动段检测标出的点，疑似乘车（见 utils/vehicle.ts）
     timestamp: { type: Number, required: true },
   },
   { _id: false },
@@ -50,6 +51,8 @@ const activitySchema = new Schema(
     endTime: { type: Number, default: null },
     duration: { type: Number, default: 0 }, // 秒（扣除暂停）
     standstillMs: { type: Number, default: 0 }, // 自动暂停：finish 时判出的静止时段总时长（毫秒）
+    vehicleMs: { type: Number, default: 0 }, // 非运动段：疑似乘车的总时长（毫秒），与 standstillMs 一样从 duration 里扣
+    vehicleM: { type: Number, default: 0 }, // 非运动段：被剔掉的位移（米）
     distance: { type: Number, default: 0 }, // 米
     avgPace: { type: Number, default: null }, // 全程平均配速（秒/公里）
     fastestKm: { type: Number, default: null }, // 轨迹内最快 1km 分段（秒/公里）

@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
+import { bestRecords } from '../src/services/stats.js';
 
 /**
  * 本榜最佳「最长距离」带回运动时长（durationSec）。
@@ -91,4 +92,30 @@ test('BD3 纪录时长为 0（老数据/未记录）时不下发 durationSec', a
   assert.ok(farthest, '游泳榜应有最长距离条目');
   assert.equal(farthest!.value, 9999997);
   assert.equal(farthest!.durationSec, undefined, '没有可信时长就不下发，前端别显示 0:00');
+});
+
+/**
+ * 配速可信度闸门：男子 1km 世界纪录 131 s/km，比它更快只可能是 GPS 漂移或把乘车段算成了跑步
+ * （线上就有一条 5.95km 轨迹被 25km/h 的车速段刷出 3'41" 并占了全国榜第一）。
+ * 这类值不该当纪录挂着——哪怕它已经写进了库里。
+ */
+test('BD4 全国榜「最快 1km」不收录人类做不到的配速', async () => {
+  await seedActivity({ type: 'running', distance: 5950, duration: 1200, fastestKm: 60 }); // 1'00"/km，物理不可能
+
+  const best = await fetchBest('running');
+  const fastest = best.find((b) => b.key === 'fastestKm');
+  assert.ok(!fastest || fastest.value > 130, `不可能配速不得成为纪录，实际 ${fastest?.value} s/km`);
+});
+
+test('BD5 个人最佳「最快配速」同样过滤不可能值', async () => {
+  await seedActivity({ type: 'running', distance: 3000, duration: 900, fastestKm: 58 });
+  await seedActivity({ type: 'running', distance: 4000, duration: 1200, fastestKm: 250 }); // 正常纪录
+
+  const best = await bestRecords(userId);
+  const row = best.minPaceByType.find((r: { type: string }) => r.type === 'running');
+  assert.ok(row, '跑步应有个人最佳配速条目');
+  assert.ok(
+    row!.fastestKm > 130,
+    `不可能的 58 s/km 不该当个人最佳（取可信条目里最快的），实际 ${row!.fastestKm}`,
+  );
 });

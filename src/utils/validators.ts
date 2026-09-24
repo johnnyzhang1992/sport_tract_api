@@ -118,7 +118,7 @@ export const FinishActivitySchema = z.object({
   endAddress: z.string().max(200).optional().default(''),
   pausedMs: z.number().optional().default(0).transform((v) => (v != null && v < 0 ? 0 : v)),
   endTime: z.number().positive('结束时间不合法').optional(),
-  weightKg: z.number().positive().max(300).optional(),
+  // 体重不接受客户端上报值：卡路里按档案体重算（services/weight.ts），收进来会让端上能改写入库口径
   deviceInfo: z.record(z.string(), z.unknown()).optional(),
 });
 

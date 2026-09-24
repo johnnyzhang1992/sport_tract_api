@@ -45,3 +45,18 @@ test('海拔：无海拔点时 min/max 为 null', () => {
   assert.equal(r.minAltitude, null);
   assert.equal(r.maxAltitude, null);
 });
+
+test('距离：vehicle 点的「入段」位移剔除（乘车不算运动距离）', () => {
+  // 21 个点、20 步（每步 ≈22m）；后 10 步判为车速段 → 只剩前 10 步算距离
+  const all = pts(Array.from({ length: 21 }, () => 100));
+  const plain = calcStats(all, { type: 'running', durationSec: 100 });
+  const marked = calcStats(
+    all.map((p, i) => ({ ...p, vehicle: i >= 11 })),
+    { type: 'running', durationSec: 100 },
+  );
+  assert.ok(plain.distance > 400, `对照组：不打标记应算满 20 步，实际 ${plain.distance}`);
+  assert.ok(
+    Math.abs(marked.distance - plain.distance / 2) <= 2,
+    `车速段要整体剔掉，实际 ${marked.distance} vs 半数 ${plain.distance / 2}`,
+  );
+});

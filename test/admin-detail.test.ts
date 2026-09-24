@@ -169,4 +169,53 @@ test('轨迹详情：不存在的轨迹返回 404', async () => {
 test('未携带管理员凭证返回 401', async () => {
   assert.equal((await req(`/sport-track/api/admin/users/${userId}`, false)).statusCode, 401);
   assert.equal((await req(`/sport-track/api/admin/activities/${activityId}`, false)).statusCode, 401);
+  // 导出接口也是管理员数据出口，同样不能裸奔
+  assert.equal((await req(`/sport-track/api/admin/activities/${activityId}/gpx`, false)).statusCode, 401);
+});
+
+test('管理员导出 GPX：坐标按 WGS-84 反算，且含全部轨迹点与打点', async () => {
+  const res = await req(`/sport-track/api/admin/activities/${activityId}/gpx`);
+  assert.equal(res.statusCode, 200, res.body);
+  assert.match(String(res.headers['content-type']), /application\/gpx\+xml/);
+  assert.match(String(res.headers['content-disposition']), /attachment; filename="activity-/);
+  const xml = res.body;
+  // 导出保真：车速段照导（剔除只作用在入库指标上），删点会让"导出→再导入"真的丢数据
+  assert.equal((xml.match(/<trkpt/g) ?? []).length, 3, '导出的 trkpt 数应等于库内轨迹点数');
+  assert.equal((xml.match(/<wpt/g) ?? []).length, 1, '打点应作为航点导出');
+
+  const { gcj02ToWgs84 } = await import('../src/utils/coordinate.js');
+  const { haversineDistance } = await import('../src/utils/pace.js');
+  const m = xml.match(/<trkpt lat="([-\d.]+)" lon="([-\d.]+)"/);
+  assert.ok(m, '应有轨迹点');
+  const got = { lat: Number(m![1]), lng: Number(m![2]) };
+  const gcj = { lat: 39.9042, lng: 116.4074 };
+  const wgs = gcj02ToWgs84(gcj.lat, gcj.lng);
+  assert.ok(
+    haversineDistance(wgs, got) < 1,
+    `导出坐标应是 WGS-84 反算值，实际偏差 ${haversineDistance(wgs, got).toFixed(1)}m`,
+  );
+  assert.ok(
+    haversineDistance(gcj, got) > 300,
+    '导出坐标与库内 GCJ-02 原值几乎相同 = 漏转，每次导出→导入会平移数百米',
+  );
+});
+
+test('管理员导出 GPX：无轨迹点 400 / 非法与不存在 id 404', async () => {
+  assert.equal((await req('/sport-track/api/admin/activities/not-an-id/gpx')).statusCode, 404);
+  assert.equal((await req('/sport-track/api/admin/activities/000000000000000000000000/gpx')).statusCode, 404);
+  const empty = await ActivityModel.create({
+    userId,
+    type: 'running',
+    status: 'finished',
+    startTime: Date.now() - 60000,
+    endTime: Date.now(),
+    duration: 60,
+    distance: 0,
+    trackPoints: [],
+    markers: [],
+  });
+  const res = await req(`/sport-track/api/admin/activities/${empty._id}/gpx`);
+  assert.equal(res.statusCode, 400);
+  assert.match(res.json().message, /没有轨迹点/);
+  await ActivityModel.deleteOne({ _id: empty._id });
 });

@@ -2,7 +2,7 @@ import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { locateRegion } from './region.js';
 import { calcFastestKm } from '../utils/pace.js';
-import { ACTIVITY_TYPES } from '../config/constants.js';
+import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
 import { AppError } from '../utils/app-error.js';
 
 type ObjectIdLike = Types.ObjectId | string;
@@ -339,7 +339,7 @@ export async function bestRecords(userId: ObjectIdLike) {
     ]);
   const [distRows, paceRows, durRows, elevRows] = await Promise.all([
     byTypeAgg('distance', -1),
-    byTypeAgg('fastestKm', 1, { fastestKm: { $gt: 0 } }),
+    byTypeAgg('fastestKm', 1, { fastestKm: { $gt: MIN_PLAUSIBLE_PACE_SEC_PER_KM } }),
     byTypeAgg('duration', -1),
     byTypeAgg('elevationGain', -1),
   ]);

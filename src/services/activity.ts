@@ -4,6 +4,7 @@ import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
 import { markStandstill } from '../utils/standstill.js';
+import { markVehicle, formatVehicleNotice } from '../utils/vehicle.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { cleanTrajectory } from '../utils/trajectory-clean.js';
@@ -11,6 +12,7 @@ import { markFootprintDirty } from './footprint.js';
 import { provincesOfPoints } from './region.js';
 import { monthlyAggForMonths, type ActivityMonthlyRow } from './stats.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
+import { resolveWeightKg } from './weight.js';
 import type {
   AppendPointsInput,
   CreateActivityInput,
@@ -31,6 +33,10 @@ export interface TrackPointDto {
   speed: number | null;
   accuracy: number | null;
   pauseGap?: boolean;
+  /** 静止时段点（自动暂停口径，见 utils/standstill.ts） */
+  still?: boolean;
+  /** 非运动段点（疑似乘车，见 utils/vehicle.ts） */
+  vehicle?: boolean;
   timestamp: number;
 }
 
@@ -70,8 +76,14 @@ export interface ActivityDto {
   startCity: string;
   lastPointSeq: number;
   pausedMs: number;
-  /** 自动暂停：本次判出的静止时段总时长（毫秒），运动时长 = 墙钟 − pausedMs − standstillMs */
+  /** 自动暂停：本次判出的静止时段总时长（毫秒），运动时长 = 墙钟 − pausedMs − standstillMs − vehicleMs */
   standstillMs: number;
+  /** 非运动段：疑似乘车的总时长（毫秒），位移见 vehicleM（见 utils/vehicle.ts） */
+  vehicleMs: number;
+  /** 非运动段：被剔掉的位移（米） */
+  vehicleM: number;
+  /** 非运动段：给用户看的整句说明（服务端拼好下发，见 utils/vehicle.ts#formatVehicleNotice）；无车速段为空串 */
+  vehicleNotice: string;
   note: string;
   trackPoints: TrackPointDto[];
   markers: MarkerDto[];
@@ -116,6 +128,9 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     lastPointSeq: doc.lastPointSeq ?? 0,
     pausedMs: doc.pausedMs ?? 0,
     standstillMs: doc.standstillMs ?? 0,
+    vehicleMs: doc.vehicleMs ?? 0,
+    vehicleM: doc.vehicleM ?? 0,
+    vehicleNotice: formatVehicleNotice(doc.trackPoints, doc.vehicleMs, doc.vehicleM),
     note: doc.note ?? '',
     trackPoints: doc.trackPoints ?? [],
     markers: doc.markers ?? [],
@@ -308,15 +323,22 @@ export async function finishActivity(
   // 轨迹平滑（滑动平均 + 位移守卫）：抑制 GPS 抖动，端点保持，位移过大回退原值
   const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
 
+  // 非运动段检测（疑似乘车，见 utils/vehicle.ts）：跑步/徒步途中搭车、推车、坐摆渡车的那段
+  // 既不是自己动的、又会把 GPS 噪声"运"出真实位移，位移与时长一起从指标里剔掉。
+  // 必须在静止检测之前跑——两者判据互斥（车速段不可能落在 10m 停留圈内），链接起来一次打标。
+  const veh = markVehicle(smoothedPoints, activity.type);
   // 静止时段检测（自动暂停口径）：用户在原地没动但没点暂停的时间也不该计入运动时长。
   // 只在这里算一次并入库（duration / standstillMs / 点上的 still 标记），读接口不再重算。
-  const { points: markedPoints, standstillMs } = markStandstill(smoothedPoints);
-  // 运动时长 = 墙钟 − 手动暂停 − 判出的静止（下限 0）
-  const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs - standstillMs) / 1000);
+  const { points: markedPoints, standstillMs } = markStandstill(veh.points);
+  // 运动时长 = 墙钟 − 手动暂停 − 判出的静止 − 判出的车速段（下限 0）
+  const durationSec = Math.max(
+    0,
+    (endTime - activity.startTime - input.pausedMs - standstillMs - veh.vehicleMs) / 1000,
+  );
   const stats = calcStats(markedPoints, {
     type: activity.type,
     durationSec,
-    weightKg: input.weightKg,
+    weightKg: await resolveWeightKg(activity.userId),
   });
 
   // 无效运动守卫：点数过少（单点无位移/两点成假直线）或重算距离过短
@@ -368,6 +390,8 @@ export async function finishActivity(
         pausedMs: input.pausedMs,
         duration: Math.round(durationSec),
         standstillMs: Math.round(standstillMs),
+        vehicleMs: Math.round(veh.vehicleMs),
+        vehicleM: Math.round(veh.vehicleM),
         distance: stats.distance,
         avgPace: stats.avgPace,
         fastestKm,
@@ -442,16 +466,21 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
       .filter((t) => t > 0);
     const endTime = validTs.length > 0 ? Math.max(...validTs) : Date.now();
 
-    // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 静止检测 → 重算指标
+    // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 车速段检测 → 静止检测 → 重算指标
     const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
     const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
     const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-    const { points: markedPoints, standstillMs } = markStandstill(smoothedPoints);
+    const veh = markVehicle(smoothedPoints, activity.type);
+    const { points: markedPoints, standstillMs } = markStandstill(veh.points);
     const durationSec = Math.max(
       0,
-      (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs) / 1000,
+      (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
     );
-    const stats = calcStats(markedPoints, { type: activity.type, durationSec });
+    const stats = calcStats(markedPoints, {
+      type: activity.type,
+      durationSec,
+      weightKg: await resolveWeightKg(activity.userId),
+    });
 
     // 无效运动守卫：点数过少或重算距离过短（漂移点全被清洗）→ 自动作废，与 finish 同口径
     if (trackPoints.length < MIN_EFFECTIVE_POINTS || stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
@@ -477,6 +506,8 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
           startCity: regions.startCity,
           duration: Math.round(durationSec),
           standstillMs: Math.round(standstillMs),
+          vehicleMs: Math.round(veh.vehicleMs),
+          vehicleM: Math.round(veh.vehicleM),
           distance: stats.distance,
           avgPace: stats.avgPace,
           fastestKm,
@@ -683,6 +714,7 @@ export async function reprocessActivity(
   const stats = calcStats(smoothed, {
     type: activity.type,
     durationSec: activity.duration ?? 0,
+    weightKg: await resolveWeightKg(activity.userId),
   });
   const fastestKm = calcFastestKm(smoothed, activity.type);
   // 纠偏后轨迹点变化 → 重算省市并更新
@@ -726,6 +758,7 @@ export async function updateActivityMeta(
     const stats = calcStats(activity.trackPoints ?? [], {
       type: input.type as never,
       durationSec: activity.duration ?? 0,
+      weightKg: await resolveWeightKg(activity.userId),
     });
     patch.type = input.type;
     patch.avgPace = stats.avgPace;

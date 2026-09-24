@@ -49,6 +49,20 @@ async function assertCanCreate(userId: string) {
 }
 
 /**
+ * 取 multipart 里的普通表单字段值
+ * @fastify/multipart v10 起 `part.fields[name]` 是 { type:'field', value, fieldname, … } 描述对象
+ * （更早是裸字符串），只按字符串取会把字段读成 undefined。
+ */
+function multipartField(
+  part: { fields?: Record<string, unknown> },
+  name: string,
+): string | undefined {
+  const raw = part.fields?.[name];
+  const value = raw && typeof raw === 'object' ? (raw as { value?: unknown }).value : raw;
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+/**
  * 运动记录路由（M2 核心同步协议）
  * 前缀：/api/activities，全部需登录（未登录无法新增/读取）
  */
@@ -186,11 +200,10 @@ export async function activityRoutes(fastify: FastifyInstance) {
     }
     const content = await part.toBuffer();
     const filename = part.filename || 'track.gpx';
-    // multipart 字段（wx.uploadFile formData）
-    const typeField = (part.fields?.type ?? part.fields?.['type']) as string | undefined;
-    const typeOverride = typeof typeField === 'string' && typeField ? typeField : undefined;
-    const sourceField = (part.fields?.source ?? part.fields?.['source']) as string | undefined;
-    const source = typeof sourceField === 'string' && sourceField ? sourceField : undefined;
+    // multipart 字段（wx.uploadFile formData）：@fastify/multipart v10 起给的是 { value, fieldname, … }
+    // 描述对象，早期按裸字符串取会让端上传的类型/来源静默失效（退回按平均速度猜类型）
+    const typeOverride = multipartField(part, 'type');
+    const source = multipartField(part, 'source');
     const result = await importActivity(request.user.userId, filename, content.toString('utf8'), typeOverride, source);
     return success(result, '导入成功');
   });

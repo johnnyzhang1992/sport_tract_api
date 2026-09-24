@@ -20,6 +20,7 @@ import {
   deleteFootprintById,
 } from '../services/footprint-record.js';
 import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
+import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import {
   adminListTopics,
   createTopic,
@@ -1080,6 +1081,21 @@ export async function adminRoutes(fastify: FastifyInstance) {
       // 抽稀到 ≤600 点：弹窗海拔/速度图用，避免 2 万点全量下发
       trackPoints: samplePoints(dto.trackPoints, 600),
     });
+  });
+
+  /**
+   * 导出 GPX（管理端）：与用户端 /activities/:id/gpx 同一份 toGpx 口径（坐标反算 WGS-84、打点作航点）
+   * 管理员按 id 直取不校验归属；用全量轨迹点，不像详情那样抽稀到 600 点 —— 导出是存档，不能缺点
+   */
+  fastify.get('/activities/:id/gpx', { onRequest: [adminAuth] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    assertObjectIdLike(id, '轨迹不存在');
+    const activity = await ActivityModel.findById(id).lean();
+    if (!activity) throw new AppError(404, '轨迹不存在');
+    assertActivityForGpx(activity);
+    reply.header('Content-Type', 'application/gpx+xml; charset=utf-8');
+    reply.header('Content-Disposition', `attachment; filename="activity-${id}.gpx"`);
+    return toGpx(activity);
   });
 
   // 运动榜（管理端）：与用户端 /stats/leaderboard 同口径；TOP N（默认 20）

@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { DEFAULT_WEIGHT_KG } from '../config/constants.js';
 
 const { Schema, model, models } = mongoose;
 
@@ -9,7 +10,7 @@ const userSchema = new Schema(
     nickname: { type: String, default: '' },
     avatarUrl: { type: String, default: '' },
     gender: { type: Number, enum: [0, 1, 2], default: 0 }, // 0 未知 1 男 2 女
-    weightKg: { type: Number, default: 60, min: 20, max: 300 }, // 体重 kg（卡路里计算用）
+    weightKg: { type: Number, default: DEFAULT_WEIGHT_KG, min: 20, max: 300 }, // 体重 kg（卡路里计算用）
     heightCm: { type: Number, default: 170, min: 50, max: 250 }, // 身高 cm
     profileCompleted: { type: Boolean, default: false }, // 是否主动提交过身高/体重（完善资料引导用；不能拿默认值 60/170 判断，否则永远“已完整”）
     lastLoginAt: { type: Number, default: () => Date.now() }, // 最后登录时间（管理后台排序用）

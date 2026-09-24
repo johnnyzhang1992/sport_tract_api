@@ -7,7 +7,7 @@
 import { ActivityModel } from '../models/activity.model.js';
 import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
-import { ACTIVITY_TYPES } from '../config/constants.js';
+import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
 import type { ActivityType } from '../config/constants.js';
 import { getAvatarUrl } from './oss.js';
 
@@ -236,7 +236,8 @@ export async function leaderboard(
     }
     const spec = BEST_METRIC_SPEC[key];
     facet[key] = [
-      { $match: { [spec.field]: { $gt: 0 } } },
+      // 越小越好 = 配速类：低于可信下限的（GPS 漂移、把乘车段算进运动量）不当纪录挂着
+      { $match: { [spec.field]: { $gt: spec.dir === 1 ? MIN_PLAUSIBLE_PACE_SEC_PER_KM : 0 } } },
       { $sort: { [spec.field]: spec.dir } },
       { $limit: 1 },
       // 最长距离要连它的运动时长一起下发（前端同排展示「12.34 km · 1:23:45」）；其它指标不带

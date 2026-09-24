@@ -57,6 +57,20 @@ export const MIN_EFFECTIVE_DISTANCE_M = 10;
  */
 export const MIN_EFFECTIVE_POINTS = 3;
 
+/**
+ * 可信配速下限（秒/公里）：男子 1000m 世界纪录 2'11"05 ≈ 131 s/km，比这还快的"最快 1km"
+ * 只可能是 GPS 漂移或把乘车段算成了运动量（线上实测过一条 5.95km 轨迹里的 2.76km 车速段
+ * 刷出 3'41" 并占了全国榜第一）。纪录榜与个人最佳按此过滤，不把不可能的数字当纪录挂着；
+ * 轨迹详情照实显示，不做隐藏。
+ */
+export const MIN_PLAUSIBLE_PACE_SEC_PER_KM = 130;
+
+/**
+ * 档案缺失时的兜底体重（kg）：卡路里 = MET × 体重 × 小时，必须有个体重才能算。
+ * 正常路径取 user.weightKg（user.model 的 default 就是这个值），只有查不到用户文档才会用到这里。
+ */
+export const DEFAULT_WEIGHT_KG = 60;
+
 /** 列表分页默认值 */
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;

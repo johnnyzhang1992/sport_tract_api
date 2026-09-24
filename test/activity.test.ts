@@ -5,6 +5,7 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { LoginLogModel } from '../src/models/login-log.model.js';
+import { autoFinishStaleActivities } from '../src/services/activity.js';
 
 let app: FastifyInstance;
 let tokenA = '';
@@ -266,6 +267,136 @@ test('静止剔除：只停 55s 不足门槛 → 不剔（1 分钟内的短停�
   const act = res.json().data.activity;
   assert.equal(act.standstillMs, 0);
   assert.equal(act.duration, act.totalDuration, '不足门槛时不剔，运动时长 = 墙钟');
+});
+
+/**
+ * 三段直线轨迹（每点 2s 一采）：跑 1100m → 疑似乘车 1000m → 跑 1100m
+ * 车速段 10 m/s = 36 km/h：按 1km 折算出来是 100 s/km，而男子 1km 世界纪录是 131 s/km——
+ * 线上那条 3'41" 就是这么来的：算术没错，语义错了。
+ * 跑动段刻意给 1100m（不是正好 1000m），免得断段判定卡在浮点边界上。
+ */
+function threeLegTrack(startTs: number, startLat: number) {
+  const DPM = 1 / 111194.926; // 1 米对应的纬度增量（与 haversine 的 R=6371000 同源）
+  const points: Array<Record<string, unknown>> = [];
+  let seq = 0;
+  let ts = startTs;
+  let m = 0;
+  points.push({ seq: ++seq, lat: startLat, lng: 121.4737, altitude: null, speed: null, timestamp: ts });
+  const leg = (stepM: number, steps: number) => {
+    for (let k = 0; k < steps; k++) {
+      m += stepM;
+      ts += 2000;
+      points.push({
+        seq: ++seq,
+        lat: startLat + m * DPM,
+        lng: 121.4737,
+        altitude: null,
+        speed: null,
+        timestamp: ts,
+      });
+    }
+  };
+  leg(10, 110); // 5 m/s 跑 1100m / 220s
+  leg(20, 50); // 10 m/s 乘车 1000m / 100s
+  leg(10, 110); // 5 m/s 跑 1100m / 220s
+  return { points, endTs: ts };
+}
+
+test('车速段剔除：跑 1km + 乘车 1km + 跑 1km → 位移/时长/最快 1km 都不含乘车那截', async () => {
+  // 独立用户：创建接口有「同一用户 1 小时最多 10 条」防刷
+  const tokenV = (await login('m2-vehicle')).accessToken;
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenV,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  const { points, endTs } = threeLegTrack(TEST_NOW - 60000, 31.23);
+
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenV,
+    body: { trackPoints: points, endTime: endTs, pausedMs: 0 },
+  });
+  assert.equal(res.statusCode, 200);
+  const act = res.json().data.activity;
+  assert.equal(act.totalDuration, 540, '墙钟 540s');
+
+  // 判出车速段：时长/位移入库（衔接处的点被平滑会挪几米、可能多吞 1~2 步，故用区间而非精确值）
+  assert.ok(
+    act.vehicleMs >= 98000 && act.vehicleMs <= 112000,
+    `车速段时长 ≈100s 应入库，实际 ${act.vehicleMs}ms`,
+  );
+  assert.ok(act.vehicleM >= 990 && act.vehicleM <= 1090, `车速段位移 ≈1000m 应入库，实际 ${act.vehicleM}m`);
+  // 口径自洽：运动时长 + 车速 + 静止 = 墙钟（本轨迹无手动暂停）
+  assert.equal(
+    act.duration + Math.round(act.vehicleMs / 1000) + Math.round(act.standstillMs / 1000),
+    act.totalDuration,
+  );
+  // 距离只算两段真实跑动（2200m）：不剔除会得到 3200m
+  assert.ok(
+    act.distance > 2060 && act.distance < 2290,
+    `距离应为跑动 2200m 量级（含车速段会得到 3200m），实际 ${act.distance}`,
+  );
+  // 最快 1km 只能是真实跑动配速 200 s/km，不能是车速段折算出来的 100 s/km
+  assert.ok(
+    act.fastestKm != null && act.fastestKm > 150 && act.fastestKm < 260,
+    `fastestKm 应为真实跑步配速（不剔除会得到 100 s/km），实际 ${act.fastestKm}`,
+  );
+  const vehPts = (act.trackPoints as Array<{ vehicle?: boolean }>).filter((p) => p.vehicle === true);
+  assert.ok(vehPts.length >= 50, `车速段的点应带 vehicle 标记落库，实际 ${vehPts.length} 个`);
+});
+
+test('车速段剔除只作用于人力运动类型：骑行同样几何 → 一律不剔', async () => {
+  const tokenV = (await login('m2-vehicle')).accessToken;
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenV,
+    body: { type: 'cycling', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  const { points, endTs } = threeLegTrack(TEST_NOW - 60000, 31.24);
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenV,
+    body: { trackPoints: points, endTime: endTs, pausedMs: 0 },
+  });
+  assert.equal(res.statusCode, 200);
+  const act = res.json().data.activity;
+  assert.equal(act.vehicleMs, 0, '骑行 10 m/s 是正常速度，不该判乘车');
+  assert.equal(act.vehicleM, 0);
+  assert.ok(act.distance > 3100, `不该剔任何位移，实际 ${act.distance}`);
+  assert.equal(act.duration, act.totalDuration);
+});
+
+test('超时自动收尾：同一条车速段轨迹走清理管线，剔除口径与 finish 一致', async () => {
+  const tokenV = (await login('m2-vehicle')).accessToken;
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenV,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  const { points } = threeLegTrack(TEST_NOW - 60000, 31.25);
+  const uploaded = await req('POST', `/sport-track/api/activities/${id}/points`, {
+    token: tokenV,
+    body: { points },
+  });
+  assert.equal(uploaded.statusCode, 200);
+
+  // 伪装成 24h 无更新（杀进程退出），再跑惰性清理
+  const stale = new Date(Date.now() - 25 * 3600 * 1000);
+  await ActivityModel.updateOne({ _id: id }, { $set: { updatedAt: stale } }, { timestamps: false });
+  const owner = await ActivityModel.findById(id).select('userId').lean();
+  const handled = await autoFinishStaleActivities(String(owner!.userId));
+  assert.ok(handled >= 1, '应有一条被收尾');
+
+  const doc = await ActivityModel.findById(id).lean();
+  assert.equal(doc!.status, 'finished');
+  assert.ok(
+    (doc!.vehicleMs ?? 0) >= 98000 && doc!.vehicleMs <= 112000,
+    `自动收尾也要判出车速段，实际 ${doc!.vehicleMs}ms`,
+  );
+  assert.ok(doc!.distance > 2060 && doc!.distance < 2290, `距离应剔掉车速段，实际 ${doc!.distance}`);
+  assert.ok(
+    doc!.fastestKm != null && doc!.fastestKm > 150,
+    `最快 1km 不该是车速段的 100 s/km，实际 ${doc!.fastestKm}`,
+  );
 });
 
 test('总时长：列表/详情接口同样下发（含旧数据 pausedMs 缺失）', async () => {
@@ -609,14 +740,16 @@ test('best 惰性补算：历史轨迹无 fastestKm 自动补齐', async () => {
     body: { type: 'running', startTime: TEST_NOW - 60000 },
   });
   const id = created.json().data.activityId;
-  // 上传轨迹点（2 段 1km，每段 5 间隔 20s/10s → 最快 50s/km）并 finish
+  // 上传轨迹点并 finish：两段各 1km，第 1 段 300s/km、第 2 段 200s/km（都是人速，别踩车速判定）
   const pts = [];
-  const d1 = 1000 / 111000;
+  const d1 = 1000 / 111194.926; // 1km 的纬度增量（与 haversine 的 R=6371000 同源，保证名义配速=实测配速）
   let ts = TEST_NOW - 60000;
   const baseLat = 31;
-  for (let i = 0; i <= 5; i++) pts.push({ seq: i + 1, lat: baseLat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: ts + i * 20000 });
+  for (let i = 0; i <= 5; i++)
+    pts.push({ seq: i + 1, lat: baseLat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: ts + i * 60000 });
   const b2 = pts[pts.length - 1];
-  for (let i = 1; i <= 5; i++) pts.push({ seq: pts.length + 1, lat: b2.lat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: b2.timestamp + i * 10000 });
+  for (let i = 1; i <= 5; i++)
+    pts.push({ seq: pts.length + 1, lat: b2.lat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: b2.timestamp + i * 40000 });
   await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: { trackPoints: pts, endTime: TEST_NOW, pausedMs: 0 },
@@ -629,7 +762,7 @@ test('best 惰性补算：历史轨迹无 fastestKm 自动补齐', async () => {
   const res = await req('GET', '/sport-track/api/stats/best', { token: tokenA });
   assert.equal(res.statusCode, 200);
   const after = await ActivityModel.findById(id).lean();
-  assert.ok(after?.fastestKm !== null, 'fastestKm 被补算');
+  assert.equal(after?.fastestKm, 200, 'fastestKm 应按入库轨迹补算出最快那段 200 s/km');
   await ActivityModel.deleteOne({ _id: id });
 });
 
@@ -1170,10 +1303,72 @@ test('导入轨迹：与 finish 共用口径——静止时段同样剔除，sta
   assert.ok(stillPts.length >= 3, '静止时段的点应带 still 标记落库');
 });
 
+test('导入轨迹：车速段同样剔除（与 finish 同口径），vehicleMs/vehicleM 与点标记入库', async () => {
+  const tokenV = (await login('m2-import-vehicle')).accessToken;
+  // GPX（WGS-84）：与 threeLegTrack 同几何——跑 1100m → 10 m/s 疑似乘车 1000m → 跑 1100m
+  const DPM = 1 / 111194.926;
+  const LAT0 = 31.23;
+  let m = 0;
+  let ts = TEST_NOW - 600000;
+  const rows: string[] = [];
+  const push = () =>
+    rows.push(
+      `    <trkpt lat="${(LAT0 + m * DPM).toFixed(9)}" lon="114.4"><time>${new Date(ts).toISOString()}</time></trkpt>`,
+    );
+  push();
+  const leg = (stepM: number, steps: number) => {
+    for (let k = 0; k < steps; k++) {
+      m += stepM;
+      ts += 2000;
+      push();
+    }
+  };
+  leg(10, 110);
+  leg(20, 50);
+  leg(10, 110);
+  const gpx = `<?xml version="1.0"?>\n<gpx version="1.1" creator="test"><trk><trkseg>\n${rows.join('\n')}\n</trkseg></trk></gpx>`;
+
+  const boundary = '----sporttrackvehicle';
+  const payload = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="type"\r\n\r\nrunning\r\n`),
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="v.gpx"\r\nContent-Type: application/gpx+xml\r\n\r\n`,
+    ),
+    Buffer.from(gpx),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const imported = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/activities/import',
+    payload,
+    headers: { authorization: `Bearer ${tokenV}`, 'content-type': `multipart/form-data; boundary=${boundary}` },
+  });
+  assert.equal(imported.statusCode, 200, imported.body);
+  const id = imported.json().data.id;
+  // 导入路径不跑平滑/纠偏，剔除量应当是干净的 1000m / 100s
+  assert.ok(
+    Math.abs(imported.json().data.distance - 2200) <= 6,
+    `距离应只剩两段跑动 2200m，实际 ${imported.json().data.distance}`,
+  );
+  assert.equal(imported.json().data.duration, 440, '净时长 = 墙钟 540s − 车速 100s');
+
+  const detail = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenV });
+  const act = detail.json().data;
+  assert.equal(act.vehicleMs, 100000);
+  assert.ok(Math.abs(act.vehicleM - 1000) <= 6, `车速段位移应入库，实际 ${act.vehicleM}`);
+  assert.equal(
+    act.duration + Math.round(act.vehicleMs / 1000) + Math.round(act.standstillMs / 1000),
+    Math.round((act.endTime - act.startTime) / 1000),
+    '口径自洽：运动时长 + 车速 + 静止 = 墙钟',
+  );
+  const vehPts = (act.trackPoints as Array<{ vehicle?: boolean }>).filter((p) => p.vehicle === true);
+  assert.equal(vehPts.length, 50, '车速段的 50 个点应带 vehicle 标记落库');
+});
+
 test('导出 GPX → 再导入：经纬度往返一致（GPX 标准是 WGS-84，导出必须反算 GCJ-02）', async () => {
   const tokenR = (await login('m2-gpx-roundtrip')).accessToken;
 
-  // 造一条活动：武汉附近 5 个点，每点间隔 ~110m（避免导入的去重合并）
+  // 造一条活动：武汉附近 6 个点，相邻 ~147m（避免导入的去重合并）
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenR,
     body: { type: 'running', startTime: TEST_NOW - 300000 },
@@ -1186,7 +1381,8 @@ test('导出 GPX → 再导入：经纬度往返一致（GPX 标准是 WGS-84，
     lng: 114.486967 + i * 0.001,
     altitude: 30 + i,
     speed: null,
-    timestamp: TEST_NOW - 300000 + i * 20000,
+    // 60s 一步 = 2.45 m/s（6'48"/km 的真跑配速）；间隔再小会被车速段判走，距离对不上
+    timestamp: TEST_NOW - 300000 + i * 60000,
   }));
   const fin = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenR,
