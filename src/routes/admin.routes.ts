@@ -29,6 +29,7 @@ import {
   type TopicInput,
 } from '../services/topic.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
+import { backfillVehicle } from '../services/vehicle-backfill.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
 import { getSignedUrl, cleanUrl, getThumbUrl, uploadBuffer } from '../services/oss.js';
@@ -1183,6 +1184,20 @@ export async function adminRoutes(fastify: FastifyInstance) {
       ? await ActivityModel.countDocuments({ ...filter, _id: { $gt: new Types.ObjectId(lastId) } })
       : 0;
     return success({ dryRun, processed: acts.length, updated, lastId, remaining, changes });
+  });
+
+  // 车速段回填（历史数据按新口径重算，换判据门槛后可重跑）：
+  // 与上面的 recompute-elevation 相反，这里默认**只算不写**、必须显式 apply:true 才落库——
+  // 它会重写整条 trackPoints，误触的代价不是一次重算那么小
+  fastify.post('/activities/backfill-vehicle', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as { apply?: boolean | string; id?: string; limit?: number | string };
+    return success(
+      await backfillVehicle({
+        apply: body.apply === true || body.apply === 'true',
+        id: body.id ? String(body.id) : '',
+        limit: Math.max(0, Number(body.limit) || 0),
+      }),
+    );
   });
 
   // ==================== 专题管理（官方信息页，小程序首页入口） ====================
