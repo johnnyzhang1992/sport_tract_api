@@ -184,22 +184,35 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
-  // 时间维度数据量：新增用户/新增轨迹/新增足迹 + 登录 UV·PV（today/week/month）
+  // 时间维度数据量：新增用户/新增轨迹（含已完成子集）/新增足迹 + 登录 UV·PV（today/week/month）
   fastify.get('/stats', { onRequest: [adminAuth] }, async (request) => {
     const DAY = 86400000;
     const now = Date.now();
+    // 「今日」按东八区 0 点：运行容器是 UTC，用服务器本地时区会把东八区 0~8 点的记录划到昨天
     const ranges = {
-      today: new Date(new Date(now).setHours(0, 0, 0, 0)).getTime(),
+      today: bjToday0(),
       week: now - 7 * DAY,
       month: now - 30 * DAY,
     };
-    const out: Record<string, { newUsers: number; newActivities: number; newFootprints: number; uv: number; pv: number }> = {};
+    const out: Record<
+      string,
+      {
+        newUsers: number;
+        newActivities: number;
+        finishedActivities: number;
+        newFootprints: number;
+        uv: number;
+        pv: number;
+      }
+    > = {};
     for (const [k, start] of Object.entries(ranges)) {
       const since = new Date(start);
       // 登录 UV/PV：PV = 登录次数，UV = 周期内登录过的去重用户数
-      const [newUsers, newActivities, newFootprints, pv, uvRows] = await Promise.all([
+      const [newUsers, newActivities, finishedActivities, newFootprints, pv, uvRows] = await Promise.all([
         UserModel.countDocuments({ createdAt: { $gte: since } }),
         ActivityModel.countDocuments({ createdAt: { $gte: since } }),
+        // 概览页的「新增轨迹」要显示 已完成/总，子集得在这里数出来（前端手里没有 status 可推）
+        ActivityModel.countDocuments({ createdAt: { $gte: since }, status: 'finished' }),
         FootprintRecordModel.countDocuments({ createdAt: { $gte: since } }),
         LoginLogModel.countDocuments({ createdAt: { $gte: since } }),
         LoginLogModel.aggregate([
@@ -207,7 +220,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
           { $group: { _id: '$userId' } },
         ]),
       ]);
-      out[k] = { newUsers, newActivities, newFootprints, uv: uvRows.length, pv };
+      out[k] = { newUsers, newActivities, finishedActivities, newFootprints, uv: uvRows.length, pv };
     }
     return success(out);
   });
