@@ -32,6 +32,8 @@ export interface OverviewTrack {
   fastestKm: number | null;
   elevationGain: number;
   calories: number;
+  /** 起点的省（老数据可能为空串）：轨迹合集页的省份筛选靠它在前端聚合候选与条数 */
+  startProvince: string;
   /** 抽稀后的轨迹点；lean 模式不下发 */
   points?: OverviewPoint[];
 }
@@ -84,6 +86,7 @@ export async function getOverview(
     fastestKm: 1,
     elevationGain: 1,
     calories: 1,
+    startProvince: 1,
   };
   if (!lean) {
     select['trackPoints.lat'] = 1;
@@ -115,6 +118,7 @@ export async function getOverview(
     fastestKm: a.fastestKm ?? null,
     elevationGain: a.elevationGain || 0,
     calories: a.calories || 0,
+    startProvince: a.startProvince || '', // 老数据/导入数据没有省 → 空串（前端不列进候选）
   }));
   if (lean) {
     return { range, ...totals, tracks: metaTracks, heat: [], ...(dateSummaryData ? { dateSummary: dateSummaryData } : {}) };
