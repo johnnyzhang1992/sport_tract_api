@@ -74,6 +74,26 @@ function bjDateStr(ms: number): string {
 }
 
 /**
+ * ISO-8601 周标签（YYYY-Www），与 MongoDB 的 %G-W%V 同口径：
+ * 以「该日所在周的周四」决定所属年份与周号。入参是 epoch ms，内部先挪 +8h 再按 UTC 取分量，
+ * 所以算的是东八区墙上时间的那一周，与服务器时区无关。
+ */
+function bjIsoWeekLabel(ms: number): string {
+  const day = new Date(ms + 8 * 3600000);
+  const dow = (day.getUTCDay() + 6) % 7; // 周一 = 0
+  const thu = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate() - dow + 3));
+  const jan4 = new Date(Date.UTC(thu.getUTCFullYear(), 0, 4));
+  const week = 1 + Math.round(((thu.getTime() - jan4.getTime()) / DAY_MS - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7);
+  return `${thu.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
+}
+
+/** 东八区的年/月分量（同样靠「挪 +8h 后按 UTC 读」，不碰服务器本地时区） */
+function bjYearMonth(ms: number): { y: number; m: number } {
+  const b = new Date(ms + 8 * 3600000);
+  return { y: b.getUTCFullYear(), m: b.getUTCMonth() + 1 };
+}
+
+/**
  * 生成趋势图时间桶：range=week（近 7 天按天）/ month（近 30 天按天）/ year（近 12 个月按月）
  * 返回时间桶标签 + 查询起始时间 + MongoDB 分组格式（均按东八区）
  */
@@ -229,70 +249,54 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // day：近 30 天按天；week：近 25 周按周；month：近 12 个月按月；year：近 6 年按半年（12 个点）
   fastify.get('/trend', { onRequest: [adminAuth] }, async (request) => {
     const type = String((request.query as { type?: string }).type || 'day');
-    const DAY = 86400000;
-    // 各维度配置：桶 key 生成函数 + 标签 + 起止
+    // 桶标签与聚合分组必须同口径：两边都按东八区，否则日/周/月界差 8 小时，计数会串桶
     let fmt = '%Y-%m-%d';
-    let labelOf: (d: Date) => string;
-    let buckets: string[] = [];
-    const now = new Date();
+    const buckets: string[] = [];
+    const nowMs = Date.now();
+    const today0 = bjToday0();
 
     if (type === 'week') {
       // 近 25 周（ISO 年-周）
       fmt = '%G-W%V';
-      labelOf = (d) => {
-        const t = new Date(d.getTime());
-        t.setHours(12, 0, 0, 0); // 避免周末边界时区问题
-        const day = (t.getDay() + 6) % 7; // 周一 = 0
-        t.setDate(t.getDate() - day + 3); // 周四（ISO 周锚点）
-        const isoYear = t.getFullYear();
-        const week = Math.ceil(((t.getTime() - new Date(isoYear, 0, 4).getTime()) / DAY + 1) / 7);
-        return `${isoYear}-W${String(week).padStart(2, '0')}`;
-      };
-      for (let i = 24; i >= 0; i--) {
-        buckets.push(labelOf(new Date(Date.now() - i * 7 * DAY)));
-      }
+      for (let i = 24; i >= 0; i--) buckets.push(bjIsoWeekLabel(today0 - i * 7 * DAY_MS));
     } else if (type === 'month') {
       fmt = '%Y-%m';
-      labelOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const cur = bjYearMonth(nowMs);
       for (let i = 11; i >= 0; i--) {
-        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-        buckets.push(labelOf(d));
+        const idx = cur.y * 12 + cur.m - 1 - i;
+        buckets.push(`${Math.floor(idx / 12)}-${String((idx % 12) + 1).padStart(2, '0')}`);
       }
     } else if (type === 'year') {
-      // 近 6 年按半年（H1/H2）
-      fmt = '%Y-%m';
-      labelOf = (d) => {
-        const half = d.getMonth() < 6 ? 'H1' : 'H2';
-        return `${d.getFullYear()}-${half}`;
-      };
-      // 最近 12 个半年（含当前半年）
-      const y = now.getFullYear();
-      const halfIdx = now.getMonth() < 6 ? 0 : 1; // 当前半年的下半年索引
+      // 近 6 年按半年（H1/H2）；分组键由下方 $concat 现拼，不能用 fmt
+      const cur = bjYearMonth(nowMs);
       for (let i = 11; i >= 0; i--) {
-        const n = halfIdx - i; // 相对当前半年的偏移（0=当前，-1=上一半年…）
-        const ty = y + Math.floor(n / 2);
-        const th = ((n % 2) + 2) % 2 === 0 ? 'H1' : 'H2';
-        buckets.push(`${ty}-${th}`);
+        const n = cur.y * 2 + (cur.m <= 6 ? 0 : 1) - i;
+        buckets.push(`${Math.floor(n / 2)}-${((n % 2) + 2) % 2 === 0 ? 'H1' : 'H2'}`);
       }
     } else {
       // day：近 30 天
-      labelOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      for (let i = 29; i >= 0; i--) buckets.push(labelOf(new Date(Date.now() - i * DAY)));
+      for (let i = 29; i >= 0; i--) buckets.push(bjDateStr(today0 - i * DAY_MS));
     }
 
     // 聚合：把日期时间戳按桶归并（用 ${fmt} 分组，day 直接用天）
-    const start = new Date(Date.now() - 6 * 365 * DAY); // 最多取近 6 年数据足够
+    const start = new Date(nowMs - 6 * 365 * DAY_MS); // 最多取近 6 年数据足够
     // year 维度：按月分组后桶是 年-H1/H2 不匹配，直接用 年+半年 拼接分组
     const idExpr =
       type === 'year'
         ? {
             $concat: [
-              { $dateToString: { format: '%Y', date: '$createdAt' } },
+              { $dateToString: { format: '%Y', date: '$createdAt', timezone: '+08:00' } },
               '-',
-              { $cond: [{ $lt: [{ $month: '$createdAt' }, 7] }, 'H1', 'H2'] },
+              {
+                $cond: [
+                  { $lt: [{ $month: { date: '$createdAt', timezone: '+08:00' } }, 7] },
+                  'H1',
+                  'H2',
+                ],
+              },
             ],
           }
-        : { $dateToString: { format: fmt, date: '$createdAt' } };
+        : { $dateToString: { format: fmt, date: '$createdAt', timezone: '+08:00' } };
     const [uRows, aRows, fRows] = await Promise.all([
       UserModel.aggregate([
         { $match: { createdAt: { $gte: start } } },
