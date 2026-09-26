@@ -10,6 +10,8 @@ export interface CleanTrackPoint {
   lat: number;
   lng: number;
   altitude?: number | null;
+  /** GPS 水平精度（米，客户端上报）：差精度点（≥ ACC_BAD_M）触发加严离群判定；缺失走现行规则 */
+  accuracy?: number | null;
   timestamp?: number;
   seq?: number;
 }
@@ -96,6 +98,14 @@ export interface CleanOptions {
   /** 孤立点倍数（相对局部尺度） */
   outlierRatio?: number;
 }
+
+/** —— 精度因子（accuracy）加严判定 ——
+ * accuracy 是 GPS 上报的水平精度圈半径：值越大，该点真实位置的可疑偏移幅度越大。
+ * 好精度（< ACC_BAD_M）走现行规则零影响；缺失（旧数据/导入）同样不受影响。 */
+/** 差精度阈值（米）：≥ 该值的点触发加严离群判定 */
+export const ACC_BAD_M = 50;
+/** 差精度点离群距离系数：点偏离前后连线中点 > accuracy × 该系数 即判漂移 */
+export const ACC_OUTLIER_FACTOR = 1.0;
 
 /**
  * 轨迹纠偏：剔除尖刺点与孤立离群点（保持首尾）
@@ -184,6 +194,18 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
     if ((v1 > highV || v2 > highV) && Math.min(v1, v2) > lowV) {
       drop[i] = true;
       continue;
+    }
+
+    // 3.5) 差精度点加严（accuracy 因子）：自身上报精度 ≥ ACC_BAD_M 的点，位置可信度低，
+    //      偏离前后连线中点超过 accuracy 本身即判漂移——不再要求"高速/大转角"双条件。
+    //      盲区堵漏：连续同向偏移、速度正常的坏点（现行规则看不见）由此剔除。
+    const acc = (b as { accuracy?: number | null }).accuracy;
+    if (acc != null && acc >= ACC_BAD_M) {
+      const mid = { lat: (a.lat + c.lat) / 2, lng: (a.lng + c.lng) / 2 };
+      if (distM(b, mid) > acc * ACC_OUTLIER_FACTOR) {
+        drop[i] = true;
+        continue;
+      }
     }
 
     // 4) 孤立离群：距前后连线远（绝对 + 相对局部尺度）且两侧位移均不小 → 剔除

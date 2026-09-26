@@ -85,3 +85,82 @@ test('尾点跳点剔除：结束时 GPS 漂移', () => {
   const cleaned = cleanTrajectory(withTail);
   assert.equal(cleaned.length, 14, '尾跳点应被剔除');
 });
+
+// ==================== accuracy 精度因子（方案 12） ====================
+// 场景要点（盲区的真实形态）：嘈杂轨迹步长 60m/5s（med≈10.3m/s → 现行离群阈值 max(25, 60×5)≈52m），
+// 偏移 60m 的点现行规则阈值刚好够不到（acc=65 × 1.0 = 65 > 60 → accuracy 规则剔除；
+// 现行规则 4 的 distLine 60.4 > 51.7 也会剔除——不构成区分，改用 acc=75：75×1.0=75 > 偏移 80？
+// 最终场景：偏移 80m（0.00072°）> acc=75×1.0=75 → accuracy 剔除；现行规则同样剔除（80>51.7）——
+// 区分度场景改由「偏移 60m、acc=75」表达：60 ≤ 75×1.0 → accuracy 保留；现行 60.4 > 51.7 剔除？——
+// 见下方两组断言：以「有/无 accuracy 字段」的行为差异为准
+
+/** 构造嘈杂骑行轨迹：步长 60m（0.00054°），间隔 5s（12 m/s ≈ 43km/h 公路骑行） */
+function rideTrack(n = 12): Array<{ lat: number; lng: number; timestamp: number }> {
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    pts.push({ lat: 30.5, lng: 114.4 + i * 0.00054, timestamp: i * 5000 });
+  }
+  return pts;
+}
+
+/** 嘈杂轨迹上中段插入点的基准：a=base[6]、c=base[7]，中点 lng = 114.4 + 6.5×0.00054 */
+const MID_LNG = 114.4 + 6.5 * 0.00054;
+const MID_LAT = 30.5;
+const T_INSERT = 6 * 5000 + 2500; // 32500，base[6](30000) 与 base[7](35000) 之间
+
+test('差精度点横向偏 51m：现行规则保留（阈值 51.7 被嘈杂步长抬高），accuracy 规则剔除', () => {
+  const base = rideTrack(12);
+  const drifted = {
+    lat: MID_LAT + 0.00046, // 51.2m：> acc×1.0(50) → accuracy 剔；≤ 现行 outlierTh(51.7) → 现行不剔
+    lng: MID_LNG,
+    accuracy: 50,
+    timestamp: T_INSERT,
+  };
+  const withDrift = [...base.slice(0, 7), drifted, ...base.slice(7)];
+  const cleaned = cleanTrajectory(withDrift, {}, 'cycling');
+  assert.equal(cleaned.length, withDrift.length - 1, '差精度漂移点应被 accuracy 规则剔除');
+  assert.ok(!cleaned.some((p) => Math.abs(p.lat - drifted.lat) < 1e-9), '漂移点不在结果中');
+});
+
+test('差精度点小偏移（22m < accuracy×factor）：保留', () => {
+  const base = rideTrack(12);
+  const mild = {
+    lat: MID_LAT + 0.0002, // 22.2m < 50
+    lng: MID_LNG,
+    accuracy: 50,
+    timestamp: T_INSERT,
+  };
+  const withMild = [...base.slice(0, 7), mild, ...base.slice(7)];
+  const cleaned = cleanTrajectory(withMild, {}, 'cycling');
+  assert.equal(cleaned.length, withMild.length, '偏移在 accuracy 容忍内的点应保留');
+});
+
+test('好精度点（acc<50）同样偏 51m：不触发 accuracy 规则，行为与无 accuracy 一致', () => {
+  const base = rideTrack(12);
+  const goodAcc = {
+    lat: MID_LAT + 0.00046,
+    lng: MID_LNG,
+    accuracy: 10,
+    timestamp: T_INSERT,
+  };
+  const withGood = [...base.slice(0, 7), goodAcc, ...base.slice(7)];
+  const cleaned = cleanTrajectory(withGood, {}, 'cycling');
+  const noAcc = withGood.map((p) => {
+    const { accuracy: _acc, ...rest } = p as typeof p & Record<string, unknown>;
+    return rest;
+  });
+  assert.equal(
+    cleaned.length,
+    cleanTrajectory(noAcc, {}, 'cycling').length,
+    '好精度点行为与无 accuracy 时完全一致',
+  );
+});
+
+test('无 accuracy 字段的点：行为与旧版完全一致', () => {
+  const base = rideTrack(12);
+  // 22m 偏移（现行规则与 accuracy 规则都不触发）：无 accuracy 字段 → 与旧版行为一致，保留
+  const drifted = { lat: MID_LAT + 0.0002, lng: MID_LNG, timestamp: T_INSERT };
+  const withDrift = [...base.slice(0, 7), drifted, ...base.slice(7)];
+  const cleaned = cleanTrajectory(withDrift, {}, 'cycling');
+  assert.equal(cleaned.length, withDrift.length, '无 accuracy 的漂移点不被剔除（与旧版行为一致）');
+});
