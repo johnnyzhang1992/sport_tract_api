@@ -11,6 +11,7 @@ import { cleanTrajectory } from '../utils/trajectory-clean.js';
 import { markFootprintDirty } from './footprint.js';
 import { provincesOfPoints } from './region.js';
 import { monthlyAggForMonths, type ActivityMonthlyRow } from './stats.js';
+import { compactTrackPoints, normalizeTrackPoints } from '../utils/track-compact.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
 import { resolveWeightKg } from './weight.js';
 import type {
@@ -132,7 +133,7 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     vehicleM: doc.vehicleM ?? 0,
     vehicleNotice: formatVehicleNotice(doc.trackPoints, doc.vehicleMs, doc.vehicleM),
     note: doc.note ?? '',
-    trackPoints: doc.trackPoints ?? [],
+    trackPoints: normalizeTrackPoints(doc.trackPoints, doc.startTime),
     markers: doc.markers ?? [],
     createdAt: doc.createdAt?.toISOString?.() ?? '',
     updatedAt: doc.updatedAt?.toISOString?.() ?? '',
@@ -335,7 +336,9 @@ export async function finishActivity(
     0,
     (endTime - activity.startTime - input.pausedMs - standstillMs - veh.vehicleMs) / 1000,
   );
-  const stats = calcStats(markedPoints, {
+  // 先紧凑化再算指标：落库值 = 基于落库点重算的值（惰性补算/重算永远与存储自洽）
+  const storedPoints = compactTrackPoints(markedPoints, activity.startTime);
+  const stats = calcStats(storedPoints, {
     type: activity.type,
     durationSec,
     weightKg: await resolveWeightKg(activity.userId),
@@ -370,9 +373,9 @@ export async function finishActivity(
   }
 
   // 轨迹内最快 1km 分段（个人最佳"最快配速"口径：分段最快，非全程平均）
-  const fastestKm = calcFastestKm(markedPoints, activity.type);
+  const fastestKm = calcFastestKm(storedPoints, activity.type);
   // 落库省市（按省查询轨迹 + 点亮地图省下钻）
-  const regions = provincesOfPoints(markedPoints);
+  const regions = provincesOfPoints(storedPoints);
 
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
@@ -380,7 +383,7 @@ export async function finishActivity(
       $set: {
         status: 'finished',
         endTime,
-        trackPoints: markedPoints,
+        trackPoints: storedPoints,
         markers: input.markers ?? activity.markers ?? [],
         startAddress: input.startAddress,
         endAddress: input.endAddress,
@@ -476,7 +479,8 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
       0,
       (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
     );
-    const stats = calcStats(markedPoints, {
+    const storedPoints = compactTrackPoints(markedPoints, activity.startTime);
+    const stats = calcStats(storedPoints, {
       type: activity.type,
       durationSec,
       weightKg: await resolveWeightKg(activity.userId),
@@ -491,7 +495,7 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
       continue;
     }
 
-    const fastestKm = calcFastestKm(markedPoints, activity.type);
+    const fastestKm = calcFastestKm(storedPoints, activity.type);
     const regions = provincesOfPoints(markedPoints);
 
     await ActivityModel.updateOne(
@@ -500,7 +504,7 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
         $set: {
           status: 'finished',
           endTime,
-          trackPoints: markedPoints,
+          trackPoints: storedPoints,
           provinces: regions.provinces,
           startProvince: regions.startProvince,
           startCity: regions.startCity,
@@ -711,19 +715,20 @@ export async function reprocessActivity(
   const altitudeCleaned = cleanAltitudeSpikes(raw);
   const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
   const smoothed = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-  const stats = calcStats(smoothed, {
+  const storedPoints = compactTrackPoints(smoothed, activity.startTime);
+  const stats = calcStats(storedPoints, {
     type: activity.type,
     durationSec: activity.duration ?? 0,
     weightKg: await resolveWeightKg(activity.userId),
   });
-  const fastestKm = calcFastestKm(smoothed, activity.type);
+  const fastestKm = calcFastestKm(storedPoints, activity.type);
   // 纠偏后轨迹点变化 → 重算省市并更新
   const regions = provincesOfPoints(smoothed);
   const updated = await ActivityModel.findByIdAndUpdate(
     activityId,
     {
       $set: {
-        trackPoints: smoothed,
+        trackPoints: storedPoints,
         provinces: regions.provinces,
         startProvince: regions.startProvince,
         startCity: regions.startCity,

@@ -740,16 +740,15 @@ test('best 惰性补算：历史轨迹无 fastestKm 自动补齐', async () => {
     body: { type: 'running', startTime: TEST_NOW - 60000 },
   });
   const id = created.json().data.activityId;
-  // 上传轨迹点并 finish：两段各 1km，第 1 段 300s/km、第 2 段 200s/km（都是人速，别踩车速判定）
+  // 上传轨迹点并 finish：两段各约 1km（步长 105m，km 完成点留 50m 裕量——
+  // 对 7 位坐标舍入的 ±0.006m 抖动稳健），第 1 段 300s/km、第 2 段 200s/km（都是人速，别踩车速判定）
   const pts = [];
-  const d1 = 1000 / 111194.926; // 1km 的纬度增量（与 haversine 的 R=6371000 同源，保证名义配速=实测配速）
-  let ts = TEST_NOW - 60000;
+  const dStep = 105 / 111194.926; // 105m 的纬度增量（与 haversine 的 R=6371000 同源）
   const baseLat = 31;
-  for (let i = 0; i <= 5; i++)
-    pts.push({ seq: i + 1, lat: baseLat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: ts + i * 60000 });
-  const b2 = pts[pts.length - 1];
-  for (let i = 1; i <= 5; i++)
-    pts.push({ seq: pts.length + 1, lat: b2.lat + (d1 * i) / 5, lng: 121, altitude: null, speed: null, timestamp: b2.timestamp + i * 40000 });
+  for (let i = 0; i <= 10; i++)
+    pts.push({ seq: i + 1, lat: baseLat + dStep * i, lng: 121, altitude: null, speed: null, timestamp: TEST_NOW - 630000 + i * 31500 });
+  for (let i = 1; i <= 10; i++)
+    pts.push({ seq: pts.length + 1, lat: baseLat + dStep * (10 + i), lng: 121, altitude: null, speed: null, timestamp: TEST_NOW - 630000 + 315000 + i * 21000 });
   await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
     body: { trackPoints: pts, endTime: TEST_NOW, pausedMs: 0 },

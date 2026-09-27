@@ -23,6 +23,9 @@ export function toGpx(doc: Record<string, any>): string {
     altitude?: number | null;
     timestamp?: number;
   }>;
+  // 时间戳兼容：紧凑格式存相对 startTime 的 ms（<1e12），旧格式为绝对 ms
+  const startMs = Number(doc.startTime ?? 0);
+  const absTs = (t?: number) => (t == null ? null : t > 1e12 ? t : startMs + t);
   const markers = (doc.markers ?? []) as Array<{
     lat: number;
     lng: number;
@@ -35,7 +38,8 @@ export function toGpx(doc: Record<string, any>): string {
     .map((p) => {
       const c = gcj02ToWgs84(p.lat, p.lng);
       const ele = p.altitude != null ? `<ele>${p.altitude}</ele>` : '';
-      const time = p.timestamp ? `<time>${new Date(p.timestamp).toISOString()}</time>` : '';
+      const abs = absTs(p.timestamp);
+      const time = abs ? `<time>${new Date(abs).toISOString()}</time>` : '';
       return `      <trkpt lat="${c.lat}" lon="${c.lng}">${ele}${time}</trkpt>`;
     })
     .join('\n');

@@ -6,6 +6,7 @@
  */
 import { XMLParser } from 'fast-xml-parser';
 import { ActivityModel } from '../models/activity.model.js';
+import { compactTrackPoints } from '../utils/track-compact.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance, type TrackPointLike } from '../utils/pace.js';
 import { markStandstill } from '../utils/standstill.js';
@@ -294,7 +295,9 @@ export async function importActivity(
   const { points: markedPoints, standstillMs } = markStandstill(veh.points);
   const wallSec = (endTime - startTime) / 1000;
   const durationSec = Math.max(1, Math.round(wallSec - standstillMs / 1000 - veh.vehicleMs / 1000));
-  const stats = calcStats(markedPoints, {
+  // 先紧凑化再算指标：与 finish 同口径（落库值 = 基于落库点重算的值）
+  const storedPoints = compactTrackPoints(markedPoints, startTime);
+  const stats = calcStats(storedPoints, {
     type: type as never,
     durationSec,
     weightKg: await resolveWeightKg(userId),
@@ -305,16 +308,7 @@ export async function importActivity(
     throw new AppError(400, '轨迹距离过短（不足 10 米），未导入');
   }
 
-  const trackPoints = markedPoints.map((p, i) => ({
-    seq: i + 1,
-    lat: p.lat,
-    lng: p.lng,
-    altitude: p.altitude,
-    speed: null,
-    timestamp: p.timestamp,
-    ...(p.still ? { still: true } : {}),
-    ...(p.vehicle ? { vehicle: true } : {}),
-  }));
+  const trackPoints = storedPoints.map((p, i) => ({ ...p, seq: i + 1 }));
   // 落库省市（按省查询轨迹用）
   const regions = provincesOfPoints(trackPoints);
 
@@ -336,7 +330,7 @@ export async function importActivity(
     provinces: regions.provinces,
     startProvince: regions.startProvince,
     startCity: regions.startCity,
-    trackPoints: trackPoints.slice(0, MAX_TRACK_POINTS),
+    trackPoints: compactTrackPoints(trackPoints.slice(0, MAX_TRACK_POINTS), startTime),
     markers: [],
     lastPointSeq: trackPoints.length,
     deviceInfo: { source: source || guessSource(filename), filename },
