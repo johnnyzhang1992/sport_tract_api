@@ -1418,3 +1418,57 @@ test('导出 GPX → 再导入：经纬度往返一致（GPX 标准是 WGS-84，
   assert.ok(dLast < 1, `末点往返偏移应 <1m，实际 ${dLast.toFixed(1)}m`);
   assert.ok(Math.abs(back.distance - fin.json().data.activity.distance) < 1, '距离也应一致');
 });
+
+test('紧凑存储：GPX 导出时间为绝对时间（非 1970），再导入后时间戳还原', async () => {
+  const tokenC = (await login('m2-compact-gpx')).accessToken;
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenC,
+    body: { type: 'running', startTime: TEST_NOW - 300000 },
+  });
+  const id = created.json().data.activityId;
+  const step = 0.001;
+  const pts = Array.from({ length: 6 }, (_, i) => ({
+    seq: i + 1,
+    lat: 30.507991 + i * step,
+    lng: 114.486967 + i * step,
+    altitude: 30 + i,
+    speed: null,
+    accuracy: 15,
+    timestamp: TEST_NOW - 300000 + i * 60000, // 首点 startTime 本身 → 紧凑后 ts=0，最容易露馅
+  }));
+  await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenC,
+    body: { trackPoints: pts, endTime: pts[pts.length - 1].timestamp, pausedMs: 0 },
+  });
+
+  // 落库后是紧凑格式（首点 ts=0）→ GPX 导出必须还原绝对时间
+  const exported = await req('GET', `/sport-track/api/activities/${id}/gpx`, { token: tokenC });
+  assert.equal(exported.statusCode, 200, exported.body);
+  const times = [...exported.body.matchAll(/<trkpt[^>]*>[\s\S]*?<time>([^<]+)<\/time>/g)].map((m) => m[1]);
+  assert.equal(times.length, 6, '应有 6 个 trkpt <time>');
+  assert.equal(times[0], new Date(TEST_NOW - 300000).toISOString(), '首点 <time> 应为绝对时间（非 1970）');
+  assert.equal(times[5], new Date(TEST_NOW - 300000 + 5 * 60000).toISOString(), '末点 <time> 应为绝对时间');
+
+  // 再导入：时间戳应还原为绝对 ms（紧凑导入点 + startTime）
+  const boundary = '----compactgpx';
+  const payload = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="c.gpx"\r\nContent-Type: application/gpx+xml\r\n\r\n`),
+    Buffer.from(exported.body),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const imported = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/activities/import',
+    payload,
+    headers: { authorization: `Bearer ${tokenC}`, 'content-type': `multipart/form-data; boundary=${boundary}` },
+  });
+  assert.equal(imported.statusCode, 200, imported.body);
+  const back = (await req('GET', `/sport-track/api/activities/${imported.json().data.id}`, { token: tokenC })).json().data;
+  assert.equal(back.trackPoints.length, 6, '再导入应保留 6 点');
+  assert.equal(back.trackPoints[0].timestamp, TEST_NOW - 300000, '再导入首点时间戳应为绝对 ms');
+  assert.equal(
+    back.trackPoints[5].timestamp - back.trackPoints[0].timestamp,
+    300000,
+    '时间步长应保持 60s',
+  );
+});
