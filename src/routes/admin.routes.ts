@@ -30,6 +30,7 @@ import {
 } from '../services/topic.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { backfillVehicle } from '../services/vehicle-backfill.js';
+import { gapImpact } from '../services/gap-impact.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
 import { getSignedUrl, cleanUrl, getThumbUrl, uploadBuffer } from '../services/oss.js';
@@ -1226,6 +1227,29 @@ export async function adminRoutes(fastify: FastifyInstance) {
         id,
         limit: Math.max(0, Number(body.limit) || 0),
         syncCalories,
+      }),
+    );
+  });
+
+  // 断档虚高影响评估（**只读**，不写库）：折算要改指标口径，动手前先看影响面。
+  // 口径与视觉断线不同 —— 这里只看前两条判据（间隔拉长 + 位移超限），
+  // 因为"沿跑道把弯切了"的步视觉不该断、里程却是实打实虚高的。
+  fastify.post('/activities/gap-impact', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as {
+      ids?: string | string[];
+      userId?: string;
+      limit?: number | string;
+      listCap?: number | string;
+    };
+    const rawIds = Array.isArray(body.ids) ? body.ids : body.ids ? [String(body.ids)] : [];
+    const ids = rawIds.map((id) => String(id)).filter((id) => id.length > 0);
+    ids.forEach((id) => assertObjectIdLike(id, '活动不存在'));
+    return success(
+      await gapImpact({
+        ids,
+        userId: body.userId ? String(body.userId) : undefined,
+        limit: Math.max(0, Number(body.limit) || 0),
+        listCap: Math.max(1, Number(body.listCap) || 50),
       }),
     );
   });

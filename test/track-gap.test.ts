@@ -20,6 +20,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   markGapJumps,
+  detectGapSteps,
   GAP_MIN_SEC,
   GAP_SEC_MULT,
   GAP_DIST_MULT,
@@ -194,6 +195,51 @@ test('点数不足或全同位置：返回空标记（中位数取不到时不�
   assert.equal(markGapJumps([]).gaps, 0);
   const flat = Array.from({ length: 6 }, (_, i) => ({ lat: 30.5, lng: 114.4, timestamp: i * 2000 }));
   assert.equal(markGapJumps(flat).gaps, 0, '一步都没走 → 中位步速 0，不该把所有步都判成漂移');
+});
+
+test('detectGapSteps：折算口径只看前两条判据，沿跑道的长步也要报', () => {
+  // markGapJumps 带第三条横向闸门（视觉不断线），但距离虚高恰恰来自这类"沿跑道跳到前面"的步
+  const pts = makeTrack([...Array(8).fill(NORMAL), { m: 75, sec: 7 }, ...Array(8).fill(NORMAL)]);
+  assert.equal(markGapJumps(pts).gaps, 0, '同一份输入，视觉标记不标');
+  const { steps, medSpeed } = detectGapSteps(pts);
+  assert.equal(steps.length, 1, '但折算要看得到它');
+  assert.equal(steps[0].index, 9);
+  assert.ok(Math.abs(steps[0].distM - 75) < 1, `位移 ${steps[0].distM}`);
+  assert.ok(Math.abs(medSpeed - 2.4) < 0.1, `中位步速 ${medSpeed}`);
+  // 这 7s 人按自己节奏只能走 2.4×7 ≈ 16.8m，其余都是虚高
+  assert.ok(Math.abs(steps[0].plausibleM - medSpeed * 7) < 0.01);
+  assert.ok(steps[0].overM > 55 && steps[0].overM < 60, `虚高 ${steps[0].overM}`);
+});
+
+test('detectGapSteps：真实样本那 5 步全部报出，虚高合计约 328m', () => {
+  // 线上样本实测（本地副本 6ab9066c）：5 处沿跑道的长步，视觉一处都不标
+  const real = [at(75, 7, 1), at(96, 8, 5), at(66, 6, 6), at(66, 6, 11), at(112, 10, 3)];
+  const pts = makeTrack([
+    ...Array(8).fill(NORMAL),
+    real[0],
+    ...Array(4).fill(NORMAL),
+    real[1],
+    ...Array(4).fill(NORMAL),
+    real[2],
+    ...Array(4).fill(NORMAL),
+    real[3],
+    ...Array(4).fill(NORMAL),
+    real[4],
+    ...Array(8).fill(NORMAL),
+  ]);
+  const { steps, chordM, overM } = detectGapSteps(pts);
+  assert.equal(markGapJumps(pts).gaps, 0);
+  assert.equal(steps.length, 5);
+  const chord = Math.round(chordM);
+  assert.ok(chord > 400 && chord < 430, `弦合计 ${chord}m`);
+  const over = Math.round(overM);
+  assert.ok(over > 300 && over < 360, `虚高合计 ${over}m`);
+});
+
+test('detectGapSteps：点数不足或没走动时不判也不崩', () => {
+  assert.equal(detectGapSteps([]).steps.length, 0);
+  const flat = Array.from({ length: 6 }, (_, i) => ({ lat: 30.5, lng: 114.4, timestamp: i * 2000 }));
+  assert.equal(detectGapSteps(flat).steps.length, 0, '中位步速 0 时不该把所有步都算成虚高');
 });
 
 test('常量口径外露（供文档与前端对齐）', () => {

@@ -109,18 +109,43 @@ function crossOffsetM<T extends { lat: number; lng: number; timestamp?: number }
   return pre != null && post != null ? Math.min(pre, post) : null;
 }
 
+/** 一处采样断档：该步的实测位移 vs 按自己的节奏所能走出的距离 */
+export interface GapStep {
+  /** 落点在点数组里的下标 */
+  index: number;
+  /** 实测位移（米） */
+  distM: number;
+  /** 采样间隔（秒） */
+  dtSec: number;
+  /** 这段时间按全轨迹中位步速能走出的距离（米） */
+  plausibleM: number;
+  /** 虚高部分（米）= distM - plausibleM */
+  overM: number;
+}
+
+export interface GapStepReport {
+  steps: GapStep[];
+  medDt: number;
+  medSpeed: number;
+  /** 断档步实测位移合计（米） */
+  chordM: number;
+  /** 断档步按中位步速应有的距离合计（米） */
+  plausibleM: number;
+  /** 虚高合计（米） */
+  overM: number;
+}
+
 /**
- * 标记断档连线（不改点序、不改坐标、不删点，只加/清 gapJump 标记）
- * 入参上已有的 gapJump 一律先清再按本次结果重标，所以可重复跑（回填、重跑纠偏不会累积）。
+ * 判「采样断档步」：只看前两条判据（间隔被拉长 + 位移超出该间隔能走出的距离）。
+ * 这是**距离口径**用的：位置被报到前面，那段地面人当时没到过，里程却照记了。
+ * 视觉断线要在这之上再加第三条横向闸门（见 markGapJumps）——沿跑道把弯切了的步
+ * 线是贴着自己的轨迹的，不该断，但它的虚高照样要算。
  */
-export function markGapJumps<T extends GapPointLike>(points: T[]): GapResult<T> {
-  const rows = (points ?? []).map((p) => {
-    const copy = { ...p } as T & { gapJump?: true };
-    delete copy.gapJump;
-    return copy;
-  });
+export function detectGapSteps<T extends GapPointLike>(points: T[]): GapStepReport {
+  const rows = points ?? [];
   const n = rows.length;
-  if (n < 3) return { points: rows, gaps: 0, gapM: 0 };
+  const empty: GapStepReport = { steps: [], medDt: 0, medSpeed: 0, chordM: 0, plausibleM: 0, overM: 0 };
+  if (n < 3) return empty;
 
   const secs: number[] = [];
   const speeds: number[] = [];
@@ -133,22 +158,48 @@ export function markGapJumps<T extends GapPointLike>(points: T[]): GapResult<T> 
   }
   const medDt = median(secs);
   const medSpeed = median(speeds);
-  if (!secs.length || medSpeed <= 0) return { points: rows, gaps: 0, gapM: 0 };
+  if (!secs.length || medSpeed <= 0) return empty;
 
   const minSec = Math.max(medDt * GAP_SEC_MULT, GAP_MIN_SEC);
+  const steps: GapStep[] = [];
+  for (let i = 1; i < n; i++) {
+    const dtSec = ((rows[i].timestamp ?? 0) - (rows[i - 1].timestamp ?? 0)) / 1000;
+    if (dtSec < minSec) continue;
+    const distM = haversineDistance(rows[i - 1], rows[i]);
+    if (distM <= Math.max(GAP_MIN_M, medSpeed * dtSec * GAP_DIST_MULT)) continue;
+    const plausibleM = medSpeed * dtSec;
+    steps.push({ index: i, distM, dtSec, plausibleM, overM: Math.max(0, distM - plausibleM) });
+  }
+  return {
+    steps,
+    medDt,
+    medSpeed,
+    chordM: steps.reduce((a, s) => a + s.distM, 0),
+    plausibleM: steps.reduce((a, s) => a + s.plausibleM, 0),
+    overM: steps.reduce((a, s) => a + s.overM, 0),
+  };
+}
+
+/**
+ * 标记断档连线（不改点序、不改坐标、不删点，只加/清 gapJump 标记）
+ * 入参上已有的 gapJump 一律先清再按本次结果重标，所以可重复跑（回填、重跑纠偏不会累积）。
+ */
+export function markGapJumps<T extends GapPointLike>(points: T[]): GapResult<T> {
+  const rows = (points ?? []).map((p) => {
+    const copy = { ...p } as T & { gapJump?: true };
+    delete copy.gapJump;
+    return copy;
+  });
+  const det = detectGapSteps(rows);
   let gaps = 0;
   let gapM = 0;
-  for (let i = 1; i < n; i++) {
-    const dt = ((rows[i].timestamp ?? 0) - (rows[i - 1].timestamp ?? 0)) / 1000;
-    if (dt < minSec) continue;
-    const dist = haversineDistance(rows[i - 1], rows[i]);
-    if (dist <= Math.max(GAP_MIN_M, medSpeed * dt * GAP_DIST_MULT)) continue;
-    // 第 3 道闸：只有"横着离开原方向"的位移才值得断线；沿跑道把弯切了的那条弦照画
-    const cross = crossOffsetM(rows, i);
-    if (cross == null || cross <= Math.max(GAP_CROSS_MIN_M, medSpeed * dt * GAP_CROSS_MULT)) continue;
-    rows[i].gapJump = true;
+  for (const s of det.steps) {
+    // 第 3 道闸：只有"横着离开走廊"的位移才值得断线；沿跑道把弯切了的那条弦照画
+    const cross = crossOffsetM(rows, s.index);
+    if (cross == null || cross <= Math.max(GAP_CROSS_MIN_M, s.plausibleM * GAP_CROSS_MULT)) continue;
+    rows[s.index].gapJump = true;
     gaps += 1;
-    gapM += dist;
+    gapM += s.distM;
   }
   return { points: rows, gaps, gapM };
 }
