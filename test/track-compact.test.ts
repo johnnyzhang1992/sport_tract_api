@@ -23,6 +23,7 @@ function pipelinePoints(n = 50) {
       ...(i === 10 ? { pauseGap: true } : {}),
       ...(i === 20 ? { still: true } : {}),
       ...(i === 30 ? { vehicle: true } : {}),
+      ...(i === 40 ? { gapJump: true } : {}),
     });
   }
   return pts;
@@ -46,6 +47,8 @@ test('紧凑化：字段瘦身 + 相对时间 + 稀疏布尔', () => {
   assert.equal(compact[20].still, true);
   assert.equal(compact[30].vehicle, true);
   assert.ok(!('vehicle' in compact[0]));
+  assert.equal(compact[40].gapJump, true, '断档连线标记也要稀疏写入');
+  assert.ok(!('gapJump' in compact[0]));
   // 无 altitude/accuracy 的点省略字段
   const bare = compactTrackPoints([{ seq: 1, lat: 30.5, lng: 114.4, timestamp: START + 5000 }], START);
   assert.ok(!('altitude' in bare[0]) && !('accuracy' in bare[0]) && !('speed' in bare[0]));
@@ -64,6 +67,7 @@ test('往返：管线点 → 紧凑 → 归一化，与原点等价（时间可�
     assert.ok(Math.abs(restored[i].lat - smoothed[i].lat) < 1e-7, `点${i} 纬度 7 位内一致`);
     assert.equal(restored[i].pauseGap, smoothed[i].pauseGap === true);
     assert.equal(restored[i].vehicle, smoothed[i].vehicle === true);
+    assert.equal(restored[i].gapJump, smoothed[i].gapJump === true);
   }
 });
 

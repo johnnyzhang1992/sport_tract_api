@@ -4,6 +4,7 @@ import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
 import { markStandstill } from '../utils/standstill.js';
+import { markGapJumps } from '../utils/track-gap.js';
 import { markVehicle, formatVehicleNotice } from '../utils/vehicle.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
@@ -38,6 +39,8 @@ export interface TrackPointDto {
   still?: boolean;
   /** 非运动段点（疑似乘车，见 utils/vehicle.ts） */
   vehicle?: boolean;
+  /** 采样断档连线的落点（渲染时在此断开，见 utils/track-gap.ts）；不影响任何指标 */
+  gapJump?: boolean;
   timestamp: number;
 }
 
@@ -330,7 +333,9 @@ export async function finishActivity(
   const veh = markVehicle(smoothedPoints, activity.type);
   // 静止时段检测（自动暂停口径）：用户在原地没动但没点暂停的时间也不该计入运动时长。
   // 只在这里算一次并入库（duration / standstillMs / 点上的 still 标记），读接口不再重算。
-  const { points: markedPoints, standstillMs } = markStandstill(veh.points);
+  const { points: stillMarked, standstillMs } = markStandstill(veh.points);
+  // 采样断档连线（见 utils/track-gap.ts）：只打标，不删点、不改任何指标——渲染方遇到该标记就断开连线
+  const { points: markedPoints } = markGapJumps(stillMarked);
   // 运动时长 = 墙钟 − 手动暂停 − 判出的静止 − 判出的车速段（下限 0）
   const durationSec = Math.max(
     0,
@@ -474,7 +479,9 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
     const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
     const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
     const veh = markVehicle(smoothedPoints, activity.type);
-    const { points: markedPoints, standstillMs } = markStandstill(veh.points);
+    const { points: stillMarked, standstillMs } = markStandstill(veh.points);
+    // 采样断档连线（见 utils/track-gap.ts）：只打标，不删点、不改任何指标——渲染方遇到该标记就断开连线
+    const { points: markedPoints } = markGapJumps(stillMarked);
     const durationSec = Math.max(
       0,
       (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
@@ -529,12 +536,12 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
   return stale.length;
 }
 
-/** 预览点合并：均匀采样点 + 暂停断点按 seq 归并排序，断点优先（同 seq 覆盖）并保留 pauseGap 标 */
+/** 预览点合并：均匀采样点 + 断点（暂停 / 断档连线）按 seq 归并排序，断点优先（同 seq 覆盖）并保留标记 */
 function mergePreviewPoints(
   sampled: Array<Record<string, any>>,
   gaps: Array<Record<string, any>>,
-): Array<{ lat: number; lng: number; pauseGap?: boolean }> {
-  const bySeq = new Map<number, { lat: number; lng: number; pauseGap?: boolean }>();
+): Array<{ lat: number; lng: number; pauseGap?: true; gapJump?: true }> {
+  const bySeq = new Map<number, { lat: number; lng: number; pauseGap?: true; gapJump?: true }>();
   for (const p of sampled ?? []) {
     if (p && typeof p.seq === 'number' && Number.isFinite(p.lat) && Number.isFinite(p.lng)) {
       bySeq.set(p.seq, { lat: p.lat, lng: p.lng });
@@ -542,7 +549,13 @@ function mergePreviewPoints(
   }
   for (const g of gaps ?? []) {
     if (g && typeof g.seq === 'number' && Number.isFinite(g.lat) && Number.isFinite(g.lng)) {
-      bySeq.set(g.seq, { lat: g.lat, lng: g.lng, pauseGap: true });
+      const flags: { lat: number; lng: number; pauseGap?: true; gapJump?: true } = {
+        lat: g.lat,
+        lng: g.lng,
+      };
+      if (g.pauseGap === true) flags.pauseGap = true;
+      if (g.gapJump === true) flags.gapJump = true;
+      bySeq.set(g.seq, flags);
     }
   }
   return [...bySeq.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
@@ -638,12 +651,27 @@ export async function listActivities(
               },
             },
           },
-          // 暂停断点全量带出（数量少）：均匀采样会丢掉 pauseGap 标，与采样点按 seq 合并后段首重打标
+          // 断点全量带出（数量少）：均匀采样会丢失标记点，与采样点按 seq 合并后段首重打标
+          // pauseGap=暂停间隙、gapJump=采样断档连线（斜穿弦），两者都要求渲染处断开
           gapPoints: {
             $map: {
-              input: { $filter: { input: '$trackPoints', as: 'tp', cond: { $eq: ['$$tp.pauseGap', true] } } },
+              input: {
+                $filter: {
+                  input: '$trackPoints',
+                  as: 'tp',
+                  cond: {
+                    $or: [{ $eq: ['$$tp.pauseGap', true] }, { $eq: ['$$tp.gapJump', true] }],
+                  },
+                },
+              },
               as: 'g',
-              in: { seq: '$$g.seq', lat: '$$g.lat', lng: '$$g.lng', pauseGap: true },
+              in: {
+                seq: '$$g.seq',
+                lat: '$$g.lat',
+                lng: '$$g.lng',
+                pauseGap: { $ifNull: ['$$g.pauseGap', false] },
+                gapJump: { $ifNull: ['$$g.gapJump', false] },
+              },
             },
           },
         },
@@ -653,7 +681,7 @@ export async function listActivities(
 
   // 预览点后处理：
   // - 空轨迹置空（聚合 $ifNull 兜底会对空数组产生 60 个 (0,0) 填充点）
-  // - 合并暂停断点，保证缩略图暂停间隙断开（与 overview 切段保标口径一致）
+  // - 合并断点（暂停间隙 / 断档连线），保证缩略图在不可信连线处断开（与 overview 切段保标口径一致）
   for (const item of items as Array<Record<string, any>>) {
     if (!item.pointsCount) {
       item.previewPoints = [];
@@ -715,7 +743,9 @@ export async function reprocessActivity(
   const altitudeCleaned = cleanAltitudeSpikes(raw);
   const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
   const smoothed = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-  const storedPoints = compactTrackPoints(smoothed, activity.startTime);
+  // 重跑纠偏同样要重打断档标记（markGapJumps 会先清旧标，不会累积）
+  const { points: gapMarked } = markGapJumps(smoothed);
+  const storedPoints = compactTrackPoints(gapMarked, activity.startTime);
   const stats = calcStats(storedPoints, {
     type: activity.type,
     durationSec: activity.duration ?? 0,

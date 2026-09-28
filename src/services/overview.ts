@@ -19,6 +19,7 @@ const RANGE_DAYS: Record<OverviewRange, number | null> = {
 
 export interface OverviewPoint extends LatLng {
   pauseGap?: boolean; // 暂停恢复后首个有效点（前端渲染时断开连线）
+  gapJump?: boolean; // 采样断档连线的落点（同样断开，见 utils/track-gap.ts）
 }
 
 export interface OverviewTrack {
@@ -92,6 +93,7 @@ export async function getOverview(
     select['trackPoints.lat'] = 1;
     select['trackPoints.lng'] = 1;
     select['trackPoints.pauseGap'] = 1;
+    select['trackPoints.gapJump'] = 1;
   }
   const activities = await ActivityModel.find(query)
     .select(select)
@@ -127,28 +129,30 @@ export async function getOverview(
   // 按轨迹抽稀：轨迹越多，每轨迹点越少（全局预算 3000）
   const rawTracks: OverviewPoint[][] = activities.map(
     (a) =>
-      ((a.trackPoints ?? []) as Array<{ lat?: number; lng?: number; pauseGap?: boolean }>)
+      ((a.trackPoints ?? []) as Array<{ lat?: number; lng?: number; pauseGap?: boolean; gapJump?: boolean }>)
         .filter((p) => p && typeof p.lat === 'number' && typeof p.lng === 'number')
         .map((p) => ({
           lat: p.lat as number,
           lng: p.lng as number,
           ...(p.pauseGap ? { pauseGap: true } : {}),
+          ...(p.gapJump ? { gapJump: true } : {}),
         })),
   );
 
-  // 按 pauseGap 切段（暂停间隙不连线）：所有轨迹的段合成一个数组过同一套抽稀（保全局预算），
-  // 抽稀后再拼回各轨迹，段首重新打 pauseGap 标记（前端按标记断开连线）
-  const segments: { owner: number; pts: OverviewPoint[] }[] = [];
+  // 按「不可信连线」切段：pauseGap（手动暂停）与 gapJump（采样断档连线，见 utils/track-gap.ts）
+  // 都在标记点前断开。所有轨迹的段合成一个数组过同一套抽稀（保全局预算），抽稀后再拼回各轨迹，
+  // 段首重新打上原来的标记（前端按标记断开连线）
+  const segments: { owner: number; pts: OverviewPoint[]; head: OverviewPoint }[] = [];
   activities.forEach((_, i) => {
     const raw = rawTracks[i];
     let start = 0;
     for (let j = 1; j < raw.length; j++) {
-      if (raw[j].pauseGap && j > start) {
-        segments.push({ owner: i, pts: raw.slice(start, j) });
+      if ((raw[j].pauseGap || raw[j].gapJump) && j > start) {
+        segments.push({ owner: i, pts: raw.slice(start, j), head: raw[j] });
         start = j;
       }
     }
-    if (start < raw.length) segments.push({ owner: i, pts: raw.slice(start) });
+    if (start < raw.length) segments.push({ owner: i, pts: raw.slice(start), head: raw[start] });
   });
   const simplifiedSegs = simplifyTracks(
     segments.map((s) => s.pts),
@@ -160,14 +164,24 @@ export async function getOverview(
     const seg = segRaw as OverviewPoint[];
     if (seg.length === 0) return;
     const out = tracks[segments[k].owner];
-    if (out.length > 0) out.push({ ...seg[0], pauseGap: true });
-    else out.push(seg[0]);
+    if (out.length > 0) {
+      const head = segments[k].head;
+      out.push({
+        ...seg[0],
+        ...(head.pauseGap ? { pauseGap: true } : {}),
+        ...(head.gapJump ? { gapJump: true } : {}),
+      });
+    } else out.push(seg[0]);
     for (let j = 1; j < seg.length; j++) out.push(seg[j]);
   });
   const heat = gridHeat(rawTracks, 150, 200);
 
   // 卡片缩略图点：与 /activities 列表 previewPoints 同口径（均匀采样 60 点 + 暂停断点全量补回），
   // 保证轨迹列表与轨迹合集两处缩略图形状一致；地图渲染仍用上面的保形抽稀点
+  const flagsOf = (p: OverviewPoint) => ({
+    ...(p.pauseGap ? { pauseGap: true } : {}),
+    ...(p.gapJump ? { gapJump: true } : {}),
+  });
   const previewPointsOf = (raw: OverviewPoint[]) => {
     const n = raw.length;
     if (n === 0) return [];
@@ -176,11 +190,11 @@ export async function getOverview(
     for (let i = 0; i < 60; i++) {
       const idx = Math.min(n - 1, Math.floor(i * step));
       const p = raw[idx];
-      byIdx.set(idx, { lat: p.lat, lng: p.lng, ...(p.pauseGap ? { pauseGap: true } : {}) });
+      byIdx.set(idx, { lat: p.lat, lng: p.lng, ...flagsOf(p) });
     }
-    // 断点全量补回（数量少）：采样会丢 pauseGap 标，同 idx 时断点优先
+    // 断点全量补回（数量少）：采样会丢标记，同 idx 时断点优先
     raw.forEach((p, idx) => {
-      if (p.pauseGap) byIdx.set(idx, { lat: p.lat, lng: p.lng, pauseGap: true });
+      if (p.pauseGap || p.gapJump) byIdx.set(idx, { lat: p.lat, lng: p.lng, ...flagsOf(p) });
     });
     return [...byIdx.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
   };

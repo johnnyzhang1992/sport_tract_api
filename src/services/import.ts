@@ -10,6 +10,7 @@ import { compactTrackPoints } from '../utils/track-compact.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance, type TrackPointLike } from '../utils/pace.js';
 import { markStandstill } from '../utils/standstill.js';
+import { markGapJumps } from '../utils/track-gap.js';
 import { markVehicle } from '../utils/vehicle.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { wgs84ToGcj02 } from '../utils/coordinate.js';
@@ -292,9 +293,12 @@ export async function importActivity(
   const veh = markVehicle(points, type);
   // 与 finish 共用静止剔除口径（见 utils/standstill.ts）：导入文件没有暂停语义，
   // 若不剔，同一条徒步「导进来 = 墙钟、App 里录 = 净时长」两条路径永远对不上。
-  const { points: markedPoints, standstillMs } = markStandstill(veh.points);
+  const { points: stillMarked, standstillMs } = markStandstill(veh.points);
   const wallSec = (endTime - startTime) / 1000;
   const durationSec = Math.max(1, Math.round(wallSec - standstillMs / 1000 - veh.vehicleMs / 1000));
+  // 采样断档连线打标（与 finish 同口径，见 utils/track-gap.ts）：第三方文件粗采样很常见，
+  // 只打标让渲染端断开连线，距离/时长一律不改（导入本来就只是把别人的点搬进来）
+  const { points: markedPoints } = markGapJumps(stillMarked);
   // 先紧凑化再算指标：与 finish 同口径（落库值 = 基于落库点重算的值）
   const storedPoints = compactTrackPoints(markedPoints, startTime);
   const stats = calcStats(storedPoints, {

@@ -19,6 +19,7 @@ const trackPointSchema = new Schema(
     pauseGap: { type: Boolean, default: false }, // 暂停恢复后首个有效点（渲染时断开连线）
     still: { type: Boolean, default: false }, // 静止时段检测标出的点（finish 时算，见 utils/standstill.ts）
     vehicle: { type: Boolean, default: false }, // 非运动段检测标出的点，疑似乘车（见 utils/vehicle.ts）
+    gapJump: { type: Boolean, default: false }, // 采样断档连线的落点（渲染时在此断开，见 utils/track-gap.ts）
     timestamp: { type: Number, required: true },
   },
   { _id: false },

@@ -862,6 +862,52 @@ test('列表 previewPoints：暂停断点（pauseGap）不被均匀采样丢失'
   await ActivityModel.deleteOne({ _id: id });
 });
 
+test('列表 previewPoints：断档连线（gapJump）不被均匀采样丢失', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 201 点直线（2s / 2.2m ≈1.1m/s 向北），第 101→102 点采样断档 10s 却**横着**蹦了 89m
+  //（横向才断线：沿跑道把弯切了的那种同向长步，断开只会在正常线上挖洞）
+  const pts: Array<Record<string, unknown>> = [];
+  let lat = 31.2304;
+  let lng = 121.4737;
+  let t = TEST_NOW - 420000;
+  for (let seq = 1; seq <= 201; seq++) {
+    pts.push({ seq, lat, lng, altitude: null, speed: null, timestamp: t });
+    if (seq === 101) lng += 89 / (111320 * Math.cos((lat * Math.PI) / 180));
+    else lat += 2.2 / 111320;
+    t += (seq === 101 ? 10 : 2) * 1000;
+  }
+  const finished = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: pts, endTime: TEST_NOW, pausedMs: 0 },
+  });
+  // 夹具自检：管线确实判出了 1 处断档（否则下面的列表断言是假绿）
+  const detailPts = finished.json().data.activity.trackPoints as Array<{ gapJump?: boolean }>;
+  assert.equal(
+    detailPts.filter((p) => p.gapJump === true).length,
+    1,
+    '夹具应让 finish 管线恰好标出 1 个 gapJump 点',
+  );
+
+  const list = await req('GET', '/sport-track/api/activities?pageSize=100', { token: tokenA });
+  const item = list.json().data.items.find((i: { _id: string }) => String(i._id) === id);
+  assert.ok(item, 'finished 活动应在列表');
+  const pp = item.previewPoints;
+  assert.ok(pp.length >= 60 && pp.length <= 70, `预览点数异常: ${pp.length}`);
+  const jumps = pp.filter((p: { gapJump?: boolean }) => p.gapJump === true);
+  assert.equal(jumps.length, 1, '断档点应随预览点带出且不重复');
+  assert.equal(pp.filter((p: { pauseGap?: boolean }) => p.pauseGap === true).length, 0, '不该有暂停标');
+  // 断档点坐标来自横穿的落点（lng 被推走 89m），而非邻近的均匀采样点
+  assert.ok(
+    jumps[0].lng > 121.4745 && jumps[0].lng < 121.4755,
+    `断点坐标应来自横穿落点，实际 lng=${jumps[0].lng}`,
+  );
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('列表 previewPoints：空轨迹不产生 (0,0) 填充点', async () => {
   // 注：finish 现在会作废空轨迹（点数守卫），这里直接在库内造 finished 空轨迹
   //（覆盖列表聚合对异常存量数据的防御分支）
