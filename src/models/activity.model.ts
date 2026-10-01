@@ -47,6 +47,9 @@ const activitySchema = new Schema(
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     type: { type: String, enum: ACTIVITY_TYPES, required: true },
     status: { type: String, enum: ACTIVITY_STATUS, default: 'in_progress', index: true },
+    // 轨迹是否已纠偏：finish 落库原始点默认 false；用户点「纠偏」跑管线后置 true。
+    // 2026-09-27 前的旧轨迹经自动管线落库，默认视为已纠偏
+    corrected: { type: Boolean, default: true },
 
     startTime: { type: Number, required: true },
     endTime: { type: Number, default: null },

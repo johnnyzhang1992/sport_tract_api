@@ -13,6 +13,7 @@ import { markFootprintDirty } from './footprint.js';
 import { provincesOfPoints } from './region.js';
 import { monthlyAggForMonths, type ActivityMonthlyRow } from './stats.js';
 import { compactTrackPoints, normalizeTrackPoints } from '../utils/track-compact.js';
+import { TYPE_CONFIGS, DEFAULT_TYPE_CONFIG } from '../utils/trajectory-clean.js';
 import { deleteOssObjects, cleanUrl } from './oss.js';
 import { resolveWeightKg } from './weight.js';
 import type {
@@ -62,6 +63,8 @@ export interface ActivityDto {
   id: string;
   type: string;
   status: string;
+  /** 轨迹是否已纠偏：false = 存的是原始点（纠偏权在用户） */
+  corrected: boolean;
   startTime: number;
   endTime: number | null;
   duration: number;
@@ -136,6 +139,7 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     vehicleM: doc.vehicleM ?? 0,
     vehicleNotice: formatVehicleNotice(doc.trackPoints, doc.vehicleMs, doc.vehicleM),
     note: doc.note ?? '',
+    corrected: doc.corrected ?? true, // 2026-09-27 前的旧轨迹无字段：均经自动管线落库，视为已纠偏；新 finish 落库显式写 false
     trackPoints: normalizeTrackPoints(doc.trackPoints, doc.startTime),
     markers: doc.markers ?? [],
     createdAt: doc.createdAt?.toISOString?.() ?? '',
@@ -258,7 +262,13 @@ export async function addMarker(
  *   自动作废（cancelled）不保存，返回 reason=TOO_FEW_POINTS / DISTANCE_TOO_SHORT
  * - 幂等：已 finished 直接返回当前活动（防客户端重试）
  */
-export type FinishInvalidReason = 'TOO_FEW_POINTS' | 'DISTANCE_TOO_SHORT';
+
+/** 该运动类型的物理速度上限（m/s）：取类型配置的绝对超速阈值 */
+function typeMaxAbsSpeed(type: string): number {
+  return (TYPE_CONFIGS[type] ?? DEFAULT_TYPE_CONFIG).maxAbsSpeed;
+}
+
+export type FinishInvalidReason = 'TOO_FEW_POINTS' | 'DISTANCE_TOO_SHORT' | 'IMPOSSIBLE_SPEED';
 
 export interface FinishActivityResult {
   status: string;
@@ -266,6 +276,10 @@ export interface FinishActivityResult {
   activity: ActivityDto;
   /** 轨迹无效作废原因（status=cancelled 时存在） */
   reason?: FinishInvalidReason;
+  /** 纠偏前统计：管线预检出的可疑定位点数（前端引导纠偏用） */
+  suspiciousPoints?: number;
+  /** 纠偏后距离预估（米），未纠偏展示用 */
+  projectedDistanceM?: number;
 }
 
 export async function finishActivity(
@@ -318,66 +332,88 @@ export async function finishActivity(
     .filter((t) => t > 0);
   const endTime = validTs.length > 0 ? Math.max(...validTs) : (input.endTime ?? Date.now());
 
-  // 海拔尖刺清洗（GPS 误差：短时间大幅跳变且方向反转 → 海拔置 null）
-  const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
+  // 运动时长 = 墙钟 − 手动暂停（下限 0）。原始口径：静止/车速段的修正在纠偏时才发生
+  const durationSec = Math.max(0, (endTime - activity.startTime - input.pausedMs) / 1000);
 
-  // 轨迹纠偏（决策：GPS 漂移点剔除）—— 尖刺点（短时高速来回跳）与孤立离群点
-  const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
+  // 存储距离口径 = 客户端 tracker 实时累加值（用户运动时看到的数字）；
+  // 客户端未传（旧版本）时退化为服务端按原始点直算（Haversine 累加）
+  let storedDistance = input.clientDistance;
+  if (storedDistance == null) {
+    let d = 0;
+    for (let i = 1; i < trackPoints.length; i++) d += haversineDistance(trackPoints[i - 1], trackPoints[i]);
+    storedDistance = Math.round(d);
+  }
 
-  // 轨迹平滑（滑动平均 + 位移守卫）：抑制 GPS 抖动，端点保持，位移过大回退原值
-  const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-
-  // 非运动段检测（疑似乘车，见 utils/vehicle.ts）：跑步/徒步途中搭车、推车、坐摆渡车的那段
-  // 既不是自己动的、又会把 GPS 噪声"运"出真实位移，位移与时长一起从指标里剔掉。
-  // 必须在静止检测之前跑——两者判据互斥（车速段不可能落在 10m 停留圈内），链接起来一次打标。
-  const veh = markVehicle(smoothedPoints, activity.type);
-  // 静止时段检测（自动暂停口径）：用户在原地没动但没点暂停的时间也不该计入运动时长。
-  // 只在这里算一次并入库（duration / standstillMs / 点上的 still 标记），读接口不再重算。
-  const { points: stillMarked, standstillMs } = markStandstill(veh.points);
-  // 采样断档连线（见 utils/track-gap.ts）：只打标，不删点、不改任何指标——渲染方遇到该标记就断开连线
-  const { points: markedPoints } = markGapJumps(stillMarked);
-  // 运动时长 = 墙钟 − 手动暂停 − 判出的静止 − 判出的车速段（下限 0）
-  const durationSec = Math.max(
-    0,
-    (endTime - activity.startTime - input.pausedMs - standstillMs - veh.vehicleMs) / 1000,
-  );
-  // 先紧凑化再算指标：落库值 = 基于落库点重算的值（惰性补算/重算永远与存储自洽）
-  const storedPoints = compactTrackPoints(markedPoints, activity.startTime);
-  const stats = calcStats(storedPoints, {
-    type: activity.type,
-    durationSec,
-    weightKg: await resolveWeightKg(activity.userId),
-  });
-
-  // 无效运动守卫：点数过少（单点无位移/两点成假直线）或重算距离过短
-  // （原地不动结束/漂移点全被清洗）→ 自动作废不保存，
-  // 避免无意义轨迹进入列表与统计（原始点仍入库留底，仅状态不可见）
+  // 无效运动守卫（极简版，不跑管线）：
+  // - 点数过少：单点无位移/两点成假直线
+  // - 距离过短：原地不动结束（原始口径下也必然不足）
+  // - 记录跨度内平均速度超骑行上限（如全程车内 GPS 漂移注水）：拦住这类垃圾轨迹。
+  //   速度分母用「首尾点时间差」（实际记录跨度）而非墙钟——用户坐车到达起点再开始记录，
+  //   墙钟含车程，会把正常运动误判成超速
   const tooFewPoints = trackPoints.length < MIN_EFFECTIVE_POINTS;
-  if (tooFewPoints || stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
+  const tooShort = storedDistance < MIN_EFFECTIVE_DISTANCE_M;
+  // 平均速度用「步长速度的中位数」（抗抖动点干扰：单点大跳不抬高中位数；全程车内时中位数照样超限）
+  const stepSpeeds: number[] = [];
+  for (let i = 1; i < trackPoints.length; i++) {
+    const dt = (trackPoints[i].timestamp - trackPoints[i - 1].timestamp) / 1000;
+    if (dt > 0) stepSpeeds.push(haversineDistance(trackPoints[i - 1], trackPoints[i]) / dt);
+  }
+  stepSpeeds.sort((a, b) => a - b);
+  const medStepSpeed = stepSpeeds.length > 0 ? stepSpeeds[Math.floor(stepSpeeds.length / 2)] : 0;
+  if (tooFewPoints || tooShort || medStepSpeed > typeMaxAbsSpeed(activity.type)) {
+    const reason = tooFewPoints
+      ? 'TOO_FEW_POINTS'
+      : tooShort
+        ? 'DISTANCE_TOO_SHORT'
+        : 'IMPOSSIBLE_SPEED';
     const cancelled = await ActivityModel.findByIdAndUpdate(
       activityId,
       {
         $set: {
           status: 'cancelled',
           endTime,
-          trackPoints,
+          trackPoints: compactTrackPoints(trackPoints, activity.startTime),
           markers: input.markers ?? activity.markers ?? [],
           pausedMs: input.pausedMs,
           duration: Math.round(durationSec),
-          distance: stats.distance,
+          distance: storedDistance,
+          corrected: false, // cancelled 轨迹保存原始点，若允许纠偏应从未纠偏状态开始
         },
       },
       { returnDocument: 'after' },
     );
     return {
-      status: 'cancelled',
+      status: cancelled!.status,
       lastPointSeq: cancelled!.lastPointSeq,
       activity: toActivityDto(cancelled!.toObject()),
-      reason: tooFewPoints ? 'TOO_FEW_POINTS' : 'DISTANCE_TOO_SHORT',
+      reason,
     };
   }
 
-  // 轨迹内最快 1km 分段（个人最佳"最快配速"口径：分段最快，非全程平均）
+  // 落库点先紧凑化（存储口径）
+  const storedPoints = compactTrackPoints(trackPoints, activity.startTime);
+
+  // 原始口径的爬升/海拔极值/卡路里：复用 calcStats（其爬升算法含 EMA+滞回，不宜复制），
+  // 距离字段不采用（存储距离 = tracker 口径）
+  const weightKg = await resolveWeightKg(activity.userId);
+  const rawStats = calcStats(storedPoints, {
+    type: activity.type,
+    durationSec,
+    weightKg,
+  });
+
+  // ===== 纠偏前统计：管线跑一遍但不落库，仅产出「可疑点数」供前端引导（存储距离/时长保持原始口径） =====
+  const altitudeCleaned = cleanAltitudeSpikes(storedPoints as never);
+  const trajectoryCleaned = cleanTrajectory(altitudeCleaned as never, {}, activity.type);
+  const smoothedPoints = smoothTrackSmart(trajectoryCleaned as never, 5, haversineDistance);
+  const suspiciousPoints = storedPoints.length - smoothedPoints.length;
+  const projected = calcStats(smoothedPoints as never, {
+    type: activity.type,
+    durationSec,
+    weightKg,
+  });
+
+  // 轨迹内最快 1km 分段（个人最佳"最快配速"口径）：基于原始存储点（未纠偏口径）
   const fastestKm = calcFastestKm(storedPoints, activity.type);
   // 落库省市（按省查询轨迹 + 点亮地图省下钻）
   const regions = provincesOfPoints(storedPoints);
@@ -397,17 +433,16 @@ export async function finishActivity(
         startCity: regions.startCity,
         pausedMs: input.pausedMs,
         duration: Math.round(durationSec),
-        standstillMs: Math.round(standstillMs),
-        vehicleMs: Math.round(veh.vehicleMs),
-        vehicleM: Math.round(veh.vehicleM),
-        distance: stats.distance,
-        avgPace: stats.avgPace,
+        distance: storedDistance,
+        avgPace: durationSec > 0 && storedDistance > 0 ? durationSec / (storedDistance / 1000) : null,
         fastestKm,
-        calories: stats.calories,
-        elevationGain: stats.elevationGain,
-        minAltitude: stats.minAltitude,
-        maxAltitude: stats.maxAltitude,
-        lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
+        calories: rawStats.calories,
+        elevationGain: rawStats.elevationGain,
+        minAltitude: rawStats.minAltitude,
+        maxAltitude: rawStats.maxAltitude,
+        lastPointSeq: trackPoints.length > 0 ? trackPoints[trackPoints.length - 1].seq : 0,
+        corrected: false, // 落库原始点，纠偏权在用户
+        suspiciousPoints, // 供前端引导：「检测到 X 个可疑定位点」
       },
     },
     { returnDocument: 'after' },
@@ -415,10 +450,15 @@ export async function finishActivity(
 
   await markFootprintDirty(String(activity.userId)); // 足迹失效，下次读取重算
 
+  // 可疑点投影距离（纠偏后距离的预估，前端确认弹窗展示）
+  void projected;
+
   return {
     status: 'finished',
     lastPointSeq: updated!.lastPointSeq,
     activity: toActivityDto(updated!.toObject()),
+    suspiciousPoints,
+    projectedDistanceM: projected.distance,
   };
 }
 
@@ -512,6 +552,7 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
           status: 'finished',
           endTime,
           trackPoints: storedPoints,
+          corrected: true, // 无人值守收尾：自动管线清好（用户不在场，无纠偏选择权）
           provinces: regions.provinces,
           startProvince: regions.startProvince,
           startCity: regions.startCity,
@@ -734,7 +775,7 @@ export async function getActivityDetailView(
 export async function reprocessActivity(
   activityId: ObjectIdLike,
   userId: string,
-): Promise<ActivityDto> {
+): Promise<ActivityDto & { suspiciousPoints: number }> {
   const activity = await findOwnedActivity(activityId, userId);
   const raw = (activity.trackPoints ?? []) as TrackPointDto[];
   if (raw.length === 0) {
@@ -743,12 +784,20 @@ export async function reprocessActivity(
   const altitudeCleaned = cleanAltitudeSpikes(raw);
   const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
   const smoothed = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-  // 重跑纠偏同样要重打断档标记（markGapJumps 会先清旧标，不会累积）
-  const { points: gapMarked } = markGapJumps(smoothed);
+  // 非运动段/静止段随纠偏重打标（用户主动纠偏 = 接受这类修正）
+  const veh = markVehicle(smoothed, activity.type);
+  const { points: stillMarked, standstillMs } = markStandstill(veh.points);
+  const { points: gapMarked } = markGapJumps(stillMarked);
   const storedPoints = compactTrackPoints(gapMarked, activity.startTime);
+  // 纠偏后时长口径：墙钟 − 手动暂停 − 判出的静止 − 判出的车速段
+  const endMs = activity.endTime ?? (raw.length ? raw[raw.length - 1].timestamp ?? activity.startTime : activity.startTime);
+  const durationSec = Math.max(
+    0,
+    (endMs - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
+  );
   const stats = calcStats(storedPoints, {
     type: activity.type,
-    durationSec: activity.duration ?? 0,
+    durationSec,
     weightKg: await resolveWeightKg(activity.userId),
   });
   const fastestKm = calcFastestKm(storedPoints, activity.type);
@@ -762,6 +811,11 @@ export async function reprocessActivity(
         provinces: regions.provinces,
         startProvince: regions.startProvince,
         startCity: regions.startCity,
+        duration: Math.round(durationSec),
+        standstillMs: Math.round(standstillMs),
+        vehicleMs: Math.round(veh.vehicleMs),
+        vehicleM: Math.round(veh.vehicleM),
+        corrected: true,
         distance: stats.distance,
         avgPace: stats.avgPace,
         fastestKm,
@@ -774,7 +828,11 @@ export async function reprocessActivity(
     },
     { returnDocument: 'after' },
   );
-  return toActivityDto(updated!.toObject());
+  const before = { length: raw.length };
+  return {
+    ...toActivityDto(updated!.toObject()),
+    suspiciousPoints: before.length - storedPoints.length,
+  };
 }
 
 /** 更新活动信息（类型/备注；类型变化时重算配速/卡路里） */

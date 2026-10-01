@@ -30,8 +30,8 @@ import {
   UpdateMarkerSchema,
 } from '../utils/validators.js';
 
-/** 轨迹新增防刷：1 小时滑动窗口内最多创建 10 条，超出拒绝（冻结 1 小时） */
-const CREATE_LIMIT = 10;
+/** 轨迹新增防刷：1 小时滑动窗口内最多创建 10 条，超出拒绝（冻结 1 小时）；测试环境豁免 */
+const CREATE_LIMIT = process.env.WX_MOCK_LOGIN === 'true' && process.env.NODE_ENV !== 'production' ? 100000 : 10;
 const CREATE_WINDOW_MS = 3600000;
 
 async function assertCanCreate(userId: string) {
@@ -170,8 +170,9 @@ export async function activityRoutes(fastify: FastifyInstance) {
   // 重新纠偏（事后清洗历史轨迹）
   fastify.post('/:id/reprocess', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id } = request.params as { id: string };
-    const activity = await reprocessActivity(id, request.user.userId);
-    return success({ activity }, '已重新纠偏');
+    const result = await reprocessActivity(id, request.user.userId);
+    const { suspiciousPoints, ...activity } = result;
+    return success({ activity, suspiciousPoints }, '已重新纠偏');
   });
 
   // 更新活动信息（类型/备注）

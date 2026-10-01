@@ -113,6 +113,8 @@ export const UpdateMarkerSchema = z.object({
 /** 结束活动（final 包，服务端对账） */
 export const FinishActivitySchema = z.object({
   trackPoints: z.array(TrackPointSchema).max(20000, '轨迹点超出上限'),
+  // 客户端 tracker 实时累加的距离（米）：存储口径即客户端口径，纠偏前不变
+  clientDistance: z.number().min(0).optional(),
   markers: z.array(CreateMarkerSchema).optional(),
   startAddress: z.string().max(200).optional().default(''),
   endAddress: z.string().max(200).optional().default(''),
