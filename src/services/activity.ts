@@ -3,7 +3,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
-import { markStandstill } from '../utils/standstill.js';
+import { markStandstill, shrinkStillSegments } from '../utils/standstill.js';
 import { markGapJumps } from '../utils/track-gap.js';
 import { markVehicle, formatVehicleNotice } from '../utils/vehicle.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
@@ -774,9 +774,13 @@ export async function getActivityDetailView(
 /** 重新纠偏：对已完成活动重跑 海拔清洗→轨迹纠偏→平滑→重算指标（决策：事后清洗历史脏数据） */
 export async function reprocessActivity(
   activityId: ObjectIdLike,
-  userId: string,
+  userId: string | null,
 ): Promise<ActivityDto & { suspiciousPoints: number }> {
-  const activity = await findOwnedActivity(activityId, userId);
+  // userId=null 时跳过归属校验（admin 跨用户纠偏用）；体重口径仍按轨迹 owner 的档案
+  const activity = userId
+    ? await findOwnedActivity(activityId, userId)
+    : await ActivityModel.findById(activityId).lean();
+  if (!activity) throw new AppError(404, '活动不存在');
   const raw = (activity.trackPoints ?? []) as TrackPointDto[];
   if (raw.length === 0) {
     throw new AppError(400, '轨迹点为空');
@@ -788,19 +792,22 @@ export async function reprocessActivity(
   const veh = markVehicle(smoothed, activity.type);
   const { points: stillMarked, standstillMs } = markStandstill(veh.points);
   const { points: gapMarked } = markGapJumps(stillMarked);
-  const storedPoints = compactTrackPoints(gapMarked, activity.startTime);
+  const fullPoints = compactTrackPoints(gapMarked, activity.startTime);
   // 纠偏后时长口径：墙钟 − 手动暂停 − 判出的静止 − 判出的车速段
   const endMs = activity.endTime ?? (raw.length ? raw[raw.length - 1].timestamp ?? activity.startTime : activity.startTime);
   const durationSec = Math.max(
     0,
     (endMs - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
   );
-  const stats = calcStats(storedPoints, {
+  // 指标基于「收缩前」的全量点算（无损）：静止段收缩只影响存储密度（渲染/回放），
+  // 不改变距离/配速等指标——收缩是有损的，先收缩再算会丢掉段内微位移
+  const stats = calcStats(fullPoints, {
     type: activity.type,
     durationSec,
     weightKg: await resolveWeightKg(activity.userId),
   });
-  const fastestKm = calcFastestKm(storedPoints, activity.type);
+  const fastestKm = calcFastestKm(fullPoints, activity.type);
+  const storedPoints = shrinkStillSegments(fullPoints);
   // 纠偏后轨迹点变化 → 重算省市并更新
   const regions = provincesOfPoints(smoothed);
   const updated = await ActivityModel.findByIdAndUpdate(

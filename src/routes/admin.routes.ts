@@ -19,7 +19,7 @@ import {
   adminGetFootprintById,
   deleteFootprintById,
 } from '../services/footprint-record.js';
-import { autoFinishStaleActivities, toActivityDto } from '../services/activity.js';
+import { autoFinishStaleActivities, toActivityDto, reprocessActivity } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import {
   adminListTopics,
@@ -778,6 +778,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
       last180Days: stats[2],
       total: stats[3],
     });
+  });
+
+  // 跨用户轨迹纠偏（重跑清洗管线：静止收缩/精度因子等），管理员手动触发
+  fastify.post('/activities/:id/reprocess', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const result = await reprocessActivity(id, null);
+    return success({ activity: result, suspiciousPoints: result.suspiciousPoints }, '已重新纠偏');
   });
 
   // 轨迹列表（含用户昵称；支持 类型/状态/距离/时长/用户昵称 筛选 + 距离/时长排序）

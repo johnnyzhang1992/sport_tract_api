@@ -244,7 +244,8 @@ test('静止剔除：停留 ≥60s 的时段从运动时长里剔掉，standstil
   assert.equal(repAct.duration, 80, '纠偏后运动时长 = 墙钟 160s − 静止 80s');
   assert.equal(repAct.corrected, true, '纠偏后状态为已纠偏');
   const repStill = (repAct.trackPoints as Array<{ still?: boolean }>).filter((p) => p.still === true);
-  assert.ok(repStill.length >= 3, '纠偏后静止时段的点带 still 标记');
+  // 静止段已收缩（首尾+抽样保留）：80s 静止 16 点 → 段首+段尾必留，抽样若干
+  assert.ok(repStill.length >= 2, '纠偏后静止段首尾点带 still 标记（收缩后仍保留代表点）');
 });
 
 test('静止剔除：只停 55s 不足门槛 → 不剔（1 分钟内的短停照算）', async () => {

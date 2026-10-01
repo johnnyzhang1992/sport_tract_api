@@ -114,3 +114,37 @@ export function markStandstill<T extends TrackPointLike>(points: T[]): Standstil
 
   return { points: out, standstillMs, spans };
 }
+
+/** —— 静止段收缩（纠偏管线用）——
+ * 连续 still 段的信息密度极低（挂机数小时 = 数千个原地重复点），全量存储浪费严重。
+ * 收缩策略：每段保留首点（进入静止的位置）、尾点（离开的位置），中间每 KEEP_EVERY 个采样 1 个。
+ * 只动存储密度、不动语义：standstillMs 早已按时间轴扣除，收缩后时长/距离/配速零变化。 */
+
+/** 静止段中间点的采样间隔（每 N 个保留 1 个） */
+export const STILL_SHRINK_KEEP_EVERY = 30;
+
+export function shrinkStillSegments<T extends { still?: boolean }>(points: T[], keepEvery = STILL_SHRINK_KEEP_EVERY): T[] {
+  if (points.length === 0) return points;
+
+  // 两遍法：第一遍定位连续 still 段 [start, end]，第二遍按段收缩
+  const keep = new Array<boolean>(points.length).fill(true);
+  let i = 0;
+  while (i < points.length) {
+    if (points[i].still !== true) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < points.length && points[i].still === true) i += 1;
+    const end = i - 1; // 段末点下标（含）
+    const segLen = end - start + 1;
+    if (segLen <= keepEvery) continue; // 短段全保留
+
+    // 长段：保留首点；中间点每 keepEvery 个采样 1 个；尾点必留（离开静止的位置）
+    for (let j = start + 1; j < end; j++) {
+      const offset = j - start; // 段内序号（0=首点）
+      keep[j] = offset % keepEvery === 0;
+    }
+  }
+  return points.filter((_, idx) => keep[idx]);
+}
