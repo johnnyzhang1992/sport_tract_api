@@ -21,6 +21,7 @@ import {
   deleteFootprintById,
 } from '../services/footprint-record.js';
 import { autoFinishStaleActivities, toActivityDto, reprocessActivity } from '../services/activity.js';
+import { purgeCancelledActivities } from '../services/cancelled-purge.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
 import {
   adminListTopics,
@@ -829,7 +830,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const allowedSortFields = ['distance', 'duration', 'startTime'];
     const sortField = allowedSortFields.includes(q.sortBy || '') ? q.sortBy! : 'startTime';
     const sortOrder = q.order === 'asc' ? 1 : -1;
-    const [total, items, users] = await Promise.all([
+    const [total, items, users, purgePreview] = await Promise.all([
       ActivityModel.countDocuments(filter),
       // 列表不下发轨迹点/打点大字段
       ActivityModel.find(filter)
@@ -839,6 +840,11 @@ export async function adminRoutes(fastify: FastifyInstance) {
         .limit(ps)
         .lean(),
       UserModel.find({}).select('_id nickname gender').lean(),
+      // 顺带报一句"有多少作废行到了可以清的程度"——**只试运行，不在读接口里删数据**：
+      // 这个接口会被后台每次刷新/翻页调用，也会被测试和脚本调用，把不可逆删除挂上来
+      // 等于随手就能删库。真删要走显式的 POST /activities/purge-cancelled。
+      // 与上面的列表筛选无关，是全库口径（字段名带 preview 也是这个意思）。
+      purgeCancelledActivities({ dryRun: true }),
     ]);
     // 图片列要数图：只回表捞这一页的 markers 照片字段（不放开头条的 -markers，避免整坨打点下发）
     const photoRows = items.length
@@ -853,6 +859,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
       total,
       page: p,
       pageSize: ps,
+      // 后台顶部那行"可清理 N 条"就靠它；只给计数，样本 id 留给手动接口
+      purgePreview: {
+        retentionDays: purgePreview.retentionDays,
+        wouldDelete: purgePreview.wouldDelete,
+        keptRescuable: purgePreview.keptRescuable,
+        keptRecent: purgePreview.keptRecent,
+      },
       items: items.map((a) => ({
         id: String(a._id),
         userId: String(a.userId),
@@ -1238,6 +1251,31 @@ export async function adminRoutes(fastify: FastifyInstance) {
         limit: Math.max(0, Number(body.limit) || 0),
         syncCalories,
       }),
+    );
+  });
+
+  // 清理已作废轨迹（**默认试运行**）：判据是"恢复出来也成不了一条运动"，不是"有没有点"，
+  // 详见 services/cancelled-purge.ts。只有管理员能触发——用户端看不到作废行，也没有恢复入口。
+  fastify.post('/activities/purge-cancelled', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as { dryRun?: boolean | string; retentionDays?: number | string; userId?: string };
+    const userId = body.userId ? String(body.userId).trim() : '';
+    if (userId) assertObjectIdLike(userId, '用户不存在');
+    // 只有显式 false/'false' 才真删；字段缺失一律按试运行
+    const dryRun = !(body.dryRun === false || body.dryRun === 'false');
+    let retentionDays: number | undefined;
+    if (body.retentionDays !== undefined && body.retentionDays !== null && body.retentionDays !== '') {
+      const n = Number(body.retentionDays);
+      if (!Number.isInteger(n) || n < 1 || n > 365) {
+        throw new AppError(400, `保留期 retentionDays 仅支持 1-365 天的整数，收到的是 ${JSON.stringify(body.retentionDays)}`);
+      }
+      retentionDays = n;
+    }
+    const result = await purgeCancelledActivities({ dryRun, retentionDays, userId: userId || undefined });
+    return success(
+      result,
+      dryRun
+        ? `试运行：可清理 ${result.wouldDelete} 条，未删除任何数据`
+        : `已清理 ${result.deleted} 条作废轨迹（保留可恢复 ${result.keptRescuable} 条）`,
     );
   });
 
