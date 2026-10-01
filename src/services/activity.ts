@@ -191,6 +191,29 @@ export async function createActivity(userId: string, input: CreateActivityInput)
  * - 单次 findOneAndUpdate 原子追加（$push $each + $max）
  * - finish 后禁止上传 → 409
  */
+/** 东八区墙上时刻 MM-DD HH:mm:ss（容器跑在 UTC，直接 toLocaleString 会差 8 小时） */
+function bjClock(ms: number): string {
+  const d = new Date(ms + 8 * 3600_000);
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  return `${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
+}
+
+/**
+ * 上传被拒（活动已不在进行中）的文案：对象 + 实际结束时刻 + 本次被丢的点数 + 后果。
+ * 只说「活动已结束，不能再上传轨迹点」的话，用户端界面还在照常计时计距，
+ * 没人知道自己后半场的点已经不入库了。
+ */
+function uploadRejectedError(
+  activity: { status: string; endTime?: number | null },
+  rejectedPoints: number,
+): AppError {
+  const label = activity.status === 'cancelled' ? '作废' : '结束';
+  const at = activity.endTime ? bjClock(activity.endTime) : '未知时刻';
+  return new AppError(409, `这条运动已于 ${at} ${label}，本次 ${rejectedPoints} 个点不再入库`, {
+    code: 'ACTIVITY_FINISHED',
+  });
+}
+
 export async function appendPoints(
   activityId: ObjectIdLike,
   userId: string,
@@ -201,12 +224,12 @@ export async function appendPoints(
   // 两个并发请求都按旧的 lastPointSeq 过滤，同一批 seq 会被 $push 两遍（距离、配速全虚高）。
   // 每次重试都重读一遍，被别的请求抢先推进 lastPointSeq 就重新过滤，最多 3 次。
   for (let attempt = 0; attempt < 3; attempt++) {
-    const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status lastPointSeq trackPoints').lean();
+    const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status endTime lastPointSeq trackPoints').lean();
     if (!activity) {
       throw new AppError(404, '活动不存在');
     }
     if (activity.status !== 'in_progress') {
-      throw new AppError(409, '活动已结束，不能再上传轨迹点', { code: 'ACTIVITY_FINISHED' });
+      throw uploadRejectedError(activity, input.points.length);
     }
 
     // 去重按"库里已有的 seq"，不按"seq > 水位"：并发下晚到的批次可能先落库，
@@ -240,12 +263,12 @@ export async function appendPoints(
   }
 
   // 连续 3 次都被抢先：如实回当前水位，客户端按 lastPointSeq 重传即可，不算错误
-  const latest = await ActivityModel.findOne({ _id: activityId, userId }).select('status lastPointSeq').lean();
+  const latest = await ActivityModel.findOne({ _id: activityId, userId }).select('status endTime lastPointSeq').lean();
   if (!latest) {
     throw new AppError(404, '活动不存在');
   }
   if (latest.status !== 'in_progress') {
-    throw new AppError(409, '活动已结束，不能再上传轨迹点', { code: 'ACTIVITY_FINISHED' });
+    throw uploadRejectedError(latest, input.points.length);
   }
   return { lastPointSeq: latest.lastPointSeq, added: 0 };
 }

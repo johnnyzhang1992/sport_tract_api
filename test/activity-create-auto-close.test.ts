@@ -229,3 +229,38 @@ test('CC7 同用户多条进行中（旧存量）：新建时全部收尾，一�
     );
   }
 });
+
+/** 东八区墙上时间（容器时区是 UTC，直接用 toLocaleString 会差 8 小时） */
+const BJ = Date.UTC(2026, 9, 1, 10, 0, 0); // = 2026-10-01 18:00:00 (UTC+8)
+
+test('CC8 被踢的那台继续上传：409 要说清对象 + 实际结束时间 + 本次被丢的点数', async () => {
+  const created = await post('', { type: 'running', startTime: BJ - 30000 });
+  const id = created.json().data.activityId as string;
+  await post(`/${id}/points`, {
+    points: [0, 1, 2].map((k) => ({ seq: k + 1, lat: 31.23 + k * 0.0002, lng: 121.47, timestamp: BJ - (2 - k) * 10000 })),
+  });
+  // 另一台设备点开始 → 这条被自动收尾
+  await post('', { type: 'cycling', startTime: TEST_NOW });
+
+  const rejected = await post(`/${id}/points`, {
+    points: [{ seq: 4, lat: 31.231, lng: 121.47, timestamp: BJ + 5000 }],
+  });
+  assert.equal(rejected.statusCode, 409, rejected.body);
+  const body = rejected.json();
+  assert.equal(body.data.code, 'ACTIVITY_FINISHED', 'code 不变，客户端只认一套');
+  assert.match(body.message, /已于 10-01 18:00:00 结束/, `要带东八区的实际结束时间，实际「${body.message}」`);
+  assert.match(body.message, /1 个点不再入库/, `要说清本次被丢的数量，实际「${body.message}」`);
+});
+
+test('CC9 收尾成作废的那台继续上传：文案要说「作废」而不是「结束」', async () => {
+  const created = await post('', { type: 'running', startTime: BJ - 30000 });
+  const id = created.json().data.activityId as string;
+  // 只有 1 个点：收尾时走"点数不足"分支 → cancelled
+  await post(`/${id}/points`, { points: [{ seq: 1, lat: 31.23, lng: 121.47, timestamp: BJ }] });
+  await post('', { type: 'cycling', startTime: TEST_NOW });
+  assert.equal((await ActivityModel.findById(id).select('status').lean())!.status, 'cancelled', '前置：这条已作废');
+
+  const rejected = await post(`/${id}/points`, { points: [{ seq: 2, lat: 31.2301, lng: 121.47, timestamp: BJ + 5000 }] });
+  assert.equal(rejected.statusCode, 409, rejected.body);
+  assert.match(rejected.json().message, /已于 .+ 作废/, `状态不同要说清，实际「${rejected.json().message}」`);
+});
