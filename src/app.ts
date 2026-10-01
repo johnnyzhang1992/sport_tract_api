@@ -28,6 +28,8 @@ export interface BuildAppOptions {
 export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInstance> {
   const fastify = Fastify({
     trustProxy: true,
+    // 默认 1MiB 会拒掉超长轨迹的 finish final 包（2 万点 ≈ 1.5MB JSON）→ 放宽到 4MiB
+    bodyLimit: 4 * 1024 * 1024,
     logger:
       opts.logger ??
       (config.isDev

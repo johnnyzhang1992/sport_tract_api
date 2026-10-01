@@ -1496,6 +1496,67 @@ test('导出 GPX → 再导入：经纬度往返一致（GPX 标准是 WGS-84，
   assert.ok(Math.abs(back.distance - fin.json().data.activity.distance) < 1, '距离也应一致');
 });
 
+test('跨度守卫：记录跨度超 24h → cancelled 留底（SPAN_TOO_LONG），不按运动落库', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'walking', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 两点跨 25 小时，位移 222m（速度 2.5m/s 正常）——仅跨度超限
+  const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.25, lng: 121.1, altitude: null, speed: null, accuracy: 12, timestamp: TEST_NOW - 90000000 },
+        { seq: 2, lat: 31.252, lng: 121.1, altitude: null, speed: null, accuracy: 12, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const body = res.json().data;
+  assert.equal(body.status, 'cancelled');
+  assert.equal(body.reason, 'SPAN_TOO_LONG');
+  const after = await ActivityModel.findById(id).lean();
+  assert.equal(after.status, 'cancelled');
+  assert.equal(after.trackPoints.length, 2, '原始点留底');
+});
+
+test('超点数软着陆：final 包超 20000 点 → 抽稀落库不拒绝，距离保持 tracker 口径', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 20005 个点：每点 ~0.1m 位移（速度远低于阈值不被清洗/守卫拦截），时间步 1s（span 20005s < 24h）
+  const baseLat = 31.25;
+  // 折返线（去 10000 点 + 回 10005 点）：包围盒对角线 ~1.1km → DP 容差 ~16m，
+  // 步长 0.11m 的直线段中间点仍会被抽，但拐点+抽样保留应远多于 2 点（验证上限截断生效）
+  const pts = Array.from({ length: 20005 }, (_, i) => {
+    const leg = i <= 10000 ? i : 20005 - i;
+    return {
+      seq: i + 1,
+      lat: baseLat + leg * 0.00005, // ≈5.5m/步
+      lng: 121.1 + leg * 0.00005,
+      altitude: null,
+      speed: null,
+      accuracy: 12,
+      timestamp: TEST_NOW - 60000 + i * 1000,
+    };
+  });
+  const fin = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: pts, clientDistance: 2000, endTime: TEST_NOW - 60000 + 20004 * 1000, pausedMs: 0 },
+  });
+  assert.equal(fin.statusCode, 200, fin.body);
+  const act = fin.json().data.activity;
+  assert.equal(act.status, 'finished', '超点数应软着陆为 finished');
+  assert.ok(act.trackPoints.length <= 20000, `落库点数应 ≤20000，实际 ${act.trackPoints.length}`);
+  assert.ok(act.distance > 1500 && act.distance < 2500, '距离保持 tracker 口径不变');
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('紧凑存储：GPX 导出时间为绝对时间（非 1970），再导入后时间戳还原', async () => {
   const tokenC = (await login('m2-compact-gpx')).accessToken;
   const created = await req('POST', '/sport-track/api/activities', {

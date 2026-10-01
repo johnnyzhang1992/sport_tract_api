@@ -112,9 +112,12 @@ export const UpdateMarkerSchema = z.object({
 
 /** 结束活动（final 包，服务端对账） */
 export const FinishActivitySchema = z.object({
-  trackPoints: z.array(TrackPointSchema).max(20000, '轨迹点超出上限'),
+  // 超上限不拒绝：软着陆为服务端 DP 抽稀（activity.ts），用户运动不能因点数丢失
+  trackPoints: z.array(TrackPointSchema).max(50000, '轨迹点超出上限'),
   // 客户端 tracker 实时累加的距离（米）：存储口径即客户端口径，纠偏前不变
   clientDistance: z.number().min(0).optional(),
+  // 客户端记录跨度（毫秒，首尾点时间差）：24h 上限守卫用，缺省用 trackPoints 首尾推算
+  clientSpanMs: z.number().min(0).optional(),
   markers: z.array(CreateMarkerSchema).optional(),
   startAddress: z.string().max(200).optional().default(''),
   endAddress: z.string().max(200).optional().default(''),

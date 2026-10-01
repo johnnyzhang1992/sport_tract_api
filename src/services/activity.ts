@@ -4,6 +4,7 @@ import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
 import { markStandstill, shrinkStillSegments } from '../utils/standstill.js';
+import { simplifyTracks } from '../utils/simplify.js';
 import { markGapJumps } from '../utils/track-gap.js';
 import { markVehicle, formatVehicleNotice } from '../utils/vehicle.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
@@ -268,7 +269,10 @@ function typeMaxAbsSpeed(type: string): number {
   return (TYPE_CONFIGS[type] ?? DEFAULT_TYPE_CONFIG).maxAbsSpeed;
 }
 
-export type FinishInvalidReason = 'TOO_FEW_POINTS' | 'DISTANCE_TOO_SHORT' | 'IMPOSSIBLE_SPEED';
+/** 记录跨度硬上限（毫秒）：超过视为挂机未关闭，拒绝按运动落库（原始点已随 cancelled 留底） */
+const MAX_SPAN_MS = 24 * 3600 * 1000;
+
+export type FinishInvalidReason = 'TOO_FEW_POINTS' | 'DISTANCE_TOO_SHORT' | 'IMPOSSIBLE_SPEED' | 'SPAN_TOO_LONG';
 
 export interface FinishActivityResult {
   status: string;
@@ -344,6 +348,34 @@ export async function finishActivity(
     storedDistance = Math.round(d);
   }
 
+  // 跨度守卫：记录跨度超过 24h → 视为挂机未关闭，拒绝按运动落库。
+  // cancelled 保存紧凑化原始点留底（与无效轨迹同待遇），endTime 用最后点时间
+  const spanMs = validTs.length >= 2 ? Math.max(...validTs) - Math.min(...validTs) : (input.clientSpanMs ?? 0);
+  if (spanMs > MAX_SPAN_MS) {
+    const cancelled = await ActivityModel.findByIdAndUpdate(
+      activityId,
+      {
+        $set: {
+          status: 'cancelled',
+          endTime: validTs.length > 0 ? Math.max(...validTs) : endTime,
+          trackPoints: compactTrackPoints(trackPoints, activity.startTime),
+          markers: input.markers ?? activity.markers ?? [],
+          pausedMs: input.pausedMs,
+          duration: Math.round(durationSec),
+          distance: storedDistance,
+          corrected: false,
+        },
+      },
+      { returnDocument: 'after' },
+    );
+    return {
+      status: cancelled!.status,
+      lastPointSeq: cancelled!.lastPointSeq,
+      activity: toActivityDto(cancelled!.toObject()),
+      reason: 'SPAN_TOO_LONG',
+    };
+  }
+
   // 无效运动守卫（极简版，不跑管线）：
   // - 点数过少：单点无位移/两点成假直线
   // - 距离过短：原地不动结束（原始口径下也必然不足）
@@ -391,7 +423,21 @@ export async function finishActivity(
   }
 
   // 落库点先紧凑化（存储口径）
-  const storedPoints = compactTrackPoints(trackPoints, activity.startTime);
+  let storedPoints = compactTrackPoints(trackPoints, activity.startTime);
+
+  // 超点数软着陆：final 包超过 20000 点时不拒绝（用户运动不能丢），
+  // 服务端 DP 抽稀到上限内再落库（保留形状）；距离用 tracker 口径，与抽稀无关
+  if (storedPoints.length > MAX_TRACK_POINTS) {
+    // DP 抽稀算出保留点的经纬度，再按坐标映射回原点（保留 seq/timestamp 等全部字段）
+    const [simplified] = simplifyTracks([storedPoints], { maxPoints: MAX_TRACK_POINTS - 1, maxPerTrack: MAX_TRACK_POINTS - 1 });
+    if (simplified && simplified.length >= 2) {
+      const byCoord = new Map(storedPoints.map((p) => [`${p.lat},${p.lng}`, p]));
+      const mapped = simplified
+        .map((q) => byCoord.get(`${q.lat},${q.lng}`))
+        .filter((p) => p != null);
+      if (mapped.length >= 2) storedPoints = mapped;
+    }
+  }
 
   // 原始口径的爬升/海拔极值/卡路里：复用 calcStats（其爬升算法含 EMA+滞回，不宜复制），
   // 距离字段不采用（存储距离 = tracker 口径）
