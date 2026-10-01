@@ -16,11 +16,41 @@ export const RefreshSchema = z.object({
   refreshToken: z.string().min(1, '缺少 refreshToken'),
 });
 
+/**
+ * 图片类地址只允许 http/https。
+ *
+ * 为什么不能只靠 `z.string().url()`：它底层就是 `new URL()`，而 `javascript:` / `data:`
+ * 在 URL 解析器眼里都是合法 URL，会一路放过。管理后台把足迹照片渲染成 `<a href={p}>`
+ * （webAdmin components/FootprintDetailDialog.tsx 照片宫格），用户提交一条 javascript: 地址
+ * 就等于让管理员在后台源里执行脚本。
+ *
+ * 判"解析后的协议"而不是判字符串前缀：制表符、换行、前导空格、大小写这些混淆
+ * 都会先被 URL 解析器归一，前缀黑名单必漏。http 要留——微信头像域名给的就是 http。
+ * 提示里只带协议不带原始串，免得把注入载荷反射进管理端可见的文案。
+ */
+function httpImageUrl(label: string, max: number) {
+  return z
+    .string()
+    .max(max, `${label}最长 ${max} 字符`)
+    .superRefine((v, ctx) => {
+      let proto: string;
+      try {
+        proto = new URL(v).protocol;
+      } catch {
+        ctx.addIssue({ code: 'custom', message: `${label}不是合法地址` });
+        return;
+      }
+      if (proto !== 'https:' && proto !== 'http:') {
+        ctx.addIssue({ code: 'custom', message: `${label}只接受 http/https 地址，收到的是 ${proto}` });
+      }
+    });
+}
+
 /** 更新个人资料 */
 export const UpdateMeSchema = z
   .object({
     nickname: z.string().trim().min(1, '昵称不能为空').max(30, '昵称最长 30 字').optional(),
-    avatarUrl: z.union([z.string().url('头像地址不合法').max(500), z.literal('')]).optional(),
+    avatarUrl: z.union([httpImageUrl('头像地址', 500), z.literal('')]).optional(),
     avatarPreset: z.string().max(32).optional(),
     gender: z.union([z.literal(0), z.literal(1), z.literal(2)]).optional(),
     weightKg: z.number().min(20, '体重最低 20kg').max(300, '体重最高 300kg').optional(),
@@ -78,8 +108,8 @@ export const AppendPointsSchema = z.object({
 /** 打点类型 */
 export const MarkerTypeSchema = z.enum(['checkpoint', 'rest', 'photo', 'note']);
 
-/** 照片 URL：允许空字符串（未拍照）或合法 URL */
-const PhotoUrlSchema = z.union([z.literal(''), z.string().url('照片地址不合法').max(500)]);
+/** 照片 URL：允许空字符串（未拍照）或 http(s) 合法地址 */
+const PhotoUrlSchema = z.union([z.literal(''), httpImageUrl('照片地址', 500)]);
 
 /** 多图数组（上限 3 张，决策 F11：打卡点可带多张现场照片） */
 const PhotosSchema = z.array(PhotoUrlSchema).max(3, '每个打卡点最多 3 张图片').default([]);
@@ -152,8 +182,8 @@ const VisitDateSchema = z
     return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === v;
   }, '日期不是有效日历日');
 
-/** 照片 URL（裸地址或带签名参数均可，服务层 cleanUrl 归一） */
-const FootprintPhotoSchema = z.string().url('照片地址不合法').max(600);
+/** 照片地址（裸地址或带签名参数均可，服务层 cleanUrl 归一）：只接受 http/https */
+const FootprintPhotoSchema = httpImageUrl('照片地址', 600);
 
 /** 足迹分类：9 个 key 或 ''（未分类）。创建/编辑/geo 过滤共用同一闸门 */
 const FootprintCategorySchema = z
