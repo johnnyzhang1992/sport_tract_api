@@ -91,6 +91,17 @@ const activitySchema = new Schema(
 
 // 列表查询：用户 + 状态 + 开始时间倒序
 activitySchema.index({ userId: 1, status: 1, startTime: -1 });
+
+// 防脚本注入：同用户同时只允许一条进行中活动（应用层 findOne 检查有并发窗口，唯一索引兜底）。
+// 已有历史 in_progress 数据时建索引会失败——上线前先清理或收尾存量
+activitySchema.index(
+  { userId: 1, status: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { status: 'in_progress' },
+    name: 'unique_in_progress_per_user',
+  },
+);
 // 按省查询轨迹（点亮地图省下钻）：provinces 为多键索引
 activitySchema.index({ userId: 1, provinces: 1 });
 

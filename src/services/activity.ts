@@ -25,7 +25,7 @@ import type {
   ListActivitiesQueryInput,
   UpdateMarkerInput,
 } from '../utils/validators.js';
-import { ACTIVITY_TYPES, MAX_TRACK_POINTS, MIN_EFFECTIVE_DISTANCE_M, MIN_EFFECTIVE_POINTS } from '../config/constants.js';
+import { ACTIVITY_TYPES, MAX_TRACK_POINTS, MIN_EFFECTIVE_DISTANCE_M, MIN_EFFECTIVE_POINTS, type ActivityType } from '../config/constants.js';
 
 type ObjectIdLike = Types.ObjectId | string;
 
@@ -158,8 +158,23 @@ async function findOwnedActivity(activityId: ObjectIdLike, userId: ObjectIdLike)
   return activity;
 }
 
-/** 创建进行中活动（决策 D13：幂等，客户端可重试） */
+/** 创建进行中活动（决策 D13：客户端可重试；撞上自己的存量时先收尾再建） */
 export async function createActivity(userId: string, input: CreateActivityInput): Promise<ActivityDto> {
+  // 同用户同时只允许一条进行中，但**不硬拒**：先把存量全部收尾，再建新的。
+  // 硬拒 409 会把真用户锁死——「继续上次运动」入口读的是本地 storage（清缓存/重装/换设备就没了），
+  // 服务端那条孤儿 in_progress 只能等 24h 超时清理，期间点「开始」一直报错且没有任何出路。
+  // 并发双开（脚本/两台设备真同时）仍由 partial unique index 兜底，落到 409 ACTIVITY_IN_PROGRESS。
+  //
+  // 收尾的是「全部」而不是第一条：互斥上线前（含索引没建起来的库）同一用户可能躺着多条进行中，
+  // 只处理一条会让剩下的永远卡在——多条进行中正是 unique 索引建不起来的直接原因。
+  // 不做条数上限：创建频控已经限住了一小时 10 条（activity.routes CREATE_LIMIT），刷不出洪水。
+  const abandoned = await ActivityModel.find({ userId, status: 'in_progress' })
+    .select(ABANDONED_SELECT)
+    .sort({ startTime: 1 })
+    .lean();
+  for (const doc of abandoned) {
+    await closeAbandonedActivity(doc as unknown as AbandonedActivity);
+  }
   const activity = await ActivityModel.create({
     userId,
     type: input.type,
@@ -182,38 +197,57 @@ export async function appendPoints(
   input: AppendPointsInput,
 ): Promise<{ lastPointSeq: number; added: number }> {
   assertObjectIdLike(activityId, '活动不存在');
-  const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status lastPointSeq trackPoints').lean();
-  if (!activity) {
+  // 读—判—写必须做成条件更新：原先 findOne 看完 status/lastPointSeq 再裸 $push，
+  // 两个并发请求都按旧的 lastPointSeq 过滤，同一批 seq 会被 $push 两遍（距离、配速全虚高）。
+  // 每次重试都重读一遍，被别的请求抢先推进 lastPointSeq 就重新过滤，最多 3 次。
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status lastPointSeq trackPoints').lean();
+    if (!activity) {
+      throw new AppError(404, '活动不存在');
+    }
+    if (activity.status !== 'in_progress') {
+      throw new AppError(409, '活动已结束，不能再上传轨迹点', { code: 'ACTIVITY_FINISHED' });
+    }
+
+    // 去重按"库里已有的 seq"，不按"seq > 水位"：并发下晚到的批次可能先落库，
+    // 拿水位过滤会把先发出去的那批当成旧点整批丢掉（点数不丢是底线）。
+    const seen = new Set(activity.trackPoints.map((p: { seq: number }) => p.seq));
+    const newPoints = input.points
+      .filter((p) => !seen.has(p.seq))
+      .sort((a, b) => a.seq - b.seq);
+
+    if (newPoints.length === 0) {
+      return { lastPointSeq: activity.lastPointSeq, added: 0 };
+    }
+
+    // 上限保护（文档：2 万点保护，超出提示客户端抽稀）
+    if (activity.trackPoints.length + newPoints.length > MAX_TRACK_POINTS) {
+      throw new AppError(400, '轨迹点超出上限，请先抽稀', { code: 'TRACK_TOO_LARGE' });
+    }
+
+    const updated = await ActivityModel.findOneAndUpdate(
+      // CAS：状态与 lastPointSeq 都进过滤器，任一变了这条写就不命中
+      { _id: activityId, userId, status: 'in_progress', lastPointSeq: activity.lastPointSeq },
+      {
+        $push: { trackPoints: { $each: newPoints } },
+        $max: { lastPointSeq: newPoints[newPoints.length - 1].seq },
+      },
+      { returnDocument: 'after' },
+    );
+    if (updated) {
+      return { lastPointSeq: updated.lastPointSeq, added: newPoints.length };
+    }
+  }
+
+  // 连续 3 次都被抢先：如实回当前水位，客户端按 lastPointSeq 重传即可，不算错误
+  const latest = await ActivityModel.findOne({ _id: activityId, userId }).select('status lastPointSeq').lean();
+  if (!latest) {
     throw new AppError(404, '活动不存在');
   }
-  if (activity.status !== 'in_progress') {
+  if (latest.status !== 'in_progress') {
     throw new AppError(409, '活动已结束，不能再上传轨迹点', { code: 'ACTIVITY_FINISHED' });
   }
-
-  // 过滤重复点 + 排序
-  const newPoints = input.points
-    .filter((p) => p.seq > activity.lastPointSeq)
-    .sort((a, b) => a.seq - b.seq);
-
-  if (newPoints.length === 0) {
-    return { lastPointSeq: activity.lastPointSeq, added: 0 };
-  }
-
-  // 上限保护（文档：2 万点保护，超出提示客户端抽稀）
-  if (activity.trackPoints.length + newPoints.length > MAX_TRACK_POINTS) {
-    throw new AppError(400, '轨迹点超出上限，请先抽稀', { code: 'TRACK_TOO_LARGE' });
-  }
-
-  const updated = await ActivityModel.findByIdAndUpdate(
-    activityId,
-    {
-      $push: { trackPoints: { $each: newPoints } },
-      $max: { lastPointSeq: newPoints[newPoints.length - 1].seq },
-    },
-    { returnDocument: 'after' },
-  );
-
-  return { lastPointSeq: updated!.lastPointSeq, added: newPoints.length };
+  return { lastPointSeq: latest.lastPointSeq, added: 0 };
 }
 
 /** 新增打点（运动中） */
@@ -239,18 +273,32 @@ export async function addMarker(
   // 净化：编辑回传的签名 URL → 裸 URL 入库
   marker.photoUrl = cleanUrl(marker.photoUrl);
   marker.photos = (marker.photos ?? []).map(cleanUrl);
-  await ActivityModel.updateOne(
-    { _id: activityId },
-    {
-      $pull: { markers: { id: input.id } },
-    },
+
+  // 幂等要一次判定就完成：原先 $pull + $push 是两条独立写，并发提交同 id 会留下两份。
+  // 先按 id 原地覆盖；没命中再"确认该 id 不存在"地追加——第二条的过滤器在写入时刻求值，
+  // 并发对手刚插进去的那一份会让它不命中，因此同 id 只会存在一份。
+  // 两条写都带上 status/归属，避免检查与写入之间活动被结束后还往里写。
+  const replaced = await ActivityModel.findOneAndUpdate(
+    { _id: activityId, userId, status: 'in_progress', 'markers.id': input.id },
+    { $set: { 'markers.$[m]': marker } },
+    { arrayFilters: [{ 'm.id': input.id }], returnDocument: 'after' },
   );
-  await ActivityModel.updateOne(
-    { _id: activityId },
-    {
-      $push: { markers: marker },
-    },
-  );
+  if (!replaced) {
+    const pushed = await ActivityModel.updateOne(
+      { _id: activityId, userId, status: 'in_progress', 'markers.id': { $ne: input.id } },
+      { $push: { markers: marker } },
+    );
+    if (pushed.matchedCount === 0) {
+      const now = await ActivityModel.findOne({ _id: activityId, userId }).select('status').lean();
+      if (!now) {
+        throw new AppError(404, '活动不存在');
+      }
+      if (now.status !== 'in_progress') {
+        throw new AppError(409, '活动已结束，不能再打点', { code: 'ACTIVITY_FINISHED' });
+      }
+      // 活动仍在进行却没写进去 = 并发请求已经把这个 id 写上了，等价于覆盖成功
+    }
+  }
 
   return { marker: marker as MarkerDto };
 }
@@ -342,10 +390,19 @@ export async function finishActivity(
   // 存储距离口径 = 客户端 tracker 实时累加值（用户运动时看到的数字）；
   // 客户端未传（旧版本）时退化为服务端按原始点直算（Haversine 累加）
   let storedDistance = input.clientDistance;
+  // 服务端按同一点集直算的「重算距离」（轨迹点序列的 Haversine 累加）
+  let recomputedDistance = 0;
+  for (let i = 1; i < trackPoints.length; i++) recomputedDistance += haversineDistance(trackPoints[i - 1], trackPoints[i]);
+  recomputedDistance = Math.round(recomputedDistance);
+  // 防脚本注入复核：clientDistance 与点集可推导的距离偏差 >10%（或点级噪声容差 50m）→ 不采信，
+  // 回退为服务端重算值。正常客户端（GPS 点直算 ± 抖动）偏差远小于此；脚本虚报距离在此被拦
   if (storedDistance == null) {
-    let d = 0;
-    for (let i = 1; i < trackPoints.length; i++) d += haversineDistance(trackPoints[i - 1], trackPoints[i]);
-    storedDistance = Math.round(d);
+    storedDistance = recomputedDistance;
+  } else {
+    const tolerance = Math.max(50, recomputedDistance * 0.1);
+    if (Math.abs(storedDistance - recomputedDistance) > tolerance) {
+      storedDistance = recomputedDistance;
+    }
   }
 
   // 跨度守卫：记录跨度超过 24h → 视为挂机未关闭，拒绝按运动落库。
@@ -521,12 +578,119 @@ export async function cancelActivity(activityId: ObjectIdLike, userId: string): 
   await ActivityModel.updateOne({ _id: activityId }, { $set: { status: 'cancelled', endTime: Date.now() } });
 }
 
+/** 收尾一条进行中活动所需的字段；select 与类型保持同源，避免两边改一个漏一个 */
+const ABANDONED_SELECT = 'userId type startTime pausedMs trackPoints';
+
+export type AbandonedActivity = {
+  _id: Types.ObjectId;
+  userId: Types.ObjectId;
+  type: ActivityType;
+  startTime: number;
+  pausedMs?: number;
+  trackPoints?: TrackPointDto[];
+};
+
+/**
+ * 收尾一条被弃用的进行中活动（两个调用方共用同一口径：超时懒清理、以及新开运动时撞上存量）
+ * - 无轨迹点 / 清洗后点数或距离不达标 → cancelled 留底（不进用户列表，也不污染统计）
+ * - 其余走与 finish 相同的自动管线：海拔清洗 → 纠偏 → 平滑 → 车速段 → 静止 → 重算指标，落 finished
+ * - 写入一律带 status:'in_progress' 条件：并发对手（真 finish / 取消 / 另一路清理）已改掉状态就不再覆盖，
+ *   此时返回 skipped——不覆盖别人的指标结果，也不重复标足迹脏
+ */
+export async function closeAbandonedActivity(
+  activity: AbandonedActivity,
+): Promise<'finished' | 'cancelled' | 'skipped'> {
+  const abandon = async (endTime: number) => {
+    const hit = await ActivityModel.updateOne(
+      { _id: activity._id, status: 'in_progress' },
+      { $set: { status: 'cancelled', endTime } },
+    );
+    return hit.matchedCount > 0 ? 'cancelled' : 'skipped';
+  };
+
+  const pts = (activity.trackPoints ?? []) as TrackPointDto[];
+  if (pts.length === 0) {
+    return abandon(Date.now());
+  }
+
+  // 最终点集：按 seq 去重排序（与 finish 兜底一致）
+  const seen = new Set<number>();
+  const trackPoints = pts
+    .filter((p) => {
+      if (seen.has(p.seq)) return false;
+      seen.add(p.seq);
+      return true;
+    })
+    .sort((a, b) => a.seq - b.seq);
+
+  // 结束时间：以最后一个轨迹点的上报时间为准（异常中断后自动收尾，不把中断后的空档计入时长）
+  const validTs = trackPoints
+    .map((p) => (typeof p.timestamp === 'number' && Number.isFinite(p.timestamp) ? p.timestamp : 0))
+    .filter((t) => t > 0);
+  const endTime = validTs.length > 0 ? Math.max(...validTs) : Date.now();
+
+  // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 车速段检测 → 静止检测 → 重算指标
+  const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
+  const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
+  const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
+  const veh = markVehicle(smoothedPoints, activity.type);
+  const { points: stillMarked, standstillMs } = markStandstill(veh.points);
+  // 采样断档连线（见 utils/track-gap.ts）：只打标，不删点、不改任何指标——渲染方遇到该标记就断开连线
+  const { points: markedPoints } = markGapJumps(stillMarked);
+  const durationSec = Math.max(
+    0,
+    (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
+  );
+  const storedPoints = compactTrackPoints(markedPoints, activity.startTime);
+  const stats = calcStats(storedPoints, {
+    type: activity.type,
+    durationSec,
+    weightKg: await resolveWeightKg(activity.userId),
+  });
+
+  // 无效运动守卫：点数过少或重算距离过短（漂移点全被清洗）→ 自动作废，与 finish 同口径
+  if (trackPoints.length < MIN_EFFECTIVE_POINTS || stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
+    return abandon(endTime);
+  }
+
+  const fastestKm = calcFastestKm(storedPoints, activity.type);
+  const regions = provincesOfPoints(markedPoints);
+
+  const hit = await ActivityModel.updateOne(
+    { _id: activity._id, status: 'in_progress' },
+    {
+      $set: {
+        status: 'finished',
+        endTime,
+        trackPoints: storedPoints,
+        corrected: true, // 无人值守收尾：自动管线清好（用户不在场，无纠偏选择权）
+        provinces: regions.provinces,
+        startProvince: regions.startProvince,
+        startCity: regions.startCity,
+        duration: Math.round(durationSec),
+        standstillMs: Math.round(standstillMs),
+        vehicleMs: Math.round(veh.vehicleMs),
+        vehicleM: Math.round(veh.vehicleM),
+        distance: stats.distance,
+        avgPace: stats.avgPace,
+        fastestKm,
+        calories: stats.calories,
+        elevationGain: stats.elevationGain,
+        minAltitude: stats.minAltitude,
+        maxAltitude: stats.maxAltitude,
+        lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
+      },
+    },
+  );
+  if (hit.matchedCount === 0) return 'skipped';
+  await markFootprintDirty(String(activity.userId));
+  return 'finished';
+}
+
 /**
  * 超时活动自动收尾（惰性清理）：in_progress 超过 24h 无更新（用户杀进程/异常退出）
- * - 有轨迹点 → 重算指标：距离达标 → finished 保留数据（endTime 以最后轨迹点上报时间为准，与 finish 同管线）；
- *   距离过短（漂移点全被清洗）→ cancelled 作废，不产生无意义轨迹
- * - 无轨迹点 → cancelled 作废（无数据可保留，不污染用户列表）
- * - userId 不传则清理全部用户（admin 列表用）；返回处理条数
+ * 逐条走 closeAbandonedActivity——口径与「新开运动时撞上存量」完全同一个函数，不会分叉
+ * userId 不传则清理全部用户（admin 列表用）；返回处理条数
  */
 export async function autoFinishStaleActivities(userId?: string): Promise<number> {
   const stale = await ActivityModel.find({
@@ -534,90 +698,11 @@ export async function autoFinishStaleActivities(userId?: string): Promise<number
     status: 'in_progress',
     updatedAt: { $lt: new Date(Date.now() - 24 * 3600 * 1000) },
   })
-    .select('userId type startTime pausedMs trackPoints')
+    .select(ABANDONED_SELECT)
     .lean();
 
   for (const activity of stale) {
-    const pts = (activity.trackPoints ?? []) as TrackPointDto[];
-    if (pts.length === 0) {
-      await ActivityModel.updateOne({ _id: activity._id }, { $set: { status: 'cancelled', endTime: Date.now() } });
-      continue;
-    }
-
-    // 最终点集：按 seq 去重排序（与 finish 兜底一致）
-    const seen = new Set<number>();
-    const trackPoints = pts
-      .filter((p) => {
-        if (seen.has(p.seq)) return false;
-        seen.add(p.seq);
-        return true;
-      })
-      .sort((a, b) => a.seq - b.seq);
-
-    // 结束时间：以最后一个轨迹点的上报时间为准（异常中断后自动收尾，不把中断后的空档计入时长）
-    const validTs = trackPoints
-      .map((p) => (typeof p.timestamp === 'number' && Number.isFinite(p.timestamp) ? p.timestamp : 0))
-      .filter((t) => t > 0);
-    const endTime = validTs.length > 0 ? Math.max(...validTs) : Date.now();
-
-    // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 车速段检测 → 静止检测 → 重算指标
-    const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
-    const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
-    const smoothedPoints = smoothTrackSmart(trajectoryCleaned, 5, haversineDistance);
-    const veh = markVehicle(smoothedPoints, activity.type);
-    const { points: stillMarked, standstillMs } = markStandstill(veh.points);
-    // 采样断档连线（见 utils/track-gap.ts）：只打标，不删点、不改任何指标——渲染方遇到该标记就断开连线
-    const { points: markedPoints } = markGapJumps(stillMarked);
-    const durationSec = Math.max(
-      0,
-      (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
-    );
-    const storedPoints = compactTrackPoints(markedPoints, activity.startTime);
-    const stats = calcStats(storedPoints, {
-      type: activity.type,
-      durationSec,
-      weightKg: await resolveWeightKg(activity.userId),
-    });
-
-    // 无效运动守卫：点数过少或重算距离过短（漂移点全被清洗）→ 自动作废，与 finish 同口径
-    if (trackPoints.length < MIN_EFFECTIVE_POINTS || stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
-      await ActivityModel.updateOne(
-        { _id: activity._id },
-        { $set: { status: 'cancelled', endTime } },
-      );
-      continue;
-    }
-
-    const fastestKm = calcFastestKm(storedPoints, activity.type);
-    const regions = provincesOfPoints(markedPoints);
-
-    await ActivityModel.updateOne(
-      { _id: activity._id },
-      {
-        $set: {
-          status: 'finished',
-          endTime,
-          trackPoints: storedPoints,
-          corrected: true, // 无人值守收尾：自动管线清好（用户不在场，无纠偏选择权）
-          provinces: regions.provinces,
-          startProvince: regions.startProvince,
-          startCity: regions.startCity,
-          duration: Math.round(durationSec),
-          standstillMs: Math.round(standstillMs),
-          vehicleMs: Math.round(veh.vehicleMs),
-          vehicleM: Math.round(veh.vehicleM),
-          distance: stats.distance,
-          avgPace: stats.avgPace,
-          fastestKm,
-          calories: stats.calories,
-          elevationGain: stats.elevationGain,
-          minAltitude: stats.minAltitude,
-          maxAltitude: stats.maxAltitude,
-          lastPointSeq: trajectoryCleaned.length > 0 ? trajectoryCleaned[trajectoryCleaned.length - 1].seq : 0,
-        },
-      },
-    );
-    await markFootprintDirty(String(activity.userId));
+    await closeAbandonedActivity(activity as unknown as AbandonedActivity);
   }
 
   return stale.length;
@@ -823,10 +908,19 @@ export async function reprocessActivity(
   userId: string | null,
 ): Promise<ActivityDto & { suspiciousPoints: number }> {
   // userId=null 时跳过归属校验（admin 跨用户纠偏用）；体重口径仍按轨迹 owner 的档案
+  assertObjectIdLike(activityId, '活动不存在');
   const activity = userId
     ? await findOwnedActivity(activityId, userId)
     : await ActivityModel.findById(activityId).lean();
   if (!activity) throw new AppError(404, '活动不存在');
+  // 重跑会把 trackPoints 整个 $set（含静止段有损收缩）并重算 lastPointSeq，
+  // 进行中的活动被重跑等于覆盖掉客户端正在录的那条
+  if (activity.status !== 'finished') {
+    const label = activity.status === 'in_progress' ? '进行中' : '已取消';
+    throw new AppError(409, `仅已完成轨迹可重跑纠偏，当前状态：${label}（${activity.status}）`, {
+      code: 'ACTIVITY_NOT_FINISHED',
+    });
+  }
   const raw = (activity.trackPoints ?? []) as TrackPointDto[];
   if (raw.length === 0) {
     throw new AppError(400, '轨迹点为空');

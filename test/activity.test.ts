@@ -15,16 +15,26 @@ let activityId = '';
 // 固定“当前时间”，保证活动落在今日区间（overview/trend 断言依赖）
 const TEST_NOW = Date.now();
 
+/** 本文件用户的两个 openid 命名空间：历史 mock_openid_ 前缀 + login() 现用的 act- 前缀 */
+async function purgeTestUsers() {
+  const ids = (
+    await UserModel.find({ openid: { $in: [/^mock_openid_/, /^act-/] } })
+      .select('_id')
+      .lean()
+  ).map((u) => u._id);
+  if (!ids.length) return;
+  await ActivityModel.deleteMany({ userId: { $in: ids } });
+  await LoginLogModel.deleteMany({ userId: { $in: ids } });
+  await UserModel.deleteMany({ _id: { $in: ids } });
+}
+
 before(async () => {
   app = await buildApp({ logger: false });
   await app.ready();
 
-  // 清理测试数据
-  const users = await UserModel.find({ openid: /^mock_openid_/ }).select('_id');
-  const ids = users.map((u) => u._id);
-  await ActivityModel.deleteMany({ userId: { $in: ids } });
-  await LoginLogModel.deleteMany({ userId: { $in: ids } });
-  await UserModel.deleteMany({ openid: /^mock_openid_/ });
+  // 清场必须含本文件自己的 act- 命名空间：上一轮若在 after() 之前崩掉（Ctrl-C / 断言抛错），
+  // 残留的 in_progress 会让本轮所有用同一用户的用例连坐 409
+  await purgeTestUsers();
 
   // 两个测试用户：A 是活动所有者，B 用于越权测试
   tokenA = (await login('m2-user-a')).accessToken;
@@ -32,10 +42,12 @@ before(async () => {
 });
 
 after(async () => {
+  await purgeTestUsers();
   await app.close();
 });
 
 async function login(code: string) {
+  code = 'openid:act-' + code; // 独立 openid 命名空间（wechat mock 透传），不被 auth.test 的 mock_openid_ 全局清理波及
   const res = await app.inject({
     method: 'POST',
     url: '/sport-track/api/auth/login',
@@ -1263,20 +1275,25 @@ test('海拔尖刺清洗：真实爬坡（速率正常）不被误伤', async ()
   assert.equal(pts[3].altitude, 106);
 });
 
-test('防刷：测试环境豁免创建限流（生产 CREATE_LIMIT=10 语义由常量保证）', async () => {
+test('单活动互斥：已有 in_progress 时再创建 → 不锁死，旧的空活动被自动收尾作废', async () => {
   const t = (await login('m2-rate-limit')).accessToken;
-  for (let i = 0; i < 10; i++) {
-    const r = await req('POST', '/sport-track/api/activities', {
-      token: t,
-      body: { type: 'walking', startTime: 1700000000000 + i * 1000 },
-    });
-    assert.equal(r.statusCode, 200, `第 ${i + 1} 条应创建成功`);
-  }
-  const over = await req('POST', '/sport-track/api/activities', {
+  const first = await req('POST', '/sport-track/api/activities', {
+    token: t,
+    body: { type: 'walking', startTime: 1700000000000 },
+  });
+  assert.equal(first.statusCode, 200, '首条应创建成功');
+  const firstId = first.json().data.activityId as string;
+  const second = await req('POST', '/sport-track/api/activities', {
     token: t,
     body: { type: 'walking', startTime: 1700000000000 + 100000 },
   });
-  assert.equal(over.statusCode, 200, '测试环境豁免限流：第 11 条也应创建成功');
+  // 「继续上次运动」入口靠本地 storage：换了设备/清了缓存的用户如果在这里被 409 挡死，
+  // 就只能等 24h 超时清理才能重新开一场——所以口径是"先收尾再建"，详见 activity-create-auto-close.test.ts
+  assert.equal(second.statusCode, 200, `第二条不该被锁死：${second.body}`);
+  const abandoned = await ActivityModel.findById(firstId).select('status').lean();
+  assert.equal(abandoned!.status, 'cancelled', '首条一个点都没有，应作废留底');
+  // 清场：把第二条放弃掉，恢复该用户的干净起点
+  await req('PUT', `/sport-track/api/activities/${second.json().data.activityId}/cancel`, { token: t });
 });
 
 test('数据隔离：B 用户不能读取/修改 A 用户的轨迹', async () => {
@@ -1294,6 +1311,8 @@ test('数据隔离：B 用户不能读取/修改 A 用户的轨迹', async () =>
     body: { note: '越权修改' },
   });
   assert.equal(meta.statusCode, 404, 'B 改 A 轨迹应 404');
+  // 清场：这条只是拿来当被攻击目标的靶子，留着会让后面用 tokenA 的用例被单活动互斥连坐 409
+  await req('PUT', `/sport-track/api/activities/${id}/cancel`, { token: tokenA });
 });
 
 // ==================== 非法 id 闸门：非 ObjectId 串不该冒 500 ====================
@@ -1496,11 +1515,69 @@ test('导出 GPX → 再导入：经纬度往返一致（GPX 标准是 WGS-84，
   assert.ok(Math.abs(back.distance - fin.json().data.activity.distance) < 1, '距离也应一致');
 });
 
+test('距离复核：clientDistance 与点集重算偏差 >10% → 不采信，取服务端重算值', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'cycling', startTime: TEST_NOW - 60000 },
+  });
+  assert.equal(created.statusCode, 200, `前置：创建应 200（409 说明前序用例残留了 in_progress）：${created.body}`);
+  const id = created.json().data.activityId;
+  // 6 点直线真实位移 ~5560m（10s/1112m=111m/s 超速会被守卫拦）——改用骑行（maxAbsSpeed=30 内：
+  // 111m/10s=11.1m/s < 30 ✓，med 步速同）
+  const pts = [0, 1, 2, 3, 4, 5].map((i) => ({
+    seq: i + 1,
+    lat: 31.25 + i * 0.0008,
+    lng: 121.1,
+    altitude: null,
+    speed: null,
+    accuracy: 12,
+    timestamp: TEST_NOW - 50000 + i * 10000,
+  }));
+  // 脚本注入场景：clientDistance 虚报（真实 ~445m，虚报 55600m）
+  const fin = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: pts, clientDistance: 55600, endTime: TEST_NOW, pausedMs: 0 },
+  });
+  assert.equal(fin.statusCode, 200);
+  const act = fin.json().data.activity;
+  assert.equal(act.status, 'finished');
+  // 服务端复核：落库距离 = 点集重算值（~5560m），不是虚报的 55600
+  assert.ok(act.distance > 300 && act.distance < 600, `应取重算距离（~445m 量级），实际 ${act.distance}`);
+});
+
+test('距离复核：正常客户端偏差（<10%）→ 采信 clientDistance', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'cycling', startTime: TEST_NOW - 60000 },
+  });
+  assert.equal(created.statusCode, 200, `前置：创建应 200（409 说明前序用例残留了 in_progress）：${created.body}`);
+  const id = created.json().data.activityId;
+  const pts = [0, 1, 2, 3, 4, 5].map((i) => ({
+    seq: i + 1,
+    lat: 31.25 + i * 0.0008,
+    lng: 121.1,
+    altitude: null,
+    speed: null,
+    accuracy: 12,
+    timestamp: TEST_NOW - 50000 + i * 10000,
+  }));
+  // 正常 tracker 与点集直算的差异只有 GPS 噪声级；这里 +8%（<10% 容差）模拟端上累计差
+  const clientDistance = Math.round(445 * 1.08);
+  const fin = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: { trackPoints: pts, clientDistance, endTime: TEST_NOW, pausedMs: 0 },
+  });
+  assert.equal(fin.statusCode, 200);
+  const act = fin.json().data.activity;
+  assert.equal(act.distance, clientDistance, '容差内应采信客户端距离');
+});
+
 test('跨度守卫：记录跨度超 24h → cancelled 留底（SPAN_TOO_LONG），不按运动落库', async () => {
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'walking', startTime: TEST_NOW - 60000 },
   });
+  assert.equal(created.statusCode, 200, `前置：创建应 200（409 说明前序用例残留了 in_progress）：${created.body}`);
   const id = created.json().data.activityId;
   // 两点跨 25 小时，位移 222m（速度 2.5m/s 正常）——仅跨度超限
   const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
@@ -1528,6 +1605,7 @@ test('超点数软着陆：final 包超 20000 点 → 抽稀落库不拒绝，�
     token: tokenA,
     body: { type: 'running', startTime: TEST_NOW - 60000 },
   });
+  assert.equal(created.statusCode, 200, `前置：创建应 200（409 说明前序用例残留了 in_progress）：${created.body}`);
   const id = created.json().data.activityId;
   // 20005 个点：每点 ~0.1m 位移（速度远低于阈值不被清洗/守卫拦截），时间步 1s（span 20005s < 24h）
   const baseLat = 31.25;
@@ -1547,13 +1625,13 @@ test('超点数软着陆：final 包超 20000 点 → 抽稀落库不拒绝，�
   });
   const fin = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
     token: tokenA,
-    body: { trackPoints: pts, clientDistance: 2000, endTime: TEST_NOW - 60000 + 20004 * 1000, pausedMs: 0 },
+    body: { trackPoints: pts, clientDistance: 146178, endTime: TEST_NOW - 60000 + 20004 * 1000, pausedMs: 0 },
   });
   assert.equal(fin.statusCode, 200, fin.body);
   const act = fin.json().data.activity;
   assert.equal(act.status, 'finished', '超点数应软着陆为 finished');
   assert.ok(act.trackPoints.length <= 20000, `落库点数应 ≤20000，实际 ${act.trackPoints.length}`);
-  assert.ok(act.distance > 1500 && act.distance < 2500, '距离保持 tracker 口径不变');
+  assert.ok(Math.abs(act.distance - 146178) < 14618, `距离采信 clientDistance（146178±10%），实际 ${act.distance}`);
   await ActivityModel.deleteOne({ _id: id });
 });
 
