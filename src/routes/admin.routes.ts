@@ -10,6 +10,7 @@ import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
+import { escapeRegex } from '../utils/regex.js';
 import { locateRegion } from '../services/region.js';
 import { INVALID_REGION_VALUES, isValidRegionValue } from '../services/ip-locate.js';
 import { overview as userStatsOverview, bestRecords } from '../services/stats.js';
@@ -610,7 +611,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const ps = Math.min(100, Number(pageSize) || 20);
     const filter: Record<string, unknown> = {};
     if (keyword && String(keyword).trim()) {
-      const kw = { $regex: String(keyword).trim(), $options: 'i' };
+      // 转义后按字面量搜：元字符不当通配，非法正则也不会让 Mongo 抛错（与足迹搜索同一口径）
+      const kw = { $regex: escapeRegex(String(keyword).trim()), $options: 'i' };
       filter.$or = [{ nickname: kw }, { note: kw }]; // 昵称或管理员备注匹配
     }
     const allowedSortFields = ['createdAt', 'lastLoginAt'];
@@ -818,7 +820,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (Object.keys(dur).length) filter.duration = dur;
     // 用户昵称搜索 → 先查用户 id
     if (q.keyword && String(q.keyword).trim()) {
-      const matched = await UserModel.find({ nickname: { $regex: String(q.keyword).trim(), $options: 'i' } })
+      // 同用户列表：keyword 是字面量，不是正则
+      const matched = await UserModel.find({ nickname: { $regex: escapeRegex(String(q.keyword).trim()), $options: 'i' } })
         .select('_id').lean();
       const ids = matched.map((u) => String(u._id));
       filter.userId = { $in: ids };

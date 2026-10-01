@@ -3,6 +3,7 @@ import { cleanUrl, deleteOssObjects, getSignedUrl, getThumbUrl } from './oss.js'
 import { locateRegion } from './region.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
+import { escapeRegex } from '../utils/regex.js';
 import { config } from '../config/index.js';
 import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import { UserModel } from '../models/user.model.js';
@@ -20,10 +21,6 @@ export async function assertCanCreateFootprint(userId: string) {
   if (recent >= FP_CREATE_LIMIT) {
     throw new AppError(429, `创建过于频繁，1 小时内最多新增 ${FP_CREATE_LIMIT} 条足迹`);
   }
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
