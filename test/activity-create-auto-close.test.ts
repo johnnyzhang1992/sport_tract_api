@@ -264,3 +264,75 @@ test('CC9 收尾成作废的那台继续上传：文案要说「作废」而不�
   assert.equal(rejected.statusCode, 409, rejected.body);
   assert.match(rejected.json().message, /已于 .+ 作废/, `状态不同要说清，实际「${rejected.json().message}」`);
 });
+
+/**
+ * 走 50s → 暂停 600s（暂停期间端上完全不采点，恢复后首点带 pauseGap）→ 再走 50s。
+ * 墙钟 700s，其中 600s 是暂停；库里 pausedMs 是 0（整场 sync 只传点，pausedMs 要等 finish 的 final 包）。
+ */
+async function newActivityWithPauseGap() {
+  const start = TEST_NOW - 700_000;
+  const created = await post('', { type: 'running', startTime: start });
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data.activityId as string;
+  let seq = 0;
+  const pts: Array<Record<string, unknown>> = [];
+  const push = (offsetSec: number, pauseGap = false) => {
+    seq += 1;
+    pts.push({
+      seq,
+      lat: 31.23 + seq * 0.0002,
+      lng: 121.47,
+      timestamp: start + offsetSec * 1000,
+      ...(pauseGap ? { pauseGap: true } : {}),
+    });
+  };
+  for (let k = 0; k <= 5; k++) push(k * 10);
+  push(650, true);
+  for (let k = 1; k <= 5; k++) push(650 + k * 10);
+  const up = await post(`/${id}/points`, { points: pts });
+  assert.equal(up.statusCode, 200, up.body);
+  return { id, pointCount: pts.length };
+}
+
+test('CC10 收尾时暂停空窗不算运动时长：库里 pausedMs=0 也要按 pauseGap 点反推补上', async () => {
+  const { id, pointCount } = await newActivityWithPauseGap();
+  assert.equal(pointCount, 12);
+  // 前置钉死：这条活动自己不知道暂停了多少（sync 不传 pausedMs），否则用例证不到东西
+  const before = await ActivityModel.findById(id).select('pausedMs').lean();
+  assert.equal(before!.pausedMs, 0, '前置：in_progress 期间库里 pausedMs 应为 0');
+
+  await post('', { type: 'walking', startTime: TEST_NOW }); // 触发收尾
+
+  const doc = await ActivityModel.findById(id).select('status duration pausedMs').lean();
+  assert.equal(doc!.status, 'finished', doc ? '前置：这条应已收尾' : '活动不存在');
+  assert.ok(
+    Math.abs((doc!.pausedMs ?? 0) - 600_000) < 1000,
+    `pausedMs 要按 pauseGap 空窗反推成 600s 并落库（后台「暂停时长」一栏读的就是它），实际 ${doc!.pausedMs}ms`,
+  );
+  assert.ok(
+    doc!.duration > 90 && doc!.duration < 110,
+    `运动时长应约 100s（墙钟 700 − 暂停 600），实际 ${doc!.duration}s`,
+  );
+});
+
+test('CC11 pauseGap 点时间戳比上一点还早（乱序/伪造）：反推值不得为负，时长不得超墙钟', async () => {
+  const start = TEST_NOW - 20_000;
+  const created = await post('', { type: 'running', startTime: start });
+  const id = created.json().data.activityId as string;
+  await post(`/${id}/points`, {
+    points: [
+      { seq: 1, lat: 31.23, lng: 121.47, timestamp: start },
+      { seq: 2, lat: 31.2302, lng: 121.47, timestamp: start + 10_000 },
+      { seq: 3, lat: 31.2304, lng: 121.47, timestamp: start + 20_000 },
+      // 恢复点却"回到"了 5 秒前：这一步是负间隔
+      { seq: 4, lat: 31.2306, lng: 121.47, timestamp: start + 15_000, pauseGap: true },
+    ],
+  });
+
+  await post('', { type: 'walking', startTime: TEST_NOW }); // 触发收尾
+
+  const doc = await ActivityModel.findById(id).select('status duration pausedMs').lean();
+  assert.equal(doc!.status, 'finished', '前置：这条应已收尾');
+  assert.equal(doc!.pausedMs, 0, `负间隔不能计进暂停（计了会把时长倒撑超墙钟），实际 ${doc!.pausedMs}ms`);
+  assert.ok(doc!.duration <= 20, `时长不得超过墙钟 20s，实际 ${doc!.duration}s`);
+});

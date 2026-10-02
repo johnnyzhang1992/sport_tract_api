@@ -602,16 +602,34 @@ export async function cancelActivity(activityId: ObjectIdLike, userId: string): 
 }
 
 /** 收尾一条进行中活动所需的字段；select 与类型保持同源，避免两边改一个漏一个 */
-const ABANDONED_SELECT = 'userId type startTime pausedMs trackPoints';
+const ABANDONED_SELECT = 'userId type startTime trackPoints';
 
 export type AbandonedActivity = {
   _id: Types.ObjectId;
   userId: Types.ObjectId;
   type: ActivityType;
   startTime: number;
-  pausedMs?: number;
   trackPoints?: TrackPointDto[];
 };
+
+/**
+ * 从点序列反推暂停时长（毫秒）
+ *
+ * 为什么只能这么算：整场录制期间 sync 只上传轨迹点，pausedMs 要等结束那次 final 包才进服务端，
+ * 所以 in_progress 活动库里的 pausedMs 恒为 0；而暂停期间端上完全不采点（record 的 tracker 直接丢弃），
+ * 静止检测既跨不过 >120s 的断档、也凑不满 3 个点（utils/standstill.ts），那段空窗只有 pauseGap 认得。
+ * pauseGap 标在"恢复后首个被接受的点"上，它与上一点之间的空窗即一次暂停。
+ * 只给无人值守收尾用：正常 finish 的 pausedMs 是端上全程累计的真值，不该被这里覆盖。
+ */
+function pausedMsFromGapMarks(points: TrackPointDto[]): number {
+  let ms = 0;
+  for (let i = 1; i < points.length; i++) {
+    if (points[i].pauseGap !== true) continue;
+    const gap = points[i].timestamp - points[i - 1].timestamp;
+    if (gap > 0) ms += gap;
+  }
+  return ms;
+}
 
 /**
  * 收尾一条被弃用的进行中活动（两个调用方共用同一口径：超时懒清理、以及新开运动时撞上存量）
@@ -652,6 +670,9 @@ export async function closeAbandonedActivity(
     .filter((t) => t > 0);
   const endTime = validTs.length > 0 ? Math.max(...validTs) : Date.now();
 
+  // 暂停时长：用原始点集算（平滑/抽稀可能丢掉带 pauseGap 的那个点，证据就没了）
+  const pausedMs = pausedMsFromGapMarks(trackPoints);
+
   // 与 finish 相同管线：海拔清洗 → 轨迹纠偏 → 平滑 → 车速段检测 → 静止检测 → 重算指标
   const altitudeCleaned = cleanAltitudeSpikes(trackPoints);
   const trajectoryCleaned = cleanTrajectory(altitudeCleaned, {}, activity.type);
@@ -662,7 +683,7 @@ export async function closeAbandonedActivity(
   const { points: markedPoints } = markGapJumps(stillMarked);
   const durationSec = Math.max(
     0,
-    (endTime - activity.startTime - (activity.pausedMs ?? 0) - standstillMs - veh.vehicleMs) / 1000,
+    (endTime - activity.startTime - pausedMs - standstillMs - veh.vehicleMs) / 1000,
   );
   const storedPoints = compactTrackPoints(markedPoints, activity.startTime);
   const stats = calcStats(storedPoints, {
@@ -690,6 +711,8 @@ export async function closeAbandonedActivity(
         provinces: regions.provinces,
         startProvince: regions.startProvince,
         startCity: regions.startCity,
+        // 反推值要落库：webAdmin 轨迹详情有「暂停时长」一栏（读 DTO.pausedMs），不写就永远显示 0
+        pausedMs: Math.round(pausedMs),
         duration: Math.round(durationSec),
         standstillMs: Math.round(standstillMs),
         vehicleMs: Math.round(veh.vehicleMs),
