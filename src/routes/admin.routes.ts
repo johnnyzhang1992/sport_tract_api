@@ -253,46 +253,52 @@ export async function adminRoutes(fastify: FastifyInstance) {
     }
 
     // 聚合：把日期时间戳按桶归并（用 ${fmt} 分组，day 直接用天）
-    const start = new Date(nowMs - 6 * 365 * DAY_MS); // 最多取近 6 年数据足够
+    const startMs = nowMs - 6 * 365 * DAY_MS; // 最多取近 6 年数据足够
+    const start = new Date(startMs);
     // year 维度：按月分组后桶是 年-H1/H2 不匹配，直接用 年+半年 拼接分组
-    const idExpr =
-      type === 'year'
+    // 用户/足迹按 createdAt（注册/记录时刻）；轨迹按 startTime（运动发生时刻，导入的旧轨迹不该算进今天）
+    // $dateToString 不接数字 epoch（startTime 是数字），一律先 $toDate；对 Date 字段是无操作的
+    const bucketExpr = (field: string) => {
+      const asDate = { $toDate: field };
+      return type === 'year'
         ? {
             $concat: [
-              { $dateToString: { format: '%Y', date: '$createdAt', timezone: '+08:00' } },
+              { $dateToString: { format: '%Y', date: asDate, timezone: '+08:00' } },
               '-',
               {
                 $cond: [
-                  { $lt: [{ $month: { date: '$createdAt', timezone: '+08:00' } }, 7] },
+                  { $lt: [{ $month: { date: asDate, timezone: '+08:00' } }, 7] },
                   'H1',
                   'H2',
                 ],
               },
             ],
           }
-        : { $dateToString: { format: fmt, date: '$createdAt', timezone: '+08:00' } };
+        : { $dateToString: { format: fmt, date: asDate, timezone: '+08:00' } };
+    };
     const [uRows, aRows, fRows] = await Promise.all([
       UserModel.aggregate([
         { $match: { createdAt: { $gte: start } } },
-        { $group: { _id: idExpr, count: { $sum: 1 } } },
+        { $group: { _id: bucketExpr('$createdAt'), count: { $sum: 1 } } },
       ]),
+      // startTime 是数字 epoch ms，不能拿 Date 去比（类型不同恒不命中）
       ActivityModel.aggregate([
-        { $match: { createdAt: { $gte: start } } },
-        { $group: { _id: idExpr, count: { $sum: 1 } } },
+        { $match: { startTime: { $gte: startMs } } },
+        { $group: { _id: bucketExpr('$startTime'), count: { $sum: 1 } } },
       ]),
       FootprintRecordModel.aggregate([
         { $match: { createdAt: { $gte: start } } },
-        { $group: { _id: idExpr, count: { $sum: 1 } } },
+        { $group: { _id: bucketExpr('$createdAt'), count: { $sum: 1 } } },
       ]),
     ]);
     const uMap = new Map(uRows.map((r) => [r._id, r.count]));
     const aMap = new Map(aRows.map((r) => [r._id, r.count]));
     const fMap = new Map(fRows.map((r) => [r._id, r.count]));
-    const data: { date: string; newUsers: number; newActivities: number; newFootprints: number }[] = buckets.map(
+    const data: { date: string; newUsers: number; activities: number; newFootprints: number }[] = buckets.map(
       (key) => ({
         date: key,
         newUsers: uMap.get(key) ?? 0,
-        newActivities: aMap.get(key) ?? 0,
+        activities: aMap.get(key) ?? 0,
         newFootprints: fMap.get(key) ?? 0,
       }),
     );

@@ -1,13 +1,15 @@
 /**
  * GET /admin/trend 的时间桶口径
  *
- * 这个接口是概览页「数据趋势」图的数据源，四个维度（day/week/month/year）都按 createdAt 分桶。
+ * 这个接口是概览页「数据趋势」图的数据源，四个维度（day/week/month/year）。
+ * 用户 / 足迹两条按 createdAt 分桶；**轨迹那条按 startTime 分桶**——运动发生时刻才是它的轴，
+ * 导入的旧轨迹不该算进"今天"（详见下方 activities 用例）。
  * 它原先是唯一漏了 `timezone: '+08:00'` 的 trend 接口（user-trend / activity-trend /
  * footprint-trend 都有），而 $dateToString 不写 timezone 就是 **UTC 日界，与服务器时区无关**，
  * 所以下面这些用例在任何机器上都该先红：东八区凌晨 00:00:01 的记录会被归到前一天 / 上一周 /
  * 上一月 / 上一个半年。
  *
- * 只往 users 里造数：三个集合用的是同一个 idExpr，一条边界证据就够；
+ * 用户/足迹只往 users 里造数：这两个集合用的是同一个 idExpr，一条边界证据就够；
  * 且 dev 库始终有别人的数据，一律走差分断言。
  */
 import { test, before, after } from 'node:test';
@@ -17,6 +19,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { UserModel } from '../src/models/user.model.js';
+import { ActivityModel } from '../src/models/activity.model.js';
 
 const ADMIN_USER = 'admin_trend_tz_test';
 const ADMIN_PASS = 'test123456';
@@ -43,7 +46,10 @@ let app: FastifyInstance;
 let adminToken = '';
 let seq = 0;
 
-type Bucket = { date: string; newUsers: number; newActivities: number; newFootprints: number };
+type Bucket = { date: string; newUsers: number; activities: number; newFootprints: number };
+
+/** 造轨迹专用的占位用户 id（无需真实 User，只为清理时能收口） */
+const ACT_USER = new mongoose.Types.ObjectId();
 
 async function trend(type: string): Promise<Bucket[]> {
   const res = await app.inject({
@@ -61,6 +67,22 @@ async function seedUserAt(ms: number) {
   await UserModel.create({ openid: `trendtz_openid-${seq}`, nickname: `时区测试-${seq}`, createdAt: new Date(ms) });
 }
 
+/** 造一条已完成轨迹：只钉 startTime（createdAt 走默认=此刻），用来验证轨迹条按开始时间分桶 */
+async function seedActivityAt(startTime: number) {
+  seq += 1;
+  await ActivityModel.create({
+    userId: ACT_USER,
+    type: 'walking',
+    status: 'finished',
+    startTime,
+    endTime: startTime + 60000,
+    duration: 60,
+    distance: 1000,
+    trackPoints: [],
+    markers: [],
+  });
+}
+
 /** 取某个桶标签的计数（桶不存在就直接失败，免得把"标签算错"误报成"计数 0"） */
 function pick(rows: Bucket[], label: string, field: keyof Bucket = 'newUsers') {
   const hit = rows.find((r) => r.date === label);
@@ -70,6 +92,7 @@ function pick(rows: Bucket[], label: string, field: keyof Bucket = 'newUsers') {
 
 async function purge() {
   await UserModel.deleteMany({ openid: OPENID_PREFIX });
+  await ActivityModel.deleteMany({ userId: ACT_USER });
 }
 
 before(async () => {
@@ -112,6 +135,18 @@ test('day：东八区昨天 23:59:59 的记录归昨天，不归今天', async (
   const yesterday = bjDateStr(bjToday0() - DAY);
   assert.equal(pick(after, today) - pick(before, today), 0, '不该算进今天');
   assert.equal(pick(after, yesterday) - pick(before, yesterday), 1, '该落在昨天');
+});
+
+test('day：轨迹按开始时间分桶，不按创建时间（导入的旧轨迹不算进今天）', async () => {
+  const before = await trend('day');
+  const today = bjDateStr(Date.now());
+  const yesterday = bjDateStr(bjToday0() - DAY);
+  // 两条都"创建于此刻"（createdAt=今天）；开始时间分别落在昨天正午 / 今天正午
+  await seedActivityAt(bjToday0() - DAY + 12 * 3600000);
+  await seedActivityAt(bjToday0() + 12 * 3600000);
+  const after = await trend('day');
+  assert.equal(pick(after, yesterday, 'activities') - pick(before, yesterday, 'activities'), 1, '开始时间在昨天 → 昨天桶 +1');
+  assert.equal(pick(after, today, 'activities') - pick(before, today, 'activities'), 1, '开始时间在今天 → 今天桶 +1（若按 createdAt，两条会一起挤进今天）');
 });
 
 test('week：东八区本周一 00:00:01 归本周（末桶），不落到上一周', async () => {
