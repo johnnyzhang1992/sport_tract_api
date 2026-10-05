@@ -36,6 +36,7 @@ import { gapImpact } from '../services/gap-impact.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
 import { getSignedUrl, cleanUrl, getThumbUrl, uploadBuffer } from '../services/oss.js';
+import { bjToday0, bjDateStr, bjIsoWeekLabel, bjIsoWeekStart, bjYearMonth } from '../utils/bj-time.js';
 
 /**
  * 一条轨迹的图片数与首图（列表缩略图用）
@@ -65,40 +66,9 @@ function photoSummary(markers: Array<{ photoUrl?: string; photos?: string[] }> |
 
 const DAY_MS = 86400000;
 
-/** 东八区今日 0 点（epoch ms），与服务器时区无关 */
-function bjToday0(): number {
-  const bj = new Date(Date.now() + 8 * 3600000);
-  return Date.UTC(bj.getUTCFullYear(), bj.getUTCMonth(), bj.getUTCDate()) - 8 * 3600000;
-}
-
-/** 东八区日期串（YYYY-MM-DD） */
-function bjDateStr(ms: number): string {
-  return new Date(ms + 8 * 3600000).toISOString().slice(0, 10);
-}
-
-/**
- * ISO-8601 周标签（YYYY-Www），与 MongoDB 的 %G-W%V 同口径：
- * 以「该日所在周的周四」决定所属年份与周号。入参是 epoch ms，内部先挪 +8h 再按 UTC 取分量，
- * 所以算的是东八区墙上时间的那一周，与服务器时区无关。
- */
-function bjIsoWeekLabel(ms: number): string {
-  const day = new Date(ms + 8 * 3600000);
-  const dow = (day.getUTCDay() + 6) % 7; // 周一 = 0
-  const thu = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate() - dow + 3));
-  const jan4 = new Date(Date.UTC(thu.getUTCFullYear(), 0, 4));
-  const week = 1 + Math.round(((thu.getTime() - jan4.getTime()) / DAY_MS - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7);
-  return `${thu.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
-}
-
-/** 东八区的年/月分量（同样靠「挪 +8h 后按 UTC 读」，不碰服务器本地时区） */
-function bjYearMonth(ms: number): { y: number; m: number } {
-  const b = new Date(ms + 8 * 3600000);
-  return { y: b.getUTCFullYear(), m: b.getUTCMonth() + 1 };
-}
-
 /**
  * 生成趋势图时间桶：range=week（近 7 天按天）/ month（近 30 天按天）/ year（近 12 个月按月）
- * 返回时间桶标签 + 查询起始时间 + MongoDB 分组格式（均按东八区）
+ * 返回时间桶标签 + 查询起始时间 + MongoDB 分组格式（均按东八区，见 utils/bj-time.ts）
  */
 function buildUserTrendBuckets(range: string): {
   labels: string[];
@@ -214,7 +184,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     // 「今日」按东八区 0 点：运行容器是 UTC，用服务器本地时区会把东八区 0~8 点的记录划到昨天
     const ranges = {
       today: bjToday0(),
-      week: now - 7 * DAY,
+      // 本周 = 东八区自然周（周一 0 点起）；month 仍是滚动 30 天
+      week: bjIsoWeekStart(now),
       month: now - 30 * DAY,
     };
     const out: Record<
@@ -429,12 +400,12 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 轨迹数据概况：today/week/month/year/all 各范围指标 + 状态细分 + 类型细分（一次 $facet 聚合）
   fastify.get('/activity-stats', { onRequest: [adminAuth] }, async () => {
     const DAY = 86400000;
-    // 北京时间今日 0 点（产品为中国用户，概况口径统一按东八区）
-    const today0 = new Date(new Date().toLocaleDateString('en-CA') + 'T00:00:00+08:00').getTime();
+    // 今日/本周按东八区自然日与自然周；month/year 仍是滚动 30/365 天（文案侧写「近30天/近一年」）
+    const today0 = bjToday0();
     const now = Date.now();
     const ranges: Record<string, number | null> = {
       today: today0,
-      week: now - 7 * DAY,
+      week: bjIsoWeekStart(now),
       month: now - 30 * DAY,
       year: now - 365 * DAY,
       all: null,
@@ -539,10 +510,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.get('/activity-geo-stats', { onRequest: [adminAuth] }, async (request) => {
     const q = request.query as { range?: string };
     const DAY = 86400000;
-    const today0 = new Date(new Date().toLocaleDateString('en-CA') + 'T00:00:00+08:00').getTime();
+    const today0 = bjToday0();
     const rangeMap: Record<string, number | null> = {
       today: today0,
-      week: Date.now() - 7 * DAY,
+      week: bjIsoWeekStart(Date.now()),
       month: Date.now() - 30 * DAY,
       year: Date.now() - 365 * DAY,
       all: null,
@@ -900,7 +871,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const now = Date.now();
     const ranges: Record<string, number | null> = {
       today: bjToday0(),
-      week: now - 7 * DAY,
+      week: bjIsoWeekStart(now),
       month: now - 30 * DAY,
       year: now - 365 * DAY,
       all: null,
@@ -968,7 +939,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const q = request.query as { range?: string };
     const rangeMap: Record<string, number | null> = {
       today: bjToday0(),
-      week: Date.now() - 7 * DAY_MS,
+      week: bjIsoWeekStart(Date.now()),
       month: Date.now() - 30 * DAY_MS,
       year: Date.now() - 365 * DAY_MS,
       all: null,

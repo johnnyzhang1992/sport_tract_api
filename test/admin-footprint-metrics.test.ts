@@ -6,6 +6,7 @@ import { buildApp } from '../src/app.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
+import { bjIsoWeekStart } from '../src/utils/bj-time.js';
 
 /**
  * 数据概况三接口的足迹字段：/overview（总量三口径）、/stats（今日/周/月新增）、/trend（按桶新增）
@@ -126,12 +127,13 @@ test('overview：同一用户重复出现只算一次用户数', async () => {
 
 test('stats：today/week/month 每档带 newFootprints，且只算 createdAt 落在窗口内的', async () => {
   const before0 = await get('stats');
-  const now = new Date();
+  const now = Date.now();
+  const ws = bjIsoWeekStart(now);
   await FootprintRecordModel.insertMany(
     [
-      doc({ title: `${MZ}-7`, createdAt: now }),
-      doc({ title: `${MZ}-8`, createdAt: new Date(now.getTime() - 3 * 86400000) }), // 3 天前：本周内、今日外
-      doc({ title: `${MZ}-9`, createdAt: new Date(now.getTime() - 20 * 86400000) }), // 20 天前：本月内、本周外
+      doc({ title: `${MZ}-7`, createdAt: new Date(now) }), // 今日（也在本周、近 30 天内）
+      doc({ title: `${MZ}-8`, createdAt: new Date(ws - 3600000) }), // 本周一 0 点前一小时：本周外、近 30 天内
+      doc({ title: `${MZ}-9`, createdAt: new Date(now - 20 * 86400000) }), // 20 天前：本周外、近 30 天内
     ],
     { timestamps: false },
   );
@@ -140,7 +142,11 @@ test('stats：today/week/month 每档带 newFootprints，且只算 createdAt 落
     assert.equal(typeof before0[k].newFootprints, 'number', `${k}.newFootprints 必须存在`);
   }
   assert.equal(after0.today.newFootprints - before0.today.newFootprints, 1, '今日 1 条');
-  assert.equal(after0.week.newFootprints - before0.week.newFootprints, 2, '近 7 天 2 条');
+  assert.equal(
+    after0.week.newFootprints - before0.week.newFootprints,
+    1,
+    '本周（自然周）只该算今日那条：本周一 0 点前与 20 天前都在本周之外',
+  );
   assert.equal(after0.month.newFootprints - before0.month.newFootprints, 3, '近 30 天 3 条');
 });
 
@@ -216,7 +222,7 @@ test('footprint-stats：五档齐全，时间窗口按 createdAt 各自生效', 
   );
   const d = diff(before0, (await get('footprint-stats')) as Record<string, Cell>);
   assert.equal(d.today?.total, 1, '今日 1 条');
-  assert.equal(d.week?.total, 1, '近7天 1 条');
+  assert.equal(d.week?.total, 1, '本周（自然周）1 条');
   assert.equal(d.month?.total, 1, '近30天 1 条（40 天前那条不算）');
   assert.equal(d.year?.total, 2, '近一年 2 条');
   assert.equal(d.all?.total, 3, '累计 3 条');

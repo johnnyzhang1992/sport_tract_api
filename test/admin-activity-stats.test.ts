@@ -6,6 +6,7 @@ import { buildApp } from '../src/app.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
+import { bjIsoWeekStart } from '../src/utils/bj-time.js';
 
 /**
  * admin 轨迹统计接口测试：
@@ -84,8 +85,8 @@ async function adminReq(method: string, url: string): Promise<LightMyRequestResp
 /** 创建一条 finished 活动（上海起点）
  *  注：finish 现在会作废空轨迹（点数/距离守卫），本文件测的是管理端统计聚合，
  *  直接在库内造 finished 记录 */
-async function createFinished(opts: { daysAgo: number; province?: string; city?: string; distance?: number }) {
-  const startTs = Date.now() - opts.daysAgo * 86400000;
+async function createFinished(opts: { daysAgo?: number; atMs?: number; province?: string; city?: string; distance?: number }) {
+  const startTs = opts.atMs ?? Date.now() - (opts.daysAgo ?? 0) * 86400000;
   const doc = await ActivityModel.create({
     userId,
     type: 'walking',
@@ -104,7 +105,8 @@ async function createFinished(opts: { daysAgo: number; province?: string; city?:
 
 test('activity-stats：多范围概况', async () => {
   await createFinished({ daysAgo: 0, distance: 2000 });
-  await createFinished({ daysAgo: 3, distance: 3000 });
+  // 本周 = 自然周（周一 0 点起），不能拿「3 天前」当本周内：今天若是周一/周二，它已落在上周
+  await createFinished({ atMs: bjIsoWeekStart(Date.now()) + 3600000, distance: 3000 });
   await createFinished({ daysAgo: 20, distance: 4000 });
   await createFinished({ daysAgo: 100, distance: 5000 });
 
@@ -116,9 +118,9 @@ test('activity-stats：多范围概况', async () => {
     assert.equal(typeof d[key].count, 'number');
   }
   assert.ok(d.today.count >= 1, '今日应有轨迹');
-  assert.ok(d.week.count >= 2, '本周（7天）应有 2 条');
-  assert.ok(d.month.count >= 3, '本月（30天）应有 3 条');
-  assert.ok(d.year.count >= 4, '今年（365天）应有 4 条');
+  assert.ok(d.week.count >= 2, '本周（自然周）应有 2 条');
+  assert.ok(d.month.count >= 3, '近 30 天应有 3 条');
+  assert.ok(d.year.count >= 4, '近一年应有 4 条');
   assert.ok(d.all.distance >= 14000, '累计距离应含全部测试轨迹');
 });
 

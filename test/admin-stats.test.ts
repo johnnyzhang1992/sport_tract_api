@@ -121,7 +121,7 @@ test('每档都带 finishedActivities：新增轨迹里已完成的子集', asyn
   }
 });
 
-test('「今日」以东八区 0 点为界：昨天 23:59:59 的记录不算今日、仍算近 7 天', async () => {
+test('「今日」以东八区 0 点为界：昨天 23:59:59 的记录不算今日', async () => {
   const base = await stats();
   await seedActivity('finished', bjToday0() - 1000);
 
@@ -132,7 +132,8 @@ test('「今日」以东八区 0 点为界：昨天 23:59:59 的记录不算今�
     '东八区 0 点前的记录不该进今日（按服务器时区算就会：UTC 容器上它属于「昨天」，+14 区里它又变成「今天」）',
   );
   assert.equal(d.today.finishedActivities - base.today.finishedActivities, 0, '已完成子集同界');
-  assert.equal(d.week.newActivities - base.week.newActivities, 1, '它是滚动 7 天内该计的记录');
+  // 本周是自然周，昨天在不在本周取决于今天是周几，所以这里只断言它仍落在近 30 天内
+  assert.equal(d.month.newActivities - base.month.newActivities, 1, '它仍该计进近 30 天');
 });
 
 test('结构契约：三档同构，pv/uv 一起给（概览页把它们并成一行）', async () => {
@@ -144,8 +145,9 @@ test('结构契约：三档同构，pv/uv 一起给（概览页把它们并成�
     }
     assert.ok(d[k].uv <= d[k].pv, `${k} 档：UV(去重登录用户)不该大于 PV(登录次数)`);
   }
-  assert.ok(d.today.newActivities <= d.week.newActivities, '今日 ≤ 近 7 天');
-  assert.ok(d.week.newActivities <= d.month.newActivities, '近 7 天 ≤ 近 30 天');
+  assert.ok(d.today.newActivities <= d.week.newActivities, '今日 ⊆ 本周');
+  // 本周是自然周、本月是滚动 30 天，两者互不包含（今天是 1 号且本周一落在上月时，本周会大于本月）
+  assert.ok(d.today.newActivities <= d.month.newActivities, '今日 ⊆ 近 30 天');
 });
 
 test('缺管理员凭证 → 401', async () => {

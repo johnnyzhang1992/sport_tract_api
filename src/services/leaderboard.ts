@@ -10,6 +10,7 @@ import { AppError } from '../utils/app-error.js';
 import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
 import type { ActivityType } from '../config/constants.js';
 import { getAvatarUrl } from './oss.js';
+import { bjIsoWeekStart, bjMonthStart, bjYearStart } from '../utils/bj-time.js';
 
 export interface RegionProvince {
   name: string;
@@ -104,17 +105,13 @@ export interface LeaderboardResult {
 const LEADERBOARD_PERIODS = ['week', 'month', 'year', 'all'] as const;
 export type LeaderboardPeriod = (typeof LEADERBOARD_PERIODS)[number];
 
-/** 周期 → 起始时间戳（毫秒；自然周从周一、自然月、自然年；all 不限） */
+/** 周期 → 起始时间戳（毫秒；东八区自然周从周一、自然月、自然年；all 不限） */
 export function periodStartMs(period: LeaderboardPeriod, now = new Date()): number | null {
   if (period === 'all') return null;
-  if (period === 'week') {
-    const d = new Date(now);
-    d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // 回到本周周一
-    d.setHours(0, 0, 0, 0);
-    return d.getTime();
-  }
-  if (period === 'month') return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-  return new Date(now.getFullYear(), 0, 1).getTime();
+  const ms = now.getTime();
+  if (period === 'week') return bjIsoWeekStart(ms);
+  if (period === 'month') return bjMonthStart(ms);
+  return bjYearStart(ms);
 }
 
 /** 全平台点亮统计（60s 内存缓存：聚合只读历史，短窗口内允许略旧） */

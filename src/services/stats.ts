@@ -4,26 +4,22 @@ import { locateRegion } from './region.js';
 import { calcFastestKm } from '../utils/pace.js';
 import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
 import { AppError } from '../utils/app-error.js';
+import {
+  bjDayStart,
+  bjToday0,
+  bjMonthStart,
+  bjYearStart,
+  bjDateStr,
+  bjIsoWeekStart,
+  bjIsoWeekLabel,
+  bjYearMonth,
+} from '../utils/bj-time.js';
 
 type ObjectIdLike = Types.ObjectId | string;
 
 /** 转 ObjectId（aggregate $match 不做类型转换） */
 function toObjectId(id: ObjectIdLike): Types.ObjectId {
   return typeof id === 'string' ? new Types.ObjectId(id) : id;
-}
-
-/** 时间边界工具 */
-function dayStart(ts: number): number {
-  const d = new Date(ts);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
-function dayRange(daysAgo: number): { start: number; end: number } {
-  const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo, 0, 0, 0, 0).getTime();
-  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0).getTime();
-  return { start, end };
 }
 
 export interface StatusCount {
@@ -59,16 +55,21 @@ export interface OverviewResult {
   prevMonth: Section; // 上月（自然月）
 }
 
-/** 概览聚合：今日 / 本周（近 7 天）/ 本月 / 累计 + 上周期对比（决策 F18） */
+/** 概览聚合：今日 / 本周 / 本月 / 本年 / 累计 + 上周期对比（决策 F18）；时间档一律东八区自然周期 */
 export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
   const finished: Record<string, any> = { userId: toObjectId(userId), status: 'finished' };
   const DAY = 86400000;
-  const weekStart = dayRange(6).start; // 本周窗口起点（今天往前 6 天的 0 点）
-  const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
+  const now = Date.now();
+  const today0 = bjToday0(now);
+  // 「本周」= 自然周（东八区周一 0 点起），不是「今天往前 6 天」的滚动窗口
+  const weekStart = bjIsoWeekStart(now);
+  const monthStart = bjMonthStart(now); // 东八区本月 1 号 0 点
+  const yearStart = bjYearStart(now);
+  const prevMonthStart = bjMonthStart(monthStart - 1); // 东八区上月 1 号 0 点
 
   const [today, week, month, year, total, prevWeek, prevMonth] = await Promise.all([
     ActivityModel.aggregate([
-      { $match: { ...finished, startTime: { $gte: dayStart(Date.now()) } } },
+      { $match: { ...finished, startTime: { $gte: today0 } } },
       ...sumAgg,
     ]),
     ActivityModel.aggregate([
@@ -83,7 +84,7 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
       {
         $match: {
           ...finished,
-          startTime: { $gte: new Date(new Date().getFullYear(), 0, 1).getTime() }, // 当年
+          startTime: { $gte: yearStart }, // 当年
         },
       },
       ...sumAgg,
@@ -98,7 +99,7 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
         $match: {
           ...finished,
           startTime: {
-            $gte: new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1).getTime(),
+            $gte: prevMonthStart,
             $lt: monthStart,
           },
         },
@@ -109,9 +110,7 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
 
   // 各范围的状态/类型细分（进行中/作废不参与距离/时长口径，仅计数）
   const [exToday, exWeek, exMonth, exYear, exTotal] = await Promise.all(
-    [dayStart(Date.now()), weekStart, monthStart, new Date(new Date().getFullYear(), 0, 1).getTime(), null].map(
-      (since) => extras(userId, since),
-    ),
+    [today0, weekStart, monthStart, yearStart, null].map((since) => extras(userId, since)),
   );
 
   return {
@@ -206,21 +205,8 @@ export interface TrendResult {
 
 export type TrendType = 'week' | 'month' | 'week6' | 'year' | 'daily365';
 
-/** ISO 年-周 格式（近 6 个月按周聚合） */
-function isoWeekKey(d: Date): string {
-  // 复制避免修改原日期
-  const date = new Date(d.getTime());
-  const day = (date.getDay() + 6) % 7; // 周一 = 0
-  date.setDate(date.getDate() - day + 3); // 移到周四
-  const firstThursday = new Date(date.getFullYear(), 0, 4);
-  const firstDay = (firstThursday.getDay() + 6) % 7;
-  firstThursday.setDate(firstThursday.getDate() - firstDay + 3);
-  const week = 1 + Math.round((date.getTime() - firstThursday.getTime()) / (7 * 86400000));
-  return `${date.getFullYear()}-W${String(week).padStart(2, '0')}`;
-}
-
 /**
- * 趋势聚合（决策 F19）
+ * 趋势聚合（决策 F19）—— 桶键与聚合分组都按东八区，否则东八区凌晨的记录会掉进前一天
  * - week：近 7 天按天（7 条）
  * - month：近 30 天按天（30 条）
  * - week6：近 6 个月按周（≤24 条）
@@ -231,14 +217,8 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
   const now = Date.now();
   const DAY = 86400000;
   // 注意：activity.startTime 是 Number 时间戳，start 必须也是数字（Date 对象会导致 $gte 类型不匹配）
-  const startRaw = new Date(
-    type === 'week' ? now - 6 * DAY
-    : type === 'month' ? now - 29 * DAY
-    : type === 'week6' ? now - 180 * DAY
-    : now - 364 * DAY,
-  );
-  startRaw.setHours(0, 0, 0, 0);
-  const start = startRaw.getTime();
+  const backDays = type === 'week' ? 6 : type === 'month' ? 29 : type === 'week6' ? 180 : 364;
+  const start = bjDayStart(now - backDays * DAY);
 
   // 聚合粒度：week/month 按天；week6 按周；year 按月
   const format =
@@ -254,7 +234,7 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
     },
     {
       $group: {
-        _id: { $dateToString: { format, date: { $toDate: '$startTime' } } },
+        _id: { $dateToString: { format, date: { $toDate: '$startTime' }, timezone: '+08:00' } },
         distance: { $sum: '$distance' },
         duration: { $sum: '$duration' },
         count: { $sum: 1 },
@@ -268,22 +248,20 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
     map.set(r._id, { date: r._id, distance: r.distance, duration: r.duration, count: r.count });
   }
 
-  // 补齐连续桶
+  // 补齐连续桶（桶键生成与上面的 timezone:'+08:00' 同口径）
   const data: TrendDay[] = [];
   if (type === 'year') {
     // 近 12 个月，每月一条
     for (let i = 11; i >= 0; i--) {
-      const d = new Date(now - i * 30 * DAY);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const { y, m } = bjYearMonth(now - i * 30 * DAY);
+      const key = `${y}-${String(m).padStart(2, '0')}`;
       data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
     }
   } else if (type === 'week6') {
     // 近 6 个月按周（最多 26 周，取最近 24 周）
     const keys: string[] = [];
-    const cursor = new Date(start);
-    while (cursor.getTime() <= now && keys.length < 26) {
-      keys.push(isoWeekKey(cursor));
-      cursor.setDate(cursor.getDate() + 7);
+    for (let t = start; t <= now && keys.length < 26; t += 7 * DAY) {
+      keys.push(bjIsoWeekLabel(t));
     }
     const recent = keys.slice(-24);
     for (const key of recent) {
@@ -292,9 +270,9 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
   } else {
     // 近 7 / 30 天 / 365 天按天
     const days = type === 'week' ? 7 : type === 'month' ? 30 : 365;
+    const today0 = bjToday0(now);
     for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(now - i * DAY);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const key = bjDateStr(today0 - i * DAY);
       data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
     }
   }
@@ -379,7 +357,8 @@ export async function yearMilestones(
   userId: ObjectIdLike,
   year: number,
 ): Promise<YearMilestonesResult> {
-  const yearStart = new Date(year, 0, 1).getTime();
+  // 年份边界按东八区（元旦 0 点），取年中某刻换算避免月/日歧义
+  const yearStart = bjYearStart(Date.UTC(year, 6, 1));
   const docs = await ActivityModel.find({ userId: toObjectId(userId), status: 'finished' })
     .select({ startTime: 1, type: 1, 'trackPoints.lat': 1, 'trackPoints.lng': 1 })
     .sort({ startTime: 1 })

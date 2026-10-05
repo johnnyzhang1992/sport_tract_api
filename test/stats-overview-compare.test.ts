@@ -4,10 +4,11 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
+import { bjIsoWeekStart, bjMonthStart } from '../src/utils/bj-time.js';
 
 /**
  * stats overview 上周期对比测试：
- * - prevWeek：近 7 天窗口（今天往前 6 天的 0 点）的前 7 天
+ * - prevWeek：本周（东八区自然周，周一起）的前一周
  * - prevMonth：上一个自然月
  * 断言方式：测试内与服务端同口径计算各窗口归属，避免运行日期导致的窗口重叠误判
  */
@@ -19,18 +20,13 @@ const created: number[] = []; // 所有已创建活动的时间戳
 
 const DAY = 86400000;
 
-function dayStartOf(ts: number): number {
-  const d = new Date(ts);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
-/** 与服务端同口径的窗口起点 */
+/** 与服务端同口径的窗口起点（东八区自然周/自然月） */
 function windows() {
+  const now = Date.now();
   return {
-    weekStart: dayStartOf(Date.now() - 6 * DAY),
-    monthStart: new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime(),
-    prevMonthStart: new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1).getTime(),
+    weekStart: bjIsoWeekStart(now), // 本周 = 自然周（周一 0 点起）
+    monthStart: bjMonthStart(now),
+    prevMonthStart: bjMonthStart(bjMonthStart(now) - 1),
   };
 }
 
@@ -117,8 +113,9 @@ test('overview 返回 prevWeek/prevMonth 对比字段', async () => {
   assert.equal(data.prevMonth.count, created.filter(inPrevMonth).length, 'prevMonth.count');
   assert.equal(data.month.count, created.filter(inMonth).length, 'month.count');
 
-  // 固定窗口断言：只有 2 条落在上周窗口（其它构造时间点均不落入）
-  assert.equal(data.prevWeek.count, 2);
-  // 时长：上周 2 条各 60s
-  assert.equal(data.prevWeek.duration, 120);
+  // 固定窗口断言：条数按构造点现算——「本周」是自然周，窗口宽度虽固定，但落到哪几条会随今天是周几变
+  const expectedPrevWeek = created.filter(inPrevWeek).length;
+  assert.equal(data.prevWeek.count, expectedPrevWeek, 'prevWeek 条数应与构造点一致');
+  // 时长：上周窗口每条 60s
+  assert.equal(data.prevWeek.duration, expectedPrevWeek * 60);
 });
