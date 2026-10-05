@@ -15,12 +15,14 @@
 process.env.TZ = 'UTC'; // 线上容器口径；必须在任何断言之前生效
 import { test, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import mongoose from 'mongoose';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
+import { LoginLogModel } from '../src/models/login-log.model.js';
 import { periodStartMs } from '../src/services/leaderboard.js';
 
 const BJ = 8 * 3600000;
@@ -57,6 +59,8 @@ let app: FastifyInstance;
 let adminToken = '';
 let userToken = '';
 let userId = '';
+/** 登录日志专用用户（概览页 PV/UV 是全站口径，用独立 id 才能干净地看增量） */
+const LOGIN_UID = new mongoose.Types.ObjectId();
 
 /** 冻结时刻：真实「东八区今天」的凌晨 00:30（此时 UTC 日期还停在昨天） */
 const FROZEN = (() => {
@@ -106,9 +110,9 @@ after(async () => {
     await ActivityModel.deleteMany({ userId }).catch(() => {});
     await FootprintRecordModel.deleteMany({ userId }).catch(() => {});
   }
+  await LoginLogModel.deleteMany({ userId: LOGIN_UID }).catch(() => {});
   await AdminModel.deleteOne({ username: ADMIN_USER });
   await app.close();
-  const mongoose = (await import('mongoose')).default;
   await mongoose.disconnect().catch(() => {});
 });
 
@@ -205,6 +209,21 @@ async function adminStatsWeek(): Promise<{ newActivities: number }> {
   });
   assert.equal(res.statusCode, 200);
   return res.json().data.week as { newActivities: number };
+}
+
+async function adminStatsToday(): Promise<{ pv: number; uv: number }> {
+  const res = await app.inject({
+    method: 'GET',
+    url: '/sport-track/api/admin/stats',
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assert.equal(res.statusCode, 200);
+  return res.json().data.today as { pv: number; uv: number };
+}
+
+/** 造一条登录日志：createdAt 钉死在 ms（只测窗口边界，不走真实登录链路，免得触发限流） */
+async function seedLoginAt(ts: number) {
+  await LoginLogModel.create({ userId: LOGIN_UID, createdAt: new Date(ts) });
 }
 
 async function adminFootprintWeek(): Promise<{ total: number }> {
@@ -328,4 +347,23 @@ test('管理端 footprint-stats：本周按自然周（createdAt 口径）', asy
   const after = await atBjDawn(adminFootprintWeek);
 
   assert.equal(after.total - base.total, 1, '本周新增足迹只该多出本周一那条');
+});
+
+/* ------------- 6. 登录 PV/UV「今日」边界（概览页用户段「登录 PV·UV」那行） ------------- */
+
+test('管理端 /stats：登录 PV/UV 的「今日」也以东八区 0 点为界，且 UV 去重（TZ=UTC）', async () => {
+  const { y, m, d } = bjParts(FROZEN);
+  const base = await atBjDawn(adminStatsToday);
+  // 同一用户今天凌晨登录两次（PV+2、UV 只 +1）；另一条落在昨天中午（不该进今日）
+  await seedLoginAt(bjMs(y, m, d, 0, 10));
+  await seedLoginAt(bjMs(y, m, d, 0, 20));
+  await seedLoginAt(bjMs(y, m, d - 1, 12, 0));
+  const after = await atBjDawn(adminStatsToday);
+
+  assert.equal(
+    after.pv - base.pv,
+    2,
+    '今日 PV 只该数东八区 0 点后的两次登录（为 0 说明窗口退到了服务器本地 0 点＝UTC 0 点）',
+  );
+  assert.equal(after.uv - base.uv, 1, '同一用户两次登录，UV 去重后只 +1');
 });
