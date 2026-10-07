@@ -79,6 +79,13 @@ const BEST_METRICS: Record<string, BestMetricKey[]> = {
   rowing: ['farthest'],
 };
 
+/**
+ * 要求「整条轨迹没检出疑似搭车」的指标。搭车段会把距离/配速刷成不可信值，
+ * 这类轨迹不该占纪录（哪怕指标已剔除过 vehicleM）。
+ * 判据用 $not/$gt 而不是 $lte:0——缺 vehicleMs 字段的老文档是"没搭车"，$lte 会把它们全排掉。
+ */
+const NO_VEHICLE_METRICS: ReadonlySet<BestMetricKey> = new Set(['farthest', 'fastestKm']);
+
 /** 指标 → 活动字段与排序方向（dir=1 越小越好，如配速） */
 const BEST_METRIC_SPEC: Record<BestMetricKey, { field: string; dir: 1 | -1 }> = {
   farthest: { field: 'distance', dir: -1 }, // 米
@@ -234,7 +241,13 @@ export async function leaderboard(
     const spec = BEST_METRIC_SPEC[key];
     facet[key] = [
       // 越小越好 = 配速类：低于可信下限的（GPS 漂移、把乘车段算进运动量）不当纪录挂着
-      { $match: { [spec.field]: { $gt: spec.dir === 1 ? MIN_PLAUSIBLE_PACE_SEC_PER_KM : 0 } } },
+      // 另：最长距离 / 最快配速要求整条轨迹没检出疑似搭车（见 NO_VEHICLE_METRICS）
+      {
+        $match: {
+          [spec.field]: { $gt: spec.dir === 1 ? MIN_PLAUSIBLE_PACE_SEC_PER_KM : 0 },
+          ...(NO_VEHICLE_METRICS.has(key) ? { vehicleMs: { $not: { $gt: 0 } } } : {}),
+        },
+      },
       { $sort: { [spec.field]: spec.dir } },
       { $limit: 1 },
       // 最长距离要连它的运动时长一起下发（前端同排展示「12.34 km · 1:23:45」）；其它指标不带
