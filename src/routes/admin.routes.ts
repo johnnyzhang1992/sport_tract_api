@@ -166,8 +166,19 @@ export async function adminRoutes(fastify: FastifyInstance) {
           { $group: { _id: null, total: { $sum: { $size: { $ifNull: ['$photos', []] } } } } },
         ]),
       ]);
+    // 性别分布：1 男 / 2 女 / 0 未知（注册默认）
+    const genderAgg = await UserModel.aggregate<{ _id: number; count: number }>([
+      { $group: { _id: '$gender', count: { $sum: 1 } } },
+    ]);
+    const genderCount = { male: 0, female: 0, unknown: 0 };
+    for (const g of genderAgg) {
+      if (g._id === 1) genderCount.male = g.count;
+      else if (g._id === 2) genderCount.female = g.count;
+      else genderCount.unknown += g.count;
+    }
     return success({
       userCount,
+      genderCount,
       activityCount,
       finishedCount,
       totalDistanceKm: Math.round(((distAgg[0]?.total as number) ?? 0) / 10) / 100,
