@@ -175,16 +175,23 @@ export interface TypeCount {
 }
 
 /**
- * 运动榜分类 chips 的排序依据：各运动类型上榜轨迹数
+ * 运动榜分类 chips 的排序依据：各运动类型在「指定周期」的上榜轨迹数。
+ * chips 排序必须与当前选中的周期一致——周榜下按周数据排，总榜下按全量排；
  * 零填充全部类型，前端才能区分「真没人玩」和「接口没返回这项」
  */
-export async function leaderboardTypeCounts(): Promise<{ types: TypeCount[] }> {
+export async function leaderboardTypeCounts(period: LeaderboardPeriod = 'all'): Promise<{ types: TypeCount[]; period: LeaderboardPeriod }> {
+  const startMs = periodStartMs(period);
+  const match: Record<string, unknown> = { status: 'finished', type: { $in: [...ACTIVITY_TYPES] } };
+  if (startMs != null) match.startTime = { $gte: startMs };
   const rows = await ActivityModel.aggregate<{ _id: string; n: number }>([
-    { $match: { status: 'finished', type: { $in: [...ACTIVITY_TYPES] } } },
+    { $match: match },
     { $group: { _id: '$type', n: { $sum: 1 } } },
   ]);
   const map = new Map(rows.map((r) => [r._id, r.n]));
-  return { types: ACTIVITY_TYPES.map((type) => ({ type, count: map.get(type) ?? 0 })) };
+  return {
+    types: ACTIVITY_TYPES.map((type) => ({ type, count: map.get(type) ?? 0 })),
+    period,
+  };
 }
 
 export async function leaderboard(

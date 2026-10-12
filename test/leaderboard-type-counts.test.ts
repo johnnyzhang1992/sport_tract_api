@@ -27,10 +27,10 @@ async function loginMock(openid: string) {
   return { userId: body.user?.id ?? body.user?._id, token: body.accessToken };
 }
 
-async function counts(): Promise<Array<{ type: string; count: number }>> {
+async function counts(period = ''): Promise<Array<{ type: string; count: number }>> {
   const res = await app.inject({
     method: 'GET',
-    url: '/sport-track/api/stats/leaderboard-type-counts',
+    url: '/sport-track/api/stats/leaderboard-type-counts' + (period ? `?period=${period}` : ''),
     headers: { authorization: `Bearer ${token}` },
   });
   assert.equal(res.statusCode, 200, res.body);
@@ -103,4 +103,32 @@ test('TC3 榜外脏 type 不冒出来、也不影响任何一项', async () => {
 test('TC4 未登录 401', async () => {
   const res = await app.inject({ method: 'GET', url: '/sport-track/api/stats/leaderboard-type-counts' });
   assert.equal(res.statusCode, 401);
+});
+
+
+test('TC6 period 过滤：本周的数据在 week 下计入、all 下也计入（week 是 all 的子集）', async () => {
+  // 本周种 2 条 cycling
+  await ActivityModel.create([
+    { userId, type: 'cycling', status: 'finished', distance: 3000, startTime: NOW },
+    { userId, type: 'cycling', status: 'finished', distance: 3000, startTime: NOW },
+  ]);
+  const weekRows = await counts('week');
+  assert.ok(pick(weekRows, 'cycling') >= 2, '本周 cycling 应计入 week');
+  const allRows = await counts('all');
+  assert.ok(pick(allRows, 'cycling') >= pick(weekRows, 'cycling'), 'all 计数应 ≥ week');
+});
+
+test('TC7 period 缺省为 week：旧数据（一年前）不计入缺省，计入 all', async () => {
+  // 一年前的 hiking：week/month 都不该算，all 要算
+  await ActivityModel.create({
+    userId,
+    type: 'hiking',
+    status: 'finished',
+    distance: 5000,
+    startTime: NOW - 365 * 86400000,
+  });
+  const def = await counts('');
+  const all = await counts('all');
+  assert.ok(pick(def, 'hiking') === 0, `缺省（week）不该计一年前的数据，实际 ${pick(def, 'hiking')}`);
+  assert.ok(pick(all, 'hiking') >= 1, 'all 应计入一年前的 hiking');
 });
