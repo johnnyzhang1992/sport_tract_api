@@ -1,3 +1,4 @@
+import { Types } from 'mongoose';
 /**
  * 运动榜（决策：运动排行榜 tab）
  * - regions：全平台点亮地图（所有用户 finished 轨迹，直接聚合落库的 provinces/startCity 字段）
@@ -178,9 +179,16 @@ export interface TypeCount {
  * 运动榜分类 chips 的排序依据：各运动类型上榜轨迹数
  * 零填充全部类型，前端才能区分「真没人玩」和「接口没返回这项」
  */
-export async function leaderboardTypeCounts(): Promise<{ types: TypeCount[] }> {
+/**
+ * 各类型 finished 轨迹数（chips「有数据的排前面」用）。
+ * userId 传入 = 只统计该用户的数据（运动榜默认选中用户自己有数据的类型）；
+ * 不传 = 全平台口径（管理端/兼容旧客户端）。
+ */
+export async function leaderboardTypeCounts(userId?: string | null): Promise<{ types: TypeCount[] }> {
+  const match: Record<string, unknown> = { status: 'finished', type: { $in: [...ACTIVITY_TYPES] } };
+  if (userId) match.userId = new Types.ObjectId(userId);
   const rows = await ActivityModel.aggregate<{ _id: string; n: number }>([
-    { $match: { status: 'finished', type: { $in: [...ACTIVITY_TYPES] } } },
+    { $match: match },
     { $group: { _id: '$type', n: { $sum: 1 } } },
   ]);
   const map = new Map(rows.map((r) => [r._id, r.n]));
