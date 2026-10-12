@@ -104,25 +104,3 @@ test('TC4 未登录 401', async () => {
   const res = await app.inject({ method: 'GET', url: '/sport-track/api/stats/leaderboard-type-counts' });
   assert.equal(res.statusCode, 401);
 });
-
-
-test('TC5 按当前用户过滤：只统计自己的 finished 轨迹', async () => {
-  // 其他用户种 5 条 running；当前用户种 2 条 hiking
-  const other = await loginMock('mock_openid_type_counts_other');
-  await ActivityModel.create([
-    { userId: other.userId, type: 'running', status: 'finished', distance: 3000, startTime: NOW },
-    { userId: other.userId, type: 'running', status: 'finished', distance: 3000, startTime: NOW },
-    { userId: other.userId, type: 'running', status: 'finished', distance: 3000, startTime: NOW },
-    { userId: other.userId, type: 'running', status: 'finished', distance: 3000, startTime: NOW },
-    { userId: other.userId, type: 'running', status: 'finished', distance: 3000, startTime: NOW },
-  ]);
-  const beforeHike = pick(await counts(), 'hiking');
-  await ActivityModel.create([
-    { userId, type: 'hiking', status: 'finished', distance: 2000, startTime: NOW },
-    { userId, type: 'hiking', status: 'finished', distance: 2000, startTime: NOW },
-  ]);
-  const rows = await counts();
-  // 别人的 running 不计入；自己的 hiking 计入
-  assert.equal(pick(rows, 'running'), 0, `别人的 running 不该计入，实际 ${pick(rows, 'running')}`);
-  assert.equal(pick(rows, 'hiking') - beforeHike, 2, '自己的 hiking 应计入');
-});

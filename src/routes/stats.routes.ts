@@ -73,8 +73,8 @@ export async function statsRoutes(fastify: FastifyInstance) {
   });
 
   // 运动榜：各运动类型上榜轨迹数（前端 chips 按「有数据的排前面」排序）
-  fastify.get('/leaderboard-type-counts', { onRequest: [fastify.authenticate] }, async (request) => {
-    return success(await leaderboardTypeCounts(request.user.userId));
+  fastify.get('/leaderboard-type-counts', { onRequest: [fastify.authenticate] }, async () => {
+    return success(await leaderboardTypeCounts());
   });
 
   // 运动榜：当前用户各类型榜名次一览（单次聚合；首页摘要按 周榜→月榜→年榜→总榜 回退取最优展示）
