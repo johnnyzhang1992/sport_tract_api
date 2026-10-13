@@ -1,7 +1,7 @@
 import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { locateRegion } from './region.js';
-import { calcFastestKm } from '../utils/pace.js';
+import { calcFastestKm, calcPbMarks } from '../utils/pace.js';
 import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
 import { AppError } from '../utils/app-error.js';
 import {
@@ -294,6 +294,14 @@ export async function bestRecords(userId: ObjectIdLike) {
     const fk = calcFastestKm(a.trackPoints ?? [], a.type);
     await ActivityModel.updateOne({ _id: a._id }, { $set: { fastestKm: fk } });
   }
+  // 距离里程碑惰性补算：pbMarks 未落库的历史轨迹（补算后写 []，避免反复扫点）
+  const missingMarks = await ActivityModel.find({ ...base, pbMarks: { $exists: false } })
+    .select('_id trackPoints')
+    .limit(50)
+    .lean();
+  for (const a of missingMarks) {
+    await ActivityModel.updateOne({ _id: a._id }, { $set: { pbMarks: calcPbMarks(a.trackPoints ?? []) } });
+  }
   const select = '_id type startTime distance avgPace fastestKm duration elevationGain';
   const fmt = (a: Record<string, any> | undefined): Record<string, any> | null =>
     a
@@ -315,11 +323,19 @@ export async function bestRecords(userId: ObjectIdLike) {
       { $project: { type: 1, startTime: 1, distance: 1, avgPace: 1, fastestKm: 1, duration: 1, elevationGain: 1 } },
       { $group: { _id: '$type', doc: { $first: '$$ROOT' } } },
     ]);
-  const [distRows, paceRows, durRows, elevRows] = await Promise.all([
+  const [distRows, paceRows, durRows, elevRows, markRows] = await Promise.all([
     byTypeAgg('distance', -1),
     byTypeAgg('fastestKm', 1, { fastestKm: { $gt: MIN_PLAUSIBLE_PACE_SEC_PER_KM } }),
     byTypeAgg('duration', -1),
     byTypeAgg('elevationGain', -1),
+    // 距离里程碑保持者链原料：所有 (type, 轨迹, km, 用时, 开始时间)，重放在 JS 侧做
+    ActivityModel.aggregate([
+      { $match: base },
+      { $unwind: '$pbMarks' },
+      { $match: { 'pbMarks.sec': { $gt: 0 } } },
+      { $project: { type: 1, startTime: 1, km: '$pbMarks.km', sec: '$pbMarks.sec' } },
+      { $sort: { type: 1, km: 1, startTime: 1, sec: 1 } },
+    ]),
   ]);
   // 个人最佳按类型分组：各运动类型分别取最佳（不同类型绝对值/配速均不可比）
   type BestRow = { type: string; [k: string]: any };
@@ -327,11 +343,59 @@ export async function bestRecords(userId: ObjectIdLike) {
     rows
       .map((r) => ({ type: r._id, ...fmt(r.doc) }) as BestRow)
       .sort((a, b) => ((a[sortKey] ?? 0) - (b[sortKey] ?? 0)) * dir);
+
+  // 保持者链重放：同 (类型, 公里) 按轨迹时间升序，用时严格更短才换人（同秒并列先到先得）。
+  // 「达成即留痕」——曾被刷新的前纪录保持者也留在链里（isCurrent=false + 保持天数），
+  // 纠偏重算 pbMarks 后链会按新数据自动重放修正
+  const DAY = 86400000;
+  const now = Date.now();
+  type ChainRow = {
+    type: string;
+    km: number;
+    id: string;
+    sec: number;
+    startTime: number;
+    isCurrent: boolean;
+    heldDays: number; // 保持天数：被刷新时刻（或当前时刻）距达成时刻的整天数
+  };
+  const bestSoFar = new Map<string, ChainRow>();
+  const chain: ChainRow[] = [];
+  for (const r of markRows) {
+    const key = `${r.type}:${r.km}`;
+    const prev = bestSoFar.get(key);
+    if (prev && r.sec >= prev.sec) continue;
+    if (prev) {
+      prev.isCurrent = false;
+      prev.heldDays = Math.max(0, Math.floor((r.startTime - prev.startTime) / DAY));
+    }
+    const row: ChainRow = {
+      type: r.type,
+      km: r.km,
+      id: String(r._id),
+      sec: r.sec,
+      startTime: r.startTime,
+      isCurrent: true,
+      heldDays: 0,
+    };
+    bestSoFar.set(key, row);
+    chain.push(row);
+  }
+  for (const row of bestSoFar.values()) {
+    row.heldDays = Math.max(0, Math.floor((now - row.startTime) / DAY));
+  }
+  chain.sort((a, b) => (a.type === b.type ? a.km - b.km : a.type < b.type ? -1 : 1));
+
   return {
     maxDistanceByType: mapByType(distRows, 'distance', -1),
     minPaceByType: mapByType(paceRows, 'fastestKm', 1), // 配速升序=最快
     maxDurationByType: mapByType(durRows, 'duration', -1),
     maxElevationByType: mapByType(elevRows, 'elevationGain', -1),
+    // 距离里程碑当前纪录（口径与旧版一致：每 类型+公里 全局最快一条）
+    fastestDistanceByKm: chain
+      .filter((r) => r.isCurrent)
+      .map(({ type, km, id, sec, startTime }) => ({ type, km, id, sec, startTime })),
+    // 距离里程碑保持者链（含已被刷新的前纪录，列表/详情徽章「曾保持」用）
+    distancePbChain: chain,
   };
 }
 

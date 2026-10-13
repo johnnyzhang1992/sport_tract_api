@@ -768,8 +768,59 @@ test('活动列表：包含统计字段，不含完整点集', async () => {
   assert.equal(item.trackPoints, undefined); // 列表不返回完整点集
 });
 
-test('best 惰性补算：历史轨迹无 fastestKm 自动补齐', async () => {
-  // 创建并 finish 一条轨迹，然后删除 fastestKm（模拟历史数据）
+test('距离里程碑 PB：finish 落库 pbMarks，best 聚合 fastestDistanceByKm + 惰性回填', async () => {
+  // 两条 5km+ 轨迹：slow 先达成（前纪录保持者）、fast 后达成（当前纪录）→ 保持者链应两条都在
+  const finish5k = async (token: string, secPerStep: number, startOffsetMs: number, endTs: number) => {
+    const created = await req('POST', '/sport-track/api/activities', {
+      token,
+      body: { type: 'running', startTime: startOffsetMs },
+    });
+    const id = created.json().data.activityId;
+    // 步长 105m × 48 步 = 5040m（留浮点裕量），3.5 m/s 人速
+    const pts = [];
+    const dStep = 105 / 111194.926;
+    for (let i = 0; i <= 48; i++)
+      pts.push({ seq: i + 1, lat: 31 + dStep * i, lng: 121, altitude: null, speed: null, timestamp: startOffsetMs + i * secPerStep * 1000 });
+    const res = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+      token,
+      body: { trackPoints: pts, endTime: endTs, pausedMs: 0 },
+    });
+    assert.equal(res.statusCode, 200);
+    return { id, act: res.json().data.activity };
+  };
+  const slow = await finish5k(tokenA, 40, TEST_NOW - 2 * 86400000, TEST_NOW - 2 * 86400000 + 48 * 40 * 1000 + 60000); // 两天前，~1905s，endTime 紧随最后一点（勿触发 24h 跨度守卫）
+  assert.ok(Array.isArray(slow.act.pbMarks) && slow.act.pbMarks.length === 1, '5km 轨迹应落库 1 个里程碑');
+  assert.equal(slow.act.pbMarks[0].km, 5);
+  assert.equal(slow.act.pbMarks[0].sec, 1905);
+
+  const fast = await finish5k(tokenA, 30, TEST_NOW - 60000, TEST_NOW); // 今天，~1429s
+  assert.ok(Math.abs(fast.act.pbMarks[0].sec - 1428.6) <= 2, `里程碑用时 ~1429s，实际 ${fast.act.pbMarks[0].sec}`);
+
+  // 模拟历史数据：删掉 fast 的 pbMarks → best 触发惰性回填并聚合
+  await ActivityModel.updateOne({ _id: fast.id }, { $unset: { pbMarks: '' } }, { timestamps: false });
+  const res = await req('GET', '/sport-track/api/stats/best', { token: tokenA });
+  assert.equal(res.statusCode, 200);
+  const after = await ActivityModel.findById(fast.id).lean();
+  assert.ok(Array.isArray(after?.pbMarks) && (after?.pbMarks ?? []).length === 1, 'pbMarks 应被惰性回填');
+
+  // 当前纪录：只保留最快一条
+  const km5 = res.json().data.fastestDistanceByKm.filter((r: { type: string; km: number }) => r.type === 'running' && r.km === 5);
+  assert.equal(km5.length, 1);
+  assert.equal(km5[0].id, String(fast.id), 'fastestDistanceByKm 应只含当前纪录（fast）');
+  // 保持者链：两条都在，slow 是前纪录并带保持天数（两天前达成 → 次日被刷新 = 保持 1 天）
+  const chain5 = res.json().data.distancePbChain.filter((r: { type: string; km: number }) => r.type === 'running' && r.km === 5);
+  assert.equal(chain5.length, 2, '保持者链应含前纪录与当前纪录');
+  const slowRow = chain5.find((r: { id: string }) => r.id === String(slow.id));
+  const fastRow = chain5.find((r: { id: string }) => r.id === String(fast.id));
+  assert.equal(slowRow.isCurrent, false, 'slow 已被刷新，非当前纪录');
+  assert.equal(slowRow.heldDays, 1);
+  assert.equal(fastRow.isCurrent, true, 'fast 为当前纪录');
+  assert.equal(fastRow.heldDays, 0, '今天达成，保持 0 天（前端展示为「保持中」）');
+  await ActivityModel.deleteOne({ _id: fast.id });
+  await ActivityModel.deleteOne({ _id: slow.id });
+});
+
+test('best 惰性补算：历史轨迹无 fastestKm 自动补齐', async () => {  // 创建并 finish 一条轨迹，然后删除 fastestKm（模拟历史数据）
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,
     body: { type: 'running', startTime: TEST_NOW - 60000 },

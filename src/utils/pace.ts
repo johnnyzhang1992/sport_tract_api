@@ -148,6 +148,57 @@ export function formatPace(secPerKm: number): string {
   return `${m}'${s.toString().padStart(2, '0')}"`;
 }
 
+/** 距离里程碑 PB 标记：到达 5/10/15…公里（每 5km 一个）的累计用时（秒） */
+export interface PbMark {
+  km: number;
+  sec: number;
+}
+
+/** 里程碑步长（米）：每 5km 一个记录 */
+const PB_MARK_STEP_M = 5000;
+
+/**
+ * 距离里程碑耗时（5公里PB/10公里PB/…）：从起点累计距离每满 5km 记一次用时
+ * - 用时与距离的累计规则与 calcFastestKm 完全同款：
+ *   a) 静止时段（still）照计——停下来休息也算跑完这段的耗时
+ *   b) 暂停恢复点（pauseGap）/ 相邻点 >60s 丢点 / 车速段（vehicle）：
+ *      跨越的距离与时间都不计（暂停位移是 GPS 漂移、暂停时间不该算成绩）
+ * - 里程碑时刻在跨越它的相邻两点间按距离比例线性插值
+ * - 不足 5km 的轨迹返回 []（里程碑必须真实到达）
+ */
+export function calcPbMarks(points: TrackPointLike[]): PbMark[] {
+  const sorted = [...points]
+    .filter((p) => p.timestamp != null)
+    .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+  if (sorted.length < 2) return [];
+  const marks: PbMark[] = [];
+  let markIndex = 1; // 第几个里程碑（× PB_MARK_STEP_M = 目标距离）
+  let cumDist = 0;
+  let cumSec = 0;
+  let prev = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const dt = ((cur.timestamp ?? 0) - (prev.timestamp ?? 0)) / 1000; // 秒
+    // 与 calcFastestKm 同款：跨暂停/丢点/车速段的距离与时间都不算
+    if (cur.pauseGap || cur.vehicle || !Number.isFinite(dt) || dt < 0 || dt > GAP_MS / 1000) {
+      prev = cur;
+      continue;
+    }
+    const stepDist = haversineDistance(prev, cur);
+    // 单步跨多个里程碑时逐个补齐（按距离比例插值到里程碑时刻）
+    // epsilon：恰好跑满 5km 时 haversine 累计的浮点误差可能停在 4999.999999x，不能因此漏记
+    while (stepDist > 0 && cumDist + stepDist >= markIndex * PB_MARK_STEP_M - 1e-6) {
+      const remain = markIndex * PB_MARK_STEP_M - cumDist;
+      marks.push({ km: markIndex * 5, sec: Math.round(cumSec + (dt * remain) / stepDist) });
+      markIndex++;
+    }
+    cumDist += stepDist;
+    cumSec += dt;
+    prev = cur;
+  }
+  return marks;
+}
+
 /** 轨迹内最快 1 公里分段（秒/公里）
  * - 1km 分段：从起点起每累计 1000m 记一段（不足 1km 的尾段剔除），段内按实际距离归一化到 1km
  * - 用时按**经过时间**算（与 Keep/华为的分段口径一致）：段内静止时段（still）照计，

@@ -2,7 +2,7 @@ import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
-import { calcStats, calcFastestKm, haversineDistance } from '../utils/pace.js';
+import { calcStats, calcFastestKm, calcPbMarks, haversineDistance } from '../utils/pace.js';
 import { markStandstill, shrinkStillSegments } from '../utils/standstill.js';
 import { simplifyTracks } from '../utils/simplify.js';
 import { markGapJumps } from '../utils/track-gap.js';
@@ -73,6 +73,8 @@ export interface ActivityDto {
   distance: number;
   avgPace: number | null;
   fastestKm: number | null;
+  /** 距离里程碑 PB：到达 5/10/15…公里的累计用时（秒），每 5km 一项 */
+  pbMarks: { km: number; sec: number }[];
   calories: number;
   elevationGain: number;
   minAltitude: number | null;
@@ -124,6 +126,7 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     distance: doc.distance ?? 0,
     avgPace: doc.avgPace ?? null,
     fastestKm: doc.fastestKm ?? null,
+    pbMarks: doc.pbMarks ?? [],
     calories: doc.calories ?? 0,
     elevationGain: doc.elevationGain ?? 0,
     minAltitude: doc.minAltitude ?? null,
@@ -541,6 +544,8 @@ export async function finishActivity(
 
   // 轨迹内最快 1km 分段（个人最佳"最快配速"口径）：基于原始存储点（未纠偏口径）
   const fastestKm = calcFastestKm(storedPoints, activity.type);
+  // 距离里程碑 PB（5/10/15…公里累计用时）：与最快配速同款断点规则，原始点口径
+  const pbMarks = calcPbMarks(storedPoints);
   // 落库省市（按省查询轨迹 + 点亮地图省下钻）
   const regions = provincesOfPoints(storedPoints);
 
@@ -562,6 +567,7 @@ export async function finishActivity(
         distance: storedDistance,
         avgPace: durationSec > 0 && storedDistance > 0 ? durationSec / (storedDistance / 1000) : null,
         fastestKm,
+        pbMarks,
         calories: rawStats.calories,
         elevationGain: rawStats.elevationGain,
         minAltitude: rawStats.minAltitude,
@@ -698,6 +704,7 @@ export async function closeAbandonedActivity(
   }
 
   const fastestKm = calcFastestKm(storedPoints, activity.type);
+  const pbMarks = calcPbMarks(storedPoints);
   const regions = provincesOfPoints(markedPoints);
 
   const hit = await ActivityModel.updateOne(
@@ -720,6 +727,7 @@ export async function closeAbandonedActivity(
         distance: stats.distance,
         avgPace: stats.avgPace,
         fastestKm,
+        pbMarks,
         calories: stats.calories,
         elevationGain: stats.elevationGain,
         minAltitude: stats.minAltitude,
@@ -830,6 +838,8 @@ export async function listActivities(
           avgPace: 1,
           calories: 1,
           elevationGain: 1,
+          // 距离里程碑 PB（个人最佳角标匹配用，每条最多几个小对象）
+          pbMarks: 1,
           minAltitude: 1,
           maxAltitude: 1,
           startAddress: 1,
@@ -993,6 +1003,7 @@ export async function reprocessActivity(
     weightKg: await resolveWeightKg(activity.userId),
   });
   const fastestKm = calcFastestKm(fullPoints, activity.type);
+  const pbMarks = calcPbMarks(fullPoints);
   const storedPoints = shrinkStillSegments(fullPoints);
   // 纠偏后轨迹点变化 → 重算省市并更新
   const regions = provincesOfPoints(smoothed);
@@ -1012,6 +1023,7 @@ export async function reprocessActivity(
         distance: stats.distance,
         avgPace: stats.avgPace,
         fastestKm,
+        pbMarks,
         calories: stats.calories,
         elevationGain: stats.elevationGain,
         minAltitude: stats.minAltitude,
