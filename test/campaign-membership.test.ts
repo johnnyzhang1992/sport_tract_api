@@ -288,3 +288,51 @@ test('CM11 E11000 兜底：{campaignId,userId} 唯一冲突翻成 409「你已�
     assert.ok(!res.body.includes(leak), `响应里出现了内部信息 ${leak}：${res.body.slice(0, 200)}`);
   }
 });
+
+test('CM12 已解散 / 已到期的活动：approve 403（且不产生 joined 行）', async () => {
+  // 可达路径：活动解散后发起人详情页仍能拉 /pending、徽标可点 → approveMember 没有状态闸门时
+  // 会把 pending 行刷成 joined（joinedAt=now），该成员在死活动里开始累积成绩。
+  const dissolved = await mk(String(U.creator), { title: 'CM12-dissolved', visibility: 'private' });
+  await joinCampaign(dissolved, String(U.a)); // 造一条 pending 申请（此时活动还活着）
+  await dissolveCampaign(dissolved, String(U.creator));
+
+  await assert.rejects(
+    () => approveMember(dissolved, String(U.creator), String(U.a)),
+    (e: any) => {
+      assert.equal(e.statusCode, 403, `解散后 approve 应 403，实际：${e.statusCode} ${e.message}`);
+      assert.match(e.message, /已解散/, '文案要说明是「已解散」');
+      assert.match(e.message, /dissolved/, '文案要含活动状态实值');
+      return true;
+    },
+  );
+  assert.equal(
+    await CampaignMemberModel.countDocuments({ campaignId: dissolved, userId: U.a, state: 'joined' }),
+    0,
+    '已解散的活动不得因 approve 产生 joined 行',
+  );
+
+  // 到期：effectiveStatus 按 now 派生 ended（不写库）。join 自己也有闸门走不通，
+  // 直接落一条 pending 行模拟「到期前申请、拖到到期后才审批」。
+  const ended = await mk(String(U.creator), {
+    title: 'CM12-ended',
+    visibility: 'private',
+    startDate: '2000-01-01',
+    endDate: '2000-01-07',
+  });
+  await CampaignMemberModel.create({ campaignId: ended, userId: U.b, role: 'member', state: 'pending' });
+
+  await assert.rejects(
+    () => approveMember(ended, String(U.creator), String(U.b)),
+    (e: any) => {
+      assert.equal(e.statusCode, 403, `到期后 approve 应 403，实际：${e.statusCode} ${e.message}`);
+      assert.match(e.message, /已结束/, '文案要说明是「已结束」');
+      assert.match(e.message, /ended/, '文案要含活动状态实值');
+      return true;
+    },
+  );
+  assert.equal(
+    await CampaignMemberModel.countDocuments({ campaignId: ended, userId: U.b, state: 'joined' }),
+    0,
+    '已到期的活动不得因 approve 产生 joined 行',
+  );
+});

@@ -383,10 +383,27 @@ async function assertPendingRow(campaignId: mongoose.Types.ObjectId, targetUid: 
   return row;
 }
 
-/** 同意：pending → joined 并刷新 joinedAt（统计窗口下界） */
+/**
+ * 同意：pending → joined 并刷新 joinedAt（统计窗口下界）。
+ *
+ * 状态闸门与 joinCampaign 同形：解散 / 到期（effectiveStatus 派生）后不能再批入队。
+ * 不拦的话——发起人详情页在活动解散后仍能拉 /pending、徽标可点——approve 会把 pending 行
+ * 刷成 joined（joinedAt=now），该成员在已死活动里开始累积成绩。
+ * 文案区分「已解散」/「已结束」并带上状态实值，便于端上提示与排障。
+ * 注意：reject / kick / leave 是**收缩**成员集合的操作，刻意不加闸门；dissolve 保持幂等。
+ */
 export async function approveMember(id: string, creatorId: string, targetUid: string): Promise<void> {
   const c = await loadCampaignOr404(id);
   assertCreator(c, creatorId);
+  const status = effectiveStatus(c);
+  if (status !== 'active') {
+    throw new AppError(
+      403,
+      status === 'dissolved'
+        ? '活动已解散（活动状态：dissolved），不能再同意加入'
+        : '活动已结束（活动状态：ended），不能再同意加入',
+    );
+  }
   const row = await assertPendingRow(c._id, targetUid);
   row.state = 'joined';
   row.joinedAt = Date.now();
@@ -503,6 +520,10 @@ export async function campaignLeaderboard(
 /**
  * 成员明细（仅发起人）：概况 + 分页轨迹列表。
  *
+ * 权限与存在性：仅发起人；`uid` 与 `:id` 同待遇——畸形串走 404 闸门（本仓硬性惯例），
+ * 且目标在本活动**没有任何加入段**（从未加入 / 只有 pending）也 404，而不是 200 + 全 0。
+ * 「是成员但还没有轨迹」不受影响：有加入段即照常 200 + 全 0。
+ *
  * 明细的**计入判据与 campaign-stats 同口径**（否则弹窗里的条数/距离会和汇总对不上）：
  * 判据由 `memberActivityMatch` 单点提供（`status='finished'`、`vehicleMs: { $not: { $gt: 0 } }`、
  * `type ∈ allowedTypes`、`startTime` 落在该用户的贡献时段并集内）—— 明细不再自己拼一份，改口径时两边同步。
@@ -521,15 +542,21 @@ export async function memberDetail(
 }> {
   const c = await loadCampaignOr404(id);
   assertCreator(c, creatorId);
+  // uid 与 :id 同待遇：畸形串按「成员不存在」404，不让它静默落进 200 + 全 0
+  assertObjectIdLike(targetUid, '成员不存在');
+  // 归一成小写 hex（String(ObjectId) 恒小写）：行内 userId 的字符串形与 segs 键都是它，直接拿原串比会对不上大写 hex
+  const uid = String(new mongoose.Types.ObjectId(targetUid));
 
   const segs = await loadSegments(String(c._id));
-  const targetSegs = segs.get(targetUid) ?? [];
-  const stats = (await statsForMembers(c, segs, [targetUid])).get(targetUid) ?? emptyStats();
+  // 没有任何加入段（从未加入 / 只有 pending，joinedAt 为空）＝ 不是成员 → 404
+  if (!segs.has(uid)) throw new AppError(404, '成员不存在');
+  const targetSegs = segs.get(uid)!;
+  const stats = (await statsForMembers(c, segs, [uid])).get(uid) ?? emptyStats();
 
   // 计入判据与汇总**同源**：复用 campaign-stats 的 memberActivityMatch（含 baseMatch + timeOr），
   // 不再手抄 status / vehicleMs / type / 时间窗 —— 未来改口径时此处自动跟随。
-  // 无贡献时段（从未加入 / 未产生段）→ helper 返回 null，据此短路：`$or: []` 是非法查询，绝不能进 match。
-  const match = memberActivityMatch(c, targetUid, targetSegs);
+  // 上面已 404 掉无加入段的人，match 正常必非 null；这里保留兜底，确保 `$or: []` 永不进 match。
+  const match = memberActivityMatch(c, uid, targetSegs);
   if (match === null) {
     return { stats, items: [], total: 0, page: query.page, pageSize: query.pageSize };
   }

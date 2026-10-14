@@ -168,7 +168,7 @@ test('CL2 非成员调排行榜 → 403；成员可调', async () => {
   );
 });
 
-test('CL3 成员明细：非发起人 403；发起人拿到概况 + 分页明细（判据与 campaign-stats 同口径）', async () => {
+test('CL3 成员明细：非发起人 403；发起人拿到概况 + 分页明细；成员零轨迹 200、未加入 404（判据与 campaign-stats 同口径）', async () => {
   const cid = await mk(String(U.creator), { title: 'CL3', allowedTypes: ['running'] });
   // 明细目标用**专属用户 t**：计入窗口以 joinedAt≈now 为下界，若复用其它用例的用户，
   // 那些用例造的「now 附近」轨迹会落进本次窗口，条数随用例执行耗时窜动。
@@ -239,9 +239,16 @@ test('CL3 成员明细：非发起人 403；发起人拿到概况 + 分页明细
   assert.equal(p2.items.length, 1);
   assert.equal(p2.total, 3);
 
-  // 该用户在活动里没有任何贡献时段（未加入过）→ 空明细，绝不能因 $or:[] 抛错
-  const empty = await memberDetail(cid, String(U.creator), String(U.noSeg), { page: 1, pageSize: 20 });
-  assert.equal(empty.stats.count, 0);
-  assert.equal(empty.total, 0);
-  assert.deepEqual(empty.items, []);
+  // 是成员但零轨迹 → 仍 200 + 全 0（A3 改动后的「不要误伤」面：有加入段即可，轨迹可以一条都没有）
+  const zero = await memberDetail(cid, String(U.creator), String(U.c), { page: 1, pageSize: 20 });
+  assert.equal(zero.stats.count, 0);
+  assert.equal(zero.total, 0);
+  assert.deepEqual(zero.items, []);
+
+  // 未加入过（在本活动没有任何加入段）→ 404：不是成员就不按「空数据」回 200。
+  // （旧行为是 200 + 全 0，与本仓「非法/不属于即 404」惯例冲突，随 A3 修正。）
+  await assert.rejects(
+    () => memberDetail(cid, String(U.creator), String(U.noSeg), { page: 1, pageSize: 20 }),
+    (e: any) => e.statusCode === 404,
+  );
 });

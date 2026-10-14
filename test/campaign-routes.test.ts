@@ -222,8 +222,10 @@ test('CR4 小程序码：未登录 401；非成员 403；body 非法 400（成�
   assert.equal(badBody.statusCode, 400);
 
   // 成功分支（真实调微信取码 + OSS 上传，失败降级 base64）刻意不在此断言：
-  // 它完整镜像 src/routes/share.routes.ts 的同款流程，而该文件在本仓同样没有测试覆盖，
-  // 产物靠人工联调验证。这里只钉鉴权 / 成员闸门 / 入参校验——均不依赖外部服务。
+  // 它完整镜像 src/routes/share.routes.ts 的同款流程，而 share.routes.ts 的 404/400
+  // 闸门分支在 test/auth.test.ts「分享：非本人活动生成小程序码 → 404」/「分享：非法 activityId → 400」
+  // 已有覆盖，真正无覆盖的只有成功分支，产物靠人工联调验证。
+  // 这里只钉鉴权 / 成员闸门 / 入参校验——均不依赖外部服务。
 });
 
 test('CR5 非法 id → 404（不是 500，也不是 400）', async () => {
@@ -239,4 +241,57 @@ test('CR5 非法 id → 404（不是 500，也不是 400）', async () => {
 
   // uid 段非法也应 404（非发起人根本到不了；发起人对不存在的活动先 404）
   assert.equal((await get('/campaigns/not-an-id/members/not-a-uid', creator.token)).statusCode, 404);
+});
+
+test("CR6 创建日期必须真实存在：假日期 → 400（不是 500）", async () => {
+  // 只过 \d{4}-\d{2}-\d{2} 正则的话，'2026-13-01' / '2026-02-30' 会一路进 createCampaign 的
+  // Date.parse → NaN → bjDayStart(NaN) → mongoose「Cast to Number failed」→ 通用 500
+  //（dev 环境还把内部 message 回给客户端）。这里钉住门票层 400 + 提示含字段名与实际值。
+  const form = {
+    title: '日期校验',
+    description: '',
+    visibility: 'public',
+    allowedTypes: [],
+    memberLimit: null,
+    startDate: '2099-01-01',
+    endDate: '2099-01-07',
+  };
+  for (const bad of ['2026-13-01', '2026-02-30']) {
+    const res = await post('/campaigns', { ...form, startDate: bad }, creator.token);
+    assert.equal(res.statusCode, 400, `startDate=${bad} 应为 400，实际 ${res.statusCode}: ${res.body}`);
+    assert.equal(res.json().code, 400);
+    assert.match(res.json().message, /startDate/, `提示应含字段名，实际：${res.json().message}`);
+    assert.ok(res.json().message.includes(bad), `提示应含实际值 ${bad}，实际：${res.json().message}`);
+  }
+  // endDate 同样走闸门（提示换字段名）。用「区间合法但日历上不存在」的值，
+  // 避免先被 endDate >= startDate 的区间校验拦下、盖住真正要钉的日历校验提示。
+  const badEnd = await post('/campaigns', { ...form, endDate: '2099-02-30' }, creator.token);
+  assert.equal(badEnd.statusCode, 400, badEnd.body);
+  assert.match(badEnd.json().message, /endDate/, `提示应含字段名，实际：${badEnd.json().message}`);
+  assert.ok(badEnd.json().message.includes('2099-02-30'), `提示应含实际值，实际：${badEnd.json().message}`);
+
+  // 正常（含闰日）日期仍 200
+  const ok = await mkCampaign(creator.token, { startDate: '2099-01-01', endDate: '2099-01-07' });
+  assert.match(ok, /^[a-f\d]{24}$/i);
+});
+
+test('CR7 成员明细 uid 闸门：畸形 uid / 非成员 → 404；成员零轨迹仍 200', async () => {
+  const cid = await mkCampaign(creator.token);
+
+  // 畸形 uid：与 :id 同待遇走 404 闸门（既不是 CastError → 500，也不是静默 200 + 全 0）
+  const malformed = await get(`/campaigns/${cid}/members/not-a-uid`, creator.token);
+  assert.equal(malformed.statusCode, 404, malformed.body);
+  assert.equal(malformed.json().code, 404);
+
+  // 格式合法（24 位 hex）但与本活动无关的人：没有任何加入段 → 不是成员 → 404
+  const stranger = String(new mongoose.Types.ObjectId());
+  const strangerRes = await get(`/campaigns/${cid}/members/${stranger}`, creator.token);
+  assert.equal(strangerRes.statusCode, 404, `非成员 hex 应 404，实际 ${strangerRes.statusCode}: ${strangerRes.body}`);
+
+  // 是成员但还没有轨迹 → 仍是 200 + 全 0（不要误伤这条既有正确行为）
+  assert.equal((await post(`/campaigns/${cid}/join`, {}, joiner.token)).statusCode, 200);
+  const memberRes = await get(`/campaigns/${cid}/members/${joiner.id}`, creator.token);
+  assert.equal(memberRes.statusCode, 200, memberRes.body);
+  assert.deepEqual(memberRes.json().data.stats, { count: 0, distance: 0, duration: 0 });
+  assert.equal(memberRes.json().data.total, 0);
 });

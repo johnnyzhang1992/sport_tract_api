@@ -259,6 +259,31 @@ export const ACTIVITY_TYPE_VALUES = [
   'walking', 'running', 'hiking', 'mountaineering', 'cycling', 'skiing', 'rowing', 'swimming',
 ] as const;
 
+/**
+ * 创建活动的日期字段（startDate / endDate）。
+ *
+ * 正则只验「长得像」，还必须用真实日期解析验「日历上存在」：
+ * - '2026-13-01' / '2026-10-32' / '2026-00-10' → `Date.parse` 得 NaN，会一路进
+ *   createCampaign 的 `bjDayStart(NaN)` → mongoose「Cast to Number failed」→ 落
+ *   error-handler 的通用 **500**（dev 下还把内部 message 回给客户端）；
+ * - '2026-02-30' 这类 V8 会顺延成 3 月初的假日期，靠 `toISOString` 回环比对拦下（两者选一，只在此处拦）。
+ * 提示带字段名（startDate / endDate）+ 实际值 + 要求；400 由 zod → error-handler 统一出。
+ */
+function campaignDateField(key: 'startDate' | 'endDate', label: string) {
+  return z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, `${label}格式应为 YYYY-MM-DD`)
+    .superRefine((v, ctx) => {
+      const d = new Date(`${v}T00:00:00Z`);
+      if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== v) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `${label}（${key}）不是有效日期：收到的是 "${v}"，需为日历上真实存在的 YYYY-MM-DD`,
+        });
+      }
+    });
+}
+
 export const CreateCampaignSchema = z
   .object({
     title: z.string().trim().min(1, '标题不能为空').max(30, '标题最多 30 字'),
@@ -266,8 +291,8 @@ export const CreateCampaignSchema = z
     visibility: z.enum(['public', 'private']),
     allowedTypes: z.array(z.enum(ACTIVITY_TYPE_VALUES)).max(8).default([]),
     memberLimit: z.number().int().positive().max(500, '人数上限最多 500').nullable().default(null),
-    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '开始日期格式应为 YYYY-MM-DD'),
-    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '结束日期格式应为 YYYY-MM-DD'),
+    startDate: campaignDateField('startDate', '开始日期'),
+    endDate: campaignDateField('endDate', '结束日期'),
   })
   .refine((v) => v.endDate >= v.startDate, { message: '结束日期不能早于开始日期', path: ['endDate'] });
 
