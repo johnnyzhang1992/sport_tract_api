@@ -12,6 +12,7 @@ import mongoose from 'mongoose';
 import { CampaignModel } from '../models/campaign.model.js';
 import { CampaignMemberModel } from '../models/campaign-member.model.js';
 import { UserModel } from '../models/user.model.js';
+import { ActivityModel } from '../models/activity.model.js';
 import {
   loadSegments,
   statsForMembers,
@@ -422,4 +423,138 @@ export async function dissolveCampaign(id: string, creatorId: string): Promise<v
   assertCreator(c, creatorId);
   if (c.status === 'dissolved') return;
   await CampaignModel.updateOne({ _id: c._id }, { $set: { status: 'dissolved' } });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 活动内排行榜 + 成员明细（Task 5）
+//
+// 权限（Spec §5 总则）：成员数据只对 `joined`（含发起人）可见 —— 排行榜非成员 403；
+// 他人明细进一步收紧为**仅发起人**（普通成员只看得到汇总）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 排行榜一行：页面用它同时渲染「成员列表＋排行榜」这一栏（名次 / 头像 / 昵称 / 距离 / 次数 / 时长） */
+export interface LeaderRow {
+  rank: number;
+  userId: string;
+  name: string;
+  avatarUrl: string;
+  avatarPreset: string;
+  distance: number;
+  count: number;
+  duration: number;
+}
+
+/** 成员明细里的一条轨迹（概况之外的逐条列表；字段刻意精简，够弹窗列表渲染即可） */
+export interface CampaignTrackDto {
+  id: string;
+  type: string;
+  distance: number;
+  duration: number;
+  startTime: number;
+  elevationGain: number;
+}
+
+/**
+ * 活动内排行榜：仅当前 `joined` 成员，按**距离降序**（Spec §8 默认）。
+ * 非成员（含待审批 / 游客 / 已离开 / 被踢）一律 403 —— 成员数据不外泄（§5 总则）。
+ */
+export async function campaignLeaderboard(
+  id: string,
+  viewerId: string,
+): Promise<{ rows: LeaderRow[] }> {
+  const c = await loadCampaignOr404(id);
+  const mine = await CampaignMemberModel.find({
+    campaignId: c._id,
+    userId: new mongoose.Types.ObjectId(viewerId),
+  }).lean();
+  if (myStateOf(mine) !== 'joined') throw new AppError(403, '只有活动成员可以查看排行榜');
+
+  const members = await CampaignMemberModel.find({ campaignId: c._id, state: 'joined' })
+    .select('userId')
+    .lean();
+  const uids = members.map((m) => String(m.userId));
+  const users = await UserModel.find({ _id: { $in: uids } })
+    .select('nickname avatarUrl avatarPreset')
+    .lean();
+  const uMap = new Map(users.map((u) => [String(u._id), u]));
+  const stats = await statsForMembers(c, await loadSegments(String(c._id)), uids);
+
+  return {
+    rows: uids
+      .map((uid) => {
+        const s = stats.get(uid)!;
+        const u = uMap.get(uid);
+        return {
+          userId: uid,
+          name: u?.nickname || '微信用户',
+          avatarUrl: u?.avatarUrl || '',
+          avatarPreset: u?.avatarPreset || '',
+          distance: s.distance,
+          count: s.count,
+          duration: s.duration,
+        };
+      })
+      .sort((a, b) => b.distance - a.distance)
+      .map((r, i) => ({ rank: i + 1, ...r })),
+  };
+}
+
+/**
+ * 成员明细（仅发起人）：概况 + 分页轨迹列表。
+ *
+ * 明细的**计入判据与 campaign-stats 同口径**（否则弹窗里的条数/距离会和汇总对不上）：
+ * `status='finished'`、`vehicleMs` 用 `{ $not: { $gt: 0 } }`（**不要** `$lte:0`，缺字段的老文档要计入）、
+ * `type ∈ allowedTypes`（空则不限）、`startTime` 落在该用户的贡献时段并集内。
+ */
+export async function memberDetail(
+  id: string,
+  creatorId: string,
+  targetUid: string,
+  query: { page: number; pageSize: number },
+): Promise<{
+  stats: MemberStats;
+  items: CampaignTrackDto[];
+  total: number;
+  page: number;
+  pageSize: number;
+}> {
+  const c = await loadCampaignOr404(id);
+  assertCreator(c, creatorId);
+
+  const segs = await loadSegments(String(c._id));
+  const targetSegs = segs.get(targetUid) ?? [];
+  const stats = (await statsForMembers(c, segs, [targetUid])).get(targetUid) ?? emptyStats();
+
+  // 没有贡献时段（该用户从未加入 / 未产生段）→ 空明细。
+  // 必须在此短路：`$or: []` 在 MongoDB 里是非法查询（会抛错），不能让空数组进 match。
+  if (targetSegs.length === 0) {
+    return { stats, items: [], total: 0, page: query.page, pageSize: query.pageSize };
+  }
+
+  const match = {
+    userId: new mongoose.Types.ObjectId(targetUid),
+    status: 'finished' as const,
+    vehicleMs: { $not: { $gt: 0 } },
+    ...(c.allowedTypes.length > 0 ? { type: { $in: c.allowedTypes } } : {}),
+    $or: targetSegs.map((s) => ({
+      startTime: { $gte: s.joinedAt, ...(s.leftAt != null ? { $lt: s.leftAt } : {}) },
+    })),
+  };
+  const [total, docs] = await Promise.all([
+    ActivityModel.countDocuments(match),
+    ActivityModel.find(match)
+      .sort({ startTime: -1 })
+      .skip((query.page - 1) * query.pageSize)
+      .limit(query.pageSize)
+      .lean(),
+  ]);
+  const items: CampaignTrackDto[] = docs.map((d) => ({
+    id: String(d._id),
+    type: d.type,
+    distance: d.distance ?? 0,
+    duration: d.duration ?? 0,
+    startTime: d.startTime,
+    elevationGain: d.elevationGain ?? 0,
+  }));
+  return { stats, items, total, page: query.page, pageSize: query.pageSize };
 }
