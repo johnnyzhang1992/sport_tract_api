@@ -64,3 +64,17 @@ export function gcj02ToWgs84(lat: number, lng: number): { lat: number; lng: numb
   }
   return { lat: wgsLat, lng: wgsLng };
 }
+
+/**
+ * BD-09 → GCJ-02（百度坐标 → 火星坐标）
+ * 百度系导出（百度地图/骑迹等）先转 GCJ-02 才能与微信地图对齐。
+ * 标准公开公式（百度官方 JS API 逆向版），精度米级。
+ */
+export function bd09ToGcj02(lat: number, lng: number): { lat: number; lng: number } {
+  const xPi = (Math.PI * 3000.0) / 180.0;
+  const x = lng - 0.0065;
+  const y = lat - 0.006;
+  const z = Math.sqrt(x * x + y * y) - 0.00002 * Math.sin(y * xPi);
+  const theta = Math.atan2(y, x) - 0.000003 * Math.cos(x * xPi);
+  return { lat: z * Math.sin(theta), lng: z * Math.cos(theta) };
+}

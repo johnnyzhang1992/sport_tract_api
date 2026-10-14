@@ -60,6 +60,10 @@ const activitySchema = new Schema(
     distance: { type: Number, default: 0 }, // 米
     avgPace: { type: Number, default: null }, // 全程平均配速（秒/公里）
     fastestKm: { type: Number, default: null }, // 轨迹内最快 1km 分段（秒/公里）
+    // 表现分（ITRA 风格幂律评分，仅类跑步类型；utils/perf-score.ts）
+    perfScore: { type: Number, default: null },
+    // 实跑/规划判别（导入时判定；采集的轨迹恒为 recorded）
+    trackKind: { type: String, enum: ['recorded', 'planned', 'uncertain'], default: 'recorded' },
     // 距离里程碑 PB：到达 5/10/15…公里的累计用时（秒）；finish/reprocess 时算出落库，
     // 历史轨迹由 /stats/best 惰性补算（无标记的写 []，避免反复扫点）
     pbMarks: {

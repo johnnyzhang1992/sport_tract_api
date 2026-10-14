@@ -9,11 +9,14 @@ import { ActivityModel } from '../models/activity.model.js';
 import { compactTrackPoints } from '../utils/track-compact.js';
 import { AppError } from '../utils/app-error.js';
 import { calcStats, haversineDistance, type TrackPointLike } from '../utils/pace.js';
+import { calcPerfScore } from '../utils/perf-score.js';
+import { detectCrs } from '../utils/crs-detect.js';
+import { classifyTrackKind } from '../utils/track-kind.js';
 import { markStandstill } from '../utils/standstill.js';
 import { markGapJumps } from '../utils/track-gap.js';
 import { markVehicle } from '../utils/vehicle.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
-import { wgs84ToGcj02 } from '../utils/coordinate.js';
+import { wgs84ToGcj02, bd09ToGcj02 } from '../utils/coordinate.js';
 import { markFootprintDirty } from './footprint.js';
 import { resolveWeightKg } from './weight.js';
 import { provincesOfPoints } from './region.js';
@@ -26,6 +29,12 @@ export interface ImportedPoint {
   timestamp: number;
 }
 
+/** 解析元信息（时间戳是否存在为原始信号——finalize 会给缺失时间补 1s 间隔，之后就无法区分了） */
+export interface ParseMeta {
+  hasTime?: boolean;
+  creator?: string;
+}
+
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: '@_',
@@ -35,12 +44,12 @@ const parser = new XMLParser({
 
 const MAX_IMPORT_POINTS = 50_000;
 
-/** 解析文件内容 → 轨迹点（时间缺失时按 1s 间隔补全） */
-export function parseTrackFile(filename: string, content: string): ImportedPoint[] {
+/** 解析文件内容 → 轨迹点（时间缺失时按 1s 间隔补全）；meta 带回 creator/是否含原始时间 */
+export function parseTrackFile(filename: string, content: string, meta?: ParseMeta): ImportedPoint[] {
   const lower = filename.toLowerCase();
-  if (lower.endsWith('.gpx')) return parseGpx(content);
-  if (lower.endsWith('.kml')) return parseKml(content);
-  if (lower.endsWith('.tcx')) return parseTcx(content);
+  if (lower.endsWith('.gpx')) return parseGpx(content, meta);
+  if (lower.endsWith('.kml')) return parseKml(content, meta);
+  if (lower.endsWith('.tcx')) return parseTcx(content, meta);
   throw new AppError(400, `不支持的文件格式：${filename}（支持 .gpx/.kml/.tcx）`);
 }
 
@@ -87,10 +96,11 @@ function finalize(points: ImportedPoint[]): ImportedPoint[] {
   return cleanAltitudeSpikes(out);
 }
 
-/** GPX 解析：trk/trkseg/trkpt */
-export function parseGpx(xml: string): ImportedPoint[] {
+/** GPX 解析：trk/trkseg/trkpt（creator 属性用于坐标系识别） */
+export function parseGpx(xml: string, meta?: ParseMeta): ImportedPoint[] {
   const root = parser.parse(xml);
   const gpx = root?.gpx ?? {};
+  if (meta && typeof gpx?.['@_creator'] === 'string') meta.creator = String(gpx['@_creator']).slice(0, 100);
   const trks = asArray(gpx.trk);
   const points: ImportedPoint[] = [];
   for (const trk of trks) {
@@ -102,6 +112,7 @@ export function parseGpx(xml: string): ImportedPoint[] {
         if (!validLatLng(lat, lng)) continue;
         const alt = toNum(pt?.ele);
         const time = pt?.time ? new Date(String(pt.time)).getTime() : 0;
+        if (meta && Number.isFinite(time) && time > 0) meta.hasTime = true;
         points.push({
           lat: lat as number,
           lng: lng as number,
@@ -115,7 +126,7 @@ export function parseGpx(xml: string): ImportedPoint[] {
 }
 
 /** KML 解析：递归收集所有 Placemark（两步路轨迹在 Folder 内） */
-export function parseKml(xml: string): ImportedPoint[] {
+export function parseKml(xml: string, meta?: ParseMeta): ImportedPoint[] {
   const root = parser.parse(xml);
   const doc = root?.kml?.Document ?? root?.kml ?? {};
   const placemarks = collectPlacemarks(doc);
@@ -135,6 +146,7 @@ export function parseKml(xml: string): ImportedPoint[] {
         const alt = toNum(parts[2]);
         const when = whens[i];
         const t = when ? new Date(String(when)).getTime() : 0;
+        if (meta && Number.isFinite(t) && t > 0) meta.hasTime = true;
         points.push({
           lat: lat as number,
           lng: lng as number,
@@ -187,10 +199,11 @@ function collectPlacemarks(node: unknown): any[] {
 }
 
 /** TCX 解析：Activities/Activity/Lap/Track/Trackpoint */
-export function parseTcx(xml: string): ImportedPoint[] {
+export function parseTcx(xml: string, meta?: ParseMeta): ImportedPoint[] {
   const root = parser.parse(xml);
   const training = root?.TrainingCenterDatabase ?? {};
   const acts = asArray(training.Activities?.Activity);
+  if (meta && typeof acts?.[0]?.Creator?.Name === 'string') meta.creator = String(acts[0].Creator.Name).slice(0, 100);
   const points: ImportedPoint[] = [];
   for (const act of acts) {
     const laps = asArray(act.Lap);
@@ -203,6 +216,7 @@ export function parseTcx(xml: string): ImportedPoint[] {
           if (!validLatLng(lat, lng)) continue;
           const alt = toNum(tp?.AltitudeMeters);
           const time = tp?.Time ? new Date(String(tp.Time)).getTime() : 0;
+          if (meta && Number.isFinite(time) && time > 0) meta.hasTime = true;
           points.push({
             lat: lat as number,
             lng: lng as number,
@@ -254,19 +268,33 @@ export function guessType(filename: string, points: ImportedPoint[]): string {
   return 'running';
 }
 
-/** 导入：解析 + 计算指标 + 创建 finished 活动 */
+/** 导入：解析 + 坐标系识别/转换 + 计算指标 + 创建 finished 活动 */
 export async function importActivity(
   userId: string,
   filename: string,
   content: string,
   typeOverride?: string,
   source?: string,
-): Promise<{ id: string; type: string; distance: number; duration: number; pointCount: number; source: string }> {
-  let points = parseTrackFile(filename, content);
-  // 坐标系转换（决策 M7）：第三方文件为 WGS-84，微信地图为 GCJ-02，中国境内偏移数百米
-  // 转换后再做类型推断/去重/入库
+): Promise<{
+  id: string;
+  type: string;
+  distance: number;
+  duration: number;
+  pointCount: number;
+  source: string;
+  crs: string;
+  crsConfidence: string;
+  trackKind: string;
+  trackKindReason: string;
+}> {
+  const meta: ParseMeta = {};
+  let points = parseTrackFile(filename, content, meta);
+  // 坐标系识别（TrailCraft 同思路）：国内 App 记录/导出的已是 GCJ-02，百度系为 BD-09，
+  // 国际设备为 WGS-84；识别不出按 WGS-84（历史默认口径）
+  const crsInfo = detectCrs({ creator: meta.creator, fileName: filename });
   points = points.map((p) => {
-    const c = wgs84ToGcj02(p.lat, p.lng);
+    if (crsInfo.crs === 'gcj02') return p;
+    const c = crsInfo.crs === 'bd09' ? bd09ToGcj02(p.lat, p.lng) : wgs84ToGcj02(p.lat, p.lng);
     return { ...p, lat: c.lat, lng: c.lng };
   });
   let type = typeOverride || guessType(filename, points);
@@ -288,6 +316,11 @@ export async function importActivity(
 
   const startTime = points[0].timestamp;
   const endTime = points[points.length - 1].timestamp;
+  // 实跑/规划判别（三态）：规划路线（无时间信息）不参与配速/表现分统计
+  let dist = 0;
+  for (let i = 1; i < points.length; i++) dist += haversineDistance(points[i - 1], points[i]);
+  const kindInfo = classifyTrackKind(points as TrackPointLike[], dist, { hasTime: meta.hasTime !== false });
+  const isPlanned = kindInfo.kind === 'planned';
   // 非运动段（疑似乘车）先判：第三方文件里"开车去徒步、到山顶开录"这类混入段很常见，
   // 不剔的话导入的轨迹会带着车速段刷出个人最快配速（与 finish 同口径，见 utils/vehicle.ts）
   const veh = markVehicle(points, type);
@@ -306,6 +339,8 @@ export async function importActivity(
     durationSec,
     weightKg: await resolveWeightKg(userId),
   });
+  // 表现分：仅实跑 + 类跑步类型；规划路线没有"跑得怎么样"可言
+  const perf = kindInfo.kind === 'recorded' ? calcPerfScore(type, stats.distance, stats.elevationGain, durationSec) : null;
 
   // 无效轨迹守卫：导入文件重算距离过短（静止/漂移）→ 拒绝导入，与 finish 作废口径一致
   if (stats.distance < MIN_EFFECTIVE_DISTANCE_M) {
@@ -331,6 +366,8 @@ export async function importActivity(
     calories: stats.calories,
     elevationGain: stats.elevationGain,
     maxAltitude: stats.maxAltitude,
+    perfScore: perf?.score ?? null,
+    trackKind: kindInfo.kind,
     provinces: regions.provinces,
     startProvince: regions.startProvince,
     startCity: regions.startCity,
@@ -349,5 +386,9 @@ export async function importActivity(
     duration: durationSec,
     pointCount: trackPoints.length,
     source: source || guessSource(filename),
+    crs: crsInfo.crs,
+    crsConfidence: crsInfo.confidence,
+    trackKind: kindInfo.kind,
+    trackKindReason: kindInfo.reason,
   };
 }

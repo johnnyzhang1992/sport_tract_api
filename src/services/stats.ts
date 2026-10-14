@@ -2,6 +2,7 @@ import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { locateRegion } from './region.js';
 import { calcFastestKm, calcPbMarks } from '../utils/pace.js';
+import { calcPerfScore } from '../utils/perf-score.js';
 import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
 import { AppError } from '../utils/app-error.js';
 import {
@@ -286,7 +287,8 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
 export async function bestRecords(userId: ObjectIdLike) {
   const base = { userId: toObjectId(userId), status: 'finished' };
   // 惰性补算：fastestKm 新字段上线前完成的历史轨迹无该字段 → 批量补算（每次本用户全量，数据量小）
-  const missing = await ActivityModel.find({ ...base, fastestKm: null })
+  // 规划路线（无时间信息，1s 补全会造出假配速）永不补算
+  const missing = await ActivityModel.find({ ...base, fastestKm: null, trackKind: { $ne: 'planned' } })
     .select('_id trackPoints')
     .limit(100)
     .lean();
@@ -295,14 +297,24 @@ export async function bestRecords(userId: ObjectIdLike) {
     await ActivityModel.updateOne({ _id: a._id }, { $set: { fastestKm: fk } });
   }
   // 距离里程碑惰性补算：pbMarks 未落库的历史轨迹（补算后写 []，避免反复扫点）
-  const missingMarks = await ActivityModel.find({ ...base, pbMarks: { $exists: false } })
+  const missingMarks = await ActivityModel.find({ ...base, pbMarks: { $exists: false }, trackKind: { $ne: 'planned' } })
     .select('_id trackPoints')
     .limit(50)
     .lean();
   for (const a of missingMarks) {
     await ActivityModel.updateOne({ _id: a._id }, { $set: { pbMarks: calcPbMarks(a.trackPoints ?? []) } });
   }
-  const select = '_id type startTime distance avgPace fastestKm duration elevationGain';
+  // 表现分惰性补算：只需已落库指标（距离/爬升/时长），不扫点
+  const missingPerf = await ActivityModel.find({ ...base, perfScore: null, trackKind: { $ne: 'planned' } })
+    .select('_id type distance elevationGain duration')
+    .limit(100)
+    .lean();
+  for (const a of missingPerf) {
+    const perf = calcPerfScore(a.type, a.distance ?? 0, a.elevationGain ?? 0, a.duration ?? 0);
+    // 不适用（骑行游泳/过短）写 0 哨兵避免反复查询；展示侧 >0 才算数
+    await ActivityModel.updateOne({ _id: a._id }, { $set: { perfScore: perf ? perf.score : 0 } });
+  }
+  const select = '_id type startTime distance avgPace fastestKm duration elevationGain perfScore';
   const fmt = (a: Record<string, any> | undefined): Record<string, any> | null =>
     a
       ? {
@@ -314,20 +326,33 @@ export async function bestRecords(userId: ObjectIdLike) {
           fastestKm: a.fastestKm ?? null, // 最快 1km 分段（秒/公里）
           duration: a.duration ?? 0,
           elevationGain: a.elevationGain ?? 0,
+          perfScore: a.perfScore ?? null,
         }
       : null;
   const byTypeAgg = (sortField: string, dir: 1 | -1, extraMatch: Record<string, unknown> = {}) =>
     ActivityModel.aggregate([
       { $match: { ...base, ...extraMatch } },
       { $sort: { [sortField]: dir } },
-      { $project: { type: 1, startTime: 1, distance: 1, avgPace: 1, fastestKm: 1, duration: 1, elevationGain: 1 } },
+      {
+        $project: {
+          type: 1,
+          startTime: 1,
+          distance: 1,
+          avgPace: 1,
+          fastestKm: 1,
+          duration: 1,
+          elevationGain: 1,
+          perfScore: 1,
+        },
+      },
       { $group: { _id: '$type', doc: { $first: '$$ROOT' } } },
     ]);
-  const [distRows, paceRows, durRows, elevRows, markRows] = await Promise.all([
+  const [distRows, paceRows, durRows, elevRows, perfRows, markRows] = await Promise.all([
     byTypeAgg('distance', -1),
     byTypeAgg('fastestKm', 1, { fastestKm: { $gt: MIN_PLAUSIBLE_PACE_SEC_PER_KM } }),
     byTypeAgg('duration', -1),
     byTypeAgg('elevationGain', -1),
+    byTypeAgg('perfScore', -1, { perfScore: { $gt: 0 } }),
     // 距离里程碑保持者链原料：所有 (type, 轨迹, km, 用时, 开始时间)，重放在 JS 侧做
     ActivityModel.aggregate([
       { $match: base },
@@ -390,6 +415,7 @@ export async function bestRecords(userId: ObjectIdLike) {
     minPaceByType: mapByType(paceRows, 'fastestKm', 1), // 配速升序=最快
     maxDurationByType: mapByType(durRows, 'duration', -1),
     maxElevationByType: mapByType(elevRows, 'elevationGain', -1),
+    maxPerfScoreByType: mapByType(perfRows, 'perfScore', -1), // 最高表现分（按类型）
     // 距离里程碑当前纪录（口径与旧版一致：每 类型+公里 全局最快一条）
     fastestDistanceByKm: chain
       .filter((r) => r.isCurrent)
