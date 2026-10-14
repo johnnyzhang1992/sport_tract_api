@@ -10,6 +10,9 @@ import { AppError } from '../utils/app-error.js';
  */
 const UNIQUE_CONFLICT_COPY: Record<string, { code: string; message: string }> = {
   'status+userId': { code: 'ACTIVITY_IN_PROGRESS', message: '已有进行中的运动，请先结束或放弃' },
+  // campaign_members 的 partial unique index（仅约束 state='joined'）：
+  // join 的「先查再插」有并发窗口，同一用户同时 join 两次时输的一方由此兜底 → 复用应用层 409 的文案。
+  'campaignId+userId': { code: 'ALREADY_JOINED', message: '你已在该活动中' },
 };
 
 /**

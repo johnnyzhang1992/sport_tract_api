@@ -264,3 +264,162 @@ async function memberCounts(campaignId: mongoose.Types.ObjectId) {
   const get = (s: string) => rows.find((r) => r._id === s)?.n ?? 0;
   return { joined: get('joined'), pending: get('pending'), occupied: get('joined') + get('pending') };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 成员状态机（Task 4）
+//
+// 一行 = 一个加入段：再入是**插新行**，旧行留成 left/removed 并封口 leftAt（统计据此切时段）。
+// `{campaignId,userId}` 的 partial unique index（仅约束 state='joined'）保证同一时刻只有一条活跃行。
+// 黑名单 = 该 (活动,用户) 存在任一 state='removed' 的行。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 活动 id → 文档（非法 / 不存在一律 404） */
+export async function loadCampaignOr404(id: string): Promise<CampaignDoc> {
+  assertObjectIdLike(id, '活动不存在');
+  const c = (await CampaignModel.findById(id).lean()) as CampaignDoc | null;
+  if (!c) throw new AppError(404, '活动不存在');
+  return c;
+}
+
+/** 发起人闸门：审批 / 踢人 / 解散都只认发起人（发起人只能解散，不能离开） */
+export function assertCreator(c: CampaignDoc, userId: string): void {
+  if (String(c.creatorId) !== String(userId)) throw new AppError(403, '只有发起人可以操作');
+}
+
+/** 该用户在此活动是否有被踢记录（黑名单） */
+async function isRemoved(campaignId: mongoose.Types.ObjectId, userId: string): Promise<boolean> {
+  return (
+    (await CampaignMemberModel.countDocuments({
+      campaignId,
+      userId: new mongoose.Types.ObjectId(userId),
+      state: 'removed',
+    })) > 0
+  );
+}
+
+/** 加入：公开直接 joined；隐私置 pending（被拒过则复用那条 rejected 行改回 pending） */
+export async function joinCampaign(id: string, userId: string): Promise<{ myState: MyState }> {
+  const c = await loadCampaignOr404(id);
+  if (effectiveStatus(c) !== 'active') throw new AppError(403, '活动已结束或已解散');
+  if (await isRemoved(c._id, userId)) throw new AppError(403, '你已被移出该活动，无法再次加入');
+
+  const uid = new mongoose.Types.ObjectId(userId);
+  const mine = await CampaignMemberModel.find({ campaignId: c._id, userId: uid }).lean();
+  const st = myStateOf(mine);
+  if (st === 'joined') throw new AppError(409, '你已在该活动中');
+  if (st === 'pending') throw new AppError(409, '你已提交申请，等待发起人同意');
+
+  if (c.memberLimit != null) {
+    const { occupied } = await memberCounts(c._id);
+    if (occupied >= c.memberLimit) throw new AppError(409, `人数已满（上限 ${c.memberLimit}）`);
+  }
+
+  if (c.visibility === 'public') {
+    await CampaignMemberModel.create({
+      campaignId: c._id,
+      userId: uid,
+      role: 'member',
+      state: 'joined',
+      joinedAt: Date.now(),
+    });
+    return { myState: 'joined' };
+  }
+  // 隐私：已有 rejected 行则复用为 pending，否则新插
+  const lastRejected = mine.find((m) => m.state === 'rejected');
+  if (lastRejected) {
+    await CampaignMemberModel.updateOne({ _id: lastRejected._id }, { $set: { state: 'pending' } });
+  } else {
+    await CampaignMemberModel.create({ campaignId: c._id, userId: uid, role: 'member', state: 'pending' });
+  }
+  return { myState: 'pending' };
+}
+
+/** 离开：自愿退出 → left（可再入）；发起人不能离开（只能解散） */
+export async function leaveCampaign(id: string, userId: string): Promise<{ myState: MyState }> {
+  const c = await loadCampaignOr404(id);
+  if (String(c.creatorId) === String(userId)) throw new AppError(403, '发起人不能离开，请改用解散');
+  const row = await CampaignMemberModel.findOne({
+    campaignId: c._id,
+    userId: new mongoose.Types.ObjectId(userId),
+    state: 'joined',
+  });
+  if (!row) throw new AppError(409, '你当前不在该活动中');
+  row.state = 'left';
+  row.leftAt = Date.now();
+  await row.save();
+  return { myState: 'left' };
+}
+
+/** 待审批列表（仅发起人）：pending 行 + 申请人昵称/头像 */
+export async function listPending(id: string, creatorId: string) {
+  const c = await loadCampaignOr404(id);
+  assertCreator(c, creatorId);
+  const rows = await CampaignMemberModel.find({ campaignId: c._id, state: 'pending' })
+    .sort({ createdAt: 1 })
+    .lean();
+  const users = await UserModel.find({ _id: { $in: rows.map((r) => r.userId) } })
+    .select('nickname avatarUrl avatarPreset')
+    .lean();
+  const uMap = new Map(users.map((u) => [String(u._id), u]));
+  return rows.map((r) => ({
+    userId: String(r.userId),
+    appliedAt: r.createdAt,
+    name: uMap.get(String(r.userId))?.nickname || '微信用户',
+    avatarUrl: uMap.get(String(r.userId))?.avatarUrl || '',
+    avatarPreset: uMap.get(String(r.userId))?.avatarPreset || '',
+  }));
+}
+
+/** 取某人的 pending 行（审批 / 拒绝共用；不在 pending 一律 404） */
+async function assertPendingRow(campaignId: mongoose.Types.ObjectId, targetUid: string) {
+  const row = await CampaignMemberModel.findOne({
+    campaignId,
+    userId: new mongoose.Types.ObjectId(targetUid),
+    state: 'pending',
+  });
+  if (!row) throw new AppError(404, '该申请不存在或已处理');
+  return row;
+}
+
+/** 同意：pending → joined 并刷新 joinedAt（统计窗口下界） */
+export async function approveMember(id: string, creatorId: string, targetUid: string): Promise<void> {
+  const c = await loadCampaignOr404(id);
+  assertCreator(c, creatorId);
+  const row = await assertPendingRow(c._id, targetUid);
+  row.state = 'joined';
+  row.joinedAt = Date.now();
+  await row.save();
+}
+
+/** 拒绝：pending → rejected（被拒者可再申请，再申请时复用该行改回 pending） */
+export async function rejectMember(id: string, creatorId: string, targetUid: string): Promise<void> {
+  const c = await loadCampaignOr404(id);
+  assertCreator(c, creatorId);
+  const row = await assertPendingRow(c._id, targetUid);
+  row.state = 'rejected';
+  await row.save();
+}
+
+/** 踢人：joined → removed（进黑名单，封口 leftAt）；不能踢发起人自己 */
+export async function kickMember(id: string, creatorId: string, targetUid: string): Promise<void> {
+  const c = await loadCampaignOr404(id);
+  assertCreator(c, creatorId);
+  if (String(c.creatorId) === String(targetUid)) throw new AppError(403, '不能踢出自己');
+  const row = await CampaignMemberModel.findOne({
+    campaignId: c._id,
+    userId: new mongoose.Types.ObjectId(targetUid),
+    state: 'joined',
+  });
+  if (!row) throw new AppError(404, '该成员当前不在活动中');
+  row.state = 'removed';
+  row.leftAt = Date.now();
+  await row.save();
+}
+
+/** 解散：仅发起人；写库 status='dissolved'（幂等，已是 dissolved 直接返回） */
+export async function dissolveCampaign(id: string, creatorId: string): Promise<void> {
+  const c = await loadCampaignOr404(id);
+  assertCreator(c, creatorId);
+  if (c.status === 'dissolved') return;
+  await CampaignModel.updateOne({ _id: c._id }, { $set: { status: 'dissolved' } });
+}
