@@ -252,6 +252,35 @@ export const FootprintGeoQuery = z.object({
   category: FootprintCategorySchema.optional(),
 });
 
+// ==================== 一起运动活动（campaigns） ====================
+
+/** 活动类型白名单可选值：与 miniprogram/config/index.js 的 ACTIVITY_TYPES、leaderboard.ts 的 BEST_METRICS 三处同集合 */
+export const ACTIVITY_TYPE_VALUES = [
+  'walking', 'running', 'hiking', 'mountaineering', 'cycling', 'skiing', 'rowing', 'swimming',
+] as const;
+
+export const CreateCampaignSchema = z
+  .object({
+    title: z.string().trim().min(1, '标题不能为空').max(30, '标题最多 30 字'),
+    description: z.string().trim().max(300, '描述最多 300 字').default(''),
+    visibility: z.enum(['public', 'private']),
+    allowedTypes: z.array(z.enum(ACTIVITY_TYPE_VALUES)).max(8).default([]),
+    memberLimit: z.number().int().positive().max(500, '人数上限最多 500').nullable().default(null),
+    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '开始日期格式应为 YYYY-MM-DD'),
+    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '结束日期格式应为 YYYY-MM-DD'),
+  })
+  .refine((v) => v.endDate >= v.startDate, { message: '结束日期不能早于开始日期', path: ['endDate'] });
+
+export const ListCampaignQuery = z.object({
+  role: z.enum(['created', 'joined']).default('created'),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(100).default(20),
+});
+
+export const CampaignIdParamSchema = z.object({
+  id: z.string().regex(/^[a-f\d]{24}$/i, '活动不存在'),
+});
+
 export type LoginInput = z.infer<typeof LoginSchema>;
 export type RefreshInput = z.infer<typeof RefreshSchema>;
 export type UpdateMeInput = z.infer<typeof UpdateMeSchema>;
@@ -264,3 +293,5 @@ export type ListActivitiesQueryInput = z.infer<typeof ListActivitiesQuery>;
 export type CreateFootprintRecordInput = z.infer<typeof CreateFootprintRecordSchema>;
 export type ListFootprintQueryInput = z.infer<typeof ListFootprintQuery>;
 export type FootprintGeoQueryInput = z.infer<typeof FootprintGeoQuery>;
+export type CreateCampaignInput = z.infer<typeof CreateCampaignSchema>;
+export type ListCampaignQueryInput = z.infer<typeof ListCampaignQuery>;
