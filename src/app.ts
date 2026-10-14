@@ -10,6 +10,7 @@ import { authRoutes } from './routes/auth.routes.js';
 import { userRoutes } from './routes/user.routes.js';
 import { ossRoutes } from './routes/oss.routes.js';
 import { activityRoutes } from './routes/activity.routes.js';
+import { campaignRoutes } from './routes/campaign.routes.js';
 import { statsRoutes } from './routes/stats.routes.js';
 import { shareRoutes } from './routes/share.routes.js';
 import { geoRoutes } from './routes/geo.routes.js';
@@ -78,6 +79,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(userRoutes, { prefix: `${config.apiPrefix}/users` });
   await fastify.register(ossRoutes, { prefix: `${config.apiPrefix}/oss` });
   await fastify.register(activityRoutes, { prefix: `${config.apiPrefix}/activities` });
+  await fastify.register(campaignRoutes, { prefix: `${config.apiPrefix}/campaigns` });
   await fastify.register(statsRoutes, { prefix: `${config.apiPrefix}/stats` });
   await fastify.register(shareRoutes, { prefix: `${config.apiPrefix}/share` });
   await fastify.register(geoRoutes, { prefix: `${config.apiPrefix}/geo` });
