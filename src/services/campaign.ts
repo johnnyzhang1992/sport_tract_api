@@ -579,10 +579,27 @@ export interface AdminCampaignRow {
 }
 
 /**
+ * `status` 筛选必须与**下发值**同口径：下发走 `effectiveStatus`（派生），而库里的 `status`
+ * 只在解散时被写成 'dissolved'，'ended' **从不落库** —— 直接 `filter.status = query.status`
+ * 会让 `status=ended` 永远查不到（永空）、`status=active` 把已结束的活动也带出来。
+ * 所以这里按有效状态反向构造条件，并把同一个 `now` 传给 `effectiveStatus`，保证一次请求内
+ * 筛选与展示不会因「刚好跨过 endAt」而互相矛盾。
+ */
+function statusFilter(status: string, now: number): Record<string, unknown> {
+  switch (status) {
+    case 'dissolved':
+      return { status: 'dissolved' };
+    case 'ended':
+      return { $or: [{ status: 'ended' }, { status: 'active', endAt: { $lte: now } }] };
+    default:
+      return { status: 'active', endAt: { $gt: now } }; // 'active'
+  }
+}
+
+/**
  * 后台活动列表：分页 + status/visibility 过滤。
- * `status` 过滤打在**库内 status 字段**上，而下发的 status 是 `effectiveStatus` 派生的：
- * 「已过 endAt 但库内仍是 active」的活动筛 active 筛不到、筛 ended 也筛不到（这类只能靠 endAt 判断）。
- * 保持与库内字段一致是为了能用上 `{ status: 1, endAt: -1 }` 索引，且语义稳定（派生状态随时在变）。
+ * `status` 过滤按**有效状态**反向构造条件（见 `statusFilter`），与下发的 `effectiveStatus` 同口径，
+ * 且筛选与展示共用同一个 `now`，不会因「刚好跨过 endAt」而出现「列表显示 ended、筛 ended 却筛不到」。
  */
 export async function adminListCampaigns(query: {
   page: number;
@@ -590,8 +607,9 @@ export async function adminListCampaigns(query: {
   status?: string;
   visibility?: string;
 }): Promise<{ items: AdminCampaignRow[]; total: number; page: number; pageSize: number }> {
+  const now = Date.now();
   const filter: Record<string, unknown> = {};
-  if (query.status) filter.status = query.status;
+  if (query.status) Object.assign(filter, statusFilter(query.status, now));
   if (query.visibility) filter.visibility = query.visibility;
 
   const [total, docs] = await Promise.all([
@@ -612,7 +630,7 @@ export async function adminListCampaigns(query: {
       id: String(c._id),
       title: c.title,
       visibility: c.visibility,
-      status: effectiveStatus(c),
+      status: effectiveStatus(c, now),
       allowedTypes: c.allowedTypes,
       memberLimit: c.memberLimit ?? null,
       startAt: c.startAt,

@@ -1305,7 +1305,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return success(
       await adminListCampaigns({
         page: Math.max(1, Number(q.page) || 1),
-        pageSize: Math.min(100, Number(q.pageSize) || 20),
+        pageSize: Math.min(100, Math.max(1, Number(q.pageSize) || 20)),
         status,
         visibility,
       }),

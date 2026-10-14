@@ -23,6 +23,7 @@ import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
 const API = '/sport-track/api';
 const ADMIN_USER = 'test_admin_campaign';
 const ADMIN_PASS = 'admin_pass_123';
+const DAY = 24 * 60 * 60 * 1000;
 
 let app: FastifyInstance;
 
@@ -34,6 +35,10 @@ let adminToken = '';
 
 /** 夹具活动的 id 与发起人的**编号** uid（下发的 creatorUid/uid 是这个，不是 _id） */
 let cid = '';
+/** 三态过滤夹具：active（远期）/ ended（库内 active 但 endAt 已过）/ dissolved（已解散） */
+let cidActive = '';
+let cidEnded = '';
+let cidDissolved = '';
 let creatorUid: number | null = null;
 
 /** 本文件创建的 campaign id：after() 只清这些，不碰 dev 库里既有数据 */
@@ -103,6 +108,7 @@ before(async () => {
   );
   assert.equal(created.statusCode, 200, `创建活动失败: ${created.body}`);
   cid = created.json().data.id;
+  cidActive = cid;
   createdIds.push(new mongoose.Types.ObjectId(cid));
 
   const applied = await post(`/campaigns/${cid}/join`, {}, joiner.token);
@@ -111,6 +117,47 @@ before(async () => {
 
   const approved = await post(`/campaigns/${cid}/approve`, { userId: joiner.id }, creator.token);
   assert.equal(approved.statusCode, 200, `审批失败: ${approved.body}`);
+
+  // ended 档夹具：绕开 POST /campaigns（zod 会拒过期日期），直接用模型造一条
+  // 「库内 status 仍是 active、但 endAt 已过」的活动 —— 这正是派生状态与库内状态分叉的那类。
+  const now = Date.now();
+  const endedDoc = await CampaignModel.create({
+    creatorId: new mongoose.Types.ObjectId(creator.id),
+    title: 'admin 已到期回归',
+    description: '',
+    visibility: 'private',
+    allowedTypes: [],
+    memberLimit: null,
+    startAt: now - 7 * DAY,
+    endAt: now - 1 * DAY,
+    status: 'active',
+  });
+  cidEnded = String(endedDoc._id);
+  createdIds.push(endedDoc._id);
+
+  // dissolved 档夹具：正常建一条再解散（dissolveCampaign 会把库内 status 写成 'dissolved'）
+  const diss = await post(
+    '/campaigns',
+    {
+      title: 'admin 已解散回归',
+      description: '',
+      visibility: 'private',
+      allowedTypes: [],
+      memberLimit: null,
+      startDate: '2099-01-01',
+      endDate: '2099-01-07',
+    },
+    creator.token,
+  );
+  assert.equal(diss.statusCode, 200, `创建待解散活动失败: ${diss.body}`);
+  cidDissolved = diss.json().data.id;
+  createdIds.push(new mongoose.Types.ObjectId(cidDissolved));
+  const del = await app.inject({
+    method: 'DELETE',
+    url: `${API}/campaigns/${cidDissolved}`,
+    headers: auth(creator.token),
+  });
+  assert.equal(del.statusCode, 200, `解散失败: ${del.body}`);
 });
 
 after(async () => {
@@ -135,15 +182,37 @@ test('CA1 admin 列表：分页 + 下发创建者与成员数', async () => {
   assert.equal(item.status, 'active');
 });
 
-test('CA2 admin 列表：status 过滤；非法 status → 400（不是静默空列表）', async () => {
-  const ok = await get('/admin/campaigns?status=dissolved', adminToken);
-  assert.equal(ok.statusCode, 200);
-  assert.ok(ok.json().data.items.every((x: any) => x.status === 'dissolved'));
+test('CA2 admin 列表：status 过滤与下发值同口径（三个档位互斥、各含命中项）', async () => {
+  // 夹具：cidActive(2099) / cidEnded(过去 endAt，库内 status 仍是 active) / cidDissolved(已解散)
+  const ids = (d: any) => d.items.map((x: any) => x.id);
 
-  const bad = await get('/admin/campaigns?status=bogus', adminToken);
-  assert.equal(bad.statusCode, 400);
-  assert.match(bad.json().message, /bogus/); // 提示含实际值
-  assert.match(bad.json().message, /dissolved/); // 且含合法值
+  const active = (await get('/admin/campaigns?status=active&pageSize=100', adminToken)).json().data;
+  assert.ok(ids(active).includes(cidActive), 'active 应含进行中');
+  assert.ok(!ids(active).includes(cidEnded), 'active 不该含已到期（库内仍 active）的活动');
+  assert.ok(!ids(active).includes(cidDissolved), 'active 不该含已解散');
+  assert.ok(active.items.every((x: any) => x.status === 'active'), '下发值必须是 active');
+
+  const ended = (await get('/admin/campaigns?status=ended&pageSize=100', adminToken)).json().data;
+  assert.ok(ids(ended).includes(cidEnded), 'ended 必须能查出「已到期但库内仍 active」的活动');
+  assert.ok(!ids(ended).includes(cidActive), 'ended 不该含进行中');
+  assert.ok(ended.items.every((x: any) => x.status === 'ended'), '下发值必须是 ended');
+
+  const dissolved = (await get('/admin/campaigns?status=dissolved&pageSize=100', adminToken)).json().data;
+  assert.ok(ids(dissolved).includes(cidDissolved), 'dissolved 应含已解散');
+  assert.ok(!ids(dissolved).includes(cidActive), 'dissolved 不该含进行中');
+  assert.ok(dissolved.items.every((x: any) => x.status === 'dissolved'));
+});
+
+test('CA2b 非法 status / visibility → 400，提示含实际值与合法值', async () => {
+  const badStatus = await get('/admin/campaigns?status=bogus', adminToken);
+  assert.equal(badStatus.statusCode, 400);
+  assert.match(badStatus.json().message, /bogus/); // 实际值
+  assert.match(badStatus.json().message, /dissolved/); // 合法集合
+
+  const badVis = await get('/admin/campaigns?visibility=secret', adminToken);
+  assert.equal(badVis.statusCode, 400);
+  assert.match(badVis.json().message, /secret/);
+  assert.match(badVis.json().message, /private/);
 });
 
 test('CA3 admin 详情：成员列表含各自汇总', async () => {
@@ -160,12 +229,20 @@ test('CA3 admin 详情：成员列表含各自汇总', async () => {
   assert.equal(typeof me.duration, 'number');
 });
 
-test('CA4 非法 id → 404（全仓惯例；不是 400）', async () => {
+test('CA4 非法 id → 404，且是路由自己的闸门（不是「路由不存在」）', async () => {
   const res = await get('/admin/campaigns/not-an-objectid', adminToken);
   assert.equal(res.statusCode, 404);
+  // 路由没注册时 fastify 也回 404，光断状态码没有区分力 —— 必须钉业务文案
+  assert.equal(res.json().message, '活动不存在');
 });
 
 test('CA5 用户 token 打 admin 接口 → 401', async () => {
   const res = await get('/admin/campaigns', creator.token);
   assert.equal(res.statusCode, 401);
+});
+
+test('CA6 畸形 pageSize 不 500（负数会 skip(-5) 报错）', async () => {
+  const res = await get('/admin/campaigns?page=2&pageSize=-5', adminToken);
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().data.pageSize, 1);
 });
