@@ -277,9 +277,7 @@ export const ListCampaignQuery = z.object({
   pageSize: z.coerce.number().int().positive().max(100).default(20),
 });
 
-export const CampaignIdParamSchema = z.object({
-  id: z.string().regex(/^[a-f\d]{24}$/i, '活动不存在'),
-});
+// 路径参数 id 不在这里走 zod 校验：非法 id 一律由 service 的 assertObjectIdLike 抛 404（本仓硬性惯例）。
 
 export type LoginInput = z.infer<typeof LoginSchema>;
 export type RefreshInput = z.infer<typeof RefreshSchema>;
