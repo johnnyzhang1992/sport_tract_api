@@ -552,3 +552,125 @@ export async function memberDetail(
   }));
   return { stats, items, total, page: query.page, pageSize: query.pageSize };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 管理后台只读接口（Task 7）
+//
+// 后台要「看得到全站活动」，所以这里**不做成员视角裁剪**：列表下发成员数，详情下发全部成员行。
+// 汇总一律复用 `statsForMembers`（与用户端排行榜同一份 service），admin 侧不另写一套判据；
+// 状态同样走 `effectiveStatus` 派生（不写库）。两条都只读，不带任何写副作用。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 后台活动列表一行（列表页够渲染即可，不下发成员明细） */
+export interface AdminCampaignRow {
+  id: string;
+  title: string;
+  visibility: 'public' | 'private';
+  status: 'active' | 'ended' | 'dissolved';
+  allowedTypes: string[];
+  memberLimit: number | null;
+  startAt: number;
+  endAt: number;
+  creatorNickname: string;
+  creatorUid: number | null;
+  joinedCount: number;
+  pendingCount: number;
+  createdAt: Date;
+}
+
+/**
+ * 后台活动列表：分页 + status/visibility 过滤。
+ * `status` 过滤打在**库内 status 字段**上，而下发的 status 是 `effectiveStatus` 派生的：
+ * 「已过 endAt 但库内仍是 active」的活动筛 active 筛不到、筛 ended 也筛不到（这类只能靠 endAt 判断）。
+ * 保持与库内字段一致是为了能用上 `{ status: 1, endAt: -1 }` 索引，且语义稳定（派生状态随时在变）。
+ */
+export async function adminListCampaigns(query: {
+  page: number;
+  pageSize: number;
+  status?: string;
+  visibility?: string;
+}): Promise<{ items: AdminCampaignRow[]; total: number; page: number; pageSize: number }> {
+  const filter: Record<string, unknown> = {};
+  if (query.status) filter.status = query.status;
+  if (query.visibility) filter.visibility = query.visibility;
+
+  const [total, docs] = await Promise.all([
+    CampaignModel.countDocuments(filter),
+    CampaignModel.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((query.page - 1) * query.pageSize)
+      .limit(query.pageSize)
+      .lean(),
+  ]);
+  const items: AdminCampaignRow[] = [];
+  for (const c of docs as CampaignDoc[]) {
+    const [creator, counts] = await Promise.all([
+      UserModel.findById(c.creatorId).select('nickname uid').lean(),
+      memberCounts(c._id),
+    ]);
+    items.push({
+      id: String(c._id),
+      title: c.title,
+      visibility: c.visibility,
+      status: effectiveStatus(c),
+      allowedTypes: c.allowedTypes,
+      memberLimit: c.memberLimit ?? null,
+      startAt: c.startAt,
+      endAt: c.endAt,
+      creatorNickname: creator?.nickname || '微信用户',
+      creatorUid: creator?.uid ?? null,
+      joinedCount: counts.joined,
+      pendingCount: counts.pending,
+      createdAt: c.createdAt,
+    });
+  }
+  return { items, total, page: query.page, pageSize: query.pageSize };
+}
+
+/**
+ * 后台活动详情：活动自身字段 + 成员列表（含各人汇总，与用户端排行榜同源）。
+ *
+ * 成员列表取「加入过的行」（`joinedAt` 非空），即**含已离开/被踢的历史成员**（state 一并下发），
+ * 后台需要看得到这类痕迹；pending 申请人不在其中（未加入，无贡献时段）。
+ */
+export async function adminGetCampaign(id: string) {
+  const c = await loadCampaignOr404(id);
+  const members = await CampaignMemberModel.find({ campaignId: c._id, joinedAt: { $ne: null } })
+    .sort({ joinedAt: 1 })
+    .lean();
+  const uids = members.map((m) => String(m.userId));
+  const users = await UserModel.find({ _id: { $in: uids } })
+    .select('nickname uid')
+    .lean();
+  const uMap = new Map(users.map((u) => [String(u._id), u]));
+  const segs = await loadSegments(String(c._id));
+  const stats = await statsForMembers(c, segs, uids);
+  return {
+    id: String(c._id),
+    title: c.title,
+    description: c.description,
+    visibility: c.visibility,
+    allowedTypes: c.allowedTypes,
+    memberLimit: c.memberLimit,
+    startAt: c.startAt,
+    endAt: c.endAt,
+    status: effectiveStatus(c),
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    members: members.map((m) => {
+      const s = stats.get(String(m.userId))!;
+      return {
+        userId: String(m.userId),
+        role: m.role,
+        state: m.state,
+        name: uMap.get(String(m.userId))?.nickname || '微信用户',
+        uid: uMap.get(String(m.userId))?.uid ?? null,
+        joinedAt: m.joinedAt,
+        leftAt: m.leftAt,
+        count: s.count,
+        distance: s.distance,
+        duration: s.duration,
+      };
+    }),
+  };
+}

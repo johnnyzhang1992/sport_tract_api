@@ -23,6 +23,7 @@ import {
 import { autoFinishStaleActivities, toActivityDto, reprocessActivity } from '../services/activity.js';
 import { purgeCancelledActivities } from '../services/cancelled-purge.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
+import { adminListCampaigns, adminGetCampaign } from '../services/campaign.js';
 import {
   adminListTopics,
   createTopic,
@@ -1288,6 +1289,33 @@ export async function adminRoutes(fastify: FastifyInstance) {
         listCap: Math.max(1, Number(body.listCap) || 50),
       }),
     );
+  });
+
+  // 一起运动活动（只读；与用户端 /campaigns 同一份 service）
+  fastify.get('/campaigns', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as Record<string, string | undefined>;
+    const status = q.status?.trim() || undefined;
+    const visibility = q.visibility?.trim() || undefined;
+    if (status && !['active', 'ended', 'dissolved'].includes(status)) {
+      throw new AppError(400, `status 不合法：${status}（仅支持 active / ended / dissolved）`);
+    }
+    if (visibility && !['public', 'private'].includes(visibility)) {
+      throw new AppError(400, `visibility 不合法：${visibility}（仅支持 public / private）`);
+    }
+    return success(
+      await adminListCampaigns({
+        page: Math.max(1, Number(q.page) || 1),
+        pageSize: Math.min(100, Number(q.pageSize) || 20),
+        status,
+        visibility,
+      }),
+    );
+  });
+
+  // 一起运动活动详情（含成员列表与各自汇总；只读）
+  fastify.get('/campaigns/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await adminGetCampaign(id));
   });
 
   // ==================== 专题管理（官方信息页，小程序首页入口） ====================
