@@ -17,6 +17,7 @@ import {
   getCampaignDetail,
   listCampaigns,
   effectiveStatus,
+  assertTextAllowed,
 } from '../src/services/campaign.js';
 import type { CampaignDoc } from '../src/services/campaign-stats.js';
 import type { CreateCampaignInput } from '../src/utils/validators.js';
@@ -105,6 +106,27 @@ test('CC2 标题/描述过内容安全检测（checkText 被调用）', async ()
     allowedTypes: [], memberLimit: null, startDate: '2026-10-01', endDate: '2026-10-02',
   });
   assert.ok(dto.id);
+});
+
+/**
+ * CC7-C10：`assertTextAllowed` 是 createCampaign 拦截违规文本的判定核心。
+ * 为什么单测纯函数而非端到端：checkText 会真的发 HTTP 到微信，测试环境恒返回 skipped，
+ * 无法廉价地造出 risky。纯函数是唯一能真正走到「红」的路径。
+ */
+test('CC7 assertTextAllowed：任一文本 risky → 400', () => {
+  assert.throws(() => assertTextAllowed([{ risky: true }]), (e: any) => e.statusCode === 400);
+});
+
+test('CC8 assertTextAllowed：全部合规 → 放行', () => {
+  assert.doesNotThrow(() => assertTextAllowed([{ risky: false }]));
+});
+
+test('CC9 assertTextAllowed：空数组 → 放行（无文本即无可拦）', () => {
+  assert.doesNotThrow(() => assertTextAllowed([]));
+});
+
+test('CC10 assertTextAllowed：混合数组按「任一违规即拒」语义拦截', () => {
+  assert.throws(() => assertTextAllowed([{ risky: false }, { risky: true }]), (e: any) => e.statusCode === 400);
 });
 
 test('CC3 详情按身份裁剪：非成员看不到成员列表与汇总', async () => {

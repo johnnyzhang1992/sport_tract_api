@@ -84,6 +84,11 @@ function myStateOf(rows: { state: string }[]): MyState {
   return 'none';
 }
 
+/** 有任一文本被判违规就拒（skipped＝微信侧不可用，仍放行，那是容错） */
+export function assertTextAllowed(secs: { risky: boolean }[]): void {
+  if (secs.some((s) => s.risky)) throw new AppError(400, '内容包含违规信息，请修改后重试');
+}
+
 /** 建活动：发起人自动成为 joined 成员；日期按东八区日边界落库（endDate 含当日 → 左闭右开） */
 export async function createCampaign(
   creatorId: string,
@@ -96,9 +101,11 @@ export async function createCampaign(
   // 标题/描述是会被他人看到的自由文本，先过内容安全（未配置时内部降级放行）。
   // msgSecCheck 需要真实 openid，照 user.routes.ts:41-44 的既有做法先取出来传进去；
   // 不传会退化成 openid:'unknown' → 微信返回 errcode → 服务内按 skipped 放行，等于没检测。
+  // 返回值必须检查：判到 risky（含任一文本）即 400 拒写，防 UGC 红线（docs/13 §10）。
   const creator = await UserModel.findById(ocid).select('openid').lean();
-  for (const text of [input.title, input.description].filter(Boolean)) {
-    await checkText(text, creator?.openid);
+  for (const t of [input.title, input.description].filter(Boolean) as string[]) {
+    const sec = await checkText(t, creator?.openid);
+    assertTextAllowed([sec]);
   }
 
   const [campaign] = await CampaignModel.create([
