@@ -17,6 +17,7 @@ import {
   loadSegments,
   statsForMembers,
   streakForUser,
+  memberActivityMatch,
   type CampaignDoc,
   type MemberStats,
 } from './campaign-stats.js';
@@ -503,8 +504,8 @@ export async function campaignLeaderboard(
  * 成员明细（仅发起人）：概况 + 分页轨迹列表。
  *
  * 明细的**计入判据与 campaign-stats 同口径**（否则弹窗里的条数/距离会和汇总对不上）：
- * `status='finished'`、`vehicleMs` 用 `{ $not: { $gt: 0 } }`（**不要** `$lte:0`，缺字段的老文档要计入）、
- * `type ∈ allowedTypes`（空则不限）、`startTime` 落在该用户的贡献时段并集内。
+ * 判据由 `memberActivityMatch` 单点提供（`status='finished'`、`vehicleMs: { $not: { $gt: 0 } }`、
+ * `type ∈ allowedTypes`、`startTime` 落在该用户的贡献时段并集内）—— 明细不再自己拼一份，改口径时两边同步。
  */
 export async function memberDetail(
   id: string,
@@ -525,21 +526,14 @@ export async function memberDetail(
   const targetSegs = segs.get(targetUid) ?? [];
   const stats = (await statsForMembers(c, segs, [targetUid])).get(targetUid) ?? emptyStats();
 
-  // 没有贡献时段（该用户从未加入 / 未产生段）→ 空明细。
-  // 必须在此短路：`$or: []` 在 MongoDB 里是非法查询（会抛错），不能让空数组进 match。
-  if (targetSegs.length === 0) {
+  // 计入判据与汇总**同源**：复用 campaign-stats 的 memberActivityMatch（含 baseMatch + timeOr），
+  // 不再手抄 status / vehicleMs / type / 时间窗 —— 未来改口径时此处自动跟随。
+  // 无贡献时段（从未加入 / 未产生段）→ helper 返回 null，据此短路：`$or: []` 是非法查询，绝不能进 match。
+  const match = memberActivityMatch(c, targetUid, targetSegs);
+  if (match === null) {
     return { stats, items: [], total: 0, page: query.page, pageSize: query.pageSize };
   }
 
-  const match = {
-    userId: new mongoose.Types.ObjectId(targetUid),
-    status: 'finished' as const,
-    vehicleMs: { $not: { $gt: 0 } },
-    ...(c.allowedTypes.length > 0 ? { type: { $in: c.allowedTypes } } : {}),
-    $or: targetSegs.map((s) => ({
-      startTime: { $gte: s.joinedAt, ...(s.leftAt != null ? { $lt: s.leftAt } : {}) },
-    })),
-  };
   const [total, docs] = await Promise.all([
     ActivityModel.countDocuments(match),
     ActivityModel.find(match)

@@ -76,6 +76,19 @@ function baseMatch(campaign: CampaignDoc, extra: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * 单个成员在活动内的轨迹匹配条件（明细与汇总共用，避免口径分叉）。
+ * 该成员没有任何贡献时段时返回 null —— 调用方据此短路，别把空 $or 交给 Mongo。
+ */
+export function memberActivityMatch(
+  campaign: CampaignDoc,
+  userId: string,
+  segs: Segment[],
+): Record<string, unknown> | null {
+  if (segs.length === 0) return null;
+  return baseMatch(campaign, { $or: timeOr(userId, segs) });
+}
+
 /** 批量汇总：一次聚合出所有成员 { count, distance, duration } */
 export async function statsForMembers(
   campaign: CampaignDoc,

@@ -206,6 +206,15 @@ test('CL3 成员明细：非发起人 403；发起人拿到概况 + 分页明细
   assert.equal(d.stats.count, 3);
   assert.equal(d.stats.distance, 3500);
   assert.equal(d.stats.duration, 1000);
+  // 「同源」回归：total 走 memberDetail 的明细查询（countDocuments(memberActivityMatch)），
+  // stats.count 走 statsForMembers 的聚合（baseMatch + timeOr）——两条路径必须给出一致的计入判据。
+  // 本 fixture 覆盖了每个判据分支（搭车 vehicleMs / 白名单外 type / 未完成 status / 加入前时间窗 /
+  // 无 vehicleMs 字段的老文档），任一条判据只在一边改动，这两个数就会分叉、此断言即红。
+  assert.equal(
+    d.total,
+    d.stats.count,
+    '明细条数与汇总次数必须同源——两条路径的计入判据若分叉即变红',
+  );
   assert.equal(d.total, 3);
   assert.equal(d.items.length, 3);
   assert.deepEqual(
