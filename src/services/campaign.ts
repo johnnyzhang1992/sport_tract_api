@@ -93,6 +93,8 @@ export function assertTextAllowed(secs: { risky: boolean }[]): void {
 export async function createCampaign(
   creatorId: string,
   input: CreateCampaignInput,
+  /** 仅供测试注入替身；生产调用点只传两个参数，走真实 checkText */
+  check: (text: string, openid?: string) => Promise<{ risky: boolean }> = checkText,
 ): Promise<CampaignDetailDto> {
   const ocid = new mongoose.Types.ObjectId(creatorId);
   const startAt = bjDayStart(Date.parse(`${input.startDate}T00:00:00+08:00`));
@@ -104,7 +106,7 @@ export async function createCampaign(
   // 返回值必须检查：判到 risky（含任一文本）即 400 拒写，防 UGC 红线（docs/13 §10）。
   const creator = await UserModel.findById(ocid).select('openid').lean();
   for (const t of [input.title, input.description].filter(Boolean) as string[]) {
-    const sec = await checkText(t, creator?.openid);
+    const sec = await check(t, creator?.openid);
     assertTextAllowed([sec]);
   }
 

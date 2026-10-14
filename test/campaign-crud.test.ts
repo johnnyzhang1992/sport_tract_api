@@ -108,6 +108,23 @@ test('CC2 标题/描述过内容安全检测（checkText 被调用）', async ()
   assert.ok(dto.id);
 });
 
+test('CC11 接线：注入的 checkText 判 risky 时，创建整条被 400 拒（删掉 assertTextAllowed 调用即变红）', async () => {
+  // 端到端无法造 risky（未配 WX_SECRET 时 checkText 恒 skipped）→ 用 DI 注入替身，
+  // 这条才真正钉住 createCampaign 里「必须检查 checkText 返回值」这句接线。
+  await assert.rejects(
+    () =>
+      createCampaign(
+        String(userId),
+        {
+          title: '违规标题', description: '', visibility: 'public', allowedTypes: [],
+          memberLimit: null, startDate: '2099-01-01', endDate: '2099-01-02',
+        },
+        async () => ({ risky: true }),
+      ),
+    (e: any) => e.statusCode === 400,
+  );
+});
+
 /**
  * CC7-C10：`assertTextAllowed` 是 createCampaign 拦截违规文本的判定核心。
  * 为什么单测纯函数而非端到端：checkText 会真的发 HTTP 到微信，测试环境恒返回 skipped，
