@@ -287,10 +287,12 @@ function campaignDateField(key: 'startDate' | 'endDate', label: string) {
 export const CreateCampaignSchema = z
   .object({
     title: z.string().trim().min(1, '标题不能为空').max(30, '标题最多 30 字'),
-    description: z.string().trim().max(300, '描述最多 300 字').default(''),
+    description: z.string().trim().max(120, '描述最多 120 字').default(''),
     visibility: z.enum(['public', 'private']),
     allowedTypes: z.array(z.enum(ACTIVITY_TYPE_VALUES)).max(8).default([]),
-    memberLimit: z.number().int().positive().max(500, '人数上限最多 500').nullable().default(null),
+    // 默认 100：兜住「整段不带 memberLimit」的调用方（端上已预填 100，但接口不该靠调用方自觉）。
+    // 显式 null 仍是「不限」——zod 的 default 只在 undefined 时生效，端上「清空＝不限制」的明确意图不会被吃掉。
+    memberLimit: z.number().int().positive().max(500, '人数上限最多 500').nullable().default(100),
     startDate: campaignDateField('startDate', '开始日期'),
     endDate: campaignDateField('endDate', '结束日期'),
   })

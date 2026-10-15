@@ -295,3 +295,58 @@ test('CR7 成员明细 uid 闸门：畸形 uid / 非成员 → 404；成员零�
   assert.deepEqual(memberRes.json().data.stats, { count: 0, distance: 0, duration: 0 });
   assert.equal(memberRes.json().data.total, 0);
 });
+
+test('CR8 描述上限 120 字：120 字通过、121 字 → 400', async () => {
+  const okId = await mkCampaign(creator.token, { title: '描述上限', description: '字'.repeat(120) });
+  assert.match(okId, /^[a-f\d]{24}$/i, '恰好 120 字应通过');
+
+  const tooLong = await post(
+    '/campaigns',
+    {
+      title: '描述超限',
+      description: '字'.repeat(121),
+      visibility: 'public',
+      allowedTypes: [],
+      memberLimit: null,
+      startDate: '2099-01-01',
+      endDate: '2099-01-07',
+    },
+    creator.token,
+  );
+  assert.equal(tooLong.statusCode, 400, tooLong.body);
+  assert.equal(tooLong.json().code, 400);
+  assert.match(tooLong.json().message, /描述/, `提示应点名对象，实际：${tooLong.json().message}`);
+  assert.ok(tooLong.json().message.includes('120'), `提示应含上限 120，实际：${tooLong.json().message}`);
+});
+
+test('CR9 memberLimit 不带该字段 → 默认 100 落库；显式 null 仍是「不限」', async () => {
+  // ① 整段不带 memberLimit（模拟没填这个字段的调用方）
+  const omitted = await post(
+    '/campaigns',
+    {
+      title: '默认人数上限',
+      description: '',
+      visibility: 'public',
+      allowedTypes: [],
+      startDate: '2099-01-01',
+      endDate: '2099-01-07',
+    },
+    creator.token,
+  );
+  assert.equal(omitted.statusCode, 200, omitted.body);
+  const omittedId = omitted.json().data.id;
+  createdIds.push(new mongoose.Types.ObjectId(omittedId));
+  assert.equal(
+    (await get(`/campaigns/${omittedId}`, creator.token)).json().data.memberLimit,
+    100,
+    '不带该字段应按默认 100 落库（不是 null）',
+  );
+
+  // ② 显式 null＝不限：默认值只能兜「没带」，不能吃掉端上「清空＝不限制」的明确意图
+  const explicitNullId = await mkCampaign(creator.token, { title: '显式不限人数' });
+  assert.equal(
+    (await get(`/campaigns/${explicitNullId}`, creator.token)).json().data.memberLimit,
+    null,
+    '显式 null 必须仍然是不限',
+  );
+});
