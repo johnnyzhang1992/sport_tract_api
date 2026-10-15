@@ -178,7 +178,7 @@ test('CC4 非法 id → 404', async () => {
   await assert.rejects(() => getCampaignDetail('not-an-id', String(userId)), (e: any) => e.statusCode === 404);
 });
 
-test('CC5 列表 role：created 只回我发起的，joined 只回我参与的', async () => {
+test('CC5 列表 role：created 只回我发起的，joined 含我参与的+我发起的（发起人也是成员）', async () => {
   const a = new mongoose.Types.ObjectId();
   const b = new mongoose.Types.ObjectId();
   const c1 = await create(String(a), { ...base, title: 'A1' });
@@ -194,10 +194,10 @@ test('CC5 列表 role：created 只回我发起的，joined 只回我参与的',
   assert.equal(created.pageSize, 20);
 
   const joined = await listCampaigns(String(a), { role: 'joined', page: 1, pageSize: 20 });
-  assert.deepEqual(joined.items.map((i) => i.id), [c3.id]);
-  assert.equal(joined.total, 1);
+  assert.deepEqual(joined.items.map((i) => i.id).sort(), [c1.id, c2.id, c3.id].sort());
+  assert.equal(joined.total, 3);
   // 卡片自带我在该活动的汇总（无轨迹 → 全 0）
-  assert.deepEqual(joined.items[0].myStats, { count: 0, distance: 0, duration: 0 });
+  assert.deepEqual(joined.items.find((i) => i.id === c3.id)!.myStats, { count: 0, distance: 0, duration: 0 });
 });
 
 test('CC6 effectiveStatus：到期即 ended（不写库），dissolved 优先于时间', async () => {

@@ -225,7 +225,7 @@ export async function listCampaigns(
   if (query.role === 'created') {
     filter = { creatorId: oid };
   } else {
-    const rows = await CampaignMemberModel.find({ userId: oid, role: 'member', joinedAt: { $ne: null } })
+    const rows = await CampaignMemberModel.find({ userId: oid, role: { $in: ['member', 'creator'] }, joinedAt: { $ne: null } })
       .select('campaignId')
       .lean();
     filter = { _id: { $in: rows.map((r) => r.campaignId) } };
