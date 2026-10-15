@@ -8,7 +8,11 @@ import { callWithRetry } from './wechat-sec.js';
  * 调 wx.getUnlimitedQRCode，scene 传 activityId（≤32 字符），扫码直达轨迹详情
  * @returns PNG buffer
  */
-export async function getUnlimitedQRCode(scene: string, page = 'pages/track-detail/track-detail'): Promise<Buffer> {
+export async function getUnlimitedQRCode(
+  scene: string,
+  page = 'pages/track-detail/track-detail',
+  envVersion?: string,
+): Promise<Buffer> {
   if (!config.wxAppid || !config.wxSecret) {
     throw new AppError(503, 'WX_APPID / WX_SECRET 未配置');
   }
@@ -21,7 +25,7 @@ export async function getUnlimitedQRCode(scene: string, page = 'pages/track-deta
         page,
         width: 430,
         check_path: false,
-        env_version: config.wxMiniCodeEnv || 'trial',
+        env_version: envVersion || config.wxMiniCodeEnv,
       },
       { responseType: 'arraybuffer', timeout: 8000 },
     );

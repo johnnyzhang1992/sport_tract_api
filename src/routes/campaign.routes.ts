@@ -54,15 +54,18 @@ export async function campaignRoutes(fastify: FastifyInstance) {
 
   // 静态路径 `/mini-code` 必须先于 `/:id` 存在；Fastify 按优先级路由，这里显式保证不与 /:id 混淆
   fastify.post('/mini-code', auth, async (request) => {
-    const { campaignId } = z
-      .object({ campaignId: z.string().regex(/^[a-f\d]{24}$/i, '活动不存在') })
+    const { campaignId, envVersion } = z
+      .object({
+        campaignId: z.string().regex(/^[a-f\d]{24}$/i, '活动不存在'),
+        envVersion: z.enum(['develop', 'trial', 'release']).optional(),
+      })
       .parse(request.body);
 
     // 仅活动成员（含发起人）可生成邀请码（Spec §5）
     const detail = await getCampaignDetail(campaignId, request.user.userId);
     if (detail.myState !== 'joined') throw new AppError(403, '只有活动成员可以邀请');
 
-    const png = await getUnlimitedQRCode(campaignId, 'pages/campaign-detail/campaign-detail');
+    const png = await getUnlimitedQRCode(campaignId, 'pages/campaign-detail/campaign-detail', envVersion);
     // 目录按 userId 隔离（bucket 私有，前端加载需签名）
     const key = `${config.oss.baseDir}/mini-codes/${request.user.userId}/campaign-${campaignId}.png`;
     try {
