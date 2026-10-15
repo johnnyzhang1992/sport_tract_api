@@ -22,6 +22,7 @@ import {
   type MemberStats,
 } from './campaign-stats.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
+import { getAvatarUrl } from './oss.js';
 import { bjDayStart } from '../utils/bj-time.js';
 import { checkText } from './wechat-sec.js';
 import { AppError } from '../utils/app-error.js';
@@ -155,21 +156,130 @@ export async function listCampaigns(
       .lean();
     filter = { _id: { $in: rows.map((r) => r.campaignId) } };
   }
+  // 已解散的活动不出现在「我的活动」列表（两个 role 都过滤）：解散即从列表消失，
+  // 但仍可通过分享链接 / 小程序码进详情只读（详情页的「活动已解散」态）。
+  filter.status = { $ne: 'dissolved' };
 
+  const now = Date.now();
   const [total, docs] = await Promise.all([
     CampaignModel.countDocuments(filter),
-    CampaignModel.find(filter).sort({ createdAt: -1 }).skip(skip).limit(query.pageSize).lean(),
+    // 两段式排序，必须在 skip/limit 之前生效（否则翻页序与整表序不一致）：
+    //   ① 进行中（endAt 升序 —— 快结束的在前）
+    //   ② 已结束（endAt 降序 —— 刚结束的在前）
+    // 已解散的已在上面的 filter 里排除，不再参与排序。
+    // 档位与 effectiveStatus 同口径（共用一个 now）；同档同结束时间再按 createdAt 倒序兜底。
+    CampaignModel.aggregate<CampaignDoc>([
+      { $match: filter },
+      {
+        $addFields: {
+          _tier: { $cond: [{ $or: [{ $eq: ['$status', 'ended'] }, { $lte: ['$endAt', now] }] }, 1, 0] },
+        },
+      },
+      // 进行中取 endAt、已结束取 -endAt，统一成升序即「进行中快结束在前 / 已结束刚结束在前」
+      { $addFields: { _endKey: { $cond: [{ $eq: ['$_tier', 0] }, '$endAt', { $multiply: ['$endAt', -1] }] } } },
+      { $sort: { _tier: 1, _endKey: 1, createdAt: -1 } },
+      { $skip: skip },
+      { $limit: query.pageSize },
+      { $project: { _tier: 0, _endKey: 0 } },
+    ]),
   ]);
-  const items: CampaignCardDto[] = [];
-  // 每个活动一次 loadSegments：v1 接受的 N+1（页大小上限 100），不做缓存
-  for (const c of docs as CampaignDoc[]) items.push(await toCard(c, userId));
+  const docsArr = docs as CampaignDoc[];
+  const facets = await memberFacets(docsArr.map((c) => c._id));
+
+  // 每张卡一次 loadSegments + 一次 statsForMembers（v1 接受的 N+1，页大小上限 100，不做缓存）；
+  // 成员面（人数 + 头像堆叠）由 memberFacets 批量取。头像取**排行榜口径的前 3**（距离降序，平手按加入时间）。
+  const cards = await Promise.all(
+    docsArr.map(async (c) => {
+      const key = String(c._id);
+      const members = facets.members.get(key) ?? [];
+      const segs = await loadSegments(key);
+      const stats = await statsForMembers(
+        c,
+        segs,
+        members.map((m) => m.userId),
+      );
+      const rankOf = (m: { userId: string; joinedAt: number | null }) => ({
+        distance: stats.get(m.userId)?.distance ?? 0,
+        joinedAt: m.joinedAt,
+      });
+      const topUids = [...members]
+        .sort((a, b) => byDistanceThenJoin(rankOf(a), rankOf(b)))
+        .slice(0, 3)
+        .map((m) => m.userId);
+      return { c, key, stats, topUids };
+    }),
+  );
+
+  // 所有卡片的前三 uid 一次批量取头像（私有桶，链接必须签名 —— 与详情/待审批/排行榜同口径）
+  const avatarUids = [...new Set(cards.flatMap((x) => x.topUids))];
+  const users = await UserModel.find({ _id: { $in: avatarUids } })
+    .select('avatarUrl avatarPreset')
+    .lean();
+  const uMap = new Map(users.map((u) => [String(u._id), u]));
+
+  const items: CampaignCardDto[] = cards.map(({ c, key, stats, topUids }) =>
+    cardDto(
+      c,
+      stats.get(userId) ?? emptyStats(),
+      facets.counts.get(key) ?? 0,
+      topUids.map((uid) => {
+        const u = uMap.get(uid);
+        return {
+          avatarUrl: u?.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
+          avatarPreset: u?.avatarPreset || '',
+        };
+      }),
+    ),
+  );
   return { items, total, page: query.page, pageSize: query.pageSize };
 }
 
-/** 列表卡片：标题 / 时间 / 状态 / 我在该活动的汇总 */
-async function toCard(c: CampaignDoc, userId: string) {
-  const segs = await loadSegments(String(c._id));
-  const stats = await statsForMembers(c, segs, segs.has(userId) ? [userId] : []);
+/**
+ * 排行榜口径排序：距离降序；距离相同按加入时间升序（早加入在前）。
+ * 平手必须有确定顺序，否则同一活动两次请求名次会漂，卡片头像也会和排行榜「前三」对不上。
+ */
+function byDistanceThenJoin(
+  a: { distance: number; joinedAt: number | null },
+  b: { distance: number; joinedAt: number | null },
+): number {
+  return b.distance - a.distance || (a.joinedAt ?? 0) - (b.joinedAt ?? 0);
+}
+
+/** 列表卡片的成员面：joined 计数 + 每个活动的 joined 成员（uid + 加入时间，供排行榜口径排序） */
+async function memberFacets(campaignIds: mongoose.Types.ObjectId[]): Promise<{
+  counts: Map<string, number>;
+  members: Map<string, { userId: string; joinedAt: number | null }[]>;
+}> {
+  const counts = new Map<string, number>();
+  const members = new Map<string, { userId: string; joinedAt: number | null }[]>();
+  if (campaignIds.length === 0) return { counts, members };
+
+  const [countRows, memberRows] = await Promise.all([
+    CampaignMemberModel.aggregate<{ _id: mongoose.Types.ObjectId; n: number }>([
+      { $match: { campaignId: { $in: campaignIds }, state: 'joined' } },
+      { $group: { _id: '$campaignId', n: { $sum: 1 } } },
+    ]),
+    CampaignMemberModel.find({ campaignId: { $in: campaignIds }, state: 'joined' })
+      .select('campaignId userId joinedAt')
+      .lean(),
+  ]);
+  for (const r of countRows) counts.set(String(r._id), r.n);
+  for (const m of memberRows) {
+    const key = String(m.campaignId);
+    const arr = members.get(key) ?? [];
+    arr.push({ userId: String(m.userId), joinedAt: m.joinedAt ?? null });
+    members.set(key, arr);
+  }
+  return { counts, members };
+}
+
+/** 列表卡片：标题 / 时间 / 状态 / 我在该活动的汇总 / 成员面（人数 + 头像堆叠） */
+function cardDto(
+  c: CampaignDoc,
+  myStats: MemberStats,
+  memberCount: number,
+  memberAvatars: { avatarUrl: string; avatarPreset: string }[],
+) {
   return {
     id: String(c._id),
     title: c.title,
@@ -177,11 +287,13 @@ async function toCard(c: CampaignDoc, userId: string) {
     startAt: c.startAt,
     endAt: c.endAt,
     status: effectiveStatus(c),
-    myStats: stats.get(userId) ?? emptyStats(),
+    myStats,
+    memberCount,
+    memberAvatars,
   };
 }
 
-export type CampaignCardDto = Awaited<ReturnType<typeof toCard>>;
+export type CampaignCardDto = ReturnType<typeof cardDto>;
 
 export async function getCampaignDetail(id: string, viewerId: string): Promise<CampaignDetailDto> {
   assertObjectIdLike(id, '活动不存在');
@@ -237,7 +349,7 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
       userId: String(m.userId),
       role: m.role,
       name: u?.nickname || '微信用户',
-      avatarUrl: u?.avatarUrl || '',
+      avatarUrl: u?.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
       avatarPreset: u?.avatarPreset || '',
       joinedAt: m.joinedAt ?? null,
       ...(stats.get(String(m.userId)) ?? emptyStats()),
@@ -363,13 +475,16 @@ export async function listPending(id: string, creatorId: string) {
     .select('nickname avatarUrl avatarPreset')
     .lean();
   const uMap = new Map(users.map((u) => [String(u._id), u]));
-  return rows.map((r) => ({
-    userId: String(r.userId),
-    appliedAt: r.createdAt,
-    name: uMap.get(String(r.userId))?.nickname || '微信用户',
-    avatarUrl: uMap.get(String(r.userId))?.avatarUrl || '',
-    avatarPreset: uMap.get(String(r.userId))?.avatarPreset || '',
-  }));
+  return rows.map((r) => {
+    const u = uMap.get(String(r.userId));
+    return {
+      userId: String(r.userId),
+      appliedAt: r.createdAt,
+      name: u?.nickname || '微信用户',
+      avatarUrl: u?.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
+      avatarPreset: u?.avatarPreset || '',
+    };
+  });
 }
 
 /** 取某人的 pending 行（审批 / 拒绝共用；不在 pending 一律 404） */
@@ -488,7 +603,7 @@ export async function campaignLeaderboard(
   if (myStateOf(mine) !== 'joined') throw new AppError(403, '只有活动成员可以查看排行榜');
 
   const members = await CampaignMemberModel.find({ campaignId: c._id, state: 'joined' })
-    .select('userId')
+    .select('userId joinedAt')
     .lean();
   const uids = members.map((m) => String(m.userId));
   const users = await UserModel.find({ _id: { $in: uids } })
@@ -497,23 +612,32 @@ export async function campaignLeaderboard(
   const uMap = new Map(users.map((u) => [String(u._id), u]));
   const stats = await statsForMembers(c, await loadSegments(String(c._id)), uids);
 
+  // 与列表卡片头像同一条排序（byDistanceThenJoin）：两处「前三」必须一致
+  const ranked = [...members].sort((x, y) => {
+    const xs = stats.get(String(x.userId))!;
+    const ys = stats.get(String(y.userId))!;
+    return byDistanceThenJoin(
+      { distance: xs.distance, joinedAt: x.joinedAt ?? null },
+      { distance: ys.distance, joinedAt: y.joinedAt ?? null },
+    );
+  });
+
   return {
-    rows: uids
-      .map((uid) => {
-        const s = stats.get(uid)!;
-        const u = uMap.get(uid);
-        return {
-          userId: uid,
-          name: u?.nickname || '微信用户',
-          avatarUrl: u?.avatarUrl || '',
-          avatarPreset: u?.avatarPreset || '',
-          distance: s.distance,
-          count: s.count,
-          duration: s.duration,
-        };
-      })
-      .sort((a, b) => b.distance - a.distance)
-      .map((r, i) => ({ rank: i + 1, ...r })),
+    rows: ranked.map((m, i) => {
+      const uid = String(m.userId);
+      const s = stats.get(uid)!;
+      const u = uMap.get(uid);
+      return {
+        rank: i + 1,
+        userId: uid,
+        name: u?.nickname || '微信用户',
+        avatarUrl: u?.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
+        avatarPreset: u?.avatarPreset || '',
+        distance: s.distance,
+        count: s.count,
+        duration: s.duration,
+      };
+    }),
   };
 }
 
