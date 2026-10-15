@@ -21,7 +21,7 @@ export async function getUnlimitedQRCode(scene: string, page = 'pages/track-deta
         page,
         width: 430,
         check_path: false,
-        env_version: config.nodeEnv === 'production' ? 'release' : 'trial',
+        env_version: config.wxMiniCodeEnv || 'trial',
       },
       { responseType: 'arraybuffer', timeout: 8000 },
     );

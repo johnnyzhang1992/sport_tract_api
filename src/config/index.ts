@@ -42,6 +42,8 @@ export const config = {
   // 微信小程序
   wxAppid: process.env.WX_APPID ?? '',
   wxSecret: process.env.WX_SECRET ?? '',
+  // 小程序码指向的版本：trial（体验版，默认）/ release（正式版，发布后改这个）
+  wxMiniCodeEnv: process.env.WX_MINI_CODE_ENV ?? 'trial',
   // 本地开发无真实 AppID 时开启 mock 登录（任意 code 直接换取测试 openid）
   wxMockLogin: process.env.WX_MOCK_LOGIN === 'true',
 
