@@ -23,10 +23,10 @@ import {
 } from './campaign-stats.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { getAvatarUrl } from './oss.js';
-import { bjDayStart } from '../utils/bj-time.js';
+import { bjDateStr, bjDayStart } from '../utils/bj-time.js';
 import { checkText } from './wechat-sec.js';
 import { AppError } from '../utils/app-error.js';
-import type { CreateCampaignInput, ListCampaignQueryInput } from '../utils/validators.js';
+import type { CreateCampaignInput, ListCampaignQueryInput, UpdateCampaignInput } from '../utils/validators.js';
 
 const DAY_MS = 86400000;
 
@@ -61,6 +61,14 @@ export interface CampaignDetailDto {
   memberLimit: number | null;
   startAt: number;
   endAt: number;
+  /**
+   * 东八区日期串（YYYY-MM-DD），由 startAt / endAt 反推。
+   * 存在的理由：编辑页的 `<picker mode="date">` 要的就是这个格式，而端上刻意不做时区换算
+   * （见 campaign-create.js 头注）。endAt 是「结束日 24:00」，所以 endDate 要先减一天再取日期，
+   * 少减一天 = 编辑页预填多一天。
+   */
+  startDate: string;
+  endDate: string;
   status: 'active' | 'ended' | 'dissolved';
   creatorId: string;
   myState: MyState;
@@ -134,6 +142,72 @@ export async function createCampaign(
     joinedAt: Date.now(),
   });
   return getCampaignDetail(String(campaign._id), creatorId);
+}
+
+/**
+ * 发起人编辑活动：只改传进来的字段（`undefined`＝不动，见 UpdateCampaignSchema）。
+ *
+ * 闸门顺序是刻意的：**先判权限与状态、再判内容安全、最后才碰数据库**。
+ * 内容安全（msgSecCheck）必须在任何字段落库之前跑完，否则一条「改标题 + 改人数」的请求
+ * 会在标题被判违规后把人数改成功（UP8 钉的就是这个半途生效）。
+ *
+ * 状态闸门按 `effectiveStatus` 的**派生值**判，不是按落库的 `c.status`：`'ended'` 从不写库，
+ * 只挡 `'dissolved'` 会让一个早已跑完的活动继续可改（UP11 / UP13）。
+ * 所以进行中的活动可以把 `endAt` 往后推（延期），已结束的不行——过期即定稿。
+ */
+export async function updateCampaign(
+  id: string,
+  editorId: string,
+  input: UpdateCampaignInput,
+  /** 仅供测试注入替身；生产调用点只传三个参数，走真实 checkText */
+  check: (text: string, openid?: string) => Promise<{ risky: boolean }> = checkText,
+): Promise<CampaignDetailDto> {
+  const c = await loadCampaignOr404(id);
+  assertCreator(c, editorId);
+  const status = effectiveStatus(c);
+  if (status !== 'active') {
+    throw new AppError(403, status === 'dissolved' ? '活动已解散，无法修改' : '活动已结束，无法修改');
+  }
+
+  const texts = [input.title, input.description].filter(Boolean) as string[];
+  if (texts.length > 0) {
+    // 与 createCampaign 同一条 UGC 红线：改后的标题/描述同样会被他人看到。
+    // openid 取发起人的（检测要真实 openid，否则微信侧降级放行＝没检测）。
+    const owner = await UserModel.findById(c.creatorId).select('openid').lean();
+    for (const t of texts) assertTextAllowed([await check(t, owner?.openid)]);
+  }
+
+  const set: Record<string, unknown> = {};
+  if (input.title !== undefined) set.title = input.title;
+  if (input.description !== undefined) set.description = input.description;
+  if (input.visibility !== undefined) set.visibility = input.visibility;
+  if (input.allowedTypes !== undefined) set.allowedTypes = input.allowedTypes;
+  if (input.endDate !== undefined) {
+    const endAt = bjDayStart(Date.parse(`${input.endDate}T00:00:00+08:00`)) + DAY_MS;
+    // 开始日期不在本次请求里，所以提示必须把库里那个真实值点名出来
+    if (endAt <= c.startAt) {
+      throw new AppError(
+        400,
+        `结束日期不能早于开始日期（收到 ${input.endDate}，开始日期是 ${bjDateStr(c.startAt)}）`,
+      );
+    }
+    set.endAt = endAt;
+  }
+  if (input.memberLimit !== undefined && input.memberLimit !== null) {
+    // 上限低于已占位会让详情页出现「上限 3 人」而成员列表 5 行的自相矛盾，直接拒
+    const { occupied } = await memberCounts(c._id);
+    if (input.memberLimit < occupied) {
+      throw new AppError(400, `人数上限不能小于当前已占用的 ${occupied} 人（收到 ${input.memberLimit}）`);
+    }
+    set.memberLimit = input.memberLimit;
+  } else if (input.memberLimit === null) {
+    set.memberLimit = null;
+  }
+
+  if (Object.keys(set).length > 0) {
+    await CampaignModel.updateOne({ _id: c._id }, { $set: set });
+  }
+  return getCampaignDetail(String(c._id), editorId);
 }
 
 /**
@@ -315,6 +389,8 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
     memberLimit: c.memberLimit ?? null,
     startAt: c.startAt,
     endAt: c.endAt,
+    startDate: bjDateStr(c.startAt),
+    endDate: bjDateStr(c.endAt - 1),
     status,
     creatorId: String(c.creatorId),
     myState,
@@ -590,11 +666,17 @@ export interface CampaignTrackDto {
 /**
  * 活动内排行榜：仅当前 `joined` 成员，按**距离降序**（Spec §8 默认）。
  * 非成员（含待审批 / 游客 / 已离开 / 被踢）一律 403 —— 成员数据不外泄（§5 总则）。
+ *
+ * 分页只切**响应**，不切**计算**：名次要按全员距离排，少算任何一个人的距离就会整体错位，
+ * 所以 `statsForMembers` 照旧覆盖全部 joined 成员。分页真正省下来的是三处按人头的开销：
+ * 昵称/头像的 User 查询、每行一次的 `getAvatarUrl` 签名、以及响应载荷与端上渲染的节点数。
+ * 因此必须先 `slice` 再 `map`——反过来写行为一样，但那两处就白省了。
  */
 export async function campaignLeaderboard(
   id: string,
   viewerId: string,
-): Promise<{ rows: LeaderRow[] }> {
+  query: { page: number; pageSize: number },
+): Promise<{ rows: LeaderRow[]; total: number; page: number; pageSize: number }> {
   const c = await loadCampaignOr404(id);
   const mine = await CampaignMemberModel.find({
     campaignId: c._id,
@@ -606,10 +688,6 @@ export async function campaignLeaderboard(
     .select('userId joinedAt')
     .lean();
   const uids = members.map((m) => String(m.userId));
-  const users = await UserModel.find({ _id: { $in: uids } })
-    .select('nickname avatarUrl avatarPreset')
-    .lean();
-  const uMap = new Map(users.map((u) => [String(u._id), u]));
   const stats = await statsForMembers(c, await loadSegments(String(c._id)), uids);
 
   // 与列表卡片头像同一条排序（byDistanceThenJoin）：两处「前三」必须一致
@@ -622,13 +700,24 @@ export async function campaignLeaderboard(
     );
   });
 
+  const total = ranked.length;
+  const from = (query.page - 1) * query.pageSize;
+  const pageRows = ranked.slice(from, from + query.pageSize);
+
+  const users = await UserModel.find({ _id: { $in: pageRows.map((m) => m.userId) } })
+    .select('nickname avatarUrl avatarPreset')
+    .lean();
+  const uMap = new Map(users.map((u) => [String(u._id), u]));
+
   return {
-    rows: ranked.map((m, i) => {
+    // rank 用全局下标（from + j），不是页内下标：端上「加载更多」是往同一个列表后面追加的，
+    // 写 j + 1 会让第二页顶着一个「第 1 名」接在第 20 行后面。
+    rows: pageRows.map((m, j) => {
       const uid = String(m.userId);
       const s = stats.get(uid)!;
       const u = uMap.get(uid);
       return {
-        rank: i + 1,
+        rank: from + j + 1,
         userId: uid,
         name: u?.nickname || '微信用户',
         avatarUrl: u?.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
@@ -638,6 +727,9 @@ export async function campaignLeaderboard(
         duration: s.duration,
       };
     }),
+    total,
+    page: query.page,
+    pageSize: query.pageSize,
   };
 }
 

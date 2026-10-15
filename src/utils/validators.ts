@@ -298,6 +298,31 @@ export const CreateCampaignSchema = z
   })
   .refine((v) => v.endDate >= v.startDate, { message: '结束日期不能早于开始日期', path: ['endDate'] });
 
+/**
+ * 发起人编辑活动（PUT /campaigns/:id）。
+ *
+ * 与 CreateCampaignSchema 的两处不同，都是刻意的：
+ *   1. **没有 startDate**：开始时间是统计时间窗的下界，改它会让成员已计入的轨迹重新洗牌。
+ *      这里用 `.strict()` 而不是像 create 那样默默吃掉多余字段——否则端上真传了 startDate
+ *      会拿到 200「修改成功」而实际没改，比 400 坏得多。
+ *   2. **每个字段都 .optional() 且不给 default**：请求体里没出现的字段＝不改。
+ *      尤其 description：create 的 `.default('')` 在这里会把「只改标题」变成「顺手清空描述」。
+ *      memberLimit 保留 create 的「undefined vs 显式 null」分工：不带＝不改，null＝改回不限。
+ */
+export const UpdateCampaignSchema = z
+  .object({
+    title: z.string().trim().min(1, '标题不能为空').max(30, '标题最多 30 字').optional(),
+    description: z.string().trim().max(120, '描述最多 120 字').optional(),
+    visibility: z.enum(['public', 'private']).optional(),
+    allowedTypes: z.array(z.enum(ACTIVITY_TYPE_VALUES)).max(8).optional(),
+    memberLimit: z.number().int().positive().max(500, '人数上限最多 500').nullable().optional(),
+    endDate: campaignDateField('endDate', '结束日期').optional(),
+  })
+  .strict()
+  .refine((v) => Object.values(v).some((x) => x !== undefined), {
+    message: '没有任何要修改的字段（标题 / 描述 / 可见性 / 运动类型 / 人数上限 / 结束日期至少一项）',
+  });
+
 export const ListCampaignQuery = z.object({
   role: z.enum(['created', 'joined']).default('created'),
   page: z.coerce.number().int().positive().default(1),
@@ -319,4 +344,5 @@ export type CreateFootprintRecordInput = z.infer<typeof CreateFootprintRecordSch
 export type ListFootprintQueryInput = z.infer<typeof ListFootprintQuery>;
 export type FootprintGeoQueryInput = z.infer<typeof FootprintGeoQuery>;
 export type CreateCampaignInput = z.infer<typeof CreateCampaignSchema>;
+export type UpdateCampaignInput = z.infer<typeof UpdateCampaignSchema>;
 export type ListCampaignQueryInput = z.infer<typeof ListCampaignQuery>;

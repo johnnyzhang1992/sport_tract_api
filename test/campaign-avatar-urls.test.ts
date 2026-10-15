@@ -119,7 +119,7 @@ test('CAV3 活动内排行榜：成员头像给签名链', async () => {
   const cid = await mk(String(U.creator));
   await joinCampaign(cid, String(U.member));
 
-  const { rows } = await campaignLeaderboard(cid, String(U.creator));
+  const { rows } = await campaignLeaderboard(cid, String(U.creator), { page: 1, pageSize: 20 });
   const byId = new Map(rows.map((r) => [r.userId, r]));
   expectSigned(byId.get(String(U.creator))!.avatarUrl, CREATOR_AVATAR);
   expectSigned(byId.get(String(U.member))!.avatarUrl, MEMBER_AVATAR);

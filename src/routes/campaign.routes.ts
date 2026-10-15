@@ -5,9 +5,10 @@ import { getUnlimitedQRCode } from '../services/wechat-qrcode.js';
 import { uploadBuffer, getSignedUrl } from '../services/oss.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
-import { CreateCampaignSchema, ListCampaignQuery } from '../utils/validators.js';
+import { CreateCampaignSchema, ListCampaignQuery, UpdateCampaignSchema } from '../utils/validators.js';
 import {
   createCampaign,
+  updateCampaign,
   listCampaigns,
   getCampaignDetail,
   joinCampaign,
@@ -28,8 +29,8 @@ import {
  */
 const TargetSchema = z.object({ userId: z.string().regex(/^[a-f\d]{24}$/i, '成员不存在') });
 
-/** 成员明细分页参数 */
-const MemberDetailQuery = z.object({
+/** 分页参数：成员明细与排行榜共用一份，两处的默认值/上限必须同口径（20 / 100） */
+const PageQuery = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(20),
 });
@@ -78,6 +79,14 @@ export async function campaignRoutes(fastify: FastifyInstance) {
     return success(await getCampaignDetail(id, request.user.userId));
   });
 
+  // 发起人编辑活动：body 走 UpdateCampaignSchema（.strict()，多传 startDate 一律 400，
+  // 不能静默吃掉——静默吃掉会让用户以为改成功了）
+  fastify.put('/:id', auth, async (request) => {
+    const { id } = request.params as { id: string };
+    const input = UpdateCampaignSchema.parse(request.body);
+    return success(await updateCampaign(id, request.user.userId, input), '活动已更新');
+  });
+
   fastify.post('/:id/join', auth, async (request) => {
     const { id } = request.params as { id: string };
     return success(await joinCampaign(id, request.user.userId), '已加入');
@@ -90,12 +99,13 @@ export async function campaignRoutes(fastify: FastifyInstance) {
 
   fastify.get('/:id/leaderboard', auth, async (request) => {
     const { id } = request.params as { id: string };
-    return success(await campaignLeaderboard(id, request.user.userId));
+    const query = PageQuery.parse(request.query);
+    return success(await campaignLeaderboard(id, request.user.userId, query));
   });
 
   fastify.get('/:id/members/:uid', auth, async (request) => {
     const { id, uid } = request.params as { id: string; uid: string };
-    const query = MemberDetailQuery.parse(request.query);
+    const query = PageQuery.parse(request.query);
     return success(await memberDetail(id, request.user.userId, uid, query));
   });
 

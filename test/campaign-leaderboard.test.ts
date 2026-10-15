@@ -38,6 +38,9 @@ const U = {
 
 const createdIds: mongoose.Types.ObjectId[] = [];
 
+/** CL4 分页用例专用的 24 名成员（+ 发起人共 25 人）：after() 里一并清掉 */
+const pagedUserIds: mongoose.Types.ObjectId[] = [];
+
 const base = (over: Partial<CreateCampaignInput> = {}): CreateCampaignInput => ({
   title: 'T',
   description: '',
@@ -91,8 +94,8 @@ before(async () => {
 after(async () => {
   await CampaignMemberModel.deleteMany({ campaignId: { $in: createdIds } });
   await CampaignModel.deleteMany({ _id: { $in: createdIds } });
-  await ActivityModel.deleteMany({ userId: { $in: Object.values(U) } });
-  await UserModel.deleteMany({ _id: { $in: Object.values(U) } });
+  await ActivityModel.deleteMany({ userId: { $in: [...Object.values(U), ...pagedUserIds] } });
+  await UserModel.deleteMany({ _id: { $in: [...Object.values(U), ...pagedUserIds] } });
   await app.close();
 });
 
@@ -120,7 +123,7 @@ test('CL1 排行榜按距离降序，只含当前 joined 成员', async () => {
   });
   await seedActivity(U.left, jb + 3600_000, 'running', { distance: 9999 });
 
-  const { rows } = await campaignLeaderboard(cid, String(U.a));
+  const { rows } = await campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20 });
 
   assert.equal(rows.length, 2, '只有 creator 与 a 是 joined');
   assert.ok(
@@ -148,7 +151,7 @@ test('CL2 非成员调排行榜 → 403；成员可调', async () => {
 
   // 完全没加入过的登录用户
   await assert.rejects(
-    () => campaignLeaderboard(cid, String(U.outsider)),
+    () => campaignLeaderboard(cid, String(U.outsider), { page: 1, pageSize: 20 }),
     (e: any) => {
       assert.equal(e.statusCode, 403);
       return true;
@@ -156,12 +159,12 @@ test('CL2 非成员调排行榜 → 403；成员可调', async () => {
   );
   // 待审批者（myState='pending'）也不是成员，同样看不到成员数据（§5 总则）
   await assert.rejects(
-    () => campaignLeaderboard(cid, String(U.a)),
+    () => campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20 }),
     (e: any) => e.statusCode === 403,
   );
 
   // 发起人（joined）可调，证明上面的 403 是按身份闸门而非一律拒绝
-  const { rows } = await campaignLeaderboard(cid, String(U.creator));
+  const { rows } = await campaignLeaderboard(cid, String(U.creator), { page: 1, pageSize: 20 });
   assert.deepEqual(
     rows.map((r) => r.userId),
     [String(U.creator)],
@@ -251,4 +254,100 @@ test('CL3 成员明细：非发起人 403；发起人拿到概况 + 分页明细
     () => memberDetail(cid, String(U.creator), String(U.noSeg), { page: 1, pageSize: 20 }),
     (e: any) => e.statusCode === 404,
   );
+});
+
+/* ─────────────── CL4 排行榜分页（GET /:id/leaderboard?page&pageSize） ───────────────
+ * 名次是**全局名次**而不是页内序号：端上「加载更多」是往同一个列表后面追加，
+ * 第二页首行若回 rank=1，屏上就会出现两个第 1 名。
+ * 排序仍按距离降序、仍只含 joined —— CL1 已钉，这里只钉「切页」这一层。
+ * ─────────────────────────────────────────────────────────────────────────────── */
+
+/** 批次号：openid 上有唯一索引，多批成员不能撞 openid */
+let pagedBatch = 0;
+
+/**
+ * 造一个 25 人活动：成员 m1..m24 距离 1000..24000，发起人 500m。
+ * 于是名次完全可预测：m24=1、m23=2 … m1=24、发起人=25（垫底，正好落在第二页末尾）。
+ */
+async function mkPaged(title: string): Promise<string> {
+  const cid = await mk(String(U.creator), { title });
+  const now = Date.now();
+  const joinedAt = now - 10 * DAY;
+  const batch = ++pagedBatch;
+  for (let i = 1; i <= 24; i++) {
+    const uid = new mongoose.Types.ObjectId();
+    pagedUserIds.push(uid);
+    await UserModel.create({
+      _id: uid,
+      openid: `campaign-leaderboard-paged-${batch}-${i}`,
+      nickname: `成员${i}`,
+      avatarUrl: '',
+      avatarPreset: 'default-1',
+    });
+    await CampaignMemberModel.create({
+      campaignId: new mongoose.Types.ObjectId(cid),
+      userId: uid,
+      role: 'member',
+      state: 'joined',
+      joinedAt,
+    });
+    await seedActivity(uid, now, 'running', { distance: i * 1000, duration: 600 });
+  }
+  await seedActivity(U.creator, now, 'running', { distance: 500, duration: 600 });
+  return cid;
+}
+
+test('CL4 排行榜分页：page1 回 20 行、page2 回 5 行，名次接着数且两页不重不漏', async () => {
+  const cid = await mkPaged('CL4');
+
+  const p1 = await campaignLeaderboard(cid, String(U.creator), { page: 1, pageSize: 20 });
+  assert.equal(p1.total, 25, 'total 是 joined 成员总数，与分页无关');
+  assert.equal(p1.page, 1);
+  assert.equal(p1.pageSize, 20);
+  assert.equal(p1.rows.length, 20);
+  assert.equal(p1.rows[0].rank, 1);
+  assert.equal(p1.rows[0].userId, String(pagedUserIds[23]), '距离 24000 的成员排第一');
+  assert.equal(p1.rows[19].rank, 20);
+
+  const p2 = await campaignLeaderboard(cid, String(U.creator), { page: 2, pageSize: 20 });
+  assert.equal(p2.rows.length, 5);
+  assert.equal(p2.rows[0].rank, 21, '第二页首行名次必须是 21 —— 用页内下标就会写成 1');
+  assert.equal(p2.rows[4].rank, 25);
+  assert.equal(p2.rows[4].userId, String(U.creator), '发起人 500m 垫底，正好落在第二页末行');
+
+  const ids = p1.rows.concat(p2.rows).map((r) => r.userId);
+  assert.equal(new Set(ids).size, 25, '两页拼起来不重不漏');
+  assert.deepEqual(
+    p1.rows.concat(p2.rows).map((r) => r.rank),
+    Array.from({ length: 25 }, (_, i) => i + 1),
+    '拼起来的名次序列必须正好是 1..25',
+  );
+});
+
+test('CL5 越界页回空数组但 total 照给（端上据此收起「加载更多」，不能靠 rows.length 判到底）', async () => {
+  const cid = await mkPaged('CL5');
+  const p3 = await campaignLeaderboard(cid, String(U.creator), { page: 3, pageSize: 20 });
+  assert.deepEqual(p3.rows, []);
+  assert.equal(p3.total, 25);
+  assert.equal(p3.page, 3);
+});
+
+test('CL6 分页不改变闸门与排序口径：非成员仍 403，页内仍是距离降序', async () => {
+  const cid = await mkPaged('CL6');
+  await assert.rejects(
+    () => campaignLeaderboard(cid, String(U.outsider), { page: 1, pageSize: 20 }),
+    (e: any) => e.statusCode === 403,
+  );
+  const p1 = await campaignLeaderboard(cid, String(U.creator), { page: 1, pageSize: 20 });
+  assert.deepEqual(
+    p1.rows.map((r) => r.distance),
+    [...p1.rows.map((r) => r.distance)].sort((x, y) => y - x),
+  );
+});
+
+test('CL7 每页大小可变：pageSize=10 时第 3 页是第 21..30 名（名次跟着页偏移走）', async () => {
+  const cid = await mkPaged('CL7');
+  const p3 = await campaignLeaderboard(cid, String(U.creator), { page: 3, pageSize: 10 });
+  assert.equal(p3.rows.length, 5, '25 人 → 第 3 页只剩 21..25');
+  assert.deepEqual(p3.rows.map((r) => r.rank), [21, 22, 23, 24, 25]);
 });

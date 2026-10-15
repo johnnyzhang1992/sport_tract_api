@@ -52,6 +52,9 @@ const post = (url: string, payload: Record<string, unknown>, token?: string): Pr
 const del = (url: string, token?: string): Promise<LightMyRequestResponse> =>
   app.inject({ method: 'DELETE', url: `${API}${url}`, headers: auth(token) });
 
+const put = (url: string, payload: Record<string, unknown>, token?: string): Promise<LightMyRequestResponse> =>
+  app.inject({ method: 'PUT', url: `${API}${url}`, payload, headers: auth(token) });
+
 /** 建活动（远期公共表单）并登记 id 供清理；返回 campaign id */
 async function mkCampaign(
   token: string,
@@ -349,4 +352,87 @@ test('CR9 memberLimit 不带该字段 → 默认 100 落库；显式 null 仍是
     null,
     '显式 null 必须仍然是不限',
   );
+});
+
+test('CR10 编辑：未登录 PUT → 401', async () => {
+  const cid = await mkCampaign(creator.token, { title: '编辑需登录' });
+  const res = await put(`/campaigns/${cid}`, { title: '偷改' });
+  assert.equal(res.statusCode, 401);
+});
+
+test('CR11 编辑的 body 闸门：空体 / 标题超 30 / 类型不在白名单 → 400，库里原值不动', async () => {
+  const cid = await mkCampaign(creator.token, { title: '编辑入参校验' });
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['空请求体', {}],
+    ['标题超 30 字', { title: '一'.repeat(31) }],
+    ['类型不在白名单', { allowedTypes: ['yoga'] }],
+    ['只有 startDate', { startDate: '2099-03-01' }],
+  ];
+  for (const [label, payload] of cases) {
+    const res = await put(`/campaigns/${cid}`, payload, creator.token);
+    assert.equal(res.statusCode, 400, `${label} 应 400，实际 ${res.statusCode}: ${res.body}`);
+  }
+  const detail = await get(`/campaigns/${cid}`, creator.token);
+  assert.equal(detail.json().data.title, '编辑入参校验');
+  assert.equal(detail.json().data.startAt, Date.parse('2099-01-01T00:00:00+08:00'), 'startDate 不接受上送');
+
+  // 「只有 startDate」单独传会被 zod 当未知字段丢掉、再被「空体」规则兜成 400 —— 两层防御互相掩盖。
+  // 真正要钉的是**混在合法字段里**：丢掉 startDate 会返回 200，用户以为开始时间改成功了。
+  const mixed = await put(`/campaigns/${cid}`, { title: '合法标题', startDate: '2099-03-01' }, creator.token);
+  assert.equal(mixed.statusCode, 400, `startDate 混在合法字段里必须 400（.strict()），实际：${mixed.body}`);
+  assert.equal(
+    (await get(`/campaigns/${cid}`, creator.token)).json().data.title,
+    '编辑入参校验',
+    '被拒的请求不能留下半套改动',
+  );
+});
+
+test('CR12 编辑成功 → 200 回显新值，GET 详情同步（含 startDate/endDate 字符串供端上预填）', async () => {
+  const cid = await mkCampaign(creator.token, { title: '改前标题' });
+  const res = await put(
+    `/campaigns/${cid}`,
+    { title: '改后标题', endDate: '2099-02-01', visibility: 'private', memberLimit: 8 },
+    creator.token,
+  );
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().data.title, '改后标题');
+
+  const detail = (await get(`/campaigns/${cid}`, creator.token)).json().data;
+  assert.equal(detail.title, '改后标题');
+  assert.equal(detail.visibility, 'private');
+  assert.equal(detail.memberLimit, 8);
+  assert.equal(detail.startDate, '2099-01-01');
+  assert.equal(detail.endDate, '2099-02-01');
+});
+
+test('CR13 编辑只认发起人：非发起人（含成员）PUT → 403', async () => {
+  const cid = await mkCampaign(creator.token, { title: '只认发起人' });
+  const joined = await post(`/campaigns/${cid}/join`, {}, joiner.token);
+  assert.equal(joined.statusCode, 200, joined.body);
+
+  for (const token of [joiner.token, outsider.token]) {
+    const res = await put(`/campaigns/${cid}`, { title: '偷改' }, token);
+    assert.equal(res.statusCode, 403, res.body);
+  }
+  assert.equal((await get(`/campaigns/${cid}`, creator.token)).json().data.title, '只认发起人');
+});
+
+test('CR14 排行榜分页参数走路由默认：不带 query＝page1/pageSize20，越界回空页，pageSize 超上限 400', async () => {
+  const cid = await mkCampaign(creator.token, { title: '排行榜分页' });
+
+  const d = (await get(`/campaigns/${cid}/leaderboard`, creator.token)).json().data;
+  assert.equal(d.page, 1, '不带 query 要吃到默认页码');
+  assert.equal(d.pageSize, 20, '不带 query 要吃到默认页大小');
+  assert.equal(d.total, 1, 'total 是成员总数，不随分页变');
+  assert.equal(d.rows.length, 1);
+
+  const beyond = await get(`/campaigns/${cid}/leaderboard?page=2`, creator.token);
+  assert.equal(beyond.statusCode, 200, beyond.body);
+  assert.deepEqual(beyond.json().data.rows, [], '越界页回空数组，端上据此收起「加载更多」');
+  assert.equal(beyond.json().data.total, 1);
+
+  for (const q of ['?pageSize=101', '?page=0', '?page=abc']) {
+    const bad = await get(`/campaigns/${cid}/leaderboard${q}`, creator.token);
+    assert.equal(bad.statusCode, 400, `${q} 应 400，实际 ${bad.statusCode}: ${bad.body}`);
+  }
 });
