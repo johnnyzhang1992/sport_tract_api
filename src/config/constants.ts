@@ -45,6 +45,12 @@ export const ACTIVITY_TYPE_META: Record<ActivityType, ActivityTypeMeta> = {
 export const MAX_TRACK_POINTS = 20_000;
 
 /**
+ * 每用户累计照片上限（轨迹打点 + 足迹合计）。额度存在 user.photoQuotaUsed，
+ * 落库时按「新集合 − 旧集合」的差结算，所以 used 恒等于库里存着的 URL 颗数。
+ */
+export const MAX_USER_PHOTOS = 100;
+
+/**
  * 有效运动最小距离（米）：finish/惰性清理重算距离低于该值视为无效运动
  * （原地不动结束、GPS 漂移点全被过滤），自动作废（cancelled）不产生 finished 记录，
  * 避免距离为 0 的"无意义轨迹"污染列表与统计

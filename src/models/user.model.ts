@@ -26,6 +26,8 @@ const userSchema = new Schema(
     // 足迹点亮缓存（懒重算：写入只置 dirty，读时 dirty 才重算）
     footprintCache: { type: Schema.Types.Mixed, default: null },
     footprintDirty: { type: Boolean, default: true },
+    // 已占用的照片额度（轨迹打点 + 足迹合计）；存量用户可能没这个字段，读时按 0 算
+    photoQuotaUsed: { type: Number, default: 0 },
   },
   { timestamps: true },
 );

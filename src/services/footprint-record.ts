@@ -1,5 +1,6 @@
 import { Types } from 'mongoose';
 import { cleanUrl, deleteOssObjects, getSignedUrl, getThumbUrl } from './oss.js';
+import { countPhotos, settlePhotoQuota } from './photo-quota.js';
 import { locateRegion } from './region.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
@@ -116,6 +117,8 @@ function normalizePhotos(userId: string, photos: string[] | undefined): string[]
 }
 
 export async function createFootprint(userId: string, input: CreateFootprintRecordInput) {
+  const photos = normalizePhotos(userId, input.photos);
+  await settlePhotoQuota(userId, 0, countPhotos(photos)); // 超额抛在这里：足迹还没落库
   const doc = await FootprintRecordModel.create({
     userId,
     visitDate: input.visitDate,
@@ -124,7 +127,7 @@ export async function createFootprint(userId: string, input: CreateFootprintReco
     people: input.people,
     description: input.description,
     location: buildLocation(input),
-    photos: normalizePhotos(userId, input.photos),
+    photos,
   });
   return toDto(doc);
 }
@@ -339,6 +342,7 @@ export async function getFootprint(id: string, userId: string) {
 export async function updateFootprint(id: string, userId: string, input: CreateFootprintRecordInput) {
   const old = await findOwnedRecord(id, userId);
   const nextPhotos = normalizePhotos(userId, input.photos);
+  await settlePhotoQuota(userId, countPhotos(old.photos ?? []), countPhotos(nextPhotos));
   const doc = await FootprintRecordModel.findOneAndUpdate(
     { _id: id, userId },
     {
@@ -370,6 +374,7 @@ export async function deleteFootprintById(id: string) {
   if (!doc) throw new AppError(404, '足迹不存在');
   await FootprintRecordModel.deleteOne({ _id: id });
   await deleteOssObjects(doc.photos ?? []).catch(() => {});
+  await settlePhotoQuota(String(doc.userId), countPhotos(doc.photos ?? []), 0);
 }
 
 export async function deleteFootprint(id: string, userId: string) {

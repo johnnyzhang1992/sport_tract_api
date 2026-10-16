@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { AppError } from '../utils/app-error.js';
+import { countMarkerPhotos, countPhotos, settlePhotoQuota } from './photo-quota.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, calcPbMarks, haversineDistance } from '../utils/pace.js';
 import { calcPerfScore } from '../utils/perf-score.js';
@@ -290,7 +291,7 @@ export async function addMarker(
   input: CreateMarkerInput,
 ): Promise<{ marker: MarkerDto }> {
   assertObjectIdLike(activityId, '活动不存在');
-  const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status').lean();
+  const activity = await ActivityModel.findOne({ _id: activityId, userId }).select('status markers').lean();
   if (!activity) {
     throw new AppError(404, '活动不存在');
   }
@@ -306,6 +307,10 @@ export async function addMarker(
   // 净化：编辑回传的签名 URL → 裸 URL 入库
   marker.photoUrl = cleanUrl(marker.photoUrl);
   marker.photos = (marker.photos ?? []).map(cleanUrl);
+
+  // 额度：同 id 是覆盖不是追加，所以基数取库里那条同 id 打点现有的张数
+  const sameId = ((activity.markers ?? []) as Array<MarkerDto>).filter((m) => m.id === input.id);
+  await settlePhotoQuota(userId, countMarkerPhotos(sameId), countPhotos(marker));
 
   // 幂等要一次判定就完成：原先 $pull + $push 是两条独立写，并发提交同 id 会留下两份。
   // 先按 id 原地覆盖；没命中再"确认该 id 不存在"地追加——第二条的过滤器在写入时刻求值，
@@ -400,6 +405,14 @@ export async function finishActivity(
   if (activity.status !== 'in_progress') {
     throw new AppError(409, '活动已取消，无法结束', { code: 'ACTIVITY_CANCELLED' });
   }
+
+  // final 包是全量替换 markers：额度按「库里 → final 包」的差结算，超额就抛在这里，
+  // 活动保持 in_progress —— 用户删掉几张老照片后还能回来把这场保存掉
+  await settlePhotoQuota(
+    userId,
+    countMarkerPhotos(activity.markers as MarkerDto[]),
+    countMarkerPhotos((input.markers ?? activity.markers ?? []) as MarkerDto[]),
+  );
 
   // 最终点集：按 seq 排序（客户端保证完整，服务端兜底去重）
   const seen = new Set<number>();
@@ -1124,6 +1137,7 @@ export async function deleteActivity(activityId: ObjectIdLike, userId: string): 
     }
   }
 
+  await settlePhotoQuota(userId, countMarkerPhotos(activity.markers as MarkerDto[]), 0);
   await markFootprintDirty(String(activity.userId)); // 足迹失效
 }
 
@@ -1148,10 +1162,15 @@ export async function updateMarker(
     set[`markers.$.${k}`] = v;
   }
   // photos 全量替换时：净化签名 URL 入库 + 同步 photoUrl 为首图
+  let stalePhotos: string[] = [];
   if (input.photos) {
     const cleaned = input.photos.map(cleanUrl);
     set['markers.$.photos'] = cleaned;
     set['markers.$.photoUrl'] = cleaned[0] || '';
+    const before = marker.photos?.length ? marker.photos : marker.photoUrl ? [marker.photoUrl] : [];
+    await settlePhotoQuota(userId, countPhotos({ photos: before }), countPhotos({ photos: cleaned }));
+    const keep = new Set(cleaned);
+    stalePhotos = before.filter((p) => p && !keep.has(p));
   }
   if (Object.keys(set).length === 0) {
     throw new AppError(400, '没有可更新的字段');
@@ -1161,6 +1180,8 @@ export async function updateMarker(
     { _id: activityId, 'markers.id': markerId },
     { $set: set },
   );
+  // 被换掉的旧图清 OSS 文件（与足迹更新、删打点同口径）；失败不阻塞更新
+  if (stalePhotos.length > 0) await deleteOssObjects(stalePhotos).catch(() => {});
 
   const updated = await findOwnedActivity(activityId, userId);
   const updatedMarker = ((updated.markers ?? []) as Array<MarkerDto>).find((m) => m.id === markerId);
@@ -1183,6 +1204,7 @@ export async function removeMarker(
   }
 
   await ActivityModel.updateOne({ _id: activityId }, { $pull: { markers: { id: markerId } } });
+  await settlePhotoQuota(userId, countPhotos(marker), 0);
   return { marker: marker as MarkerDto };
 }
 
