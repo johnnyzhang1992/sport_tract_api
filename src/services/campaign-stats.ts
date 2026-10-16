@@ -58,11 +58,18 @@ export async function loadSegments(
   return map;
 }
 
-/** 时间窗并集条件（左闭右开；leftAt=null 视为至今） */
-function timeOr(uid: string, segs: Segment[]) {
+/**
+ * 时间窗并集条件（左闭右开；leftAt=null 视为至今）。
+ * 下限取 `max(startAt, joinedAt)`：提前报名的人在开赛前走的里程不计入活动，
+ * 开赛后才加入的人则从加入时刻算起 —— 两个方向都由这一条夹住。
+ */
+function timeOr(uid: string, segs: Segment[], startAt: number) {
   return segs.map((s) => ({
     userId: new mongoose.Types.ObjectId(uid),
-    startTime: { $gte: s.joinedAt, ...(s.leftAt != null ? { $lt: s.leftAt } : {}) },
+    startTime: {
+      $gte: Math.max(startAt, s.joinedAt),
+      ...(s.leftAt != null ? { $lt: s.leftAt } : {}),
+    },
   }));
 }
 
@@ -86,7 +93,7 @@ export function memberActivityMatch(
   segs: Segment[],
 ): Record<string, unknown> | null {
   if (segs.length === 0) return null;
-  return baseMatch(campaign, { $or: timeOr(userId, segs) });
+  return baseMatch(campaign, { $or: timeOr(userId, segs, campaign.startAt) });
 }
 
 /** 批量汇总：一次聚合出所有成员 { count, distance, duration } */
@@ -101,7 +108,7 @@ export async function statsForMembers(
   const or: unknown[] = [];
   for (const uid of userIds) {
     const segs = segmentsByUser.get(uid);
-    if (segs && segs.length > 0) or.push(...timeOr(uid, segs));
+    if (segs && segs.length > 0) or.push(...timeOr(uid, segs, campaign.startAt));
   }
   if (or.length === 0) return out;
 
@@ -131,7 +138,7 @@ export async function streakForUser(
 ): Promise<number> {
   if (!segs || segs.length === 0) return 0;
   const rows = await ActivityModel.aggregate([
-    { $match: baseMatch(campaign, { $or: timeOr(userId, segs) }) },
+    { $match: baseMatch(campaign, { $or: timeOr(userId, segs, campaign.startAt) }) },
     {
       $group: {
         _id: {

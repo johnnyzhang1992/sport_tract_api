@@ -25,6 +25,15 @@ const ADMIN_USER = 'test_admin_campaign';
 const ADMIN_PASS = 'admin_pass_123';
 const DAY = 24 * 60 * 60 * 1000;
 
+/**
+ * 相对「今天」的东八区 YYYY-MM-DD。
+ * 状态档位由服务端按 now 派生，写死日期会让夹具随哪天跑而落进不同档（2099 曾是 active，
+ * 加了 upcoming 档后它变成未开始），所以四个档位的夹具一律用相对日期。
+ */
+function bjDateAfter(days: number): string {
+  return new Date(Date.now() + 8 * 3600000 + days * DAY).toISOString().slice(0, 10);
+}
+
 let app: FastifyInstance;
 
 type Who = { id: string; token: string };
@@ -37,6 +46,7 @@ let adminToken = '';
 let cid = '';
 /** 三态过滤夹具：active（远期）/ ended（库内 active 但 endAt 已过）/ dissolved（已解散） */
 let cidActive = '';
+let cidUpcoming = '';
 let cidEnded = '';
 let cidDissolved = '';
 let creatorUid: number | null = null;
@@ -92,7 +102,7 @@ before(async () => {
   creatorUid = (await UserModel.findById(creator.id).select('uid').lean())?.uid ?? null;
   assert.equal(typeof creatorUid, 'number', '夹具发起人应有 uid 编号');
 
-  // 隐私活动（远期窗口）：joiner 申请 → 发起人审批通过 → 2 名 joined 成员
+  // 隐私活动（已开赛、还剩 5 天 → 派生 active）：joiner 申请 → 发起人审批通过 → 2 名 joined 成员
   const created = await post(
     '/campaigns',
     {
@@ -101,8 +111,8 @@ before(async () => {
       visibility: 'private',
       allowedTypes: [],
       memberLimit: null,
-      startDate: '2099-01-01',
-      endDate: '2099-01-07',
+      startDate: bjDateAfter(-1),
+      endDate: bjDateAfter(5),
     },
     creator.token,
   );
@@ -110,6 +120,29 @@ before(async () => {
   cid = created.json().data.id;
   cidActive = cid;
   createdIds.push(new mongoose.Types.ObjectId(cid));
+
+  // upcoming 档夹具：开始时间在未来、结束时间更未来
+  const upc = await post(
+    '/campaigns',
+    {
+      title: 'admin 未开赛回归',
+      description: '',
+      visibility: 'public',
+      allowedTypes: [],
+      memberLimit: null,
+      startDate: bjDateAfter(3),
+      endDate: bjDateAfter(9),
+    },
+    creator.token,
+  );
+  assert.equal(upc.statusCode, 200, `创建未开赛活动失败: ${upc.body}`);
+  cidUpcoming = upc.json().data.id;
+  createdIds.push(new mongoose.Types.ObjectId(cidUpcoming));
+  assert.equal(
+    (await get(`/campaigns/${cidUpcoming}`, creator.token)).json().data.status,
+    'upcoming',
+    '前置条件：该夹具确实派生为未开始',
+  );
 
   const applied = await post(`/campaigns/${cid}/join`, {}, joiner.token);
   assert.equal(applied.statusCode, 200, `申请加入失败: ${applied.body}`);
@@ -182,19 +215,27 @@ test('CA1 admin 列表：分页 + 下发创建者与成员数', async () => {
   assert.equal(item.status, 'active');
 });
 
-test('CA2 admin 列表：status 过滤与下发值同口径（三个档位互斥、各含命中项）', async () => {
-  // 夹具：cidActive(2099) / cidEnded(过去 endAt，库内 status 仍是 active) / cidDissolved(已解散)
+test('CA2 admin 列表：status 过滤与下发值同口径（四个档位互斥、各含命中项）', async () => {
+  // 夹具：cidActive(已开赛) / cidUpcoming(未开赛) / cidEnded(过去 endAt，库内 status 仍是 active) / cidDissolved(已解散)
   const ids = (d: any) => d.items.map((x: any) => x.id);
 
   const active = (await get('/admin/campaigns?status=active&pageSize=100', adminToken)).json().data;
   assert.ok(ids(active).includes(cidActive), 'active 应含进行中');
   assert.ok(!ids(active).includes(cidEnded), 'active 不该含已到期（库内仍 active）的活动');
   assert.ok(!ids(active).includes(cidDissolved), 'active 不该含已解散');
+  assert.ok(!ids(active).includes(cidUpcoming), 'active 不该含未开赛 —— 加了 upcoming 档后这条才真正咬合');
   assert.ok(active.items.every((x: any) => x.status === 'active'), '下发值必须是 active');
+
+  const upcoming = (await get('/admin/campaigns?status=upcoming&pageSize=100', adminToken)).json().data;
+  assert.ok(ids(upcoming).includes(cidUpcoming), 'upcoming 应含未开赛');
+  assert.ok(!ids(upcoming).includes(cidActive), 'upcoming 不该含进行中');
+  assert.ok(!ids(upcoming).includes(cidEnded), 'upcoming 不该含已到期');
+  assert.ok(upcoming.items.every((x: any) => x.status === 'upcoming'), '下发值必须是 upcoming');
 
   const ended = (await get('/admin/campaigns?status=ended&pageSize=100', adminToken)).json().data;
   assert.ok(ids(ended).includes(cidEnded), 'ended 必须能查出「已到期但库内仍 active」的活动');
   assert.ok(!ids(ended).includes(cidActive), 'ended 不该含进行中');
+  assert.ok(!ids(ended).includes(cidUpcoming), 'ended 不该含未开赛');
   assert.ok(ended.items.every((x: any) => x.status === 'ended'), '下发值必须是 ended');
 
   const dissolved = (await get('/admin/campaigns?status=dissolved&pageSize=100', adminToken)).json().data;

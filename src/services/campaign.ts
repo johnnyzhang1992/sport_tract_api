@@ -69,7 +69,7 @@ export interface CampaignDetailDto {
    */
   startDate: string;
   endDate: string;
-  status: 'active' | 'ended' | 'dissolved';
+  status: 'upcoming' | 'active' | 'ended' | 'dissolved';
   creatorId: string;
   myState: MyState;
   canJoin: boolean;
@@ -79,11 +79,16 @@ export interface CampaignDetailDto {
   myPanel?: MemberStats & { streak: number };
 }
 
-/** 派生状态：到期即 ended（不写库，避免并发写） */
-export function effectiveStatus(c: CampaignDoc, now = Date.now()): 'active' | 'ended' | 'dissolved' {
+/**
+ * 派生状态：三档全按 now 算，都不写库（避免并发写）。
+ * 优先级 dissolved > ended > upcoming > active —— 结束判据走在前面，
+ * 一个 startAt 与 endAt 都已过期的活动是「已结束」而不是「从未开始过」。
+ */
+export function effectiveStatus(c: CampaignDoc, now = Date.now()): 'upcoming' | 'active' | 'ended' | 'dissolved' {
   if (c.status === 'dissolved') return 'dissolved';
   if (c.status === 'ended') return 'ended';
-  return now >= c.endAt ? 'ended' : 'active';
+  if (now >= c.endAt) return 'ended';
+  return now < c.startAt ? 'upcoming' : 'active';
 }
 
 /** 成员行 → 我的状态（joined > pending > removed > left > rejected，越活跃越靠前） */
@@ -153,7 +158,8 @@ export async function createCampaign(
  *
  * 状态闸门按 `effectiveStatus` 的**派生值**判，不是按落库的 `c.status`：`'ended'` 从不写库，
  * 只挡 `'dissolved'` 会让一个早已跑完的活动继续可改（UP11 / UP13）。
- * 所以进行中的活动可以把 `endAt` 往后推（延期），已结束的不行——过期即定稿。
+ * 未开始（upcoming）与进行中（active）都可改 —— 还没开赛正是最该调时间的阶段；
+ * 进行中可以把 `endAt` 往后推（延期），已结束的不行——过期即定稿。
  */
 export async function updateCampaign(
   id: string,
@@ -165,7 +171,7 @@ export async function updateCampaign(
   const c = await loadCampaignOr404(id);
   assertCreator(c, editorId);
   const status = effectiveStatus(c);
-  if (status !== 'active') {
+  if (status !== 'active' && status !== 'upcoming') {
     throw new AppError(403, status === 'dissolved' ? '活动已解散，无法修改' : '活动已结束，无法修改');
   }
 
@@ -237,24 +243,49 @@ export async function listCampaigns(
   const now = Date.now();
   const [total, docs] = await Promise.all([
     CampaignModel.countDocuments(filter),
-    // 两段式排序，必须在 skip/limit 之前生效（否则翻页序与整表序不一致）：
-    //   ① 进行中（endAt 升序 —— 快结束的在前）
-    //   ② 已结束（endAt 降序 —— 刚结束的在前）
+    // 三段式排序，必须在 skip/limit 之前生效（否则翻页序与整表序不一致）：
+    //   ① 未开始（startAt 升序 —— 快开赛的在前）
+    //   ② 进行中（endAt 升序 —— 快结束的在前）
+    //   ③ 已结束（endAt 降序 —— 刚结束的在前）
     // 已解散的已在上面的 filter 里排除，不再参与排序。
-    // 档位与 effectiveStatus 同口径（共用一个 now）；同档同结束时间再按 createdAt 倒序兜底。
+    // 档位与 effectiveStatus 同口径（共用一个 now）；同档同键再按 createdAt 倒序兜底。
     CampaignModel.aggregate<CampaignDoc>([
       { $match: filter },
       {
         $addFields: {
-          _tier: { $cond: [{ $or: [{ $eq: ['$status', 'ended'] }, { $lte: ['$endAt', now] }] }, 1, 0] },
+          _ended: { $or: [{ $eq: ['$status', 'ended'] }, { $lte: ['$endAt', now] }] },
         },
       },
-      // 进行中取 endAt、已结束取 -endAt，统一成升序即「进行中快结束在前 / 已结束刚结束在前」
-      { $addFields: { _endKey: { $cond: [{ $eq: ['$_tier', 0] }, '$endAt', { $multiply: ['$endAt', -1] }] } } },
+      {
+        $addFields: {
+          _tier: {
+            $cond: [
+              { $eq: ['$_ended', true] },
+              2,
+              { $cond: [{ $gt: ['$startAt', now] }, 0, 1] },
+            ],
+          },
+        },
+      },
+      // 未开始取 startAt、进行中取 endAt、已结束取 -endAt，统一成升序即
+      // 「未开始快开赛在前 / 进行中快结束在前 / 已结束刚结束在前」
+      {
+        $addFields: {
+          _endKey: {
+            $switch: {
+              branches: [
+                { case: { $eq: ['$_tier', 0] }, then: '$startAt' },
+                { case: { $eq: ['$_tier', 1] }, then: '$endAt' },
+              ],
+              default: { $multiply: ['$endAt', -1] },
+            },
+          },
+        },
+      },
       { $sort: { _tier: 1, _endKey: 1, createdAt: -1 } },
       { $skip: skip },
       { $limit: query.pageSize },
-      { $project: { _tier: 0, _endKey: 0 } },
+      { $project: { _tier: 0, _endKey: 0, _ended: 0 } },
     ]),
   ]);
   const docsArr = docs as CampaignDoc[];
@@ -490,7 +521,12 @@ async function isRemoved(campaignId: mongoose.Types.ObjectId, userId: string): P
 /** 加入：公开直接 joined；隐私置 pending（被拒过则复用那条 rejected 行改回 pending） */
 export async function joinCampaign(id: string, userId: string): Promise<{ myState: MyState }> {
   const c = await loadCampaignOr404(id);
-  if (effectiveStatus(c) !== 'active') throw new AppError(403, '活动已结束或已解散');
+  // 未开始也可加入：报名早于开赛是常态。开赛前加入的这段空窗不计里程，由计入窗口下限
+  // max(startAt, joinedAt) 保证（campaign-stats.ts timeOr），不在这里挡。
+  const campStatus = effectiveStatus(c);
+  if (campStatus !== 'active' && campStatus !== 'upcoming') {
+    throw new AppError(403, '活动已结束或已解散');
+  }
   if (await isRemoved(c._id, userId)) throw new AppError(403, '你已被移出该活动，无法再次加入');
 
   const uid = new mongoose.Types.ObjectId(userId);
@@ -587,7 +623,7 @@ export async function approveMember(id: string, creatorId: string, targetUid: st
   const c = await loadCampaignOr404(id);
   assertCreator(c, creatorId);
   const status = effectiveStatus(c);
-  if (status !== 'active') {
+  if (status !== 'active' && status !== 'upcoming') {
     throw new AppError(
       403,
       status === 'dissolved'
@@ -809,7 +845,7 @@ export interface AdminCampaignRow {
   id: string;
   title: string;
   visibility: 'public' | 'private';
-  status: 'active' | 'ended' | 'dissolved';
+  status: 'upcoming' | 'active' | 'ended' | 'dissolved';
   allowedTypes: string[];
   memberLimit: number | null;
   startAt: number;
@@ -823,10 +859,10 @@ export interface AdminCampaignRow {
 
 /**
  * `status` 筛选必须与**下发值**同口径：下发走 `effectiveStatus`（派生），而库里的 `status`
- * 只在解散时被写成 'dissolved'，'ended' **从不落库** —— 直接 `filter.status = query.status`
- * 会让 `status=ended` 永远查不到（永空）、`status=active` 把已结束的活动也带出来。
+ * 只在解散时被写成 'dissolved'，'ended' / 'upcoming' **从不落库** —— 直接 `filter.status = query.status`
+ * 会让 `status=ended` 永远查不到（永空）、`status=active` 把已结束和未开始的都带出来。
  * 所以这里按有效状态反向构造条件，并把同一个 `now` 传给 `effectiveStatus`，保证一次请求内
- * 筛选与展示不会因「刚好跨过 endAt」而互相矛盾。
+ * 筛选与展示不会因「刚好跨过 startAt / endAt」而互相矛盾。
  */
 function statusFilter(status: string, now: number): Record<string, unknown> {
   switch (status) {
@@ -834,8 +870,11 @@ function statusFilter(status: string, now: number): Record<string, unknown> {
       return { status: 'dissolved' };
     case 'ended':
       return { $or: [{ status: 'ended' }, { status: 'active', endAt: { $lte: now } }] };
+    case 'upcoming':
+      return { status: 'active', endAt: { $gt: now }, startAt: { $gt: now } };
     default:
-      return { status: 'active', endAt: { $gt: now } }; // 'active'
+      // 'active'：已开赛且未结束
+      return { status: 'active', endAt: { $gt: now }, startAt: { $lte: now } };
   }
 }
 

@@ -50,15 +50,25 @@ const U = {
 /** 本文件创建的 campaign id：after() 只清这些，不碰 dev 库里既有数据 */
 const createdIds: mongoose.Types.ObjectId[] = [];
 
-/** 远期公共表单（落 now 之后 → 派生状态 'active'） */
+/**
+ * 窗口取「已开赛 3 天、还剩 3 天」：
+ * 结束在未来 → `effectiveStatus` 派生为 active，join/approve 不被状态闸门挡；
+ * 开始也在过去 → 不会因「未开始」把用例顺带推进 upcoming 档（那是 campaign-upcoming.test.ts 的活）。
+ * 写死日期会让红绿随「今天是哪天」飘忽，所以一律相对 now。
+ */
+const DAY_MS = 86400000;
+function bjDateAfter(days: number): string {
+  return new Date(Date.now() + 8 * 3600000 + days * DAY_MS).toISOString().slice(0, 10);
+}
+
 const base = (over: Partial<CreateCampaignInput> = {}): CreateCampaignInput => ({
   title: 'T',
   description: '',
   visibility: 'public',
   allowedTypes: [],
   memberLimit: null,
-  startDate: '2099-01-01',
-  endDate: '2099-01-07',
+  startDate: bjDateAfter(-3),
+  endDate: bjDateAfter(3),
   ...over,
 });
 

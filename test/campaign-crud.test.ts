@@ -148,10 +148,10 @@ test('CC10 assertTextAllowed：混合数组按「任一违规即拒」语义拦�
 
 test('CC3 详情按身份裁剪：非成员看不到成员列表与汇总', async () => {
   const outsider = new mongoose.Types.ObjectId();
-  // 用「现在之后」的窗口：只有 active 才可能 canJoin=true（见 bjDateAfter 注释）
+  // 窗口取「已开赛、还剩一天」：active 与 upcoming 都能 canJoin，这里要钉的是 active 下的裁剪
   const dto = await create(String(userId), {
     title: 'X', description: '', visibility: 'public', allowedTypes: [], memberLimit: null,
-    startDate: bjDateAfter(1), endDate: bjDateAfter(2),
+    startDate: bjDateAfter(-1), endDate: bjDateAfter(2),
   });
   const asOutsider = await getCampaignDetail(dto.id, String(outsider));
   assert.equal(asOutsider.members, undefined);

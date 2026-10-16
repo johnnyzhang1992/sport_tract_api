@@ -41,14 +41,26 @@ const createdIds: mongoose.Types.ObjectId[] = [];
 /** CL4 分页用例专用的 24 名成员（+ 发起人共 25 人）：after() 里一并清掉 */
 const pagedUserIds: mongoose.Types.ObjectId[] = [];
 
+const DAY_MS = 86400000;
+
+/** 相对「今天」的东八区 YYYY-MM-DD */
+function bjDateAfter(days: number): string {
+  return new Date(Date.now() + 8 * 3600000 + days * DAY_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * 窗口取「已开赛 3 天、还剩 3 天」：结束在未来 → 派生 active，join 不被挡；
+ * 开始也在过去 → 计入窗口下限 max(startAt, joinedAt) 落在 joinedAt 上，
+ * 本文件以 joinedAt（≈now）为基准造的轨迹才在窗内。
+ */
 const base = (over: Partial<CreateCampaignInput> = {}): CreateCampaignInput => ({
   title: 'T',
   description: '',
   visibility: 'public',
   allowedTypes: [],
   memberLimit: null,
-  startDate: '2099-01-01',
-  endDate: '2099-01-07',
+  startDate: bjDateAfter(-3),
+  endDate: bjDateAfter(3),
   ...over,
 });
 

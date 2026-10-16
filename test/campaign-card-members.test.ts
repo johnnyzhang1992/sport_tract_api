@@ -42,14 +42,28 @@ const createdIds: mongoose.Types.ObjectId[] = [];
 /** joinedAt 基准：取过去时间，避免与 createCampaign 里 creator 的 now 撞同毫秒 */
 const BASE = Date.now() - 100_000;
 
+const DAY_MS = 86400000;
+
+/** 相对「今天」的东八区 YYYY-MM-DD —— 窗口要跟着运行时刻走，写死日期会随哪天跑而红绿飘忽 */
+function bjDateAfter(days: number): string {
+  const d = new Date(Date.now() + 8 * 3600000 + days * DAY_MS);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * 窗口取「已开赛 3 天、还剩 3 天」：
+ *   - 结束时间在未来 → `effectiveStatus` 派生为 active，join 不会被闸门挡；
+ *   - 开始时间也在过去 → 计入窗口下限 max(startAt, joinedAt) 落在 joinedAt 上，
+ *     用例造的「≈now」轨迹才在窗内（开始时间若设在未来，这些轨迹会全部不计入）。
+ */
 const base = (over: Partial<CreateCampaignInput> = {}): CreateCampaignInput => ({
   title: 'CM',
   description: '',
   visibility: 'public',
   allowedTypes: [],
   memberLimit: null,
-  startDate: '2099-01-01',
-  endDate: '2099-01-07',
+  startDate: bjDateAfter(-3),
+  endDate: bjDateAfter(3),
   ...over,
 });
 

@@ -1296,8 +1296,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const q = request.query as Record<string, string | undefined>;
     const status = q.status?.trim() || undefined;
     const visibility = q.visibility?.trim() || undefined;
-    if (status && !['active', 'ended', 'dissolved'].includes(status)) {
-      throw new AppError(400, `status 不合法：${status}（仅支持 active / ended / dissolved）`);
+    if (status && !['upcoming', 'active', 'ended', 'dissolved'].includes(status)) {
+      throw new AppError(400, `status 不合法：${status}（仅支持 upcoming / active / ended / dissolved）`);
     }
     if (visibility && !['public', 'private'].includes(visibility)) {
       throw new AppError(400, `visibility 不合法：${visibility}（仅支持 public / private）`);

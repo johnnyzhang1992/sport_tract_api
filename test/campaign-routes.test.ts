@@ -4,8 +4,11 @@
  * 与前几个 campaign 测试文件（断言直接打在 service 上）不同，本文件走**真实 HTTP**：
  * login 拿 token → 带 authorization 头 app.inject 各接口，钉住「路由注册 + 鉴权 + 入参解析 + 状态码」。
  *
- * 时间窗一律用**远期**（2099-01-01..2099-01-07）：effectiveStatus 按 now 派生（now >= endAt 即 ended），
- * 写死的历史窗口会让 join 立刻 403，用例会因「今天是哪天」而红绿飘忽。
+/**
+ * 时间窗一律用**「已开赛 3 天、还剩 3 天」**的相对日期：
+ * `effectiveStatus` 按 now 派生 —— 结束时间在过去会立刻 ended（join 403），
+ * 开始时间在未来则会落进 upcoming，两种都会让本文件的用例测到不该测的东西。
+ * 写死日期还会让红绿随「今天是哪天」飘忽。刻意要 upcoming / 远期日期的用例自己传 over。
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -28,6 +31,13 @@ let outsider: Who;
 
 /** 本文件创建的 campaign id：after() 只清这些，不碰 dev 库里既有数据 */
 const createdIds: mongoose.Types.ObjectId[] = [];
+
+const DAY_MS = 86400000;
+
+/** 相对「今天」的东八区 YYYY-MM-DD */
+function bjDateAfter(days: number): string {
+  return new Date(Date.now() + 8 * 3600000 + days * DAY_MS).toISOString().slice(0, 10);
+}
 
 /** 登录拿 token（mock 登录：任意 code 直接换测试 openid） */
 async function loginMock(openid: string): Promise<Who> {
@@ -68,8 +78,8 @@ async function mkCampaign(
       visibility: 'public',
       allowedTypes: [],
       memberLimit: null,
-      startDate: '2099-01-01',
-      endDate: '2099-01-07',
+      startDate: bjDateAfter(-3),
+      endDate: bjDateAfter(3),
       ...over,
     },
     token,
@@ -256,8 +266,8 @@ test("CR6 创建日期必须真实存在：假日期 → 400（不是 500）", a
     visibility: 'public',
     allowedTypes: [],
     memberLimit: null,
-    startDate: '2099-01-01',
-    endDate: '2099-01-07',
+    startDate: bjDateAfter(-3),
+    endDate: bjDateAfter(3),
   };
   for (const bad of ['2026-13-01', '2026-02-30']) {
     const res = await post('/campaigns', { ...form, startDate: bad }, creator.token);
@@ -274,7 +284,7 @@ test("CR6 创建日期必须真实存在：假日期 → 400（不是 500）", a
   assert.ok(badEnd.json().message.includes('2099-02-30'), `提示应含实际值，实际：${badEnd.json().message}`);
 
   // 正常（含闰日）日期仍 200
-  const ok = await mkCampaign(creator.token, { startDate: '2099-01-01', endDate: '2099-01-07' });
+  const ok = await mkCampaign(creator.token, { startDate: bjDateAfter(-3), endDate: '2099-01-07' });
   assert.match(ok, /^[a-f\d]{24}$/i);
 });
 
@@ -311,8 +321,8 @@ test('CR8 描述上限 120 字：120 字通过、121 字 → 400', async () => {
       visibility: 'public',
       allowedTypes: [],
       memberLimit: null,
-      startDate: '2099-01-01',
-      endDate: '2099-01-07',
+      startDate: bjDateAfter(-3),
+      endDate: bjDateAfter(3),
     },
     creator.token,
   );
@@ -331,8 +341,8 @@ test('CR9 memberLimit 不带该字段 → 默认 100 落库；显式 null 仍是
       description: '',
       visibility: 'public',
       allowedTypes: [],
-      startDate: '2099-01-01',
-      endDate: '2099-01-07',
+      startDate: bjDateAfter(-3),
+      endDate: bjDateAfter(3),
     },
     creator.token,
   );
@@ -374,7 +384,7 @@ test('CR11 编辑的 body 闸门：空体 / 标题超 30 / 类型不在白名单
   }
   const detail = await get(`/campaigns/${cid}`, creator.token);
   assert.equal(detail.json().data.title, '编辑入参校验');
-  assert.equal(detail.json().data.startAt, Date.parse('2099-01-01T00:00:00+08:00'), 'startDate 不接受上送');
+  assert.equal(detail.json().data.startAt, Date.parse(`${bjDateAfter(-3)}T00:00:00+08:00`), 'startDate 不接受上送');
 
   // 「只有 startDate」单独传会被 zod 当未知字段丢掉、再被「空体」规则兜成 400 —— 两层防御互相掩盖。
   // 真正要钉的是**混在合法字段里**：丢掉 startDate 会返回 200，用户以为开始时间改成功了。
@@ -401,7 +411,7 @@ test('CR12 编辑成功 → 200 回显新值，GET 详情同步（含 startDate/
   assert.equal(detail.title, '改后标题');
   assert.equal(detail.visibility, 'private');
   assert.equal(detail.memberLimit, 8);
-  assert.equal(detail.startDate, '2099-01-01');
+  assert.equal(detail.startDate, bjDateAfter(-3));
   assert.equal(detail.endDate, '2099-02-01');
 });
 
