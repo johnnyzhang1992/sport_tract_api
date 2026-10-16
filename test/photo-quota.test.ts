@@ -30,11 +30,17 @@ function userIdFromToken(token: string): string {
   return JSON.parse(Buffer.from(payload, 'base64url').toString()).userId as string;
 }
 
+/**
+ * 每人一个独立用户：code 走 `openid:` 直通前缀，拿到唯一的 openid 命名空间。
+ * 不加前缀会被 wechat mock 按「字符和 % 10000」折成 `mock_openid_XXXX`——那个空间小到
+ * 同一文件里两个用例就能撞上（实测 3 跑 2 撞），撞了就共用一个 user 文档、共用一个额度计数，
+ * 断言随执行顺序飘红；而且 `mock_openid_` 全命名空间会被 activity.test.ts 的清理整段删掉。
+ */
 async function freshUser(tag: string): Promise<{ token: string; uid: string }> {
   const res = await app.inject({
     method: 'POST',
     url: '/sport-track/api/auth/login',
-    payload: { code: `quota-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}` },
+    payload: { code: `openid:quota-${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}` },
   });
   assert.equal(res.statusCode, 200, res.body);
   const token = res.json().data.accessToken as string;
