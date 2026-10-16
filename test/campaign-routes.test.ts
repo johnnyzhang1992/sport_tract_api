@@ -157,12 +157,14 @@ test('CR3 join / leave / leaderboard / pending / approve / reject / kick / delet
   assert.equal(lbMember.statusCode, 200);
   assert.equal(lbMember.json().data.rows.length, 2);
 
-  // 成员明细：仅发起人可看；普通成员 403
+  // 成员明细：活动内成员（发起人 / 普通成员）都能看；非成员 403
   const detailAsCreator = await get(`/campaigns/${pub}/members/${joiner.id}`, creator.token);
   assert.equal(detailAsCreator.statusCode, 200);
   assert.ok(detailAsCreator.json().data.stats);
   const detailAsMember = await get(`/campaigns/${pub}/members/${joiner.id}`, joiner.token);
-  assert.equal(detailAsMember.statusCode, 403);
+  assert.equal(detailAsMember.statusCode, 200, detailAsMember.body);
+  const detailAsOutsider = await get(`/campaigns/${pub}/members/${joiner.id}`, outsider.token);
+  assert.equal(detailAsOutsider.statusCode, 403);
 
   // leave：发起人不能离开（403）；成员可离开（200 → left）
   const leaveForbidden = await post(`/campaigns/${pub}/leave`, {}, creator.token);

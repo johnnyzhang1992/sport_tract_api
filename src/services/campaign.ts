@@ -507,6 +507,23 @@ export function assertCreator(c: CampaignDoc, userId: string): void {
   if (String(c.creatorId) !== String(userId)) throw new AppError(403, '只有发起人可以操作');
 }
 
+/**
+ * 活动内成员闸门（排行榜 / 成员明细共用）：只有**当前 joined** 的成员能看活动内数据。
+ * 认的是「现在是不是成员」——从未加入、待审批、已退出、被移出一律 403（成员数据不外泄的
+ * 对象是非成员，不是队友）。抽成一处是为了这两处闸门不会各自漂移：放宽时就该一起放宽。
+ */
+async function assertJoinedMember(
+  campaignId: mongoose.Types.ObjectId,
+  viewerId: string,
+  message: string,
+): Promise<void> {
+  const mine = await CampaignMemberModel.find({
+    campaignId,
+    userId: new mongoose.Types.ObjectId(viewerId),
+  }).lean();
+  if (myStateOf(mine) !== 'joined') throw new AppError(403, message);
+}
+
 /** 该用户在此活动是否有被踢记录（黑名单） */
 async function isRemoved(campaignId: mongoose.Types.ObjectId, userId: string): Promise<boolean> {
   return (
@@ -714,11 +731,7 @@ export async function campaignLeaderboard(
   query: { page: number; pageSize: number },
 ): Promise<{ rows: LeaderRow[]; total: number; page: number; pageSize: number }> {
   const c = await loadCampaignOr404(id);
-  const mine = await CampaignMemberModel.find({
-    campaignId: c._id,
-    userId: new mongoose.Types.ObjectId(viewerId),
-  }).lean();
-  if (myStateOf(mine) !== 'joined') throw new AppError(403, '只有活动成员可以查看排行榜');
+  await assertJoinedMember(c._id, viewerId, '只有活动成员可以查看排行榜');
 
   const members = await CampaignMemberModel.find({ campaignId: c._id, state: 'joined' })
     .select('userId joinedAt')
@@ -770,9 +783,10 @@ export async function campaignLeaderboard(
 }
 
 /**
- * 成员明细（仅发起人）：概况 + 分页轨迹列表。
+ * 成员明细（活动内成员可见，含发起人 / 队友 / 本人）：概况 + 分页轨迹列表。
  *
- * 权限与存在性：仅发起人；`uid` 与 `:id` 同待遇——畸形串走 404 闸门（本仓硬性惯例），
+ * 权限与存在性：viewer 必须是**当前 joined 的成员**（非成员 403，与排行榜同一道闸门）；
+ * `uid` 与 `:id` 同待遇——畸形串走 404 闸门（本仓硬性惯例），
  * 且目标在本活动**没有任何加入段**（从未加入 / 只有 pending）也 404，而不是 200 + 全 0。
  * 「是成员但还没有轨迹」不受影响：有加入段即照常 200 + 全 0。
  *
@@ -782,7 +796,7 @@ export async function campaignLeaderboard(
  */
 export async function memberDetail(
   id: string,
-  creatorId: string,
+  viewerId: string,
   targetUid: string,
   query: { page: number; pageSize: number },
 ): Promise<{
@@ -793,7 +807,7 @@ export async function memberDetail(
   pageSize: number;
 }> {
   const c = await loadCampaignOr404(id);
-  assertCreator(c, creatorId);
+  await assertJoinedMember(c._id, viewerId, '只有活动成员可以查看成员明细');
   // uid 与 :id 同待遇：畸形串按「成员不存在」404，不让它静默落进 200 + 全 0
   assertObjectIdLike(targetUid, '成员不存在');
   // 归一成小写 hex（String(ObjectId) 恒小写）：行内 userId 的字符串形与 segs 键都是它，直接拿原串比会对不上大写 hex

@@ -18,7 +18,7 @@ import { UserModel } from '../src/models/user.model.js';
 import { CampaignModel } from '../src/models/campaign.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
-import { createCampaign, joinCampaign, campaignLeaderboard, memberDetail } from '../src/services/campaign.js';
+import { createCampaign, joinCampaign, leaveCampaign, campaignLeaderboard, memberDetail } from '../src/services/campaign.js';
 import type { CreateCampaignInput } from '../src/utils/validators.js';
 
 let app: FastifyInstance;
@@ -183,16 +183,26 @@ test('CL2 非成员调排行榜 → 403；成员可调', async () => {
   );
 });
 
-test('CL3 成员明细：非发起人 403；发起人拿到概况 + 分页明细；成员零轨迹 200、未加入 404（判据与 campaign-stats 同口径）', async () => {
+test('CL3 成员明细：活动内成员可看（非成员 / 已退出 403）；发起人拿到概况 + 分页明细；成员零轨迹 200、未加入 404（判据与 campaign-stats 同口径）', async () => {
   const cid = await mk(String(U.creator), { title: 'CL3', allowedTypes: ['running'] });
   // 明细目标用**专属用户 t**：计入窗口以 joinedAt≈now 为下界，若复用其它用例的用户，
   // 那些用例造的「now 附近」轨迹会落进本次窗口，条数随用例执行耗时窜动。
   await joinCampaign(cid, String(U.t));
   await joinCampaign(cid, String(U.c));
 
-  // 非发起人（同为 joined 成员）不得看他人明细
+  // 闸门认的是「现在是不是活动内成员」：从未加入 → 403（成员数据不外泄的对象是非成员）
   await assert.rejects(
-    () => memberDetail(cid, String(U.c), String(U.t), { page: 1, pageSize: 20 }),
+    () => memberDetail(cid, String(U.outsider), String(U.t), { page: 1, pageSize: 20 }),
+    (e: any) => {
+      assert.equal(e.statusCode, 403);
+      return true;
+    },
+  );
+  // 加入过又退出的人不再是成员 → 同样 403（「曾经是成员」不放行）
+  await joinCampaign(cid, String(U.left));
+  await leaveCampaign(cid, String(U.left));
+  await assert.rejects(
+    () => memberDetail(cid, String(U.left), String(U.t), { page: 1, pageSize: 20 }),
     (e: any) => {
       assert.equal(e.statusCode, 403);
       return true;
@@ -245,6 +255,13 @@ test('CL3 成员明细：非发起人 403；发起人拿到概况 + 分页明细
   assert.equal(typeof d.items[0].distance, 'number');
   assert.equal(typeof d.items[0].duration, 'number');
   assert.equal(typeof d.items[0].elevationGain, 'number');
+
+  // 同为 joined 的普通成员（U.c）看到的是**同一份**明细——不是「能打开但内容被裁剪」：
+  // 两份载荷必须逐字段相等，否则「成员可见」就成了半开的口子。
+  const dAsMember = await memberDetail(cid, String(U.c), String(U.t), { page: 1, pageSize: 20 });
+  assert.deepEqual(dAsMember.items, d.items);
+  assert.deepEqual(dAsMember.stats, d.stats);
+  assert.equal(dAsMember.total, d.total);
 
   // 分页：pageSize=2 → 第 1 页 2 条、第 2 页 1 条，total 恒为 3
   const p1 = await memberDetail(cid, String(U.creator), String(U.t), { page: 1, pageSize: 2 });
