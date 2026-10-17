@@ -1,11 +1,33 @@
 import type { FastifyInstance } from 'fastify';
 import { overview, trend, bestRecords, yearMilestones, activityMonthly } from '../services/stats.js';
 import { footprint } from '../services/footprint.js';
-import { leaderboard, leaderboardMe, leaderboardRegions, leaderboardTypeCounts } from '../services/leaderboard.js';
+import {
+  leaderboard,
+  leaderboardMe,
+  leaderboardRegions,
+  leaderboardTypeCounts,
+  homeLeaderboardSummary,
+} from '../services/leaderboard.js';
+import { collectSection } from '../utils/section.js';
 import { success } from '../utils/response.js';
 
 /** 统计路由：/api/stats（决策 F18/F19） */
 export async function statsRoutes(fastify: FastifyInstance) {
+  /**
+   * 首页三段合并：一次请求带回累计数据 / 点亮省市 / 运动日历。
+   * 按段独立降级（collectSection）：某一段失败只让那段 ok:false，另两段照常下发 ——
+   * 合并成一次请求不能把 3cb2d5e 修掉的「一个接口挂掉、整块卡片消失」请回来。
+   * 三个老接口保持不动（统计页 / 我的 / 足迹分包仍在用）。
+   */
+  fastify.get('/home', { onRequest: [fastify.authenticate] }, async (request) => {
+    const userId = request.user.userId;
+    const [overviewSec, footprintSec, heatSec] = await Promise.all([
+      collectSection(() => overview(userId)),
+      collectSection(() => footprint(userId)),
+      collectSection(() => trend(userId, 'daily365')),
+    ]);
+    return success({ overview: overviewSec, footprint: footprintSec, heat: heatSec });
+  });
   // 概览：今日/本周/本月/累计
   fastify.get('/overview', { onRequest: [fastify.authenticate] }, async (request) => {
     const result = await overview(request.user.userId);
@@ -56,8 +78,13 @@ export async function statsRoutes(fastify: FastifyInstance) {
   });
 
   // 运动榜：全平台点亮地图（60s 缓存）
-  fastify.get('/leaderboard-regions', { onRequest: [fastify.authenticate] }, async () => {
-    return success(await leaderboardRegions());
+  // ?me=1 时额外带回「我的榜名次」（周→月→年→总，服务端一次请求内回退）；
+  // 不传时响应形状与原先完全一致，老调用方（运动榜页）零变化。
+  fastify.get('/leaderboard-regions', { onRequest: [fastify.authenticate] }, async (request) => {
+    const regions = await leaderboardRegions();
+    const { me } = request.query as { me?: string };
+    if (me !== '1') return success(regions);
+    return success({ ...regions, me: await homeLeaderboardSummary(request.user.userId) });
   });
 
   // 运动榜：按 运动类型 > 省份 排行（周期 week/month/year/all；TOP10 昵称完整展示 + 当前用户真实排名）

@@ -412,3 +412,33 @@ export async function leaderboardMe(
     best: ranks.length > 0 ? ranks[0] : null,
   };
 }
+
+/**
+ * 首页榜摘要的周期选择：按 `periods` 顺序逐个取，**命中即早退**。
+ * 为什么是串行而不是四个并行：多数人在周榜就有记录，串行只扫一次；四个并行会把
+ * 每次首页加载都变成 4 次全表聚合。最坏（四个周期都不上榜）才走到 4 次，且仍是一个 HTTP 请求。
+ */
+export async function pickFirstRanked<T>(
+  periods: readonly LeaderboardPeriod[],
+  fetchRanks: (period: LeaderboardPeriod) => Promise<T[]>,
+): Promise<{ period: LeaderboardPeriod | null; ranks: T[] }> {
+  for (const period of periods) {
+    const ranks = await fetchRanks(period);
+    if (ranks.length > 0) return { period, ranks };
+  }
+  return { period: null, ranks: [] };
+}
+
+/**
+ * 首页卡片副标题：全国人数之外的「我的榜名次」。
+ * 周期回退（周→月→年→总）原先在端上串行打 4 次接口，现在收进一次请求；
+ * 选中口径与 `/stats/leaderboard/me?period=xxx` 完全一致（复用同一 service）。
+ */
+export function homeLeaderboardSummary(
+  userId: string,
+): Promise<{ period: LeaderboardPeriod | null; ranks: MeRankRow[] }> {
+  return pickFirstRanked(LEADERBOARD_PERIODS, async (period) => {
+    const res = await leaderboardMe(userId, '全国', period);
+    return res.ranks;
+  });
+}
