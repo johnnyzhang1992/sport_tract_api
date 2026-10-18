@@ -172,6 +172,26 @@ test('activities 列表：startProvince/startCity 字段 + 不含轨迹点', asy
   assert.equal(item.markers, undefined, '不应下发打点');
 });
 
+test('activities 列表：下发 corrected 纠偏状态（缺字段视为已纠偏）', async () => {
+  const correctedId = await createFinished({ daysAgo: 1 });
+  const rawId = await createFinished({ daysAgo: 2 });
+  await ActivityModel.updateOne({ _id: rawId }, { $set: { corrected: false } });
+
+  const res = await adminReq('GET', `/sport-track/api/admin/activities?page=1&pageSize=100&userId=${userId}`);
+  assert.equal(res.statusCode, 200);
+  const byId = new Map(
+    (res.json().data.items as { id: string; corrected?: boolean }[]).map((i) => [i.id, i]),
+  );
+  assert.equal(byId.get(correctedId)?.corrected, true, '已纠偏轨迹应为 true');
+  assert.equal(byId.get(rawId)?.corrected, false, '未纠偏轨迹应为 false');
+
+  // 2026-09-27 前的旧轨迹库内无该字段：列表与详情同口径，视为已纠偏
+  await ActivityModel.updateOne({ _id: correctedId }, { $unset: { corrected: 1 } });
+  const res2 = await adminReq('GET', `/sport-track/api/admin/activities?page=1&pageSize=100&userId=${userId}`);
+  const legacy = (res2.json().data.items as { id: string; corrected?: boolean }[]).find((i) => i.id === correctedId);
+  assert.equal(legacy?.corrected, true, '缺字段的旧轨迹应视为已纠偏');
+});
+
 test('users 列表：下发纯数字 uid 不含 openid（敏感字段）', async () => {
   const res = await adminReq('GET', '/sport-track/api/admin/users?page=1&pageSize=5');
   assert.equal(res.statusCode, 200);

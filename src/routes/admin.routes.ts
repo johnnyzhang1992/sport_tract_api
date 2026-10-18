@@ -869,6 +869,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         userGender: genderMap.get(String(a.userId)) ?? 0,
         type: a.type,
         status: a.status,
+        corrected: a.corrected ?? true, // 与详情 DTO 同口径：旧轨迹缺字段视为已纠偏
         distance: a.distance ?? 0,
         duration: a.duration ?? 0,
         calories: a.calories ?? 0,
