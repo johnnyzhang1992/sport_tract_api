@@ -31,6 +31,13 @@ import {
   deleteTopic,
   type TopicInput,
 } from '../services/topic.js';
+import {
+  adminListNotifications,
+  createNotification,
+  updateNotification,
+  deleteNotification,
+  type NotificationInput,
+} from '../services/notification.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { backfillVehicle } from '../services/vehicle-backfill.js';
 import { gapImpact } from '../services/gap-impact.js';
@@ -1356,6 +1363,33 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const url = await uploadBuffer(buf, key, file.mimetype || 'image/png');
     // url 入库用（裸链），previewUrl 只给后台展示（私有桶裸链 403）；正文内联图同理取 previewUrl
     return success({ url, previewUrl: getSignedUrl(url) });
+  });
+
+  // ==================== 系统通知管理 ====================
+
+  // 通知列表（含未发布草稿）
+  fastify.get('/notifications', { onRequest: [adminAuth] }, async () => {
+    return success(await adminListNotifications());
+  });
+
+  // 新建通知
+  fastify.post('/notifications', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    return success(await createNotification(body as NotificationInput), '已创建');
+  });
+
+  // 更新通知（局部字段）
+  fastify.put('/notifications/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    return success(await updateNotification(id, body as NotificationInput), '已保存');
+  });
+
+  // 删除通知（级联清理已读）
+  fastify.delete('/notifications/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    await deleteNotification(id);
+    return success(null, '已删除');
   });
 }
 
