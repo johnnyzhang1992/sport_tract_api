@@ -429,8 +429,10 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
 
   const segs = await loadSegments(String(c._id));
   const counts = await memberCounts(c._id); // joined + pending 都占位（决策 §2-6）
+  // 与 joinCampaign 的闸门同口径：未开始也能报名。只判 active 会让未开始活动落到
+  // 「canJoin=false」，端上按最后一条分支显示成「人数已满」。
   const canJoin =
-    status === 'active' &&
+    (status === 'active' || status === 'upcoming') &&
     myState !== 'joined' &&
     myState !== 'pending' &&
     myState !== 'removed' &&

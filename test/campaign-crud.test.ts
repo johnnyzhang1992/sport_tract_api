@@ -174,6 +174,18 @@ test('CC3 详情按身份裁剪：非成员看不到成员列表与汇总', asyn
   assert.equal(me.avatarPreset, 'default-1');
 });
 
+test('CC12 未开始活动：非成员详情 canJoin=true（可报名，不能显示人数已满）', async () => {
+  const outsider = new mongoose.Types.ObjectId();
+  const dto = await create(String(userId), {
+    title: '未开始', description: '', visibility: 'public', allowedTypes: [], memberLimit: 100,
+    startDate: bjDateAfter(2), endDate: bjDateAfter(4),
+  });
+  const asOutsider = await getCampaignDetail(dto.id, String(outsider));
+  assert.equal(asOutsider.status, 'upcoming');
+  assert.equal(asOutsider.memberLimit, 100);
+  assert.equal(asOutsider.canJoin, true);
+});
+
 test('CC4 非法 id → 404', async () => {
   await assert.rejects(() => getCampaignDetail('not-an-id', String(userId)), (e: any) => e.statusCode === 404);
 });
