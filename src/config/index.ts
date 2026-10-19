@@ -21,6 +21,18 @@ export const config = {
   port: int(process.env.PORT, 3004),
   host: process.env.HOST ?? '0.0.0.0',
   apiPrefix: '/sport-track/api', // 前缀区分同域名下的其他服务（nginx 按 /sport-track/ 转发）
+  // 防刷：一起运动活动，每个用户滚动 1 小时 / 东八自然日的最多创建数。
+  // 测试态放宽，避免用例连续建活动撞限额（与 activity.routes 的 CREATE_LIMIT 同思路）。
+  campaignCreateHourlyLimit:
+    process.env.WX_MOCK_LOGIN === 'true' && (process.env.NODE_ENV ?? 'development') !== 'production'
+      ? 100000
+      : 5,
+  campaignCreateDailyLimit:
+    process.env.WX_MOCK_LOGIN === 'true' && (process.env.NODE_ENV ?? 'development') !== 'production'
+      ? 100000
+      : 10,
+  // 每个用户同时存在的「未开始 + 进行中」活动数上限（已结束/已解散不占）
+  campaignActiveLimit: 99,
 
   // MongoDB
   mongodbUri:

@@ -23,7 +23,8 @@ import {
 } from './campaign-stats.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { getAvatarUrl } from './oss.js';
-import { bjDateStr, bjDayStart } from '../utils/bj-time.js';
+import { bjDateStr, bjDayStart, bjToday0 } from '../utils/bj-time.js';
+import { config } from '../config/index.js';
 import { checkText } from './wechat-sec.js';
 import { AppError } from '../utils/app-error.js';
 import type { CreateCampaignInput, ListCampaignQueryInput, UpdateCampaignInput } from '../utils/validators.js';
@@ -105,6 +106,45 @@ export function assertTextAllowed(secs: { risky: boolean }[]): void {
   if (secs.some((s) => s.risky)) throw new AppError(400, '内容包含违规信息，请修改后重试');
 }
 
+/** 防刷：每用户滚动 1 小时 / 东八自然日各有一档创建上限，另限同时存在的未开始+进行中活动数。 */
+async function assertCanCreate(creatorId: mongoose.Types.ObjectId): Promise<void> {
+  const now = Date.now();
+  const [live, recentHour, recentDay] = await Promise.all([
+    // status='dissolved' 与已过期（endAt <= now）都不占；'ended' 从不落库，按 endAt 判即可
+    CampaignModel.countDocuments({
+      creatorId,
+      status: 'active',
+      endAt: { $gt: new Date(now) },
+    }),
+    CampaignModel.countDocuments({
+      creatorId,
+      createdAt: { $gte: new Date(now - 3600000) },
+    }),
+    CampaignModel.countDocuments({
+      creatorId,
+      createdAt: { $gte: new Date(bjToday0(now)) },
+    }),
+  ]);
+  if (live >= config.campaignActiveLimit) {
+    throw new AppError(
+      409,
+      `当前还有 ${live} 个未开始/进行中的活动，最多同时保留 ${config.campaignActiveLimit} 个，请先结束或解散部分活动`,
+    );
+  }
+  if (recentHour >= config.campaignCreateHourlyLimit) {
+    throw new AppError(
+      429,
+      `最近 1 小时已创建 ${recentHour} 个活动，每小时最多创建 ${config.campaignCreateHourlyLimit} 个，请稍后再试`,
+    );
+  }
+  if (recentDay >= config.campaignCreateDailyLimit) {
+    throw new AppError(
+      429,
+      `今天已创建 ${recentDay} 个活动，每天最多创建 ${config.campaignCreateDailyLimit} 个，请明天再试`,
+    );
+  }
+}
+
 /** 建活动：发起人自动成为 joined 成员；日期按东八区日边界落库（endDate 含当日 → 左闭右开） */
 export async function createCampaign(
   creatorId: string,
@@ -113,6 +153,7 @@ export async function createCampaign(
   check: (text: string, openid?: string) => Promise<{ risky: boolean }> = checkText,
 ): Promise<CampaignDetailDto> {
   const ocid = new mongoose.Types.ObjectId(creatorId);
+  await assertCanCreate(ocid);
   const startAt = bjDayStart(Date.parse(`${input.startDate}T00:00:00+08:00`));
   const endAt = bjDayStart(Date.parse(`${input.endDate}T00:00:00+08:00`)) + DAY_MS;
 

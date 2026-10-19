@@ -12,6 +12,8 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { CampaignModel } from '../src/models/campaign.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
+import { config } from '../src/config/index.js';
+import { bjToday0 } from '../src/utils/bj-time.js';
 import {
   createCampaign,
   getCampaignDetail,
@@ -184,6 +186,116 @@ test('CC12 未开始活动：非成员详情 canJoin=true（可报名，不能�
   assert.equal(asOutsider.status, 'upcoming');
   assert.equal(asOutsider.memberLimit, 100);
   assert.equal(asOutsider.canJoin, true);
+});
+
+test('CC13 防刷：每用户每天最多创建 N 个，超限 429 且提示实际值', async () => {
+  const fresh = new mongoose.Types.ObjectId();
+  const cfg = config as unknown as { campaignCreateDailyLimit: number };
+  const old = cfg.campaignCreateDailyLimit;
+  cfg.campaignCreateDailyLimit = 2;
+  const input = { ...base, startDate: bjDateAfter(2), endDate: bjDateAfter(4) };
+  try {
+    await create(String(fresh), { ...input, title: '限额1' });
+    await create(String(fresh), { ...input, title: '限额2' });
+    await assert.rejects(
+      () => create(String(fresh), { ...input, title: '限额3' }),
+      (e: any) =>
+        e.statusCode === 429 &&
+        /今天已创建 2 个活动/.test(e.message) &&
+        /每天最多创建 2 个/.test(e.message),
+    );
+  } finally {
+    cfg.campaignCreateDailyLimit = old;
+  }
+});
+
+test('CC14 每日额度按东八区自然日：昨天创建的不占今天额度', async () => {
+  const fresh = new mongoose.Types.ObjectId();
+  const cfg = config as unknown as { campaignCreateDailyLimit: number };
+  const old = cfg.campaignCreateDailyLimit;
+  cfg.campaignCreateDailyLimit = 2;
+  const input = { ...base, startDate: bjDateAfter(2), endDate: bjDateAfter(4) };
+  try {
+    const yesterday = await create(String(fresh), { ...input, title: '昨日1' });
+    // 直接改原始集合，绕开 mongoose timestamps
+    await CampaignModel.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(yesterday.id) },
+      { $set: { createdAt: new Date(bjToday0() - 1) } },
+    );
+    await create(String(fresh), { ...input, title: '今日1' });
+    await create(String(fresh), { ...input, title: '今日2' });
+    await assert.rejects(
+      () => create(String(fresh), { ...input, title: '今日3' }),
+      (e: any) => e.statusCode === 429,
+    );
+  } finally {
+    cfg.campaignCreateDailyLimit = old;
+  }
+});
+
+test('CC15 防刷：每小时最多创建 N 个，超限 429 且提示实际值', async () => {
+  const fresh = new mongoose.Types.ObjectId();
+  const cfg = config as unknown as { campaignCreateHourlyLimit: number };
+  const old = cfg.campaignCreateHourlyLimit;
+  cfg.campaignCreateHourlyLimit = 2;
+  const input = { ...base, startDate: bjDateAfter(2), endDate: bjDateAfter(4) };
+  try {
+    await create(String(fresh), { ...input, title: '小时1' });
+    await create(String(fresh), { ...input, title: '小时2' });
+    await assert.rejects(
+      () => create(String(fresh), { ...input, title: '小时3' }),
+      (e: any) =>
+        e.statusCode === 429 &&
+        /最近 1 小时已创建 2 个活动/.test(e.message) &&
+        /每小时最多创建 2 个/.test(e.message),
+    );
+  } finally {
+    cfg.campaignCreateHourlyLimit = old;
+  }
+});
+
+test('CC16 每小时额度按滚动 1 小时：1 小时前创建的不占本小时额度', async () => {
+  const fresh = new mongoose.Types.ObjectId();
+  const cfg = config as unknown as { campaignCreateHourlyLimit: number };
+  const old = cfg.campaignCreateHourlyLimit;
+  cfg.campaignCreateHourlyLimit = 1;
+  const input = { ...base, startDate: bjDateAfter(2), endDate: bjDateAfter(4) };
+  try {
+    const stale = await create(String(fresh), { ...input, title: '两小时前' });
+    await CampaignModel.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(stale.id) },
+      { $set: { createdAt: new Date(Date.now() - 2 * 3600000) } },
+    );
+    await create(String(fresh), { ...input, title: '本小时1' });
+    await assert.rejects(
+      () => create(String(fresh), { ...input, title: '本小时2' }),
+      (e: any) => e.statusCode === 429 && /最近 1 小时/.test(e.message),
+    );
+  } finally {
+    cfg.campaignCreateHourlyLimit = old;
+  }
+});
+
+test('CC17 同时存在上限：未开始+进行中最多 N 个，已结束不占', async () => {
+  const fresh = new mongoose.Types.ObjectId();
+  const cfg = config as unknown as { campaignActiveLimit: number };
+  const old = cfg.campaignActiveLimit;
+  cfg.campaignActiveLimit = 2;
+  const live = { ...base, startDate: bjDateAfter(2), endDate: bjDateAfter(4) };
+  try {
+    await create(String(fresh), { ...live, title: '进行1' });
+    await create(String(fresh), { ...base, title: '已结束不占位' });
+    await create(String(fresh), { ...live, title: '进行2' });
+    await assert.rejects(
+      () => create(String(fresh), { ...live, title: '进行3' }),
+      (e: any) =>
+        e.statusCode === 409 &&
+        /当前还有 2 个未开始\/进行中的活动/.test(e.message) &&
+        /最多同时保留 2 个/.test(e.message),
+    );
+  } finally {
+    cfg.campaignActiveLimit = old;
+  }
 });
 
 test('CC4 非法 id → 404', async () => {
