@@ -129,6 +129,51 @@ export async function statsForMembers(
   return out;
 }
 
+/** 按运动类型的汇总（webAdmin 活动详情）：次数 / 距离 / 时长 */
+export interface TypeSummaryRow {
+  type: string;
+  count: number;
+  distance: number;
+  duration: number;
+}
+
+/**
+ * 分类型汇总：判据与 `statsForMembers` 完全一致（baseMatch + 各成员窗口并集），只在 `$group` 上多切一维 type。
+ * 只传在队成员 —— 调用方决定范围；空名单直接返回 []，别把空 `$or` 交给 Mongo。
+ * 排序：距离降序、同距离次数降序（与类型筛选列表的既有阅读顺序一致）。
+ */
+export async function typeSummaryForMembers(
+  campaign: CampaignDoc,
+  segmentsByUser: Map<string, Segment[]>,
+  userIds: string[],
+): Promise<TypeSummaryRow[]> {
+  const or: unknown[] = [];
+  for (const uid of userIds) {
+    const segs = segmentsByUser.get(uid);
+    if (segs && segs.length > 0) or.push(...timeOr(uid, segs, campaign.startAt));
+  }
+  if (or.length === 0) return [];
+
+  const rows = await ActivityModel.aggregate([
+    { $match: baseMatch(campaign, { $or: or }) },
+    {
+      $group: {
+        _id: '$type',
+        count: { $sum: 1 },
+        distance: { $sum: '$distance' },
+        duration: { $sum: '$duration' },
+      },
+    },
+    { $sort: { distance: -1, count: -1 } },
+  ]);
+  return rows.map((r) => ({
+    type: String(r._id),
+    count: r.count,
+    distance: r.distance,
+    duration: r.duration,
+  }));
+}
+
 /** 某人「连续运动天数」：取他在活动内计入轨迹的东八区开始日，交给 streakDays */
 export async function streakForUser(
   campaign: CampaignDoc,

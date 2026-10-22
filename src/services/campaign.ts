@@ -18,6 +18,7 @@ import {
   statsForMembers,
   streakForUser,
   memberActivityMatch,
+  typeSummaryForMembers,
   type CampaignDoc,
   type MemberStats,
 } from './campaign-stats.js';
@@ -990,11 +991,20 @@ export async function adminListCampaigns(query: {
  * 成员列表取「加入过的行」（`joinedAt` 非空），即**含已离开/被踢的历史成员**（state 一并下发），
  * 后台需要看得到这类痕迹；pending 申请人不在其中（未加入，无贡献时段）。
  */
-export async function adminGetCampaign(id: string) {
+export async function adminGetCampaign(
+  id: string,
+  query: { page?: number; pageSize?: number } = {},
+) {
+  const page = query.page ?? 1;
+  const pageSize = query.pageSize ?? 20;
   const c = await loadCampaignOr404(id);
+  // 次键 _id：同刻加入的多行必须有确定顺序，否则翻页会漏/重
   const members = await CampaignMemberModel.find({ campaignId: c._id, joinedAt: { $ne: null } })
-    .sort({ joinedAt: 1 })
+    .sort({ joinedAt: 1, _id: 1 })
     .lean();
+  const membersTotal = members.length;
+  const from = (page - 1) * pageSize;
+  const pageMembers = members.slice(from, from + pageSize);
   const uids = members.map((m) => String(m.userId));
   const users = await UserModel.find({ _id: { $in: uids } })
     .select('nickname uid')
@@ -1002,6 +1012,30 @@ export async function adminGetCampaign(id: string) {
   const uMap = new Map(users.map((u) => [String(u._id), u]));
   const segs = await loadSegments(String(c._id));
   const stats = await statsForMembers(c, segs, uids);
+  // 汇总与排行榜只算当前在队（成员表则刻意含历史段）；排行复用同一条 byDistanceThenJoin，与小程序榜一致
+  const joined = members.filter((m) => m.state === 'joined');
+  const typeSummary = await typeSummaryForMembers(
+    c,
+    segs,
+    joined.map((m) => String(m.userId)),
+  );
+  const leaderboard = [...joined]
+    .map((m) => ({ m, s: stats.get(String(m.userId))! }))
+    .sort((x, y) =>
+      byDistanceThenJoin(
+        { distance: x.s.distance, joinedAt: x.m.joinedAt ?? null },
+        { distance: y.s.distance, joinedAt: y.m.joinedAt ?? null },
+      ),
+    )
+    .slice(0, 10)
+    .map(({ m, s }, i) => ({
+      rank: i + 1,
+      userId: String(m.userId),
+      name: uMap.get(String(m.userId))?.nickname || '微信用户',
+      distance: s.distance,
+      count: s.count,
+      duration: s.duration,
+    }));
   return {
     id: String(c._id),
     title: c.title,
@@ -1014,7 +1048,12 @@ export async function adminGetCampaign(id: string) {
     status: effectiveStatus(c),
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
-    members: members.map((m) => {
+    typeSummary,
+    leaderboard,
+    membersTotal,
+    membersPage: page,
+    membersPageSize: pageSize,
+    members: pageMembers.map((m) => {
       const s = stats.get(String(m.userId))!;
       return {
         userId: String(m.userId),

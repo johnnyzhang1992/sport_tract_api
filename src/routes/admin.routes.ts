@@ -1323,7 +1323,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 一起运动活动详情（含成员列表与各自汇总；只读）
   fastify.get('/campaigns/:id', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    return success(await adminGetCampaign(id));
+    const q = request.query as Record<string, string | undefined>;
+    // 成员表分页；汇总/排行榜始终按全员算，不受分页影响
+    return success(
+      await adminGetCampaign(id, {
+        page: Math.max(1, Number(q.page) || 1),
+        pageSize: Math.min(100, Math.max(1, Number(q.pageSize) || 20)),
+      }),
+    );
   });
 
   // ==================== 专题管理（官方信息页，小程序首页入口） ====================
