@@ -23,14 +23,17 @@ export async function geoRoutes(fastify: FastifyInstance) {
   });
 
   // 中国省界地图数据（点亮地图用；体积大放后端，前端按需拉取缓存；公开接口无需认证）
-  fastify.get('/china-map', async () => {
+  // 内容是静态的 → 允许客户端/中间层缓存一天，避免每次进地图页都整包重拉
+  fastify.get('/china-map', async (_request, reply) => {
+    reply.header('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
     return success(getChinaMap());
   });
 
   // 指定省份地图数据（按 adcode 过滤；公开接口无需认证）
-  fastify.get('/province-map', async (request) => {
+  fastify.get('/province-map', async (request, reply) => {
     const query = request.query as Record<string, unknown>;
     const { adcode } = ProvinceQuery.parse(query);
+    reply.header('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
     return success(getProvinceMap(adcode));
   });
 
