@@ -101,6 +101,23 @@ function buildUserTrendBuckets(range: string): {
   return { labels, start: today0 - (days - 1) * DAY_MS, bucketFmt: '%Y-%m-%d' };
 }
 
+/**
+ * 小时分布统计（登录活跃时段 / 轨迹频率）的时间档起点（东八区 0 点）：
+ * today=当天；week=最近 7 个自然日（含今天）；month=最近 30 个自然日（含今天）
+ */
+function hourStatsStart(range: string): number {
+  const today0 = bjToday0();
+  if (range === 'week') return today0 - 6 * DAY_MS;
+  if (range === 'month') return today0 - 29 * DAY_MS;
+  return today0;
+}
+
+/** 小时分布聚合结果补零成 0–23 完整 24 桶 */
+function toHourBuckets(rows: Array<{ _id: number; count: number }>) {
+  const byHour = new Map(rows.map((r) => [Number(r._id), Number(r.count)]));
+  return Array.from({ length: 24 }, (_, hour) => ({ hour, count: byHour.get(hour) ?? 0 }));
+}
+
 /** admin token 校验 */
 async function adminAuth(request: FastifyRequest, reply: FastifyReply) {
   const auth = request.headers.authorization ?? '';
@@ -390,6 +407,17 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
+  // 用户活跃时段：登录记录按东八区小时分桶（today=当天；week/month=最近 7/30 个自然日合计）
+  fastify.get('/login-hour-stats', { onRequest: [adminAuth] }, async (request) => {
+    const raw = String((request.query as { range?: string }).range || 'today');
+    const range = ['today', 'week', 'month'].includes(raw) ? raw : 'today';
+    const rows = await LoginLogModel.aggregate<{ _id: number; count: number }>([
+      { $match: { createdAt: { $gte: new Date(hourStatsStart(range)) } } },
+      { $group: { _id: { $hour: { date: '$createdAt', timezone: '+08:00' } }, count: { $sum: 1 } } },
+    ]);
+    return success({ range, data: toHourBuckets(rows) });
+  });
+
   // 用户分布：按登录 IP 归属地聚合省/市去重用户数（无法定位的归入“未知”，不作为省份上地图）
   fastify.get('/user-geo-stats', { onRequest: [adminAuth] }, async () => {
     const UNKNOWN = '未知';
@@ -529,6 +557,22 @@ export async function adminRoutes(fastify: FastifyInstance) {
         };
       }),
     });
+  });
+
+  // 轨迹频率统计：已完成轨迹按开始时间（东八区）小时分桶，档位口径与登录活跃时段一致
+  fastify.get('/activity-hour-stats', { onRequest: [adminAuth] }, async (request) => {
+    const raw = String((request.query as { range?: string }).range || 'today');
+    const range = ['today', 'week', 'month'].includes(raw) ? raw : 'today';
+    const rows = await ActivityModel.aggregate<{ _id: number; count: number }>([
+      { $match: { status: 'finished', startTime: { $gte: hourStatsStart(range) } } },
+      {
+        $group: {
+          _id: { $hour: { date: { $toDate: '$startTime' }, timezone: '+08:00' } },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+    return success({ range, data: toHourBuckets(rows) });
   });
 
   // 轨迹省份分布（含城市明细）：按落库 startProvince/startCity 聚合，支持时间范围
