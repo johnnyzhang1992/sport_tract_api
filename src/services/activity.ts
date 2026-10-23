@@ -6,7 +6,7 @@ import { assertObjectIdLike } from '../utils/object-id.js';
 import { calcStats, calcFastestKm, calcPbMarks, haversineDistance } from '../utils/pace.js';
 import { calcPerfScore } from '../utils/perf-score.js';
 import { markStandstill, shrinkStillSegments } from '../utils/standstill.js';
-import { simplifyTracks } from '../utils/simplify.js';
+import { simplifyTracks, simplifyTrackPoints } from '../utils/simplify.js';
 import { markGapJumps } from '../utils/track-gap.js';
 import { markVehicle, formatVehicleNotice } from '../utils/vehicle.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
@@ -1219,4 +1219,45 @@ export async function removeMarker(
 /** GPX 导出数据源 */
 export async function getActivityForGpx(activityId: ObjectIdLike, userId: string) {
   return findOwnedActivity(activityId, userId);
+}
+
+export interface MapPointDto {
+  lat: number;
+  lng: number;
+  timestamp: number | null;
+  pauseGap?: boolean;
+  gapJump?: boolean;
+  vehicle?: boolean;
+}
+
+export interface ActivityMapPoints {
+  id: string;
+  total: number;
+  points: MapPointDto[];
+}
+
+/**
+ * 列表地图缩略图：按预算抽稀轨迹点（默认 1500，上限 3000）。
+ * 只下发渲染需要的经纬度与断线标记；仅轨迹本人可读。
+ */
+export async function getActivityMapPoints(
+  activityId: ObjectIdLike,
+  userId: string,
+  maxPoints = 1500,
+): Promise<ActivityMapPoints> {
+  const activity = await findOwnedActivity(activityId, userId);
+  const all = (activity.trackPoints ?? []) as TrackPointDto[];
+  const sampled = simplifyTrackPoints(all, maxPoints);
+  return {
+    id: String(activity._id),
+    total: all.length,
+    points: sampled.map((p) => ({
+      lat: p.lat,
+      lng: p.lng,
+      timestamp: Number.isFinite(Number(p.timestamp)) ? Number(p.timestamp) : null,
+      ...(p.pauseGap ? { pauseGap: true } : {}),
+      ...(p.gapJump ? { gapJump: true } : {}),
+      ...(p.vehicle ? { vehicle: true } : {}),
+    })),
+  };
 }

@@ -143,13 +143,56 @@ export function simplifyTracks(
   return result;
 }
 
+export interface FlaggedTrackPoint extends LatLng {
+  pauseGap?: boolean;
+  gapJump?: boolean;
+}
+
+/**
+ * 单条轨迹抽稀（列表地图缩略图用）：默认压到 ≤1500 点。
+ * 与多轨迹抽稀不同，pauseGap / gapJump 断点必须保留——地图按标记断开折线，
+ * 丢了断点会把暂停位移/采样断档连成一条假线。
+ */
+export function simplifyTrackPoints<T extends FlaggedTrackPoint>(
+  points: T[],
+  maxPoints = 1500,
+): T[] {
+  const budget = Math.max(2, Math.floor(maxPoints) || 1500);
+  const valid = points.filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+  if (valid.length <= budget) return valid;
+
+  // 按断点切 run（断点作为新 run 首点，标记随原点保留）
+  const runs: T[][] = [];
+  let run: T[] = [valid[0]];
+  for (let i = 1; i < valid.length; i++) {
+    if (valid[i].pauseGap || valid[i].gapJump) {
+      runs.push(run);
+      run = [valid[i]];
+    } else {
+      run.push(valid[i]);
+    }
+  }
+  runs.push(run);
+
+  // 配额按 run 长度加权，每 run 保底 2（首尾）
+  const total = valid.length;
+  const out: T[] = [];
+  for (const r of runs) {
+    if (r.length <= 2) {
+      out.push(...r);
+      continue;
+    }
+    const quota = Math.max(2, Math.floor((r.length / total) * budget));
+    out.push(...(dpToMax(r, quota) as T[]));
+  }
+  return out;
+}
+
 export interface HeatCell {
   lat: number;
   lng: number;
   weight: number; // 0~1 归一化
-}
-
-/**
+}/**
  * 网格热力：把多轨迹点按 ~gridM 网格统计强度
  * 同一网格被越多轨迹覆盖 → 权重越高（高频路线热区）
  * @returns 网格中心 + 归一化权重（≤ maxCells 个，按权重降序取前 N）

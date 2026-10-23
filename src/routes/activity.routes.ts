@@ -8,6 +8,7 @@ import {
   finishActivity,
   getActivityDetailView,
   getActivityForGpx,
+  getActivityMapPoints,
   listActivities,
   removeMarker,
   updateMarker,
@@ -155,6 +156,15 @@ export async function activityRoutes(fastify: FastifyInstance) {
       }
     }
     return success(activity);
+  });
+
+  // 列表地图缩略图：抽稀后的轨迹点（默认 ≤1500 点，含时间戳/暂停/断档/车速标记；仅本人可读）
+  fastify.get('/:id/map-points', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const { max } = request.query as { max?: string };
+    const n = Number(max);
+    const maxPoints = Number.isFinite(n) ? Math.min(3000, Math.max(2, Math.floor(n))) : 1500;
+    return success(await getActivityMapPoints(id, request.user.userId, maxPoints));
   });
 
   // 导出 GPX
