@@ -827,7 +827,7 @@ export async function listActivities(
   /** 选中类型时附带：页内出现月份的全量聚合（轨迹列表月度统计） */
   monthlyStats: ActivityMonthlyRow[];
 }> {
-  const { type, month, province, page, pageSize } = query;
+  const { type, month, province, page, pageSize, from, to } = query;
 
   // 惰性清理：in_progress 超过 24h 无更新（用户杀进程/异常退出）→ 自动收尾
   // 有轨迹点自动 finished 保留数据（endTime 以最后点上报时间为准）；空活动作废
@@ -843,6 +843,14 @@ export async function listActivities(
     const start = new Date(y, m - 1, 1).getTime();
     const end = new Date(y, m, 1).getTime();
     filter.startTime = { $gte: start, $lt: end };
+  }
+  // 精确区间（报告页日期汇总下钻）：左闭右开，与 month 同时出现时取交集
+  if (from != null || to != null) {
+    filter.startTime = {
+      ...(filter.startTime || {}),
+      ...(from != null ? { $gte: from } : {}),
+      ...(to != null ? { $lt: to } : {}),
+    };
   }
 
   const [total, items] = await Promise.all([

@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify';
-import { overview, trend, bestRecords, yearMilestones, activityMonthly } from '../services/stats.js';
+import { overview, trend, bestRecords, yearMilestones, activityMonthly, distancePercentile } from '../services/stats.js';
+import { ACTIVITY_TYPES } from '../config/constants.js';
+import { AppError } from '../utils/app-error.js';
 import { footprint } from '../services/footprint.js';
 import {
   leaderboard,
@@ -46,17 +48,30 @@ export async function statsRoutes(fastify: FastifyInstance) {
     return success(result);
   });
 
+  // 平台分位：累计距离超越全站用户占比（统计页「超越全站 XX%」）
+  fastify.get('/percentile', { onRequest: [fastify.authenticate] }, async (request) => {
+    return success(await distancePercentile(request.user.userId));
+  });
+
   // 趋势：week(7天) / month(30天) / week6(6个月按周) / year(年按月)；days=365 兼容日历热力图
+  // activityType：可选，按运动类型筛选（不传=全部类型）
   fastify.get('/trend', { onRequest: [fastify.authenticate] }, async (request) => {
-    const { days, type } = request.query as { days?: string; type?: string };
+    const { days, type, activityType } = request.query as {
+      days?: string;
+      type?: string;
+      activityType?: string;
+    };
+    if (activityType && !ACTIVITY_TYPES.includes(activityType as never)) {
+      throw new AppError(400, '运动类型不合法');
+    }
     let result;
     if (type === 'month' || type === 'week6' || type === 'year' || type === 'week') {
-      result = await trend(request.user.userId, type);
+      result = await trend(request.user.userId, type, activityType);
     } else if (days === '365') {
       // 日历热力图：近 365 天按天
-      result = await trend(request.user.userId, 'daily365');
+      result = await trend(request.user.userId, 'daily365', activityType);
     } else {
-      result = await trend(request.user.userId, 'week');
+      result = await trend(request.user.userId, 'week', activityType);
     }
     return success(result);
   });

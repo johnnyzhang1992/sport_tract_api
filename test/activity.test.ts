@@ -1739,3 +1739,43 @@ test('紧凑存储：GPX 导出时间为绝对时间（非 1970），再导入�
     '时间步长应保持 60s',
   );
 });
+
+test('列表支持 from/to 精确时间区间（报告页日期汇总下钻用）', async () => {
+  const u = await login('m2-user-a');
+  const uid = u.user.id;
+  const DAY = 86400000;
+  const base = Date.now() - 10 * DAY;
+  const mk = (t: number, d: number) =>
+    ActivityModel.create({
+      userId: uid,
+      type: 'walking',
+      status: 'finished',
+      startTime: t,
+      endTime: t + 60000,
+      duration: 60,
+      distance: d,
+      trackPoints: [],
+      markers: [],
+    });
+  const a1 = await mk(base, 1000);
+  const a2 = await mk(base + 2 * DAY, 2000);
+  const a3 = await mk(base + 5 * DAY, 3000); // 区间之外
+
+  const from = base - 1;
+  const to = base + 3 * DAY;
+  const res = await req('GET', `/sport-track/api/activities?from=${from}&to=${to}&pageSize=100`, {
+    token: tokenA,
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const data = res.json().data;
+  const ids = data.items.map((i: { _id: string }) => String(i._id));
+  assert.ok(ids.includes(String(a1._id)), '区间内的第一条应命中');
+  assert.ok(ids.includes(String(a2._id)), '区间内的第二条应命中');
+  assert.ok(!ids.includes(String(a3._id)), '区间外的不应出现');
+  assert.equal(data.total, 2, 'total 也按区间过滤');
+
+  const bad = await req('GET', '/sport-track/api/activities?from=abc', { token: tokenA });
+  assert.equal(bad.statusCode, 400, '非数字 from 应 400');
+
+  await ActivityModel.deleteMany({ _id: { $in: [a1._id, a2._id, a3._id] } });
+});

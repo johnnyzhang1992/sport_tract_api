@@ -167,6 +167,9 @@ export const ListActivitiesQuery = z.object({
     .optional(),
   month: z.string().regex(/^\d{4}-\d{2}$/, 'month 格式应为 YYYY-MM').optional(),
   province: z.string().trim().max(20).optional(), // 按省筛选（轨迹经过的省）
+  // 精确时间区间（epoch ms，左闭右开）：报告页「日期汇总」点行下钻轨迹列表用
+  from: z.coerce.number().int().nonnegative().optional(),
+  to: z.coerce.number().int().nonnegative().optional(),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(20),
 });

@@ -20,6 +20,9 @@ export interface DateSummaryRow {
   distance: number; // 米
   duration: number; // 秒
   calories: number;
+  /** 桶的时间区间 [from, to)（epoch ms，东八区边界）：报告页点行下钻轨迹列表用 */
+  from: number;
+  to: number;
 }
 
 export interface DateSummary {
@@ -65,8 +68,8 @@ async function buildBuckets(
   const now = Date.now();
   const today0 = bjDayStart(now);
   const buckets: Bucket[] = [];
-  const add = (key: string, label: string) =>
-    buckets.push({ key, label, count: 0, distance: 0, duration: 0, calories: 0 });
+  const add = (key: string, label: string, from: number, to: number) =>
+    buckets.push({ key, label, count: 0, distance: 0, duration: 0, calories: 0, from, to });
 
   if (range === 'week') {
     // 自然周；当前周只到今天（未来日期必无数据）
@@ -74,7 +77,7 @@ async function buildBuckets(
     const end = Math.min(to ?? now + DAY, today0 + DAY);
     for (let t = start; t < end; t += DAY) {
       const { y, m, d } = bjParts(t);
-      add(dateKeyOf(y, m, d), `${m}/${d}`);
+      add(dateKeyOf(y, m, d), `${m}/${d}`, t, t + DAY);
     }
     return { title: '按天', label: '日期', buckets, rangeStart: start, rangeEnd: end };
   }
@@ -92,7 +95,7 @@ async function buildBuckets(
         s.y === e.y
           ? `${md(s.m, s.d)}-${md(e.m, e.d)}周`
           : `${s.y}${md(s.m, s.d)}-${e.y}${md(e.m, e.d)}周`;
-      add(String(mon), label);
+      add(String(mon), label, mon, mon + 7 * DAY);
     }
     return { title: '按周', label: '周', buckets, rangeStart: firstMonday, rangeEnd: lastMondayLimit + 7 * DAY };
   }
@@ -104,7 +107,7 @@ async function buildBuckets(
     const last = bjParts(Math.min(lastDay, today0)); // 当前年只到当前月
     for (let m = 1; m <= 12; m++) {
       if (bjMonthStart(y, m) > bjMonthStart(last.y, last.m)) break;
-      add(`${y}-${p2(m)}`, `${m}月`);
+      add(`${y}-${p2(m)}`, `${m}月`, bjMonthStart(y, m), bjMonthStart(y, m + 1));
     }
     const rangeEnd = Math.min(bjMonthStart(y + 1, 1), today0 + DAY);
     return { title: '按月', label: '月份', buckets, rangeStart: bjMonthStart(y, 1), rangeEnd };
@@ -120,7 +123,12 @@ async function buildBuckets(
   const np = bjParts(now);
   const nowHalf = np.m <= 6 ? 1 : 2;
   for (let y = sp.y, h = sp.m <= 6 ? 1 : 2; y < np.y || (y === np.y && h <= nowHalf); ) {
-    add(`${y}-H${h}`, `${y} ${h === 1 ? '上半年' : '下半年'}`);
+    add(
+      `${y}-H${h}`,
+      `${y} ${h === 1 ? '上半年' : '下半年'}`,
+      bjMonthStart(y, h === 1 ? 1 : 7),
+      bjMonthStart(h === 1 ? y : y + 1, h === 1 ? 7 : 1),
+    );
     h += 1;
     if (h > 2) {
       h = 1;

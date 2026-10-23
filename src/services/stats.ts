@@ -3,6 +3,7 @@ import { ActivityModel } from '../models/activity.model.js';
 import { locateRegion } from './region.js';
 import { calcFastestKm, calcPbMarks } from '../utils/pace.js';
 import { calcPerfScore } from '../utils/perf-score.js';
+import { streakDays } from '../utils/campaign-streak.js';
 import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
 import { AppError } from '../utils/app-error.js';
 import {
@@ -17,6 +18,19 @@ import {
 } from '../utils/bj-time.js';
 
 type ObjectIdLike = Types.ObjectId | string;
+
+/** 半马/全马标称距离（米） */
+const HALF_MARATHON_M = 21097.5;
+const FULL_MARATHON_M = 42195;
+/** 配速类运动：里程成绩按「跑步配速下限」判合理性；其余类型（骑行/滑雪等）只挡物理不可能 */
+const PACE_LIKE_TYPES = new Set(['running', 'walking', 'hiking', 'mountaineering']);
+const MIN_ABSOLUTE_MARK_PACE_SEC_PER_KM = 20;
+
+/** 里程成绩是否物理可信：配速类 ≥130s/km（人类极限），其余 ≥20s/km（≈300km/h，只挡脏数据） */
+function plausibleMark(type: string, km: number, sec: number): boolean {
+  const floor = PACE_LIKE_TYPES.has(type) ? MIN_PLAUSIBLE_PACE_SEC_PER_KM : MIN_ABSOLUTE_MARK_PACE_SEC_PER_KM;
+  return sec >= km * floor;
+}
 
 /** 转 ObjectId（aggregate $match 不做类型转换） */
 function toObjectId(id: ObjectIdLike): Types.ObjectId {
@@ -44,6 +58,12 @@ interface Section {
   byStatus: StatusCount[]; // 各状态轨迹数（finished/in_progress/cancelled）
   finishRate: number; // 完成率 %（1 位小数；无轨迹为 0）
   byType: TypeStat[]; // 各运动类型轨迹数/距离/时长（仅 finished，按轨迹数降序）
+  /** 活跃天数：东八区自然日去重（仅累计段下发，避免每档都多跑一次聚合） */
+  activeDays?: number;
+  /** 当前连续运动天数（今天没动从昨天起算，仅累计段） */
+  streakCurrent?: number;
+  /** 历史最长连续运动天数（仅累计段） */
+  streakLongest?: number;
 }
 
 export interface OverviewResult {
@@ -68,7 +88,7 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
   const yearStart = bjYearStart(now);
   const prevMonthStart = bjMonthStart(monthStart - 1); // 东八区上月 1 号 0 点
 
-  const [today, week, month, year, total, prevWeek, prevMonth] = await Promise.all([
+  const [today, week, month, year, total, prevWeek, prevMonth, activeDateRows] = await Promise.all([
     ActivityModel.aggregate([
       { $match: { ...finished, startTime: { $gte: today0 } } },
       ...sumAgg,
@@ -107,7 +127,24 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
       },
       ...sumAgg,
     ]),
+    // 累计活跃日期：按东八区自然日去重（活跃天数 + 连续天数一次聚合算完）
+    ActivityModel.aggregate([
+      { $match: finished },
+      {
+        $group: {
+          _id: {
+            $dateToString: {
+              format: '%Y-%m-%d',
+              date: { $toDate: '$startTime' },
+              timezone: '+08:00',
+            },
+          },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
   ]);
+  const activeDates: string[] = activeDateRows.map((r) => String(r._id));
 
   // 各范围的状态/类型细分（进行中/作废不参与距离/时长口径，仅计数）
   const [exToday, exWeek, exMonth, exYear, exTotal] = await Promise.all(
@@ -119,7 +156,13 @@ export async function overview(userId: ObjectIdLike): Promise<OverviewResult> {
     week: { ...toSection(week), ...exWeek },
     month: { ...toSection(month), ...exMonth },
     year: { ...toSection(year), ...exYear },
-    total: { ...toSection(total), ...exTotal },
+    total: {
+      ...toSection(total),
+      ...exTotal,
+      activeDays: activeDates.length,
+      streakCurrent: streakDays(activeDates, now),
+      streakLongest: longestStreak(activeDates),
+    },
     prevWeek: toSection(prevWeek),
     prevMonth: toSection(prevMonth),
   };
@@ -192,6 +235,23 @@ function toSection(rows: Array<Record<string, any>>): OverviewResult['today'] {
   };
 }
 
+/** 历史最长连续段：dates 为升序 YYYY-MM-DD（东八区自然日），日期差 1 天即连续 */
+function longestStreak(dates: string[]): number {
+  const DAY = 86400000;
+  let best = 0;
+  let run = 0;
+  let prev = NaN;
+  for (const d of dates) {
+    const t = Date.parse(`${d}T00:00:00Z`);
+    if (!Number.isFinite(t)) continue;
+    const day = Math.floor(t / DAY);
+    run = day - prev === 1 ? run + 1 : 1;
+    prev = day;
+    if (run > best) best = run;
+  }
+  return best;
+}
+
 export interface TrendDay {
   date: string; // YYYY-MM-DD
   distance: number;
@@ -214,7 +274,11 @@ export type TrendType = 'week' | 'month' | 'week6' | 'year' | 'daily365';
  * - year：近 12 个月按月（12 条）
  * - daily365：近 365 天按天（日历热力图用）
  */
-export async function trend(userId: ObjectIdLike, type: TrendType): Promise<TrendResult> {
+export async function trend(
+  userId: ObjectIdLike,
+  type: TrendType,
+  activityType?: string,
+): Promise<TrendResult> {
   const now = Date.now();
   const DAY = 86400000;
   // 注意：activity.startTime 是 Number 时间戳，start 必须也是数字（Date 对象会导致 $gte 类型不匹配）
@@ -231,6 +295,7 @@ export async function trend(userId: ObjectIdLike, type: TrendType): Promise<Tren
         userId: toObjectId(userId),
         status: 'finished',
         startTime: { $gte: start },
+        ...(activityType ? { type: activityType } : {}),
       },
     },
     {
@@ -347,7 +412,7 @@ export async function bestRecords(userId: ObjectIdLike) {
       },
       { $group: { _id: '$type', doc: { $first: '$$ROOT' } } },
     ]);
-  const [distRows, paceRows, durRows, elevRows, perfRows, markRows] = await Promise.all([
+  const [distRows, paceRows, durRows, elevRows, perfRows, markRows, longRows] = await Promise.all([
     byTypeAgg('distance', -1),
     byTypeAgg('fastestKm', 1, { fastestKm: { $gt: MIN_PLAUSIBLE_PACE_SEC_PER_KM } }),
     byTypeAgg('duration', -1),
@@ -361,6 +426,15 @@ export async function bestRecords(userId: ObjectIdLike) {
       { $project: { type: 1, startTime: 1, km: '$pbMarks.km', sec: '$pbMarks.sec' } },
       { $sort: { type: 1, km: 1, startTime: 1, sec: 1 } },
     ]),
+    // 半马/全马奖杯原料：距离达标的轨迹（疑似乘车段的不算）
+    ActivityModel.find({
+      ...base,
+      distance: { $gte: HALF_MARATHON_M },
+      trackKind: { $ne: 'planned' },
+      vehicleMs: { $not: { $gt: 0 } },
+    })
+      .select('_id type startTime distance duration')
+      .lean(),
   ]);
   // 个人最佳按类型分组：各运动类型分别取最佳（不同类型绝对值/配速均不可比）
   type BestRow = { type: string; [k: string]: any };
@@ -386,6 +460,8 @@ export async function bestRecords(userId: ObjectIdLike) {
   const bestSoFar = new Map<string, ChainRow>();
   const chain: ChainRow[] = [];
   for (const r of markRows) {
+    // 脏数据（导入的假时间戳等）会造出「5km 用时 70s」这类纪录：不参与保持者链重放
+    if (!plausibleMark(r.type, r.km, r.sec)) continue;
     const key = `${r.type}:${r.km}`;
     const prev = bestSoFar.get(key);
     if (prev && r.sec >= prev.sec) continue;
@@ -410,18 +486,101 @@ export async function bestRecords(userId: ObjectIdLike) {
   }
   chain.sort((a, b) => (a.type === b.type ? a.km - b.km : a.type < b.type ? -1 : 1));
 
+  const maxDistanceByType = mapByType(distRows, 'distance', -1);
+  const minPaceByType = mapByType(paceRows, 'fastestKm', 1); // 配速升序=最快
+  const maxDurationByType = mapByType(durRows, 'duration', -1);
+  const maxElevationByType = mapByType(elevRows, 'elevationGain', -1);
+  const maxPerfScoreByType = mapByType(perfRows, 'perfScore', -1); // 最高表现分（按类型）
+
+  // 里程碑奖杯（统计页奖杯墙）：1K 取全局最快 1km 分段；5K/10K 取里程碑当前纪录；
+  // 半马/全马取「距离达标轨迹」中最短一条的整条用时（含途中停留，不做外推）
+  type Milestone = {
+    key: string;
+    label: string;
+    km: number;
+    id: string;
+    type: string;
+    sec: number;
+    startTime: number;
+  };
+  const milestones: Milestone[] = [];
+  const addMilestone = (
+    key: string,
+    label: string,
+    km: number,
+    row: { id?: unknown; _id?: unknown; type?: unknown; sec?: unknown; startTime?: unknown } | undefined,
+  ) => {
+    if (!row) return;
+    milestones.push({
+      key,
+      label,
+      km,
+      id: String(row.id ?? row._id),
+      type: String(row.type),
+      sec: Number(row.sec),
+      startTime: Number(row.startTime),
+    });
+  };
+  const fastest1k = minPaceByType[0];
+  if (fastest1k) addMilestone('1k', '1K', 1, { ...fastest1k, sec: fastest1k.fastestKm });
+  const currentAt = (km: number) =>
+    chain.filter((r) => r.isCurrent && r.km === km).sort((a, b) => a.sec - b.sec)[0];
+  addMilestone('5k', '5K', 5, currentAt(5));
+  addMilestone('10k', '10K', 10, currentAt(10));
+  const shortestOver = (minM: number) =>
+    longRows
+      .filter((r) => Number(r.distance ?? 0) >= minM)
+      // 整条轨迹用时同样要过物理校验（距离 km × 该类型配速下限）
+      .filter((r) => {
+        const km = Number(r.distance ?? 0) / 1000;
+        const floor = PACE_LIKE_TYPES.has(String(r.type))
+          ? MIN_PLAUSIBLE_PACE_SEC_PER_KM
+          : MIN_ABSOLUTE_MARK_PACE_SEC_PER_KM;
+        return Number(r.duration ?? 0) >= km * floor;
+      })
+      .sort((a, b) => Number(a.duration ?? 0) - Number(b.duration ?? 0))[0];
+  const half = shortestOver(HALF_MARATHON_M);
+  if (half) addMilestone('half', '半马', 21.0975, { id: half._id, type: half.type, sec: half.duration, startTime: half.startTime });
+  const full = shortestOver(FULL_MARATHON_M);
+  if (full) addMilestone('full', '全马', 42.195, { id: full._id, type: full.type, sec: full.duration, startTime: full.startTime });
+
   return {
-    maxDistanceByType: mapByType(distRows, 'distance', -1),
-    minPaceByType: mapByType(paceRows, 'fastestKm', 1), // 配速升序=最快
-    maxDurationByType: mapByType(durRows, 'duration', -1),
-    maxElevationByType: mapByType(elevRows, 'elevationGain', -1),
-    maxPerfScoreByType: mapByType(perfRows, 'perfScore', -1), // 最高表现分（按类型）
+    maxDistanceByType,
+    minPaceByType,
+    maxDurationByType,
+    maxElevationByType,
+    maxPerfScoreByType,
     // 距离里程碑当前纪录（口径与旧版一致：每 类型+公里 全局最快一条）
     fastestDistanceByKm: chain
       .filter((r) => r.isCurrent)
       .map(({ type, km, id, sec, startTime }) => ({ type, km, id, sec, startTime })),
     // 距离里程碑保持者链（含已被刷新的前纪录，列表/详情徽章「曾保持」用）
     distancePbChain: chain,
+    milestones,
+  };
+}
+
+export interface DistancePercentile {
+  usersTotal: number; // 有 finished 成绩的用户数
+  betterThan: number; // 累计距离严格少于我的用户数
+  percentile: number; // 超越全站百分比（0-100 整数）
+  myDistance: number; // 我的累计距离（米）
+}
+
+/** 平台累计距离分位：一次全站聚合后与本人在 JS 侧比较 */
+export async function distancePercentile(userId: ObjectIdLike): Promise<DistancePercentile> {
+  const rows = await ActivityModel.aggregate<{ _id: Types.ObjectId; distance: number }>([
+    { $match: { status: 'finished' } },
+    { $group: { _id: '$userId', distance: { $sum: '$distance' } } },
+  ]);
+  const mine = rows.find((r) => String(r._id) === String(userId))?.distance ?? 0;
+  const usersTotal = rows.length;
+  const betterThan = rows.filter((r) => r.distance < mine).length;
+  return {
+    usersTotal,
+    betterThan,
+    percentile: usersTotal > 0 ? Math.floor((betterThan / usersTotal) * 100) : 0,
+    myDistance: mine,
   };
 }
 

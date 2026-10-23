@@ -185,3 +185,35 @@ test('GET /overview?dateSummary=1：路由透传日期汇总（集成）', async
 
   await ActivityModel.deleteMany({ userId: new Types.ObjectId(uid) });
 });
+
+test('日期汇总每行带 from/to：轨迹必落在自身桶的区间内', async () => {
+  await ActivityModel.deleteMany({ userId });
+  const at = bj(2024, 8, 7, 9, 0);
+  await seed([{ at, distance: 1000 }]);
+
+  const views: Array<{ range: 'week' | 'month' | 'year'; from: number; to: number }> = [
+    { range: 'week', from: bj(2024, 8, 5), to: bj(2024, 8, 12) },
+    { range: 'month', from: bj(2024, 8, 1), to: bj(2024, 9, 1) },
+    { range: 'year', from: bj(2024, 1, 1), to: bj(2025, 1, 1) },
+  ];
+  for (const v of views) {
+    const ds = await buildDateSummary(String(userId), v.range, { from: v.from, to: v.to });
+    assert.ok(ds.rows.length > 0);
+    for (const r of ds.rows) {
+      assert.equal(typeof r.from, 'number', `${v.range} ${r.label} 缺 from`);
+      assert.equal(typeof r.to, 'number', `${v.range} ${r.label} 缺 to`);
+      assert.ok((r.to as number) > (r.from as number), `${v.range} ${r.label} 区间非法`);
+    }
+    const hit = ds.rows.find((r) => r.count > 0);
+    assert.ok(hit, `${v.range} 应有命中桶`);
+    assert.ok((hit!.from as number) <= at && at < (hit!.to as number), `${v.range}：轨迹应落在自身桶区间内`);
+  }
+
+  // 「全部」按半年分桶，同样要带区间
+  const all = await buildDateSummary(String(userId), 'all');
+  for (const r of all.rows) {
+    assert.ok((r.to as number) > (r.from as number), `all ${r.label} 区间非法`);
+  }
+  const hitAll = all.rows.find((r) => r.count > 0);
+  assert.ok(hitAll && (hitAll.from as number) <= at && at < (hitAll.to as number));
+});
