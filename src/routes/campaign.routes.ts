@@ -14,6 +14,7 @@ import {
   joinCampaign,
   leaveCampaign,
   campaignLeaderboard,
+  campaignTrend,
   memberDetail,
   listPending,
   approveMember,
@@ -33,6 +34,18 @@ const TargetSchema = z.object({ userId: z.string().regex(/^[a-f\d]{24}$/i, '成�
 const PageQuery = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(20),
+});
+
+/** 排行榜额外支持排序指标与运动类型筛选 */
+const LeaderboardQuery = PageQuery.extend({
+  metric: z.enum(['distance', 'count', 'duration']).optional(),
+  type: z.string().min(1).max(32).optional(),
+});
+
+const TrendQuery = z.object({
+  type: z.string().min(1).max(32).optional(),
+  /** 分档：缺省按人（前三名 + 我），type＝全队按运动类型分线 */
+  by: z.enum(['person', 'type']).default('person'),
 });
 
 /**
@@ -102,8 +115,14 @@ export async function campaignRoutes(fastify: FastifyInstance) {
 
   fastify.get('/:id/leaderboard', auth, async (request) => {
     const { id } = request.params as { id: string };
-    const query = PageQuery.parse(request.query);
+    const query = LeaderboardQuery.parse(request.query);
     return success(await campaignLeaderboard(id, request.user.userId, query));
+  });
+
+  fastify.get('/:id/trend', auth, async (request) => {
+    const { id } = request.params as { id: string };
+    const query = TrendQuery.parse(request.query);
+    return success(await campaignTrend(id, request.user.userId, query));
   });
 
   fastify.get('/:id/members/:uid', auth, async (request) => {

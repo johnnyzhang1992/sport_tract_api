@@ -20,6 +20,7 @@ import {
   listCampaigns,
   effectiveStatus,
   assertTextAllowed,
+  updateCampaign,
 } from '../src/services/campaign.js';
 import type { CampaignDoc } from '../src/services/campaign-stats.js';
 import type { CreateCampaignInput } from '../src/utils/validators.js';
@@ -168,7 +169,17 @@ test('CC3 详情按身份裁剪：非成员看不到成员列表与汇总', asyn
   assert.ok(asCreator.totals);
   assert.equal(asCreator.canJoin, false); // 已在队 → 不能再加入
   assert.deepEqual(asCreator.totals, { count: 0, distance: 0, duration: 0 });
-  assert.deepEqual(asCreator.myPanel, { count: 0, distance: 0, duration: 0, streak: 0 });
+  assert.deepEqual(asCreator.myPanel, {
+    count: 0,
+    distance: 0,
+    duration: 0,
+    streak: 0,
+    rank: 1,
+    members: 1,
+    gapToLeader: 0,
+    gapToPrev: 0,
+    share: 0,
+  });
   const me = asCreator.members?.find((m) => m.userId === String(userId));
   assert.ok(me, '成员列表应含发起人');
   assert.equal(me.role, 'creator');
@@ -337,4 +348,46 @@ test('CC6 effectiveStatus：到期即 ended（不写库），dissolved 优先于
   const dissolved = (await CampaignModel.findById(dto.id).lean()) as unknown as CampaignDoc;
   assert.equal(effectiveStatus(dissolved, dto.endAt - 1), 'dissolved');
   assert.equal((await getCampaignDetail(dto.id, String(userId))).status, 'dissolved');
+});
+
+test('CC18 活动最长 365 天：365 天放行、366 天 400，提示带实际跨度', async () => {
+  // 含首尾数天数：2026-01-01 ~ 2026-12-31 正好 365 天（闰年）
+  const ok = await create(String(userId), {
+    ...base, title: '整整一年', startDate: '2026-01-01', endDate: '2026-12-31',
+  });
+  assert.ok(ok.id, '365 天不该被拦');
+
+  await assert.rejects(
+    () =>
+      create(String(userId), {
+        ...base, title: '超一天', startDate: '2026-01-01', endDate: '2027-01-01',
+      }),
+    (e: any) => {
+      assert.equal(e.statusCode, 400, e.message);
+      assert.match(e.message, /365/, '要说清上限');
+      assert.match(e.message, /366/, '要报出实际跨了多少天');
+      assert.match(e.message, /2026-01-01/, '要点名收到的开始日期');
+      assert.match(e.message, /2027-01-01/, '要点名收到的结束日期');
+      return true;
+    },
+  );
+});
+
+test('CC19 编辑把结束日期改到超一年 → 400（开始日期不在请求里，判据取库里那个）', async () => {
+  const start = bjDateAfter(0);
+  const dto = await create(String(userId), {
+    ...base, title: '先建四个月', startDate: start, endDate: bjDateAfter(120),
+  });
+  await assert.rejects(
+    () => updateCampaign(dto.id, String(userId), { endDate: bjDateAfter(400) }),
+    (e: any) => {
+      assert.equal(e.statusCode, 400, e.message);
+      assert.match(e.message, /365/);
+      assert.match(e.message, new RegExp(start.replace(/-/g, '\\-')), '开始日期是库里的，提示要把它点名出来');
+      return true;
+    },
+  );
+  // 收回到含首尾正好 365 天，照常放行
+  const back = await updateCampaign(dto.id, String(userId), { endDate: bjDateAfter(364) });
+  assert.equal(back.endDate, bjDateAfter(364));
 });

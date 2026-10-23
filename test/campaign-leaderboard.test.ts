@@ -18,7 +18,7 @@ import { UserModel } from '../src/models/user.model.js';
 import { CampaignModel } from '../src/models/campaign.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
-import { createCampaign, joinCampaign, leaveCampaign, campaignLeaderboard, memberDetail } from '../src/services/campaign.js';
+import { createCampaign, joinCampaign, leaveCampaign, campaignLeaderboard, memberDetail, getCampaignDetail, campaignTrend } from '../src/services/campaign.js';
 import type { CreateCampaignInput } from '../src/utils/validators.js';
 
 let app: FastifyInstance;
@@ -379,4 +379,189 @@ test('CL7 每页大小可变：pageSize=10 时第 3 页是第 21..30 名（名�
   const p3 = await campaignLeaderboard(cid, String(U.creator), { page: 3, pageSize: 10 });
   assert.equal(p3.rows.length, 5, '25 人 → 第 3 页只剩 21..25');
   assert.deepEqual(p3.rows.map((r) => r.rank), [21, 22, 23, 24, 25]);
+});
+
+
+/** 共享用户池的轨迹会被后续用例的计入窗口吞进来：新用例开头先清一遍（CL4-7 的专属用户不受影响） */
+async function clearSharedActivities() {
+  await ActivityModel.deleteMany({ userId: { $in: [U.creator, U.a, U.t, U.c, U.left] } });
+}
+
+test('CL8 详情 myPanel 带名次 / 总人数 / 距第一名 / 距上一名 / 全队占比', async () => {
+  await clearSharedActivities();
+  const cid = await mk(String(U.creator), { title: 'CL8' });
+  await joinCampaign(cid, String(U.a));
+  await joinCampaign(cid, String(U.t));
+  const now = Date.now();
+  await seedActivity(U.creator, now + 1000, 'running', { distance: 3000, duration: 1800 });
+  await seedActivity(U.a, now + 1000, 'running', { distance: 4000, duration: 2400 });
+  await seedActivity(U.t, now + 1000, 'running', { distance: 500, duration: 300 });
+
+  const asA = await getCampaignDetail(cid, String(U.a));
+  assert.equal(asA.myPanel?.rank, 1);
+  assert.equal(asA.myPanel?.members, 3);
+  assert.equal(asA.myPanel?.gapToLeader, 0);
+  assert.equal(asA.myPanel?.gapToPrev, 0, '第一名没有上一名');
+  assert.ok(Math.abs((asA.myPanel?.share ?? 0) - 4000 / 7500) < 1e-9, '我的距离 / 全队距离');
+
+  const asCreator = await getCampaignDetail(cid, String(U.creator));
+  assert.equal(asCreator.myPanel?.rank, 2);
+  assert.equal(asCreator.myPanel?.gapToLeader, 1000);
+  assert.equal(asCreator.myPanel?.gapToPrev, 1000, '第 2 名的上一名就是榜首，两个数应当相等');
+
+  // 第 3 名才是两个口径的分水岭：距榜首 3500，但追上上一名（第 2 名）只差 2500
+  const asT = await getCampaignDetail(cid, String(U.t));
+  assert.equal(asT.myPanel?.rank, 3);
+  assert.equal(asT.myPanel?.gapToLeader, 3500);
+  assert.equal(asT.myPanel?.gapToPrev, 2500);
+});
+
+test('CL9 排行支持次数/时长指标，并回 my 名次与差距', async () => {
+  await clearSharedActivities();
+  const cid = await mk(String(U.creator), { title: 'CL9' });
+  await joinCampaign(cid, String(U.a));
+  await joinCampaign(cid, String(U.t));
+  const now = Date.now();
+  // creator 2 次、a 1 次；距离 a 更大、时长 a 更长
+  await seedActivity(U.creator, now + 1000, 'running', { distance: 500, duration: 600 });
+  await seedActivity(U.creator, now + 2000, 'running', { distance: 500, duration: 600 });
+  await seedActivity(U.a, now + 1000, 'running', { distance: 4000, duration: 2400 });
+  await seedActivity(U.t, now + 1000, 'running', { distance: 500, duration: 300 });
+
+  const byDist = await campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20 });
+  assert.equal(byDist.metric, 'distance');
+  assert.equal(byDist.rows[0].userId, String(U.a));
+  assert.equal(byDist.my?.rank, 1);
+
+  const byCount = await campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20, metric: 'count' });
+  assert.equal(byCount.metric, 'count');
+  assert.equal(byCount.rows[0].userId, String(U.creator), '2 次排第一');
+  assert.equal(byCount.my?.rank, 2);
+  assert.equal(byCount.my?.value, 1);
+  assert.equal(byCount.my?.gapToLeader, 1);
+
+  const byDur = await campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20, metric: 'duration' });
+  assert.equal(byDur.rows[0].userId, String(U.a), '2400s 最长');
+  assert.equal(byDur.my?.rank, 1);
+});
+
+test('CL10 类型筛选只统计指定类型；超出活动白名单返回 400', async () => {
+  await clearSharedActivities();
+  const cid = await mk(String(U.creator), { title: 'CL10', allowedTypes: ['running', 'walking'] });
+  await joinCampaign(cid, String(U.a));
+  const now = Date.now();
+  await seedActivity(U.creator, now + 1000, 'running', { distance: 1000 });
+  await seedActivity(U.creator, now + 2000, 'walking', { distance: 5000 });
+  await seedActivity(U.a, now + 1000, 'running', { distance: 3000 });
+
+  const running = await campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20, type: 'running' });
+  assert.equal(running.type, 'running');
+  assert.equal(running.rows[0].userId, String(U.a));
+  assert.equal(running.rows[0].distance, 3000);
+
+  const walking = await campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20, type: 'walking' });
+  assert.equal(walking.rows[0].userId, String(U.creator));
+  assert.equal(walking.rows[0].distance, 5000);
+  assert.equal(walking.my?.value, 0);
+
+  await assert.rejects(
+    () => campaignLeaderboard(cid, String(U.a), { page: 1, pageSize: 20, type: 'cycling' }),
+    (e: any) => e.statusCode === 400,
+    '白名单外的类型不能悄悄查',
+  );
+});
+
+test('CL11 每日累计趋势：返回全员口径的日期桶，me 与前三均在内', async () => {
+  await clearSharedActivities();
+  const cid = await mk(String(U.creator), { title: 'CL11', allowedTypes: ['running', 'walking'] });
+  await joinCampaign(cid, String(U.a));
+  await joinCampaign(cid, String(U.t));
+  const cDoc = (await CampaignModel.findById(cid).lean()) as any;
+  // 把三人的加入时间挪到开赛时，才能造多天轨迹
+  await CampaignMemberModel.updateMany({ campaignId: new mongoose.Types.ObjectId(cid) }, { $set: { joinedAt: cDoc.startAt } });
+  const day = cDoc.startAt + 3600_000;
+  await seedActivity(U.creator, day, 'running', { distance: 1000 });
+  await seedActivity(U.creator, day + DAY, 'walking', { distance: 3000 });
+  await seedActivity(U.a, day, 'running', { distance: 1000 });
+  await seedActivity(U.a, day + DAY, 'running', { distance: 2000 });
+  await seedActivity(U.a, day + 2 * DAY, 'running', { distance: 1000 });
+
+  const trend = await campaignTrend(cid, String(U.a), {});
+  assert.equal(trend.metric, 'distance');
+  assert.ok(trend.labels.length >= 3, '开赛至今至少 3 个日期桶');
+  // X 轴标签的日期分隔符跟 App 其它日期展示同一口径（斜杠），别留 ISO 的横杠
+  assert.ok(
+    trend.labels.every((l: string) => /^\d{2}\/\d{2}$/.test(l)),
+    `标签应为 MM/DD，实际 ${JSON.stringify(trend.labels.slice(0, 3))}`,
+  );
+  assert.equal(trend.series.length, 3, '三名成员都在');
+  const mine = trend.series.find((s: any) => s.userId === String(U.a));
+  assert.ok(mine && mine.isMe, '本人系列要标记 isMe');
+  assert.equal(mine.values[mine.values.length - 1], 4000, '累计距离 4km');
+  assert.deepEqual(mine.values.slice(-3), [3000, 4000, 4000], '按日累计');
+
+  const walking = await campaignTrend(cid, String(U.a), { type: 'walking' });
+  const creator = walking.series.find((s: any) => s.userId === String(U.creator));
+  assert.ok(creator, '类型筛选后 creator 仍在系列里');
+  assert.equal(creator!.values[creator!.values.length - 1], 3000, '只看散步：creator 3km');
+  const mineWalking = walking.series.find((s: any) => s.userId === String(U.a));
+  assert.ok(mineWalking, '本人系列恒在');
+  assert.equal(mineWalking!.values[mineWalking!.values.length - 1], 0);
+});
+
+test('CL12 by=type：一条线＝一个运动类型，全队口径且与汇总卡同源', async () => {
+  await clearSharedActivities();
+  const cid = await mk(String(U.creator), { title: 'CL12', allowedTypes: ['running', 'walking', 'cycling'] });
+  await joinCampaign(cid, String(U.a));
+  await joinCampaign(cid, String(U.t));
+  await joinCampaign(cid, String(U.c));
+  const cDoc = (await CampaignModel.findById(cid).lean()) as any;
+  // creator / t / c 从开赛就在队；a 晚两天才加入——他加入前那 9km 不该进任何类型线
+  await CampaignMemberModel.updateMany({ campaignId: new mongoose.Types.ObjectId(cid) }, { $set: { joinedAt: cDoc.startAt } });
+  await CampaignMemberModel.updateOne(
+    { campaignId: new mongoose.Types.ObjectId(cid), userId: U.a },
+    { $set: { joinedAt: cDoc.startAt + 2 * DAY } },
+  );
+  const day = cDoc.startAt + 3600_000;
+  await seedActivity(U.creator, day, 'running', { distance: 1000 });
+  await seedActivity(U.creator, day + DAY, 'walking', { distance: 3000 });
+  await seedActivity(U.a, day, 'running', { distance: 9000 });
+  await seedActivity(U.a, day + 2 * DAY, 'cycling', { distance: 2000 });
+  await seedActivity(U.t, day + 2 * DAY, 'running', { distance: 500 });
+  // c 故意排第 4：按人档只画前三 + 我，画不到他；按类型档必须把他算进骑行线
+  await seedActivity(U.c, day + 2 * DAY, 'cycling', { distance: 100 });
+
+  const byType = await campaignTrend(cid, String(U.a), { by: 'type' });
+  assert.equal(byType.by, 'type');
+  assert.deepEqual(
+    byType.series.map((s: any) => s.type).sort(),
+    ['cycling', 'running', 'walking'],
+    '只出有数据的三类；a 加入前的 9km 不计入任何类型',
+  );
+  const last = (t: string) => {
+    const s = byType.series.find((x: any) => x.type === t)!;
+    return s.values[s.values.length - 1];
+  };
+  assert.equal(last('running'), 1500, '跑步＝creator 1000 + t 500（a 的 9000 在加入前）');
+  assert.equal(last('walking'), 3000);
+  assert.equal(last('cycling'), 2100, '骑行线吃全队：第 4 名 c 的 100m 也要在里面');
+  assert.ok(byType.series.every((s: any) => !s.isMe), '按类型档没有「我」这条线');
+  assert.ok(byType.series.every((s: any) => s.userId === undefined), '按类型档不下发 userId');
+
+  // 各条线终点相加＝「全队汇总」卡的距离：两处同源，不会分叉
+  const detail = await getCampaignDetail(cid, String(U.a));
+  const sum = byType.series.reduce((acc: number, s: any) => acc + s.values[s.values.length - 1], 0);
+  assert.equal(sum, detail.totals!.distance, '分类型累计之和要等于全队运动距离');
+
+  // 按类型档照吃类型 chip：只看骑行就只有一条线，且仍是全队口径
+  const onlyCycling = await campaignTrend(cid, String(U.a), { by: 'type', type: 'cycling' });
+  assert.deepEqual(onlyCycling.series.map((s: any) => s.type), ['cycling']);
+  assert.equal(onlyCycling.series[0].values[onlyCycling.series[0].values.length - 1], 2100);
+
+  // 缺省档＝按人，与今天完全一致：系列带 userId、不带 type，且只有前三 + 我（画不到第 4 名 c）
+  const byPerson = await campaignTrend(cid, String(U.a), {});
+  assert.equal(byPerson.by, 'person');
+  assert.ok(byPerson.series.every((s: any) => s.userId && s.type === undefined), '按人档形状不变');
+  assert.equal(byPerson.series.length, 3, '按人档＝前三 + 我，不铺全队');
+  assert.ok(!byPerson.series.some((s: any) => s.userId === String(U.c)), '第 4 名不在按人档里');
 });

@@ -19,6 +19,8 @@ import {
   streakForUser,
   memberActivityMatch,
   typeSummaryForMembers,
+  dailyDistanceForMembers,
+  dailyDistanceByType,
   type CampaignDoc,
   type MemberStats,
 } from './campaign-stats.js';
@@ -28,6 +30,7 @@ import { bjDateStr, bjDayStart, bjToday0 } from '../utils/bj-time.js';
 import { config } from '../config/index.js';
 import { checkText } from './wechat-sec.js';
 import { AppError } from '../utils/app-error.js';
+import { ACTIVITY_TYPES } from '../config/constants.js';
 import type { CreateCampaignInput, ListCampaignQueryInput, UpdateCampaignInput } from '../utils/validators.js';
 
 const DAY_MS = 86400000;
@@ -78,7 +81,19 @@ export interface CampaignDetailDto {
   /** 以下仅「成员」分支下发 */
   totals?: MemberStats;
   members?: MemberRow[];
-  myPanel?: MemberStats & { streak: number };
+  myPanel?: MemberStats & {
+    streak: number;
+    /** 我的距离名次（1 起；并列按加入时间） */
+    rank: number;
+    /** 当前 joined 成员数 */
+    members: number;
+    /** 距第一名还差多少米 */
+    gapToLeader: number;
+    /** 距上一名还差多少米（第一名没有上一名，给 0；比距榜首更贴近「再追一点就能升一名」） */
+    gapToPrev: number;
+    /** 我的距离占全队累计距离的比例（0-1） */
+    share: number;
+  };
 }
 
 /**
@@ -147,6 +162,30 @@ async function assertCanCreate(creatorId: mongoose.Types.ObjectId): Promise<void
 }
 
 /** 建活动：发起人自动成为 joined 成员；日期按东八区日边界落库（endDate 含当日 → 左闭右开） */
+/**
+ * 活动最长跨度（含首尾的日历日）。
+ * 一年以上的「组队运动」没有意义；这条也给趋势图的桶数封了顶（366 天 → 53 个周桶），
+ * X 轴标签的排字才有确定上限。
+ */
+const MAX_CAMPAIGN_SPAN_DAYS = 365;
+
+/**
+ * 跨度闸门，创建与编辑共用。
+ * 放在 service 而不是 schema：编辑请求里**没有** startDate（改开始日会让已计入的轨迹洗牌，
+ * 故意禁掉），判据只能用库里那个 `c.startAt`，schema 看不见它。
+ * endAt 是「结束日 24:00」的左闭右开值，所以两数之差就是含首尾的天数。
+ */
+function assertCampaignSpan(startAt: number, endAt: number): void {
+  const span = Math.round((endAt - startAt) / DAY_MS);
+  if (span > MAX_CAMPAIGN_SPAN_DAYS) {
+    // 提示要能照着改：对象 + 实际值 + 上限（全站惯例）
+    throw new AppError(
+      400,
+      `活动最长 ${MAX_CAMPAIGN_SPAN_DAYS} 天：${bjDateStr(startAt)} ~ ${bjDateStr(endAt - 1)} 跨 ${span} 天`,
+    );
+  }
+}
+
 export async function createCampaign(
   creatorId: string,
   input: CreateCampaignInput,
@@ -157,6 +196,7 @@ export async function createCampaign(
   await assertCanCreate(ocid);
   const startAt = bjDayStart(Date.parse(`${input.startDate}T00:00:00+08:00`));
   const endAt = bjDayStart(Date.parse(`${input.endDate}T00:00:00+08:00`)) + DAY_MS;
+  assertCampaignSpan(startAt, endAt);
 
   // 标题/描述是会被他人看到的自由文本，先过内容安全（未配置时内部降级放行）。
   // msgSecCheck 需要真实 openid，照 user.routes.ts:41-44 的既有做法先取出来传进去；
@@ -239,6 +279,8 @@ export async function updateCampaign(
         `结束日期不能早于开始日期（收到 ${input.endDate}，开始日期是 ${bjDateStr(c.startAt)}）`,
       );
     }
+    // 同一条跨度上限：不然「建的时候拦住、编辑绕过去」就形同没有
+    assertCampaignSpan(c.startAt, endAt);
     set.endAt = endAt;
   }
   if (input.memberLimit !== undefined && input.memberLimit !== null) {
@@ -360,7 +402,7 @@ export async function listCampaigns(
   // 所有卡片的前三 uid 一次批量取头像（私有桶，链接必须签名 —— 与详情/待审批/排行榜同口径）
   const avatarUids = [...new Set(cards.flatMap((x) => x.topUids))];
   const users = await UserModel.find({ _id: { $in: avatarUids } })
-    .select('avatarUrl avatarPreset')
+    .select('avatarUrl avatarPreset nickname')
     .lean();
   const uMap = new Map(users.map((u) => [String(u._id), u]));
 
@@ -374,6 +416,8 @@ export async function listCampaigns(
         return {
           avatarUrl: u?.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
           avatarPreset: u?.avatarPreset || '',
+          // 端上两级兜底都落空时拿首字画占位圆，所以昵称必须跟着行下来
+          nickname: u?.nickname || '',
         };
       }),
     ),
@@ -390,6 +434,17 @@ function byDistanceThenJoin(
   b: { distance: number; joinedAt: number | null },
 ): number {
   return b.distance - a.distance || (a.joinedAt ?? 0) - (b.joinedAt ?? 0);
+}
+
+/** 类型筛选：必须是合法运动类型，且落在活动白名单内（白名单为空 = 不限） */
+function assertCampaignType(c: CampaignDoc, type?: string) {
+  if (!type) return;
+  if (!(ACTIVITY_TYPES as readonly string[]).includes(type)) {
+    throw new AppError(400, '运动类型不合法');
+  }
+  if (c.allowedTypes.length > 0 && !c.allowedTypes.includes(type as never)) {
+    throw new AppError(400, '该运动类型不在活动范围内');
+  }
 }
 
 /** 列表卡片的成员面：joined 计数 + 每个活动的 joined 成员（uid + 加入时间，供排行榜口径排序） */
@@ -425,7 +480,7 @@ function cardDto(
   c: CampaignDoc,
   myStats: MemberStats,
   memberCount: number,
-  memberAvatars: { avatarUrl: string; avatarPreset: string }[],
+  memberAvatars: { avatarUrl: string; avatarPreset: string; nickname: string }[],
 ) {
   return {
     id: String(c._id),
@@ -514,10 +569,29 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
     }),
     emptyStats(),
   );
-  // 底部悬浮面板（仅本人）：次数 / 连续运动天数 / 距离 / 时长
+  // 底部悬浮面板（仅本人）：次数 / 连续运动天数 / 距离 / 时长 + 我的位置（距离口径）
   const myStats = stats.get(viewerId) ?? emptyStats();
   const streak = await streakForUser(c, segs.get(viewerId) ?? [], viewerId);
-  return { ...base, canJoin, totals, members: memberList, myPanel: { ...myStats, streak } };
+  const ranked = [...memberList].sort(byDistanceThenJoin);
+  const myIdx = ranked.findIndex((m) => m.userId === viewerId);
+  const leaderDistance = ranked[0]?.distance ?? 0;
+  // 上一名＝排在我前面的那一位；我第一（或查不到自己）时没有上一名，给 0 与 gapToLeader 同口径
+  const prevDistance = myIdx > 0 ? ranked[myIdx - 1].distance : myStats.distance;
+  return {
+    ...base,
+    canJoin,
+    totals,
+    members: memberList,
+    myPanel: {
+      ...myStats,
+      streak,
+      rank: myIdx >= 0 ? myIdx + 1 : ranked.length,
+      members: ranked.length,
+      gapToLeader: Math.max(0, leaderDistance - myStats.distance),
+      gapToPrev: Math.max(0, prevDistance - myStats.distance),
+      share: totals.distance > 0 ? myStats.distance / totals.distance : 0,
+    },
+  };
 }
 
 /** joined + pending 占用数（隐私活动的申请也占位，决策 §2-6） */
@@ -748,6 +822,18 @@ export interface LeaderRow {
   distance: number;
   count: number;
   duration: number;
+  /** 当前排序指标的值（距离米 / 次数 / 时长秒） */
+  value: number;
+}
+
+export type LeaderMetric = 'distance' | 'count' | 'duration';
+
+export interface LeaderboardMy {
+  rank: number;
+  value: number;
+  total: number;
+  leaderValue: number;
+  gapToLeader: number;
 }
 
 /** 成员明细里的一条轨迹（概况之外的逐条列表；字段刻意精简，够弹窗列表渲染即可） */
@@ -772,24 +858,39 @@ export interface CampaignTrackDto {
 export async function campaignLeaderboard(
   id: string,
   viewerId: string,
-  query: { page: number; pageSize: number },
-): Promise<{ rows: LeaderRow[]; total: number; page: number; pageSize: number }> {
+  query: { page: number; pageSize: number; metric?: LeaderMetric; type?: string },
+): Promise<{
+  rows: LeaderRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+  metric: LeaderMetric;
+  type: string;
+  my: LeaderboardMy;
+}> {
   const c = await loadCampaignOr404(id);
   await assertJoinedMember(c._id, viewerId, '只有活动成员可以查看排行榜');
+  assertCampaignType(c, query.type);
+  const metric: LeaderMetric = query.metric ?? 'distance';
 
   const members = await CampaignMemberModel.find({ campaignId: c._id, state: 'joined' })
     .select('userId joinedAt')
     .lean();
   const uids = members.map((m) => String(m.userId));
-  const stats = await statsForMembers(c, await loadSegments(String(c._id)), uids);
+  const stats = await statsForMembers(c, await loadSegments(String(c._id)), uids, query.type);
+  const valueOf = (s: MemberStats) =>
+    metric === 'count' ? s.count : metric === 'duration' ? s.duration : s.distance;
 
-  // 与列表卡片头像同一条排序（byDistanceThenJoin）：两处「前三」必须一致
+  // 指标优先，平手退回距离→加入时间（列表卡片头像的同一条排序）
   const ranked = [...members].sort((x, y) => {
     const xs = stats.get(String(x.userId))!;
     const ys = stats.get(String(y.userId))!;
-    return byDistanceThenJoin(
-      { distance: xs.distance, joinedAt: x.joinedAt ?? null },
-      { distance: ys.distance, joinedAt: y.joinedAt ?? null },
+    return (
+      valueOf(ys) - valueOf(xs) ||
+      byDistanceThenJoin(
+        { distance: xs.distance, joinedAt: x.joinedAt ?? null },
+        { distance: ys.distance, joinedAt: y.joinedAt ?? null },
+      )
     );
   });
 
@@ -801,6 +902,12 @@ export async function campaignLeaderboard(
     .select('nickname avatarUrl avatarPreset')
     .lean();
   const uMap = new Map(users.map((u) => [String(u._id), u]));
+
+  const myIdx = ranked.findIndex((m) => String(m.userId) === viewerId);
+  const myStats = stats.get(viewerId) ?? emptyStats();
+  const leaderStats = ranked.length > 0 ? stats.get(String(ranked[0].userId)) ?? emptyStats() : emptyStats();
+  const myValue = valueOf(myStats);
+  const leaderValue = valueOf(leaderStats);
 
   return {
     // rank 用全局下标（from + j），不是页内下标：端上「加载更多」是往同一个列表后面追加的，
@@ -818,12 +925,153 @@ export async function campaignLeaderboard(
         distance: s.distance,
         count: s.count,
         duration: s.duration,
+        value: valueOf(s),
       };
     }),
     total,
     page: query.page,
     pageSize: query.pageSize,
+    metric,
+    type: query.type || '',
+    my: {
+      rank: myIdx >= 0 ? myIdx + 1 : total,
+      value: myValue,
+      total,
+      leaderValue,
+      gapToLeader: Math.max(0, leaderValue - myValue),
+    },
   };
+}
+
+/** 逐桶距离 → 累计距离（趋势图两档共用；返回新数组） */
+function cumsum(values: number[]): number[] {
+  let sum = 0;
+  return values.map((v) => (sum += v));
+}
+
+/** 趋势图一条线：按人档＝一个成员（`userId` + 昵称）；按类型档＝一个运动类型（`type`） */
+export interface TrendSeries {
+  userId?: string;
+  /** 按类型档的类型 key；中文名走端上 TYPE_LABEL，服务端不再另存一份文案 */
+  type?: string;
+  name?: string;
+  isMe: boolean;
+  /** 累计距离（米） */
+  values: number[];
+}
+
+export interface CampaignTrendDto {
+  metric: 'distance';
+  /** 分档：person＝前三名 + 我（缺省，老端形状不变）；type＝全队每个运动类型一条线 */
+  by: 'person' | 'type';
+  /** 日期桶粒度：跨度 ≤31 天按日，否则按周（周桶标签＝该周首日） */
+  bucket: 'day' | 'week';
+  /** MM-DD */
+  labels: string[];
+  series: TrendSeries[];
+}
+
+/**
+ * 活动内每日累计距离趋势，两档共用同一条时间轴与同一套计入判据：
+ * - `by=person`：前三名 + 我（已在前三时不重复）。排名用**当前 type 筛选后**的距离，
+ *   保证「趋势里的前三」就是图表指标下的前三。
+ * - `by=type`：全队（所有 joined 成员）按运动类型分线，一条线＝一类。
+ *
+ * 两档的逐日距离都出自 campaign-stats 里同一组零件（贡献时段并集 + `baseMatch` + 东八日表达式），
+ * 所以「各类型线终点相加」必然等于「全队汇总」的运动距离，两处不会分叉。
+ * 时间轴从开赛日到今天（或结束日）止；未开赛没有桶，端上据此收起图表。
+ */
+export async function campaignTrend(
+  id: string,
+  viewerId: string,
+  query: { type?: string; by?: 'person' | 'type' },
+): Promise<CampaignTrendDto> {
+  const c = await loadCampaignOr404(id);
+  await assertJoinedMember(c._id, viewerId, '只有活动成员可以查看趋势');
+  assertCampaignType(c, query.type);
+
+  const segs = await loadSegments(String(c._id));
+  const members = await CampaignMemberModel.find({ campaignId: c._id, state: 'joined' })
+    .select('userId joinedAt')
+    .lean();
+  const uids = members.map((m) => String(m.userId));
+  const by = query.by ?? 'person';
+
+  // 东八日桶：开赛日 → min(昨天/今天, 结束日前一日)
+  const from = bjDayStart(c.startAt);
+  const lastMs = Math.min(c.endAt - 1, Date.now());
+  const dayCount = lastMs < from ? 0 : Math.round((bjDayStart(lastMs) - from) / DAY_MS) + 1;
+  const bucket = dayCount > 31 ? 'week' : 'day';
+  const bucketCount = bucket === 'week' ? Math.ceil(dayCount / 7) : dayCount;
+  // 标签给的是「MM/DD」：分隔符跟 App 其它日期展示一致（斜杠），端上原样画在 X 轴上
+  const labels = Array.from({ length: bucketCount }, (_, i) =>
+    bjDateStr(from + i * (bucket === 'week' ? 7 : 1) * DAY_MS).slice(5).replace('-', '/'),
+  );
+  /** 东八日串 → 桶下标；落在时间轴外返回 -1（调用方丢弃） */
+  const bucketOf = (date: string): number => {
+    const dayIdx = Math.round((bjDayStart(Date.parse(`${date}T00:00:00+08:00`)) - from) / DAY_MS);
+    if (dayIdx < 0 || dayIdx >= dayCount) return -1;
+    return bucket === 'week' ? Math.floor(dayIdx / 7) : dayIdx;
+  };
+
+  if (by === 'type') {
+    const acc = new Map<string, number[]>();
+    for (const r of await dailyDistanceByType(c, segs, uids, query.type)) {
+      const b = bucketOf(r.date);
+      if (b < 0) continue;
+      let values = acc.get(r.type);
+      if (!values) {
+        values = labels.map(() => 0);
+        acc.set(r.type, values);
+      }
+      values[b] += r.distance;
+    }
+    const series: TrendSeries[] = [...acc].map(([type, values]) => ({
+      type,
+      isMe: false,
+      values: cumsum(values),
+    }));
+    // 图例按累计距离降序（与全站 chip「按量排序」同一条惯例）；终点值就在最后一格
+    series.sort(
+      (x, y) => (y.values[y.values.length - 1] ?? 0) - (x.values[x.values.length - 1] ?? 0),
+    );
+    return { metric: 'distance', by, bucket, labels, series };
+  }
+
+  const stats = await statsForMembers(c, segs, uids, query.type);
+  const ranked = [...members].sort((x, y) => {
+    const xs = stats.get(String(x.userId)) ?? emptyStats();
+    const ys = stats.get(String(y.userId)) ?? emptyStats();
+    return byDistanceThenJoin(
+      { distance: xs.distance, joinedAt: x.joinedAt ?? null },
+      { distance: ys.distance, joinedAt: y.joinedAt ?? null },
+    );
+  });
+  const picked = ranked.slice(0, 3).map((m) => String(m.userId));
+  if (uids.includes(viewerId) && !picked.includes(viewerId)) picked.push(viewerId);
+
+  const users = await UserModel.find({ _id: { $in: picked } }).select('nickname').lean();
+  const nameMap = new Map(users.map((u) => [String(u._id), u.nickname]));
+  const series: TrendSeries[] = picked.map((uid) => ({
+    userId: uid,
+    name: nameMap.get(uid) || '微信用户',
+    isMe: uid === viewerId,
+    values: labels.map(() => 0),
+  }));
+  if (bucketCount === 0 || picked.length === 0) {
+    return { metric: 'distance', by, bucket, labels, series };
+  }
+
+  const idxByUid = new Map(picked.map((uid, i) => [uid, i]));
+  for (const r of await dailyDistanceForMembers(c, segs, picked, query.type)) {
+    const i = idxByUid.get(r.userId);
+    if (i === undefined) continue;
+    const b = bucketOf(r.date);
+    if (b < 0) continue;
+    series[i].values[b] += r.distance;
+  }
+  for (const s of series) s.values = cumsum(s.values);
+  return { metric: 'distance', by, bucket, labels, series };
 }
 
 /**

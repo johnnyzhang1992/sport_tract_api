@@ -101,6 +101,7 @@ export async function statsForMembers(
   campaign: CampaignDoc,
   segmentsByUser: Map<string, Segment[]>,
   userIds: string[],
+  type?: string,
 ): Promise<Map<string, MemberStats>> {
   const out = new Map<string, MemberStats>();
   for (const uid of userIds) out.set(uid, { ...EMPTY });
@@ -113,7 +114,8 @@ export async function statsForMembers(
   if (or.length === 0) return out;
 
   const rows = await ActivityModel.aggregate([
-    { $match: baseMatch(campaign, { $or: or }) },
+    // type 由调用方按「活动白名单 + 用户筛选」决定；显式覆盖 baseMatch 的 allowedTypes $in
+    { $match: baseMatch(campaign, { ...(type ? { type } : {}), $or: or }) },
     {
       $group: {
         _id: '$userId',
@@ -171,6 +173,103 @@ export async function typeSummaryForMembers(
     count: r.count,
     distance: r.distance,
     duration: r.duration,
+  }));
+}
+
+/** 按「成员 × 东八日」聚合距离（活动内趋势图用） */
+export interface DailyDistanceRow {
+  userId: string;
+  /** 东八区日期串 YYYY-MM-DD */
+  date: string;
+  distance: number;
+}
+
+/** 一批成员在活动内的「贡献时段」并集条件（`$or`）；空数组＝没有任何时段，调用方据此短路 */
+function joinedTimeOr(
+  campaign: CampaignDoc,
+  segmentsByUser: Map<string, Segment[]>,
+  userIds: string[],
+): unknown[] {
+  const or: unknown[] = [];
+  for (const uid of userIds) {
+    const segs = segmentsByUser.get(uid);
+    if (segs && segs.length > 0) or.push(...timeOr(uid, segs, campaign.startAt));
+  }
+  return or;
+}
+
+/** `$dateToString` 的东八区日表达式——两处趋势聚合共用，桶口径写两遍迟早分叉 */
+const BJ_DAY_EXPR = {
+  $dateToString: {
+    format: '%Y-%m-%d',
+    date: { $toDate: '$startTime' },
+    timezone: '+08:00',
+  },
+};
+
+/**
+ * 每日距离：判据与 `statsForMembers` 同源（baseMatch + 各成员窗口并集），
+ * 只把 `$group` 的键从 userId 换成 userId + 东八日。空名单直接返回 []，别把空 `$or` 交给 Mongo。
+ */
+export async function dailyDistanceForMembers(
+  campaign: CampaignDoc,
+  segmentsByUser: Map<string, Segment[]>,
+  userIds: string[],
+  type?: string,
+): Promise<DailyDistanceRow[]> {
+  const or = joinedTimeOr(campaign, segmentsByUser, userIds);
+  if (or.length === 0) return [];
+
+  const rows = await ActivityModel.aggregate([
+    { $match: baseMatch(campaign, { ...(type ? { type } : {}), $or: or }) },
+    {
+      $group: {
+        _id: { uid: '$userId', date: BJ_DAY_EXPR },
+        distance: { $sum: '$distance' },
+      },
+    },
+  ]);
+  return rows.map((r) => ({
+    userId: String(r._id.uid),
+    date: r._id.date,
+    distance: r.distance,
+  }));
+}
+
+/** 按「运动类型 × 东八日」聚合距离（全队分类型趋势图用；类型不再按人切，一条线＝一类） */
+export interface DailyDistanceByTypeRow {
+  type: string;
+  /** 东八区日期串 YYYY-MM-DD */
+  date: string;
+  distance: number;
+}
+
+/**
+ * 与 `dailyDistanceForMembers` 同一条判据链（`joinedTimeOr` + `baseMatch` + `BJ_DAY_EXPR`），
+ * 只换 `$group` 的键，所以「各类型线终点相加」必然等于「全队汇总」的运动距离。
+ */
+export async function dailyDistanceByType(
+  campaign: CampaignDoc,
+  segmentsByUser: Map<string, Segment[]>,
+  userIds: string[],
+  type?: string,
+): Promise<DailyDistanceByTypeRow[]> {
+  const or = joinedTimeOr(campaign, segmentsByUser, userIds);
+  if (or.length === 0) return [];
+
+  const rows = await ActivityModel.aggregate([
+    { $match: baseMatch(campaign, { ...(type ? { type } : {}), $or: or }) },
+    {
+      $group: {
+        _id: { type: '$type', date: BJ_DAY_EXPR },
+        distance: { $sum: '$distance' },
+      },
+    },
+  ]);
+  return rows.map((r) => ({
+    type: String(r._id.type),
+    date: r._id.date,
+    distance: r.distance,
   }));
 }
 

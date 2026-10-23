@@ -178,6 +178,12 @@ test('CM2 都没轨迹（距离全 0）时按 joinedAt 升序兜底：creator �
   expectSigned(card.memberAvatars[2].avatarUrl, av('m2'));
   // 备用头像档位随行下发（端上 avatarUrl 为空时回退 preset 图）
   assert.equal(card.memberAvatars[0].avatarPreset, 'preset-creator');
+  // 昵称也要随行下发：既没头像也没 preset 时，端上要用昵称首字填占位圆（少了它只能画空圈）
+  assert.deepEqual(
+    card.memberAvatars.map((a: any) => a.nickname),
+    ['用户creator', '用户m1', '用户m2'],
+    '头像堆叠带昵称（顺序同 avatarUrl）',
+  );
 });
 
 test('CM4 memberAvatars 按排行榜口径（距离降序）取前 3，不按加入时间', async () => {

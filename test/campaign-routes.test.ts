@@ -285,8 +285,9 @@ test("CR6 创建日期必须真实存在：假日期 → 400（不是 500）", a
   assert.match(badEnd.json().message, /endDate/, `提示应含字段名，实际：${badEnd.json().message}`);
   assert.ok(badEnd.json().message.includes('2099-02-30'), `提示应含实际值，实际：${badEnd.json().message}`);
 
-  // 正常（含闰日）日期仍 200
-  const ok = await mkCampaign(creator.token, { startDate: bjDateAfter(-3), endDate: '2099-01-07' });
+  // 正常（含闰日）日期仍 200。结束日不能再用 2099 远期：活动最长 365 天，
+  // 相对窗口本身就够让它在整个用例期间保持 active
+  const ok = await mkCampaign(creator.token, { startDate: bjDateAfter(-3), endDate: bjDateAfter(3) });
   assert.match(ok, /^[a-f\d]{24}$/i);
 });
 
@@ -403,7 +404,7 @@ test('CR12 编辑成功 → 200 回显新值，GET 详情同步（含 startDate/
   const cid = await mkCampaign(creator.token, { title: '改前标题' });
   const res = await put(
     `/campaigns/${cid}`,
-    { title: '改后标题', endDate: '2099-02-01', visibility: 'private', memberLimit: 8 },
+    { title: '改后标题', endDate: bjDateAfter(20), visibility: 'private', memberLimit: 8 },
     creator.token,
   );
   assert.equal(res.statusCode, 200, res.body);
@@ -414,7 +415,7 @@ test('CR12 编辑成功 → 200 回显新值，GET 详情同步（含 startDate/
   assert.equal(detail.visibility, 'private');
   assert.equal(detail.memberLimit, 8);
   assert.equal(detail.startDate, bjDateAfter(-3));
-  assert.equal(detail.endDate, '2099-02-01');
+  assert.equal(detail.endDate, bjDateAfter(20));
 });
 
 test('CR13 编辑只认发起人：非发起人（含成员）PUT → 403', async () => {
@@ -447,4 +448,19 @@ test('CR14 排行榜分页参数走路由默认：不带 query＝page1/pageSize2
     const bad = await get(`/campaigns/${cid}/leaderboard${q}`, creator.token);
     assert.equal(bad.statusCode, 400, `${q} 应 400，实际 ${bad.statusCode}: ${bad.body}`);
   }
+});
+
+test('CR15 趋势 by 参数：不带＝按人（老端形状不变），by=type 走分类型，非法值 400', async () => {
+  const cid = await mkCampaign(creator.token, { title: '趋势分档' });
+
+  const plain = await get(`/campaigns/${cid}/trend`, creator.token);
+  assert.equal(plain.statusCode, 200, plain.body);
+  assert.equal(plain.json().data.by, 'person', '缺省档要显式回 by，端上据此决定图例形态');
+
+  const byType = await get(`/campaigns/${cid}/trend?by=type`, creator.token);
+  assert.equal(byType.statusCode, 200, byType.body);
+  assert.equal(byType.json().data.by, 'type');
+
+  const bad = await get(`/campaigns/${cid}/trend?by=garbage`, creator.token);
+  assert.equal(bad.statusCode, 400, `by=garbage 应 400，实际 ${bad.statusCode}: ${bad.body}`);
 });
