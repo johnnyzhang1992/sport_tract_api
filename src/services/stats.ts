@@ -257,6 +257,10 @@ export interface TrendDay {
   distance: number;
   duration: number;
   count: number;
+  /** 消耗（统计页「消耗」趋势卡按日均，用 sum 不用均值） */
+  calories: number;
+  /** 静止时长：配速要按 duration - standstillMs 算，否则跨页比详情页偏慢 */
+  standstillMs: number;
 }
 
 export interface TrendResult {
@@ -304,6 +308,8 @@ export async function trend(
         distance: { $sum: '$distance' },
         duration: { $sum: '$duration' },
         count: { $sum: 1 },
+        calories: { $sum: '$calories' },
+        standstillMs: { $sum: '$standstillMs' },
       },
     },
     { $sort: { _id: 1 } },
@@ -311,7 +317,14 @@ export async function trend(
 
   const map = new Map<string, TrendDay>();
   for (const r of rows) {
-    map.set(r._id, { date: r._id, distance: r.distance, duration: r.duration, count: r.count });
+    map.set(r._id, {
+      date: r._id,
+      distance: r.distance,
+      duration: r.duration,
+      count: r.count,
+      calories: r.calories ?? 0,
+      standstillMs: r.standstillMs ?? 0,
+    });
   }
 
   // 补齐连续桶（桶键生成与上面的 timezone:'+08:00' 同口径）
@@ -321,7 +334,7 @@ export async function trend(
     for (let i = 11; i >= 0; i--) {
       const { y, m } = bjYearMonth(now - i * 30 * DAY);
       const key = `${y}-${String(m).padStart(2, '0')}`;
-      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
+      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0, calories: 0, standstillMs: 0 });
     }
   } else if (type === 'week6') {
     // 近 6 个月按周（最多 26 周，取最近 24 周）
@@ -331,7 +344,7 @@ export async function trend(
     }
     const recent = keys.slice(-24);
     for (const key of recent) {
-      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
+      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0, calories: 0, standstillMs: 0 });
     }
   } else {
     // 近 7 / 30 天 / 365 天按天
@@ -339,7 +352,7 @@ export async function trend(
     const today0 = bjToday0(now);
     for (let i = days - 1; i >= 0; i--) {
       const key = bjDateStr(today0 - i * DAY);
-      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0 });
+      data.push(map.get(key) ?? { date: key, distance: 0, duration: 0, count: 0, calories: 0, standstillMs: 0 });
     }
   }
 

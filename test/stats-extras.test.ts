@@ -200,6 +200,33 @@ test('stats/trend?activityType=：只聚合指定运动类型', async () => {
   assert.equal(allRow.distance, 5000, '不传类型时聚合全部');
 });
 
+test('stats/trend：每桶带 calories 与 standstillMs（消耗要日均、配速要剔静止）', async () => {
+  await ActivityModel.deleteMany({ userId });
+  const today0 = bjToday0();
+  const day = today0 - 2 * DAY + 9 * 3600 * 1000;
+  await createTrack({ startTime: day, distance: 2000, duration: 900, calories: 150, standstillMs: 120000 });
+  await createTrack({ startTime: day + 3600 * 1000, distance: 1000, duration: 600, calories: 80, standstillMs: 30000 });
+
+  const res = await app.inject({
+    method: 'GET',
+    url: '/sport-track/api/stats/trend?type=week',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(res.statusCode, 200);
+  const rows = res.json().data.data as any[];
+  const key = bjDateStr(day);
+  const row = rows.find((r) => r.date === key);
+  assert.ok(row, '当天有桶');
+  assert.equal(row.calories, 230, '当天两次运动消耗之和');
+  assert.equal(row.standstillMs, 150000, '静止时长用来把配速的静止扣掉');
+
+  // 没运动的日子补 0 而不是 undefined：端上直接参与求和/相除
+  const empty = rows.find((r) => r.date !== key && r.distance === 0);
+  assert.ok(empty, '周视图里必有无运动日');
+  assert.equal(empty.calories, 0);
+  assert.equal(empty.standstillMs, 0);
+});
+
 test('stats/trend?activityType=：非法运动类型返回 400', async () => {
   const res = await app.inject({
     method: 'GET',
