@@ -14,6 +14,8 @@ export interface CleanTrackPoint {
   accuracy?: number | null;
   timestamp?: number;
   seq?: number;
+  /** 非运动步标记（端上实时超速 / 服务端检测）：带标记的点清洗时保护，不剔除 */
+  vehicle?: boolean;
 }
 
 /** 两点球面距离（米） */
@@ -214,6 +216,12 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
     if (distLine > outlierTh && d1 > 15 && d2 > 15) {
       drop[i] = true;
     }
+  }
+
+  // 端上/上游已标记的非运动步（vehicle）是刻意保留的原始点：清洗剔除它会让相邻两步
+  // 直连、被剔位移重新计入距离（标记语义失效）。清洗只动未标记的点。
+  for (let i = 0; i < n; i++) {
+    if (drop[i] && points[i].vehicle) drop[i] = false;
   }
 
   return points.filter((_, i) => !drop[i]);

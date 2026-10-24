@@ -436,9 +436,14 @@ export async function finishActivity(
   // 存储距离口径 = 客户端 tracker 实时累加值（用户运动时看到的数字）；
   // 客户端未传（旧版本）时退化为服务端按原始点直算（Haversine 累加）
   let storedDistance = input.clientDistance;
-  // 服务端按同一点集直算的「重算距离」（轨迹点序列的 Haversine 累加）
+  // 服务端按同一点集直算的「重算距离」（轨迹点序列的 Haversine 累加）；
+  // 端上标记的坐车步（vehicle）不计入——与客户端累计、calcStats、纠偏同口径，
+  // 否则端上剔掉的乘车位移会在复核时被加回来，偏差超 10% 触发不采信回退
   let recomputedDistance = 0;
-  for (let i = 1; i < trackPoints.length; i++) recomputedDistance += haversineDistance(trackPoints[i - 1], trackPoints[i]);
+  for (let i = 1; i < trackPoints.length; i++) {
+    if (trackPoints[i].vehicle) continue;
+    recomputedDistance += haversineDistance(trackPoints[i - 1], trackPoints[i]);
+  }
   recomputedDistance = Math.round(recomputedDistance);
   // 防脚本注入复核：clientDistance 与点集可推导的距离偏差 >10%（或点级噪声容差 50m）→ 不采信，
   // 回退为服务端重算值。正常客户端（GPS 点直算 ± 抖动）偏差远小于此；脚本虚报距离在此被拦
@@ -487,9 +492,11 @@ export async function finishActivity(
   //   墙钟含车程，会把正常运动误判成超速
   const tooFewPoints = trackPoints.length < MIN_EFFECTIVE_POINTS;
   const tooShort = storedDistance < MIN_EFFECTIVE_DISTANCE_M;
-  // 平均速度用「步长速度的中位数」（抗抖动点干扰：单点大跳不抬高中位数；全程车内时中位数照样超限）
+  // 平均速度用「步长速度的中位数」（抗抖动点干扰：单点大跳不抬高中位数；全程车内时中位数照样超限）。
+  // 端上已标记的坐车步不参与——那正是被认定为「非运动」的位移，不该再触发整条轨迹作废
   const stepSpeeds: number[] = [];
   for (let i = 1; i < trackPoints.length; i++) {
+    if (trackPoints[i].vehicle) continue;
     const dt = (trackPoints[i].timestamp - trackPoints[i - 1].timestamp) / 1000;
     if (dt > 0) stepSpeeds.push(haversineDistance(trackPoints[i - 1], trackPoints[i]) / dt);
   }

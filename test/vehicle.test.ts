@@ -121,22 +121,74 @@ test('骑行/滑雪/划船/游泳一律不判（6.5 m/s 对这些类型是正常
   assert.equal(markVehicle(pts, undefined).spans, 0, '类型缺失按不判处理');
 });
 
-test('步数门槛：60s 只由 3 次粗采样定位凑成 → 不判（证据不足以删用户的量）', () => {
-  const coarse = buildTrack([[12, 60]], 1_790_000_000_000, 20); // 3 步
+test('步数门槛：60s 只由 3 次粗采样定位凑成 → 持续判据不判（证据不足以删用户的量）', () => {
+  // 8m/s 在 running minHighSpeed(10) 之下，不触发单步规则，才能钉住持续判据自己的步数门槛
+  const coarse = buildTrack([[8, 60]], 1_790_000_000_000, 20); // 3 步
   assert.equal(markVehicle(coarse, 'running').spans, 0);
-  const denser = buildTrack([[12, 60]], 1_790_000_000_000, 10); // 6 步
+  const denser = buildTrack([[8, 60]], 1_790_000_000_000, 10); // 6 步
   assert.equal(markVehicle(denser, 'running').spans, 1);
 });
 
-test('采样断档不跨段：单步 300s / 位移 2100m（速度刚好 7 m/s）是丢点不是持续高速', () => {
+test('单步可疑速度：步行一步 300m/30s（10m/s，老端上跳变恢复步形态）→ 标 vehicle', () => {
+  const pts = [
+    { lat: 30, lng: 114, timestamp: 0 },
+    { lat: 30.0000359, lng: 114, timestamp: 3000 }, // 正常步行 ~4m
+    { lat: 30.0027333, lng: 114, timestamp: 33000 }, // 一步 ~296m / 30s ≈ 9.9m/s ≥ 7
+    { lat: 30.0027783, lng: 114, timestamp: 36000 }, // 恢复正常 ~5m
+  ];
+  const r = markVehicle(pts, 'walking');
+  assert.equal(r.points[2].vehicle, true, '单步可疑速度直接标，不需要 60s 持续佐证');
+  assert.equal(r.points[1].vehicle, undefined);
+  assert.equal(r.vehicleMs, 30_000);
+  assert.ok(r.vehicleM > 250 && r.vehicleM < 350, `vehicleM=${r.vehicleM}`);
+});
+
+test('单步可疑速度：步行 8m/s 持续 30s（短途被运载）→ 整段标 vehicle', () => {
+  const r = markVehicle(buildTrack([[1.4, 15], [8, 30], [1.4, 15]]), 'walking');
+  assert.ok(r.vehicleMs >= 30_000, `vehicleMs=${r.vehicleMs}（<60s 持续判据够不着，单步规则兜住）`);
+  assert.ok(r.vehicleM > 200, `vehicleM=${r.vehicleM}`);
+});
+
+test('单步可疑速度不误伤：跑步 9m/s 冲刺步（<10）不标', () => {
+  const pts = [
+    { lat: 30, lng: 114, timestamp: 0 },
+    { lat: 30.0000359, lng: 114, timestamp: 3000 }, // ~4m
+    { lat: 30.0002787, lng: 114, timestamp: 6000 }, // ~27m / 3s = 9m/s 冲刺步
+    { lat: 30.0003146, lng: 114, timestamp: 9000 }, // ~4m
+  ];
+  const r = markVehicle(pts, 'running');
+  assert.equal(r.points[2].vehicle, undefined);
+  assert.equal(r.vehicleMs, 0);
+});
+
+test('单步可疑速度豁免骑行：下坡 14m/s（50km/h）正常速度不标', () => {
+  const r = markVehicle(buildTrack([[14, 30]]), 'cycling');
+  assert.equal(r.spans, 0);
+  assert.equal(r.vehicleMs, 0);
+});
+
+test('巨步弦：单步 300s / 位移 2100m（长时间无定位）→ 标 vehicle，距离与时长都不计', () => {
   const pts = [
     { lat: 30, lng: 114, timestamp: 1_790_000_000_000 },
     { lat: 30.0188859, lng: 114, timestamp: 1_790_000_300_000 }, // ≈2100m / 300s
-    { lat: 30.0377718, lng: 114, timestamp: 1_790_000_600_000 },
+    { lat: 30.0189129, lng: 114, timestamp: 1_790_000_303_000 }, // 之后恢复正常 3s 采样
   ];
-  const { spans, vehicleMs } = markVehicle(pts, 'running');
-  assert.equal(spans, 0);
-  assert.equal(vehicleMs, 0);
+  const { spans, vehicleMs, vehicleM, points } = markVehicle(pts, 'running');
+  assert.equal(spans, 1);
+  assert.equal(vehicleMs, 300_000);
+  assert.ok(vehicleM > 2000 && vehicleM < 2200, `vehicleM=${vehicleM}`);
+  assert.equal(points[1].vehicle, true);
+  assert.equal(points[2].vehicle, undefined);
+});
+
+test('巨步弦不跨暂停：pauseGap 步的时长已由 pausedMs 扣过，不重复标记', () => {
+  const pts = [
+    { lat: 30, lng: 114, timestamp: 0 },
+    { lat: 30.0188859, lng: 114, timestamp: 300_000, pauseGap: true }, // 暂停 5min 后恢复
+  ];
+  const r = markVehicle(pts, 'walking');
+  assert.equal(r.points[1].vehicle, undefined);
+  assert.equal(r.vehicleMs, 0);
 });
 
 test('手动暂停处断开：pauseGap 点之前的高速不跨到之后', () => {
@@ -152,14 +204,15 @@ test('手动暂停处断开：pauseGap 点之前的高速不跨到之后', () =>
   assert.equal(vehicleMs, 62_000, 'pauseGap 之前那段达标（不含跨暂停的那一步），之后的 30s 不足门槛');
 });
 
-test('清掉旧的 vehicle 标记：重跑不残留（回填脚本可重跑的前提）', () => {
+test('预标记只增不删：换类型重跑也不清端上标记（2026-10 语义变更）', () => {
   const pts = buildTrack([[8, 60]]).map((p, i) => ({ ...p, vehicle: i < 10 }));
   const first = markVehicle(pts, 'running');
   assert.equal(first.spans, 1);
-  // 换成不判的类型重跑，旧标记必须被清空
+  // 旧语义是清掉重判（回填脚本可重跑的前提）；端上实时超速标记引入后改为并集：
+  // 预标记是"端上已作证的非运动步"，清掉会把孤立超速步漏回去。换类型重跑同样保留。
   const again = markVehicle(first.points, 'cycling');
-  assert.equal(again.spans, 0);
-  assert.equal(again.points.filter((p) => p.vehicle).length, 0, '旧 vehicle 标记未清除');
+  assert.equal(again.spans, 1, '预标记段保留');
+  assert.equal(again.points.filter((p) => p.vehicle).length, pts.length, '旧 vehicle 标记不清除（预标记 + 已检出段叠加）');
 });
 
 test('空数组 / 单点 / 缺时间戳 → 0，且不抛', () => {

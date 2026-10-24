@@ -65,9 +65,12 @@ test('往返：管线点 → 紧凑 → 归一化，与原点等价（时间可�
   for (let i = 0; i < restored.length; i++) {
     assert.equal(restored[i].timestamp, smoothed[i].timestamp, `点${i} 时间戳应还原`);
     assert.ok(Math.abs(restored[i].lat - smoothed[i].lat) < 1e-7, `点${i} 纬度 7 位内一致`);
-    assert.equal(restored[i].pauseGap, smoothed[i].pauseGap === true);
-    assert.equal(restored[i].vehicle, smoothed[i].vehicle === true);
-    assert.equal(restored[i].gapJump, smoothed[i].gapJump === true);
+    assert.equal(restored[i].pauseGap === true, smoothed[i].pauseGap === true, `点${i} pauseGap 应等价`);
+    assert.equal(restored[i].vehicle === true, smoothed[i].vehicle === true, `点${i} vehicle 应等价`);
+    assert.equal(restored[i].gapJump === true, smoothed[i].gapJump === true, `点${i} gapJump 应等价`);
+    // 稀疏标记 false 不下发
+    assert.ok(!('pauseGap' in restored[i]) || restored[i].pauseGap === true, `点${i} false 不应有 pauseGap 字段`);
+    assert.ok(!('vehicle' in restored[i]) || restored[i].vehicle === true, `点${i} false 不应有 vehicle 字段`);
   }
 });
 
@@ -90,7 +93,9 @@ test('旧格式点（绝对时间戳）走 normalize 原样透传', () => {
   const restored = normalizeTrackPoints(legacy as unknown as Array<Record<string, unknown>>, START - 5000);
   assert.equal(restored[0].timestamp, START, '绝对时间戳原样（不受 startTime 干扰）');
   assert.equal(restored[0].speed, 1.7);
-  assert.equal(restored[0].pauseGap, false);
+  // 显式 false 与缺省同语义（falsy），且不下发字段
+  assert.ok(!restored[0].pauseGap);
+  assert.ok(!('pauseGap' in restored[0]));
 });
 
 test('收益：紧凑格式显著小于旧格式', () => {

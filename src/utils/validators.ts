@@ -82,8 +82,15 @@ const TrackPointSchema = z.object({
   // 负数 speed（微信定位异常值）容错归 null
   speed: z.number().nullable().optional().default(null).transform((v) => (v != null && v < 0 ? null : v)),
   accuracy: z.number().min(0).nullable().optional(), // 水平精度（米）
-  // 暂停恢复后的第一个有效点标记（渲染轨迹时断开连线）
-  pauseGap: z.boolean().optional().default(false),
+  // 暂停恢复后的第一个有效点标记（渲染轨迹时断开连线）。
+  // 三个标记都不设 default(false)：缺省保持缺省，$push 落库才是稀疏的（false 不入 库），
+  // 消费方一律按 truthy / === true 判
+  pauseGap: z.boolean().optional(),
+  // 端上实时标记的非运动步（折算速度超类型上限，视为坐车）：统计/纠偏/渲染与
+  // 服务端自判的 vehicle 同口径（该步位移不计距离、连线灰显）
+  vehicle: z.boolean().optional(),
+  // 端上精度差但抽稀保留的点（accuracy 超类型阈值；弱信号段保渲染连续性，纠偏可再判）
+  accBad: z.boolean().optional(),
   timestamp: z.number().positive('时间戳不合法'),
 });
 

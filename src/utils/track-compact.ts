@@ -31,12 +31,14 @@ export interface CompactTrackPoint {
   still?: true;
   vehicle?: true;
   gapJump?: true;
+  /** 端上精度差但抽稀保留的点（弱信号段保渲染连续性） */
+  accBad?: true;
 }
 
 const round7 = (v: number) => Math.round(v * 1e7) / 1e7;
 
 /** 紧凑化：管线输出的点 → 存储格式（幂等：已紧凑的点原样保留） */
-export function compactTrackPoints<T extends { seq?: number; lat: number; lng: number; altitude?: number | null; speed?: number | null; accuracy?: number | null; timestamp?: number; pauseGap?: boolean; still?: boolean; vehicle?: boolean; gapJump?: boolean }>(
+export function compactTrackPoints<T extends { seq?: number; lat: number; lng: number; altitude?: number | null; speed?: number | null; accuracy?: number | null; timestamp?: number; pauseGap?: boolean; still?: boolean; vehicle?: boolean; gapJump?: boolean; accBad?: boolean }>(
   points: T[],
   startTimeMs: number,
 ): CompactTrackPoint[] {
@@ -54,6 +56,7 @@ export function compactTrackPoints<T extends { seq?: number; lat: number; lng: n
     if (p.still) out.still = true;
     if (p.vehicle) out.vehicle = true;
     if (p.gapJump) out.gapJump = true;
+    if (p.accBad) out.accBad = true;
     return out;
   });
 }
@@ -65,10 +68,12 @@ export interface NormalizedTrackPoint {
   altitude: number | null;
   speed: number | null;
   accuracy: number | null;
-  pauseGap: boolean;
-  still: boolean;
-  vehicle: boolean;
-  gapJump: boolean;
+  /** 稀疏标记：false 不下发（省 DTO 体积），消费方按 truthy / === true 判 */
+  pauseGap?: boolean;
+  still?: boolean;
+  vehicle?: boolean;
+  gapJump?: boolean;
+  accBad?: boolean;
   /** 绝对毫秒时间戳（紧凑格式 + startTime 还原；旧格式原样） */
   timestamp: number;
 }
@@ -79,19 +84,22 @@ export function normalizeTrackPoints(points: Array<Record<string, unknown>> | un
   return rows.map((p) => {
     // 紧凑格式存相对 ms（< 1e12）→ 加 startTime 还原；旧格式存绝对 ms → 原样
     const ts = Number(p.timestamp ?? 0);
-    return {
+    const out: NormalizedTrackPoint = {
       seq: Number(p.seq ?? 0),
       lat: Number(p.lat),
       lng: Number(p.lng),
       altitude: p.altitude != null ? Number(p.altitude) : null,
       speed: p.speed != null ? Number(p.speed) : null,
       accuracy: p.accuracy != null ? Number(p.accuracy) : null,
-      pauseGap: p.pauseGap === true,
-      still: p.still === true,
-      gapJump: p.gapJump === true,
-      vehicle: p.vehicle === true,
       // 紧凑格式（相对 ms）→ 加 startTime 还原；旧格式（绝对 ms）原样
       timestamp: ts > ABS_TS_THRESHOLD ? ts : startTimeMs + ts,
     };
+    // 稀疏标记：true 才下发（5 个布尔 × 每点 ~15B，大轨迹详情能省上百 KB）
+    if (p.pauseGap === true) out.pauseGap = true;
+    if (p.still === true) out.still = true;
+    if (p.gapJump === true) out.gapJump = true;
+    if (p.vehicle === true) out.vehicle = true;
+    if (p.accBad === true) out.accBad = true;
+    return out;
   });
 }

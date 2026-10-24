@@ -1,4 +1,5 @@
 import { haversineDistance, type TrackPointLike } from './pace.js';
+import { TYPE_CONFIGS, DEFAULT_TYPE_CONFIG } from './trajectory-clean.js';
 
 /**
  * 非运动段（搭车/推车/坐摆渡车）检测 —— 与静止剔除相反，这里必须用**速度**判据
@@ -22,6 +23,12 @@ import { haversineDistance, type TrackPointLike } from './pace.js';
  * 23.4 km/h 的间歇会被误剔——宁可少判普通人的真数据，也不给榜单留假 PR。
  *
  * 只对人力运动类型生效：骑行 6.5 m/s（23 km/h）是通勤速度，滑雪、划船同理，套这条会把自己判没。
+ *
+ * 单步可疑速度（补盲区）：老版本端上会把超物理上限的点整批丢掉，跳变以"贴近上限的步速"
+ * 残存下来（如步行轨迹里 300m/30s=10m/s 的恢复步）；短途被运载（<60s）持续判据也够不着。
+ * 这类步按 **单步速度 ≥ minHighSpeed**（与轨迹清洗器的单侧高速跳下限同源：
+ * walking/hiking/mountaineering 7、running 10，都在人类单步冲刺之上）直接标 vehicle，
+ * 不需要持续时长佐证。骑行豁免——50km/h 下坡对骑行是正常速度，与持续判据的豁免口径一致。
  */
 /** 车速下限（m/s）：6.5 m/s = 23.4 km/h，城市车流速度 */
 export const VEHICLE_MIN_SPEED_MPS = 6.5;
@@ -51,82 +58,100 @@ export interface VehicleResult<T extends TrackPointLike> {
  * 语义：点上的 vehicle = true 表示**进入该点的那一步**（上一点 → 该点）属于非运动段，
  * 因此这一步的位移与时长都不该计入 distance / duration（与 still 只剔时长不同）。
  *
- * 入参点上若已带 vehicle（回填脚本换门槛重跑时会遇到），一律先清掉再按本次结果重标。
+ * 标记来源取**并集**：端上实时标的坐车步（折算速度超类型上限，见小程序 tracker）原样保留，
+ * 本函数只增不删——清掉重判会把孤立超速步漏回去（持续判据 ≥60s/≥5 步对单步永不命中）。
+ * 本函数自己判的速度带是 6.5 m/s–类型上限之间的持续乘车段。
+ * 时长/位移/段数口径统一按最终标记结算（检测段 + 预标记一起算）。
  */
 export function markVehicle<T extends TrackPointLike>(points: T[], type?: string): VehicleResult<T> {
-  const out = (points ?? []).map((p) => {
-    const copy = { ...p } as T & { vehicle?: boolean };
-    delete copy.vehicle;
-    return copy;
-  });
+  const out = (points ?? []).map((p) => ({ ...p }) as T & { vehicle?: boolean });
+
+  if (type && VEHICLE_TYPES.includes(type)) {
+    const minHighSpeed = (TYPE_CONFIGS[type] ?? DEFAULT_TYPE_CONFIG).minHighSpeed;
+    let runFrom = -1; // 当前高速段起始点下标
+    let endTo = -1; // 最后一个高速步的终点——收尾时以它为准，不把段尾的慢跑算进车程
+    let endSec = 0;
+    let runFastSteps = 0;
+    let pendingSlow = 0; // 末尾拖着几个慢步还没定性（等灯 vs 人真的又开始动了）
+    let runSec = 0;
+
+    const close = () => {
+      if (runFrom >= 0 && endSec >= VEHICLE_MIN_SEC && runFastSteps >= VEHICLE_MIN_STEPS) {
+        for (let k = runFrom + 1; k <= endTo; k++) out[k].vehicle = true;
+      }
+      runFrom = -1;
+      endTo = -1;
+      endSec = 0;
+      runFastSteps = 0;
+      pendingSlow = 0;
+      runSec = 0;
+    };
+
+    for (let i = 1; i < out.length; i++) {
+      const a = out[i - 1];
+      const b = out[i];
+      const hasTs = typeof a.timestamp === 'number' && typeof b.timestamp === 'number';
+      const dt = hasTs ? (b.timestamp! - a.timestamp!) / 1000 : NaN;
+      const dist = haversineDistance(a, b);
+      // 断档与暂停恢复点都是硬边界：不跨过去连段，也不当"等灯"糊掉
+      const usable = hasTs && Number.isFinite(dt) && dt > 0 && dt <= VEHICLE_MAX_STEP_SEC && !b.pauseGap;
+      const fast = usable && dist / dt >= VEHICLE_MIN_SPEED_MPS;
+
+      if (fast) {
+        // 单步可疑速度（≥minHighSpeed）：无需持续时长佐证，直接标（见文件头"单步可疑速度"）
+        if (dist / dt >= minHighSpeed) out[i].vehicle = true;
+        if (runFrom < 0) runFrom = i - 1;
+        runSec += dt;
+        runFastSteps++;
+        pendingSlow = 0;
+        endTo = i;
+        endSec = runSec;
+        continue;
+      }
+      if (!usable || runFrom < 0 || pendingSlow >= VEHICLE_MAX_SLOW_STEPS) {
+        close();
+        continue;
+      }
+      // 慢步先挂在段尾：车在路口让一下仍算同一趟，超过额度就是人又自己在动了
+      runSec += dt;
+      pendingSlow++;
+    }
+    close();
+  }
+
+  // 巨步弦（隧道/地下车库/挂机等长时间无定位后的重现点）：单步间隔远超采样节奏（>120s），
+  // 意味着这段完全没有任何采样，落点间直线是被运载/凭空连出来的 → 标 vehicle：
+  // 灰线渲染、距离与时长都不计入（与端上 tracker 的 chord 标记同口径）。
+  // 持续判据只管"开着记录坐车"，这里管"关着被运过去"；任何运动类型都判（坐车不分类型）。
+  // 不跨 pauseGap：暂停时长已由 pausedMs 扣过，再剔就是双扣。
+  for (let i = 1; i < out.length; i++) {
+    if (out[i].vehicle || out[i].pauseGap) continue;
+    const a = out[i - 1];
+    const b = out[i];
+    if (typeof a.timestamp !== 'number' || typeof b.timestamp !== 'number') continue;
+    const dt = (b.timestamp - a.timestamp) / 1000;
+    if (dt > VEHICLE_MAX_STEP_SEC) b.vehicle = true;
+  }
+
+  // 时长/位移/段数按最终标记统一结算（检测段 + 端上预标记 + 巨步弦的并集），逐「入段步」累加
   let vehicleMs = 0;
   let vehicleM = 0;
   let spans = 0;
-
-  if (!type || !VEHICLE_TYPES.includes(type)) return { points: out, vehicleMs, vehicleM, spans };
-
-  let runFrom = -1; // 当前高速段起始点下标
-  let runTo = -1; // tentative 终点（含末尾挂着的慢步）
-  let runSec = 0;
-  let runDist = 0;
-  let runFastSteps = 0;
-  let pendingSlow = 0; // 末尾拖着几个慢步还没定性（等灯 vs 人真的又开始动了）
-  let endTo = -1; // 最后一个高速步的终点——收尾时以它为准，不把段尾的慢跑算进车程
-  let endSec = 0;
-  let endDist = 0;
-
-  const close = () => {
-    if (runFrom >= 0 && endSec >= VEHICLE_MIN_SEC && runFastSteps >= VEHICLE_MIN_STEPS) {
-      for (let k = runFrom + 1; k <= endTo; k++) out[k].vehicle = true;
-      vehicleMs += Math.round(endSec * 1000);
-      vehicleM += endDist;
-      spans++;
-    }
-    runFrom = -1;
-    runTo = -1;
-    runSec = 0;
-    runDist = 0;
-    runFastSteps = 0;
-    pendingSlow = 0;
-    endTo = -1;
-    endSec = 0;
-    endDist = 0;
-  };
-
+  let inRun = false;
   for (let i = 1; i < out.length; i++) {
+    if (!out[i].vehicle) {
+      inRun = false;
+      continue;
+    }
     const a = out[i - 1];
     const b = out[i];
-    const hasTs = typeof a.timestamp === 'number' && typeof b.timestamp === 'number';
-    const dt = hasTs ? (b.timestamp! - a.timestamp!) / 1000 : NaN;
-    const dist = haversineDistance(a, b);
-    // 断档与暂停恢复点都是硬边界：不跨过去连段，也不当"等灯"糊掉
-    const usable = hasTs && Number.isFinite(dt) && dt > 0 && dt <= VEHICLE_MAX_STEP_SEC && !b.pauseGap;
-    const fast = usable && dist / dt >= VEHICLE_MIN_SPEED_MPS;
-
-    if (fast) {
-      if (runFrom < 0) runFrom = i - 1;
-      runTo = i;
-      runSec += dt;
-      runDist += dist;
-      runFastSteps++;
-      pendingSlow = 0;
-      endTo = i;
-      endSec = runSec;
-      endDist = runDist;
-      continue;
-    }
-    if (!usable || runFrom < 0 || pendingSlow >= VEHICLE_MAX_SLOW_STEPS) {
-      close();
-      continue;
-    }
-    // 慢步先挂在段尾：车在路口让一下仍算同一趟，超过额度就是人又自己在动了
-    runTo = i;
-    runSec += dt;
-    runDist += dist;
-    pendingSlow++;
+    const dtMs =
+      typeof a.timestamp === 'number' && typeof b.timestamp === 'number' ? b.timestamp - a.timestamp : 0;
+    vehicleMs += Math.max(0, dtMs);
+    vehicleM += haversineDistance(a, b);
+    if (!inRun) spans++;
+    inRun = true;
   }
-  close();
-
   return { points: out, vehicleMs: Math.round(vehicleMs), vehicleM: Math.round(vehicleM), spans };
 }
 

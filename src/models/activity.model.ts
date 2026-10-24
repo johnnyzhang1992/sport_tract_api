@@ -16,10 +16,13 @@ const trackPointSchema = new Schema(
     altitude: { type: Number, default: null },
     speed: { type: Number, default: null },
     accuracy: { type: Number, default: null }, // 水平精度（米，实时定位质量）
-    pauseGap: { type: Boolean, default: false }, // 暂停恢复后首个有效点（渲染时断开连线）
-    still: { type: Boolean, default: false }, // 静止时段检测标出的点（finish 时算，见 utils/standstill.ts）
-    vehicle: { type: Boolean, default: false }, // 非运动段检测标出的点，疑似乘车（见 utils/vehicle.ts）
-    gapJump: { type: Boolean, default: false }, // 采样断档连线的落点（渲染时在此断开，见 utils/track-gap.ts）
+    // 五个稀疏布尔一律不设 default(false)：缺省保持缺省，$push 落库才是稀疏的，
+    // 消费方（compact/normalize/清洗/渲染）一律按 truthy / === true 判
+    pauseGap: { type: Boolean }, // 暂停恢复后首个有效点（渲染时断开连线）
+    still: { type: Boolean }, // 静止时段检测标出的点（finish 时算，见 utils/standstill.ts）
+    vehicle: { type: Boolean }, // 非运动段检测标出的点，疑似乘车（见 utils/vehicle.ts）；端上实时超速标记同字段
+    gapJump: { type: Boolean }, // 采样断档连线的落点（渲染时在此断开，见 utils/track-gap.ts）
+    accBad: { type: Boolean }, // 端上精度差但抽稀保留的点（accuracy 超类型阈值；弱信号段保渲染连续性）
     timestamp: { type: Number, required: true },
   },
   { _id: false },
