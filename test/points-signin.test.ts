@@ -79,6 +79,7 @@ test('PS4 补签：昨天第 3 天，补 +3，今天签到第 4 天 +4', async (
   assert.equal(r.streakDay, 3);
   assert.equal(r.nextReward, 4); // 补完昨天，今天还能签第 4 天
   assert.equal(r.canMakeUp, false);
+  assert.equal(r.makeupDate, ''); // 昨天已补上，不再有可补签日期
   assert.equal((await signIn(String(uid4), NOW)).credited, 4);
 });
 
@@ -165,6 +166,44 @@ test('PS10 并发交错：今天的行抢在补签落库前出现 → 补签拒�
   assert.deepEqual(dateKeys, ['2026-10-22', '2026-10-24']);
   assert.equal((await PointCardModel.findById(card._id).lean())?.status, 'unused'); // 卡未消耗
   assert.equal(await PointRecordModel.countDocuments({ userId: uid10 }), 0); // 未发分
+});
+
+test('PS12 可补签日期与卡数量解耦：无卡也下发 makeupDate，canMakeUp 仍为 false', async (t) => {
+  const uid12 = new Types.ObjectId();
+  const u12 = String(uid12);
+  t.after(() => wipe(uid12));
+  // 昨天漏签、前天签过 → 存在可补空档，但一张卡都没有
+  await PointSigninModel.create({ userId: uid12, dateKey: '2026-10-22', streakDay: 2, points: 2, source: 'sign', createdAt: NOW });
+
+  const noCard = await getSigninState(u12, NOW);
+  assert.equal(noCard.makeupDate, '2026-10-23', '无卡也要下发可补日期，前端才能引导兑换');
+  assert.equal(noCard.canMakeUp, false, '没有卡不能直接补签');
+  assert.equal(noCard.cards, 0);
+
+  await PointCardModel.create({ userId: uid12, expiresAt: NOW + 86400000, createdAt: NOW });
+  const withCard = await getSigninState(u12, NOW);
+  assert.equal(withCard.makeupDate, '2026-10-23');
+  assert.equal(withCard.canMakeUp, true, '有卡且存在空档才能直接补签');
+  assert.equal(withCard.cards, 1);
+});
+
+test('PS13 今天已签到 / 前天没签时不下发 makeupDate', async (t) => {
+  const uid13 = new Types.ObjectId();
+  const uid14 = new Types.ObjectId();
+  t.after(() => Promise.all([wipe(uid13), wipe(uid14)]));
+
+  // 今天已签：可补签的窗口已关闭（补签必须在今日签到前）
+  await PointSigninModel.create({ userId: uid13, dateKey: '2026-10-22', streakDay: 2, points: 2, source: 'sign', createdAt: NOW });
+  await PointSigninModel.create({ userId: uid13, dateKey: '2026-10-24', streakDay: 3, points: 3, source: 'sign', createdAt: NOW });
+  const signedToday = await getSigninState(String(uid13), NOW);
+  assert.equal(signedToday.makeupDate, '');
+  assert.equal(signedToday.canMakeUp, false);
+
+  // 前天没签：补昨天接不上连续链，不可补
+  await PointSigninModel.create({ userId: uid14, dateKey: '2026-10-20', streakDay: 1, points: 1, source: 'sign', createdAt: NOW });
+  const noDayBefore = await getSigninState(String(uid14), NOW);
+  assert.equal(noDayBefore.makeupDate, '');
+  assert.equal(noDayBefore.canMakeUp, false);
 });
 
 test('PS11 补签发分为 0（当日已满）→ 400、卡退回未使用、不留 0 分补签行', async (t) => {

@@ -57,14 +57,17 @@ export async function getSigninState(userId: string, now = Date.now()): Promise<
     PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: now } }),
   ]);
   const baseStreak = today?.streakDay ?? yesterday?.streakDay ?? 0;
-  const canMakeUp = !today && !yesterday && !!dayBefore && cards > 0;
+  // 「可补签日期」只看漏签空档（今天没签、昨天没签、前天签过），与卡数量无关：
+  // 无卡时也要下发，前端才能引导「去兑换补签卡」；能不能直接补由 canMakeUp 决定。
+  const hasMakeupGap = !today && !yesterday && !!dayBefore;
+  const canMakeUp = hasMakeupGap && cards > 0;
   return {
     todaySigned: !!today,
     streakDay: baseStreak,
     todayReward: today?.points ?? 0,
     nextReward: rewardForStreakDay(baseStreak + 1),
     canMakeUp,
-    makeupDate: canMakeUp ? yKey : '',
+    makeupDate: hasMakeupGap ? yKey : '',
     cards,
   };
 }

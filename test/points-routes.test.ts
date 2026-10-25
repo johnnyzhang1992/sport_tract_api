@@ -188,7 +188,8 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s0.signin.nextReward, 1, '首签 1 分');
   assert.equal(s0.signin.cards, 0);
   assert.equal(s0.signin.makeupCardId, '', '没有卡时补签卡 id 为空串');
-  assert.equal(s0.signin.canMakeUp, false, '没有卡不能补签');
+  assert.equal(s0.signin.canMakeUp, false, '没有卡不能直接补签');
+  assert.equal(s0.signin.makeupDate, YESTERDAY, '无卡但存在漏签空档时仍下发可补日期（供前端引导兑换）');
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
   assert.equal(s0.item.key, 'makeup_card');
