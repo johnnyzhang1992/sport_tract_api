@@ -18,12 +18,6 @@ export type CellState = 'signed' | 'today' | 'makeup' | 'missed' | 'future';
 export interface SignedRow {
   dateKey: string;
   streakDay: number;
-  /**
-   * 该日**实际入账**分（Ruling 2026-10-25，spec §5.1）：`signIn` 落的是被 `POINTS.DAILY_CAP`
-   * 截断后的实发值，与名义分 `min(streakDay, 7)` 可以不同，格子必须报实际值。
-   * 缺省（调用方没读这一列 / 旧数据）才回落名义值；`0` 是「那天确实一分没拿到」，如实报 0。
-   */
-  points?: number;
 }
 
 export interface SigninCell {
@@ -106,13 +100,10 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     const row = signed.get(dateKey);
     if (row !== undefined) {
       // 已签格照库存值下发：窗口里重算会把连签 30 天压成 1..7（§6.1 说收敛由写路径负责）。
-      // 分值取该日实际入账的 `points`（§5.1：被每日上限截断过就不能虚报），没带这一列才回落名义值。
-      cells.push({
-        dateKey,
-        state: 'signed',
-        streakDay: row.streakDay,
-        reward: row.points ?? rewardForStreakDay(row.streakDay),
-      });
+      // 分值一律名义分 min(streakDay,7)（Ruling 2026-10-25 改回名义分，spec §5.1）：补差是
+      // 按今天入账的聚合流水（makeup_topup），摊不回该日 points；钱的真相在积分明细页，
+      // 格子负责讲规则，被每日上限截断的少见情形也不该让格子少报主路径的补差结果。
+      cells.push({ dateKey, state: 'signed', streakDay: row.streakDay, reward: rewardForStreakDay(row.streakDay) });
     } else if (dateKey === todayKey) {
       cells.push({ dateKey, state: 'today', streakDay: todayPos, reward: rewardForStreakDay(todayPos) });
     } else if (dateKey < todayKey) {

@@ -48,8 +48,9 @@ function isDuplicateKey(e: unknown): boolean {
  * - `streakDay`（前端「已连续 N 天」的唯一来源）**只报接得上的那条链**：今天签了取今天的库存值，
  *   今天没签但昨天签了取昨天的，昨天也没签就是 0。窗口里最右的已签格如果隔着断口，那是「上一段链
  *   的长度」，报出去会和同一屏的「今天签到得 1 分」自相矛盾（Ruling 2026-10-25）；
- * - 已签格的分值取该日**实际入账** `points`（被 `POINTS.DAILY_CAP` 截断过就不虚报，spec §5.1），
- *   today/makeup/future 格仍是按位置的名义分（那是「签了能拿几分」）；
+ * - 格子与 `todayReward` 的分值一律是**名义规则分** `min(streakDay, 7)`（Ruling 2026-10-25 改回
+ *   名义分，spec §5.1）：补差是按今天入账的聚合流水，摊不回每日行的 `points`，钱的真相在积分明细页；
+ *   投影也因此只读 `dateKey`/`streakDay` 两列；
  * - `nextReward` 是「下一次签到的得分」：今天签过就是明天的（连签 7 天时为 7，不是 8），
  *   今天没签就是今天能拿的；
  * - 读接口只 dryRun：本函数不写库，错位由写路径（signIn / useMakeupCard）收尾的
@@ -60,7 +61,7 @@ export async function getSigninState(userId: string, now = Date.now()): Promise<
   // 只读窗口这 7 天：段长判定截在窗口内（spec §4.1 第 4 条 / Ruling 2026-10-25），窗外的行不参与
   const [rows, cards] = await Promise.all([
     PointSigninModel.find({ userId, dateKey: { $gte: windowStartKey(todayKey), $lte: todayKey } })
-      .select({ dateKey: 1, streakDay: 1, points: 1 }).lean(),
+      .select({ dateKey: 1, streakDay: 1 }).lean(),
     PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: now } }),
   ]);
   const cells = planSigninCells(rows, todayKey);

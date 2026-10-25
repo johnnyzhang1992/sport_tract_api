@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planSigninCells, windowStartKey, shiftDateKey, WINDOW_DAYS } from '../src/utils/points-window.js';
+import { planSigninCells, windowStartKey, shiftDateKey, WINDOW_DAYS, type SignedRow } from '../src/utils/points-window.js';
 
 const T = '2026-10-25'; // 今天
 const back = (n: number) => shiftDateKey(T, -n);
@@ -102,18 +102,22 @@ test('MW9 连签从窗口外带进来：段首按库存值当锚，不按窗口�
   assert.equal(at(cells, back(6))!.todayRewardAfter, 1, '只补 19 接不上 24 的断口');
 });
 
-test('MW10 signed 格分值取库存 points，缺省才回落名义值（Ruling B）', () => {
-  // 22 被每日上限截断（名义 3 只拿到 1）；23 是没带 points 的旧行；24 是崩溃夹缝留下的 points:0
-  const cells = planSigninCells([
+test('MW10 signed 格分值恒为名义分：行上带的实发 points 不参与（Ruling 2026-10-25 改回名义分）', () => {
+  // 22 曾被每日上限截断（名义 3 实拿 1）、24 是崩溃夹缝留下的 points:0。
+  // 补差是按今天入账的聚合流水（makeup_topup），摊不回每天的 points，格子必须报名义规则分，
+  // 否则每次补签重排都让被补的那一天少报（spec §5.1：钱的真相在积分明细页）。
+  // 服务层投影已不读 points，这里**故意**把 points 塞进行里，钉死 planSigninCells 对实发值免疫。
+  const rows = [
     { dateKey: back(3), streakDay: 3, points: 1 },
     { dateKey: back(2), streakDay: 4 },
     { dateKey: back(1), streakDay: 5, points: 0 },
-  ], T);
-  assert.equal(at(cells, back(3))!.reward, 1, '有库存 points 就报实际入账分，不虚报名义 3');
-  assert.equal(at(cells, back(2))!.reward, 4, '没有 points 才回落 min(streakDay,7)');
-  assert.equal(at(cells, back(1))!.reward, 0, 'points:0 是「那天确实没收到分」，如实报 0');
+  ] as unknown as SignedRow[];
+  const cells = planSigninCells(rows, T);
+  assert.equal(at(cells, back(3))!.reward, 3, '行里有实发 points=1 也报名义 min(3,7)，不被截断值改写');
+  assert.equal(at(cells, back(2))!.reward, 4, '没带 points 的行同样按 min(streakDay,7)');
+  assert.equal(at(cells, back(1))!.reward, 5, 'points:0 的夹缝行也报名义 5，实际分去明细页看');
   assert.deepEqual(
     [at(cells, back(3))!.streakDay, at(cells, back(2))!.streakDay, at(cells, back(1))!.streakDay],
-    [3, 4, 5], 'points 只改分值，streakDay 照库存值下发');
+    [3, 4, 5], 'streakDay 照库存值下发');
   assert.equal(at(cells, T)!.reward, 6, 'today 格是「签了能拿几分」，仍是名义值');
 });

@@ -22,7 +22,7 @@ const wipe = (u: Types.ObjectId) => Promise.all([
 
 const seed = (dateKey: string, streakDay: number) => PointSigninModel.create({ userId: uid, dateKey, streakDay, points: Math.min(streakDay, 7), source: 'sign', createdAt: NOW });
 
-/** 造一行签到记录，points 显式给（Ruling B 要区分「库存 streakDay」与「实际入账 points」） */
+/** 造一行签到记录，points 显式给（区分「库存 streakDay」与当日实发 points，模拟截断/崩溃夹缝） */
 const row = (u: Types.ObjectId, dateKey: string, streakDay: number, points: number) =>
   PointSigninModel.create({ userId: u, dateKey, streakDay, points, source: 'sign', createdAt: NOW });
 
@@ -344,19 +344,26 @@ test('PS18 streakDay 只报接得上的那条链：隔着断口的旧链长度�
   assert.equal(sC.nextReward, 4);
 });
 
-test('PS19 signed 格与 todayReward 报实际入账分，不报名义分（被每日上限截断时不虚报）', async (t) => {
+test('PS19 格子与 todayReward 报名义规则分；实际入账分只活在积分明细流水里（Ruling 2026-10-25 名义分）', async (t) => {
   const u19 = new Types.ObjectId();
   t.after(() => wipe(u19));
-  // 24 与今天都被 DAILY_CAP 截断：名义 2 / 3，实拿 1 / 1
+  // 24 与今天都被 DAILY_CAP 截断：名义 2 / 3，库里行的 points 只有 1；
+  // 明细页另有一条实发 1 分的流水（bizDate=今天）——钱的真相在那里，格子负责讲规则。
   await row(u19, '2026-10-23', 1, 1);
   await row(u19, '2026-10-24', 2, 1);
   await row(u19, '2026-10-25', 3, 1);
+  await creditPoints(String(u19), {
+    type: 'signin', title: '连续签到第 3 天', points: 1, bizDate: '2026-10-25',
+    refType: 'signin', refId: '2026-10-25', idemKey: `${String(u19)}:signin:2026-10-25`,
+  }, NOW);
   const s = await getSigninState(String(u19), NOW);
-  assert.equal(s.cells.find((c) => c.dateKey === '2026-10-24')?.reward, 1, '格子报库存 points 1，不是名义 min(2,7)');
-  assert.equal(s.cells.find((c) => c.dateKey === '2026-10-25')?.reward, 1);
-  assert.equal(s.todayReward, 1, 'todayReward 与格子同源：不能一格 1 一格 3');
-  assert.equal(s.streakDay, 3, 'streakDay 仍是库存天数，points 只影响分值');
+  assert.equal(s.cells.find((c) => c.dateKey === '2026-10-24')?.reward, 2, '格子报名义 min(2,7)，行里 points=1 不参与');
+  assert.equal(s.cells.find((c) => c.dateKey === '2026-10-25')?.reward, 3, '今天格同样报名义 3');
+  assert.equal(s.todayReward, 3, 'todayReward 与格子同源，都是规则分');
+  assert.equal(s.streakDay, 3, 'streakDay 仍是库存天数，分值口径不影响它');
   assert.equal(s.nextReward, 4, 'nextReward 是「明天能拿几分」，仍按名义位置');
+  const rec = await PointRecordModel.findOne({ userId: u19, bizDate: '2026-10-25' }).lean();
+  assert.equal(rec?.delta, 1, '实际入账分记在流水里（明细页按 bizDate 报钱），不靠七格下发');
 });
 
 test('PS20 同一天重试把上次没发成的差额补回来（提前返回路径也走校正）', async (t) => {
