@@ -86,3 +86,18 @@ test('MW8 windowStartKey 是今天-6', () => {
   assert.equal(windowStartKey(T), back(6));
   assert.equal(windowStartKey('2026-01-03'), '2025-12-28');
 });
+
+test('MW9 连签从窗口外带进来：段首按库存值当锚，不按窗口里有行的天数', () => {
+  // 19 没行（窗口左界），20 的行记着第 4 天 —— 这人 10-17 就开始签了，只是前面出窗
+  const cells = planSigninCells([
+    { dateKey: back(5), streakDay: 4 }, { dateKey: back(4), streakDay: 5 },
+    { dateKey: back(3), streakDay: 6 }, { dateKey: back(2), streakDay: 7 },
+  ], T);
+  assert.equal(cells.map((c) => c.state).join(','), 'makeup,signed,signed,signed,signed,makeup,today');
+  assert.equal(at(cells, back(1))!.streakDay, 8, '24 接在 23（第 7 天）之后 → 第 8 天');
+  assert.equal(at(cells, back(1))!.reward, 7, '第 8 天仍封顶 7 分');
+  assert.equal(at(cells, back(1))!.todayRewardAfter, 7, '补 24 之后今天是第 9 天，照样 7 分');
+  assert.equal(at(cells, T)!.streakDay, 1, '24 还空着 → 今天签是新链第 1 天');
+  assert.equal(at(cells, back(6))!.streakDay, 1, '19 左边是断口 → 自己第 1 天，不受右边长链影响');
+  assert.equal(at(cells, back(6))!.todayRewardAfter, 1, '只补 19 接不上 24 的断口');
+});

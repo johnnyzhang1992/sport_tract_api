@@ -37,20 +37,23 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
   const signed = new Map<string, number>();
   for (const r of rows) if (r.dateKey <= todayKey) signed.set(r.dateKey, r.streakDay);
 
-  /** 以 key 结尾的连续已签天数（extra 视作「假想已签」，用于算补完后的位置）。
-   *  只用于没有行的格（today/makeup/future）——那些格没有库存值可取，只能按行存在性现算。 */
-  const streakAt = (key: string, extra: string[] = []): number => {
-    let n = 0;
-    let cur = key;
-    while (signed.has(cur) || extra.includes(cur)) {
-      n += 1;
-      cur = shiftDateKey(cur, -1);
+  /**
+   * key 这天（`extra` 是「假想已签」的日子，用来算补完之后今天能排第几）在新链条上的位置。
+   * 锚点口径（Ruling 2026-10-25）：先往左走到段首，段首若是真实签到行就取它的**库存 `streakDay`**
+   * ——连签 30 天的人段首可能在窗口外，按「窗口里有行的天数」现数会把第 24 天数成第 1 天，
+   * 补签的分值与封顶都会跟着算小；段首是空档之后第一天（或假想日本身）才按 1 起。
+   * 库存值可信：写路径每次收尾都用同一个锚点口径校正（`reconcileStreaks`，设计 §6.1）。
+   */
+  const positionIfSigned = (key: string, extra: string[] = []): number => {
+    let start = key;
+    let prev = shiftDateKey(start, -1);
+    while (signed.has(prev) || extra.includes(prev)) {
+      start = prev;
+      prev = shiftDateKey(start, -1);
     }
-    return n;
+    const anchor = signed.has(start) ? (signed.get(start) as number) : 1;
+    return anchor + daysBetween(start, key);
   };
-  /** key 这天若签到，会排在连续段第几天 */
-  const positionIfSigned = (key: string, extra: string[] = []): number =>
-    streakAt(shiftDateKey(key, -1), extra) + 1;
 
   const left = windowStartKey(todayKey);
   /**
@@ -71,7 +74,6 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     return n;
   };
 
-  // 全空窗口（全新用户）不用另设闸门：段长=6 > MAX_GAP_DAYS，天然没有可补格（spec §4.1 第 5 条）。
   const makeupable = new Set<string>();
   for (let i = WINDOW_DAYS - 1; i >= 1; i -= 1) {
     const d = shiftDateKey(todayKey, -i);
@@ -97,9 +99,7 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     const dateKey = shiftDateKey(start, i);
     const stored = signed.get(dateKey);
     if (stored !== undefined) {
-      // signed 格有意取库存 streakDay 现算分值（spec §6.1）：窗口内按行存在性递推会把连签 30 天
-      // 截成 1..7，反而毁掉每日分值与「已连续 N 天」文案；失真只来自交错写，下一次写路径的
-      // reconcileStreaks 会把库存修回来（Task 2 负责收敛）。
+      // 已签格照库存值下发：窗口里重算会把连签 30 天压成 1..7（§6.1 说收敛由写路径负责）
       cells.push({ dateKey, state: 'signed', streakDay: stored, reward: rewardForStreakDay(stored) });
     } else if (dateKey === todayKey) {
       cells.push({ dateKey, state: 'today', streakDay: todayPos, reward: rewardForStreakDay(todayPos) });
