@@ -37,6 +37,7 @@ interface SigninState {
   canMakeUp: boolean;
   makeupDate: string;
   cards: number;
+  makeupCardId: string;
 }
 
 interface TaskRow {
@@ -186,6 +187,7 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s0.signin.todayReward, 0);
   assert.equal(s0.signin.nextReward, 1, '首签 1 分');
   assert.equal(s0.signin.cards, 0);
+  assert.equal(s0.signin.makeupCardId, '', '没有卡时补签卡 id 为空串');
   assert.equal(s0.signin.canMakeUp, false, '没有卡不能补签');
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
@@ -217,10 +219,11 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(data<{ cardId: string; balance: number }>(ex2).cardId, cardId, '同一 requestId 复用同一张卡');
   assert.equal(data<{ cardId: string; balance: number }>(ex2).balance, 0, '不重复扣分');
 
-  // 5) 汇总带出未使用卡数量与可补签日期（昨天）
+  // 5) 汇总带出未使用卡数量、可直接使用的那张卡 id 与可补签日期（昨天）
   const s2 = data<Summary>(await get('/points/summary'));
   assert.equal(s2.balance, 0);
   assert.equal(s2.signin.cards, 1);
+  assert.equal(s2.signin.makeupCardId, cardId, '汇总要下发第一张可用补签卡的 id');
   assert.equal(s2.signin.canMakeUp, true);
   assert.equal(s2.signin.makeupDate, YESTERDAY);
 
@@ -283,6 +286,7 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s3.signin.todayReward, 4);
   assert.equal(s3.signin.nextReward, 5);
   assert.equal(s3.signin.cards, 0);
+  assert.equal(s3.signin.makeupCardId, '', '卡用掉后汇总不再下发补签卡 id');
   assert.equal(s3.signin.canMakeUp, false);
   const video = s3.tasks.find((t) => t.key === 'daily_video');
   assert.equal(video?.status, 'claimed');

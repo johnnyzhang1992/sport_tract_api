@@ -17,14 +17,25 @@ export async function pointsRoutes(fastify: FastifyInstance) {
     const userId = request.user.userId;
     // 先结算过期批次，保证余额/卡数与后续各接口看到的口径一致
     await settleExpired(userId);
-    const [signin, tasks, items, balance, cards] = await Promise.all([
-      getSigninState(userId),
+    const now = Date.now();
+    const [signin, tasks, items, balance, cards, card] = await Promise.all([
+      getSigninState(userId, now),
       getTaskRows(userId),
       getItems(),
-      getBalance(userId),
-      PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: Date.now() } }),
+      getBalance(userId, now),
+      PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: now } }),
+      // 「补签昨天」直接可用的那张卡：最早到期优先，前端无需再猜/换卡
+      PointCardModel.findOne({ userId, status: 'unused', expiresAt: { $gt: now } })
+        .sort({ expiresAt: 1, _id: 1 })
+        .select({ _id: 1 })
+        .lean(),
     ]);
-    return success({ balance, signin: { ...signin, cards }, tasks, item: items[0] });
+    return success({
+      balance,
+      signin: { ...signin, cards, makeupCardId: card ? String(card._id) : '' },
+      tasks,
+      item: items[0],
+    });
   });
 
   // 今日签到（幂等：重复提交返回 alreadySigned，不再发分）
