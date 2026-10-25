@@ -35,44 +35,44 @@ test('RK1 正常链条不动它：fixes 空、差额 0', async () => {
   assert.equal(r.topUpPoints, 0);
 });
 
-test('RK2 并发交错留下的错位（今天记 1、昨天刚被补成 5）→ 校正今天为 6 并差额 1', async () => {
+test('RK2 并发交错留下的错位（今天记 1、昨天刚被补成 5）→ 校正今天为 6 并补 5 分', async () => {
   await wipe();
   await put(back(5), 1, 1); await put(back(4), 2, 2); await put(back(3), 3, 3); await put(back(2), 4, 4);
   await put(back(1), 5, 5); // 刚补出来的昨天
   await put(TODAY, 1, 1); // 今天抢在补签之前落的行
   const r = await reconcileStreaks(userId, NOW);
   assert.deepEqual(r.fixes, [{ dateKey: TODAY, from: 1, to: 6 }]);
-  assert.equal(r.topUpPoints, 1);
+  assert.equal(r.topUpPoints, 5, '今天实际只拿了 1 分，新位置该 6 分 → 欠 5（差额不封顶在 1）');
   assert.equal((await PointSigninModel.findOne({ userId: uid, dateKey: TODAY }).lean())?.streakDay, 6);
 });
 
-test('RK3 封顶 7 之后不再产生差额', async () => {
+test('RK3 封顶 7 之后重排不产生差额（也不写空流水）', async () => {
   await wipe();
   await put(back(8), 1, 1); await put(back(7), 2, 2); await put(back(6), 3, 3);
   await put(back(5), 4, 4); await put(back(4), 5, 5); await put(back(3), 6, 6);
-  await put(back(2), 7, 7); await put(back(1), 7, 7); // 昨天被补过，今天行按旧值落了 8
-  await put(TODAY, 8, 7);
+  await put(back(2), 7, 7); await put(back(1), 7, 7); // 昨天被补过，行还记着旧值 7
   const r = await reconcileStreaks(userId, NOW);
-  assert.equal(r.fixes.length, 1);
+  assert.equal(r.fixes.length, 1, '只有昨天需要 7→8；今天没签，不落行也不校');
+  assert.equal(r.fixes[0].dateKey, back(1));
   assert.equal(r.fixes[0].to, 8);
   assert.equal(r.topUpPoints, 0, '7→8 名义分不变，不该写空流水');
-  assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 0, '差额 0 不该落任何流水');
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 0, 'reconcile 只校正不落库金额');
 });
 
 test('RK4 发差额：一条 makeup_topup 流水记在今天，重复调用不重复发', async () => {
   await wipe();
   await put(back(2), 4, 4); await put(back(1), 5, 5); await put(TODAY, 1, 1);
   const first = await creditStreakTopUp(userId, back(1), NOW);
-  assert.equal(first, 1);
+  assert.equal(first, 5, '今天 1→6 位置分，欠 5');
   const recs = await PointRecordModel.find({ userId: uid }).sort({ createdAt: 1 }).lean();
   assert.equal(recs.length, 1);
   assert.equal(recs[0].type, 'makeup_topup');
   assert.equal(recs[0].bizDate, TODAY);
-  assert.equal(recs[0].idemKey, `${userId}:streak_topup:${back(1)}`);
-  assert.equal(recs[0].delta, 1);
+  assert.equal(recs[0].idemKey, `${userId}:makeup_topup:${back(1)}`);
+  assert.equal(recs[0].delta, 5);
   assert.equal(await creditStreakTopUp(userId, back(1), NOW), 0, '链条已正，第二次不该再发');
   assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 1, '第二次调用不落新流水');
-  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 1);
+  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 5);
   // 账本不变式：Σ record.delta === account.balance === Σ 未过期 lot.remaining
   const account = await PointAccountModel.findOne({ userId: uid }).lean();
   const lotSum = (await PointLotModel.find({ userId: uid, expireAt: { $gt: NOW } }).lean())
@@ -88,35 +88,39 @@ test('RK5 窗口外的历史行不参与校正（只看最近 7 格）', async (
   assert.equal(r.fixes.find((f) => f.dateKey === back(8)), undefined);
 });
 
-test('RK6 窗口内断签后重开：空档把 prev 归零，断口右边的行按第 1 天起算', async () => {
+test('RK6 空档断链：段首以库存值为锚（不回按 1 起），向下归位校行不扣已拿的分', async () => {
   await wipe();
-  await put(back(5), 1, 1); // 10-20 第 1 天
-  await put(back(2), 2, 2); // 10-23 记成「第 2 天」，但 10-21/22 是空档 → 它必须是第 1 天
+  await put(back(5), 1, 1); await put(back(4), 2, 2); // 20-21 连续链 1..2
+  await put(back(2), 4, 4); // 23：22 是空档 → 段首，库存值 4 当锚（D1：可信，不按 1 重开）
+  await put(back(1), 9, 9); // 24：该顶到 23+1=5，记了 9 → 向下归位
   const r = await reconcileStreaks(userId, NOW);
-  assert.deepEqual(r.fixes, [{ dateKey: back(2), from: 2, to: 1 }]);
-  assert.equal(r.topUpPoints, 0, '向下归位不发分');
-  assert.equal((await PointSigninModel.findOne({ userId: uid, dateKey: back(2) }).lean())?.streakDay, 1);
+  assert.deepEqual(r.fixes, [{ dateKey: back(1), from: 9, to: 5 }], '空档不被左侧残值 push（prev 归零），断口右段首不动');
+  assert.equal(r.topUpPoints, 0, '向下归位不发分也不回扣');
+  assert.equal((await PointSigninModel.findOne({ userId: uid, dateKey: back(2) }).lean())?.streakDay, 4);
+  assert.equal((await PointSigninModel.findOne({ userId: uid, dateKey: back(1) }).lean())?.streakDay, 5);
 });
 
-test('RK7 差额按 trigger 各发一份：幂等键含 trigger，同 trigger 重复调用命中键不发分', async () => {
+test('RK7 差额按 trigger 各发一份：幂等键 makeup_topup 含 trigger，两笔全额入账', async () => {
   await wipe();
-  await put(back(2), 4, 4); await put(back(1), 5, 5); await put(TODAY, 1, 1);
-  assert.equal(await creditStreakTopUp(userId, back(1), NOW), 1, '第一次：10-24 引起，今天 1→6');
-  await put(back(3), 1, 1); // 10-22 又被补进来：10-23 从第 1 天顶到第 2 天
-  assert.equal(await creditStreakTopUp(userId, back(3), NOW), 1, '第二次：10-22 引起，另发一份差额');
-  assert.equal(await creditStreakTopUp(userId, back(3), NOW), 0, '同 trigger 重放：命中幂等键不再发');
+  await put(back(5), 1, 1); await put(back(4), 2, 2); await put(back(3), 3, 3); // 20..22 链
+  await put(back(1), 1, 1); await put(TODAY, 2, 2); // 23 空档：24/今天按新链落了 1/2
+  await put(back(2), 4, 4); // 补签 23：接在 22 之后 → 第 4 天，下游要重排
+  assert.equal(await creditStreakTopUp(userId, back(2), NOW), 8, '24 1→5 欠 4、今天 2→6 欠 4，全额 8');
+  await put(back(6), 1, 1); // 再补签 19：整条链右移一格
+  assert.equal(await creditStreakTopUp(userId, back(6), NOW), 6, '20..25 各 +1 档 → 6 天欠 6 分');
+  assert.equal(await creditStreakTopUp(userId, back(6), NOW), 0, '链条已正，同 trigger 重放不再发');
   const recs = await PointRecordModel.find({ userId: uid }).sort({ createdAt: 1 }).lean();
   assert.equal(recs.length, 2);
   assert.deepEqual(recs.map((x) => x.idemKey).sort(), [
-    `${userId}:streak_topup:${back(1)}`, `${userId}:streak_topup:${back(3)}`,
+    `${userId}:makeup_topup:${back(2)}`, `${userId}:makeup_topup:${back(6)}`,
   ].sort());
   // 账本不变式：Σ record.delta === account.balance === Σ 未过期 lot.remaining
   const account = await PointAccountModel.findOne({ userId: uid }).lean();
-  assert.equal(recs.reduce((s, x) => s + x.delta, 0), 2);
-  assert.equal(account?.balance, 2);
+  assert.equal(recs.reduce((s, x) => s + x.delta, 0), 14);
+  assert.equal(account?.balance, 14);
   const lotSum = (await PointLotModel.find({ userId: uid, expireAt: { $gt: NOW } }).lean())
     .reduce((s, l) => s + l.remaining, 0);
-  assert.equal(lotSum, 2);
+  assert.equal(lotSum, 14);
 });
 
 test('RK8 读后写前的并发改动不被覆盖：CAS 条件 streakDay=读到的旧值', async (t) => {
