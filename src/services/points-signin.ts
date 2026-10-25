@@ -128,6 +128,15 @@ export async function useMakeupCard(userId: string, cardId: string, now = Date.n
   });
   if (!row) throw new AppError(400, '昨天已签到，无需补签');
 
+  // 与签到串行化：开头读 today 到今天补签落库之间，并发 signIn 可能刚建了今天的行
+  // （它当时看不到昨天，streakDay 会是 1）。此时继续补签会留下「今天=1、昨天=3」的错位连签，
+  // 所以先撤回刚占的补签行，按「今天已签到」拒绝，卡不动。
+  const todayAfterClaim = await PointSigninModel.findOne({ userId, dateKey: todayKey }).lean();
+  if (todayAfterClaim) {
+    await PointSigninModel.deleteOne({ _id: row._id });
+    throw new AppError(400, '今天已签到，补签需在今日签到前完成');
+  }
+
   const card = await PointCardModel.findOneAndUpdate(
     { _id: cardId, userId, status: 'unused', expiresAt: { $gt: now } },
     { $set: { status: 'used', usedForDate: yKey } },
@@ -159,6 +168,16 @@ export async function useMakeupCard(userId: string, cardId: string, now = Date.n
     ]);
     throw e;
   }
+  // credited 为 0（账本判重放或当日已达上限）：不留 0 分补签行、也不能白烧卡。
+  // 与发分失败同一处理：撤回补签行 + 卡退回未使用，400 让用户稍后重试。
+  if (credited <= 0) {
+    await Promise.all([
+      PointSigninModel.deleteOne({ _id: row._id }),
+      PointCardModel.updateOne({ _id: card._id }, { $set: { status: 'unused', usedForDate: '' } }),
+    ]);
+    throw new AppError(400, '补签未入账积分（可能已达每日上限），补签卡未消耗');
+  }
+
   await PointSigninModel.updateOne({ _id: row._id }, { $set: { points: credited } });
 
   return {
