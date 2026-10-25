@@ -6,7 +6,9 @@
  * - 兑换幂等键 `exchange:${userId}:${requestId}`：先查兑换记录短路重放；并发同一 requestId
  *   由账本 idemKey + 兑换记录唯一索引 (userId, requestId) 双重兜底，只扣一次分、只留一张卡；
  * - 扣分走账本 debitPoints（余额闸门），余额不足由账本抛 400，文案带当前值与所需值；
- * - 先扣分再发卡：并发落败方会先发出一张无人认领的卡，必须撤回，否则重放会白得一张卡；
+ * - 余额恰好只够一次的连点：后到请求会先撞余额闸门，补查在途兑换记录，命中即返回同一张卡；
+ * - 先扣分再发卡：兑换记录落库失败（含并发落败）时，本次发出的卡无人认领，必须撤回，
+ *   否则重试会变成「一次扣分换两张卡」；
  * - 兑换记录状态实时推导：卡仍是 unused 但已过 expiresAt 时返回 expired，不依赖离线结算任务。
  */
 import { POINTS } from '../config/points.js';
@@ -57,6 +59,11 @@ function isDuplicateKey(e: unknown): boolean {
   return (e as { code?: number } | null)?.code === DUPLICATE_KEY;
 }
 
+/** 账本余额闸门失败（文案形如「积分不足（当前 0，需要 200）」） */
+function isInsufficientBalance(e: unknown): boolean {
+  return e instanceof AppError && e.statusCode === 400 && e.message.startsWith('积分不足');
+}
+
 /** 卡状态：used/expired 以落库为准；unused 但已过有效期按过期展示 */
 function cardStatus(card: { status?: string; expiresAt?: number }, now: number): CardStatus {
   if (card.status === 'used') return 'used';
@@ -72,7 +79,7 @@ export function getItems(): ItemDto[] {
     subtitle: '恢复连续打卡记录',
     price: POINTS.MAKEUP_CARD_PRICE,
     validDays: POINTS.MAKEUP_CARD_VALID_DAYS,
-    description: '每张仅可使用一次；仅用于补签昨天；兑换后 30 天内有效',
+    description: `每张仅可使用一次；仅用于补签昨天；兑换后 ${POINTS.MAKEUP_CARD_VALID_DAYS} 天内有效`,
   }];
 }
 
@@ -92,16 +99,25 @@ export async function exchangeMakeupCard(
   const exists = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
   if (exists) return { cardId: String(exists.cardId), balance: await getBalance(userId, now) };
 
-  await debitPoints(userId, {
-    type: 'exchange',
-    title: '兑换补签卡',
-    points: POINTS.MAKEUP_CARD_PRICE,
-    bizDate: bjDateStr(now),
-    refType: 'item',
-    refId: ITEM_KEY,
-    // 明细表 idemKey 全局唯一，必须带 userId
-    idemKey: `exchange:${userId}:${rid}`,
-  }, now);
+  try {
+    await debitPoints(userId, {
+      type: 'exchange',
+      title: '兑换补签卡',
+      points: POINTS.MAKEUP_CARD_PRICE,
+      bizDate: bjDateStr(now),
+      refType: 'item',
+      refId: ITEM_KEY,
+      // 明细表 idemKey 全局唯一，必须带 userId
+      idemKey: `exchange:${userId}:${rid}`,
+    }, now);
+  } catch (e) {
+    if (!isInsufficientBalance(e)) throw e;
+    // 余额恰好够一次的连点：A 扣光余额后、兑换记录落库前，B 会先撞余额闸门。
+    // 补查在途记录：命中说明是同一笔点击，返回 A 那张卡（不再扣分/发卡）；否则才是真的余额不足。
+    const inFlight = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
+    if (!inFlight) throw e;
+    return { cardId: String(inFlight.cardId), balance: await getBalance(userId, now) };
+  }
 
   const card = await PointCardModel.create({
     userId,
@@ -122,10 +138,12 @@ export async function exchangeMakeupCard(
       createdAt: now,
     });
   } catch (e) {
-    if (!isDuplicateKey(e)) throw e;
-    // 并发同一 requestId：另一请求已先落兑换记录（账本已按 idemKey 去重，不会重复扣分）。
-    // 本次刚发的卡没有记录认领，撤回后返回胜出方那张卡。
+    // 兑换记录没落下（含并发 E11000 落败）：本次刚发的卡无人认领，一律撤回，
+    // 否则重试会变成「一次扣分换两张卡」。
     await PointCardModel.deleteOne({ _id: card._id });
+    if (!isDuplicateKey(e)) throw e;
+    // 并发同一 requestId：另一请求已先落兑换记录（账本已按 idemKey 去重，不会重复扣分），
+    // 返回胜出方那张卡。
     const winner = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
     if (!winner) throw e;
     return { cardId: String(winner.cardId), balance: await getBalance(userId, now) };

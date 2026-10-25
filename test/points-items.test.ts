@@ -211,3 +211,80 @@ test('PI5 并发同 requestId 只扣一次分、只发一张卡', async (t) => {
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 1);
   assert.equal(await getBalance(String(uid), NOW), 200);
 });
+
+test('PI6 余额恰好用尽的双击：后到请求命中在途兑换记录，返回同一张卡', async (t) => {
+  const uid = newUser();
+  t.after(() => wipe(uid));
+
+  // 请求 A 的成果：扣光 200 → 余额 0；本用例不造积分，兑换记录在「夹缝」里落库（见下）
+  const cardA = await PointCardModel.create({
+    userId: uid, status: 'unused', expiresAt: NOW + POINTS.MAKEUP_CARD_VALID_DAYS * DAY, createdAt: NOW,
+  });
+  const seedExchangeRow = () => PointExchangeModel.create({
+    userId: uid, itemKey: 'makeup_card', cost: 200, cardId: cardA._id, requestId: 'req-dbl', createdAt: NOW,
+  });
+
+  // 复现「B 的前置查询早于 A 落库、B 的扣分晚于 A 扣分」的窗口：
+  // 第一次 findOne 真的查过库（此刻还没有记录），查到之后才让 A 的兑换记录落库
+  const model = PointExchangeModel as unknown as {
+    findOne: (...args: unknown[]) => { lean: () => Promise<unknown> };
+  };
+  const realFindOne = PointExchangeModel.findOne.bind(PointExchangeModel);
+  let calls = 0;
+  model.findOne = (...args: unknown[]) => {
+    calls += 1;
+    const query = (realFindOne as unknown as typeof model.findOne)(...args);
+    if (calls === 1) {
+      return {
+        lean: async () => {
+          const row = await query.lean();
+          await seedExchangeRow();
+          return row;
+        },
+      };
+    }
+    return query;
+  };
+  t.after(() => { model.findOne = realFindOne as unknown as typeof model.findOne; });
+
+  const r = await exchangeMakeupCard(String(uid), 'req-dbl', NOW);
+
+  // 命中在途记录：返回 A 的卡，而不是抛 400「积分不足」
+  assert.equal(r.cardId, String(cardA._id));
+  assert.equal(r.balance, 0);
+  assert.equal(calls, 2, '应补查一次兑换记录');
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1);
+  assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 1);
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 0); // 没有第二次扣分
+});
+
+test('PI7 兑换记录写失败不留孤儿卡，重试仍只对应一次扣分', async (t) => {
+  const uid = newUser();
+  t.after(() => wipe(uid));
+  await seedPoints(uid, POINTS.MAKEUP_CARD_PRICE);
+
+  const model = PointExchangeModel as unknown as {
+    create: (...args: unknown[]) => Promise<unknown>;
+  };
+  const realCreate = PointExchangeModel.create.bind(PointExchangeModel);
+  const restore = () => { model.create = realCreate as unknown as typeof model.create; };
+  t.after(restore);
+
+  // 非重复键失败：卡已发出但兑换记录写不进去
+  model.create = async () => { throw new Error('exchange write boom'); };
+  await assert.rejects(exchangeMakeupCard(String(uid), 'req-orphan', NOW), /exchange write boom/);
+
+  // 扣分已发生（先扣后发，本轮不引入事务），但卡必须撤回，否则重试等于白得一张
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0);
+  assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 0);
+  assert.equal(await getBalance(String(uid), NOW), 0);
+
+  // 恢复后重试：账本按 idemKey 重放（不二次扣分），一扣分对应一卡一记录
+  restore();
+  const r = await exchangeMakeupCard(String(uid), 'req-orphan', NOW);
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1);
+  assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 1);
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 1);
+  assert.equal(r.balance, 0);
+  assert.equal(String((await PointExchangeModel.findOne({ userId: uid, requestId: 'req-orphan' }).lean())?.cardId), r.cardId);
+});
