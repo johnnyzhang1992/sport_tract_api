@@ -96,7 +96,7 @@ test('PS6 今天已签到时补签被拒，卡不消耗', async () => {
   }
   const card = await PointCardModel.create({ userId: uid6, expiresAt: NOW + 86400000, createdAt: NOW });
   await assert.rejects(useMakeupCard(String(uid6), String(card._id), NOW), /今天已签到/);
-  const after = await PointCardModel.findById(card._id).lean();
-  assert.equal(after?.status, 'unused');
+  const cardAfter = await PointCardModel.findById(card._id).lean();
+  assert.equal(cardAfter?.status, 'unused');
   await wipe(uid6);
 });
