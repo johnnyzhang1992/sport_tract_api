@@ -18,7 +18,7 @@ import { previousDateKey } from '../src/utils/points-domain.js';
  * /points/* HTTP 接线：登录闸门、汇总结构、以及「汇总 → 兑换 → 补签 → 签到 → 领任务」全链路。
  *
  * 时间是路由内 Date.now()，所以造数据一律相对「今天（东八区）」：
- * 前天有签到行（补签卡可用的前提）、昨天/今天留空（补签只能补昨天）。
+ * 前天有签到行、昨天/今天留空 → 昨天是窗口内的可补格，补签接口按 dateKey 走。
  * 清理只动本用例自己登录出来的那个用户及其积分行，不碰库里其他数据。
  */
 
@@ -149,7 +149,7 @@ before(async () => {
     PointRecordModel.init(), PointAccountModel.init(),
   ]);
 
-  // 前天签到：补签卡「只能补昨天」的前提；昨天/今天留空
+  // 前天签到：让昨天成为「所在未签段 ≤2 天」的可补格；昨天/今天留空
   await PointSigninModel.create({
     userId: uid,
     dateKey: DAY_BEFORE,
@@ -180,7 +180,7 @@ test('PR1 未登录访问 /points/* 全部 401', async () => {
     ['POST', '/points/tasks/daily_video/claim'],
     ['GET', '/points/items'],
     ['POST', '/points/items/makeup_card/exchange'],
-    ['POST', '/points/cards/000000000000000000000000/use'],
+    ['POST', '/points/signin/makeup'],
     ['GET', '/points/exchanges'],
   ] as const;
   for (const [method, url] of cases) {
@@ -240,16 +240,19 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s2.signin.makeupCardId, cardId, '汇总要下发第一张可用补签卡的 id');
   assert.deepEqual(makeupKeys(s2.signin), [YESTERDAY]);
 
-  // 6) 非法卡 id → service 的 400 原样透出
-  const badCard = await post('/points/cards/not-an-object-id/use');
-  assert.equal(badCard.statusCode, 400, badCard.body);
-  assert.match(badCard.json().message, /补签卡/);
+  // 6) 非法 dateKey（今天的行不算漏签日）→ service 的 400 原样透出，卡不消耗
+  const badDate = await post('/points/signin/makeup', { dateKey: TODAY });
+  assert.equal(badDate.statusCode, 400, badDate.body);
+  assert.match(badDate.json().message, /不能补签/);
+  assert.equal((await PointCardModel.findOne({ userId: uid }).lean())?.status, 'unused', '参数错不烧卡');
 
-  // 7) 用卡补签昨天：连签接到前天（3），得 3 分；今天仍未签到
-  const used = await post(`/points/cards/${cardId}/use`);
+  // 7) 按日期用卡补签昨天：连签接到前天（3），得 3 分；今天仍未签到、没欠分可补 → toppedUp 0
+  const used = await post('/points/signin/makeup', { dateKey: YESTERDAY });
   assert.equal(used.statusCode, 200, used.body);
-  const useData = data<{ credited: number; balance: number } & SigninState>(used);
+  const useData = data<{ credited: number; toppedUp: number; cardId: string; balance: number } & SigninState>(used);
   assert.equal(useData.credited, 3);
+  assert.equal(useData.toppedUp, 0, '今天没签到行，重排没欠分');
+  assert.equal(useData.cardId, cardId, '服务端挑的就是那个 exchange 拿到的卡');
   assert.equal(useData.balance, 3);
   assert.equal(useData.streakDay, 3);
   assert.equal(useData.todaySigned, false);

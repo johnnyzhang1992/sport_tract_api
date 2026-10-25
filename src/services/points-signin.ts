@@ -1,24 +1,25 @@
 /**
  * 签到与补签。
  *
- * 规则（需求 §4）：
+ * 规则（需求 §4 改版 / 设计 2026-10-25）：
  * - 连续签到第 N 天得 `min(N, 7)` 分；第 8 天起每天 7 分，直到断签才从第 1 天重算；
  * - 断签判定只看「昨天有没有签到行」：有则 streak = 昨天 + 1，没有则从 1 起；
  * - 签到行以 (userId, dateKey) 唯一键落库，重复签到返回 alreadySigned、不再发当天分，
  *   但仍跑一次差额校正（同一天重试也是「下一次写」，设计 §6.1）；
- * - 补签卡只能补「昨天」，且必须满足：今天还没签到、昨天没签、前天已签；
- *   补签同样写入一条 source='makeup' 的签到行，因此今天再签到会自然接上昨天补出来的连签。
+ * - 补签**按日期逐格**：窗口（今天-6..今天）内、没签到行、且所在未签段 ≤2 天的日子才可补，
+ *   一格一张卡（服务端挑最早过期的可用卡，客户端不传卡 id），今天已签照样能补（口径 3）；
+ * - 补签写一条 source='makeup' 的行，插入后整条链按 §4.2 递推重排，重排欠分由收尾的
+ *   `creditStreakTopUp` 一次补发（差额的唯一出口，本流程不自己算差额，Ruling D3）。
  *
  * 幂等键带 userId 前缀：明细表的 idemKey 是全局唯一索引，不带用户前缀时第二个用户在同一天
  * 签到会被误判成重放（credited 0）。
  */
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
-import { isObjectIdLike } from '../utils/object-id.js';
 import { previousDateKey, rewardForStreakDay } from '../utils/points-domain.js';
 import { planSigninCells, windowStartKey, type SigninCell } from '../utils/points-window.js';
 import { PointCardModel, PointSigninModel } from '../models/point.model.js';
-import { creditPoints, getBalance } from './points-ledger.js';
+import { creditPoints, debitPoints, getBalance } from './points-ledger.js';
 import { creditStreakTopUp } from './points-streak.js';
 
 export interface SigninState {
@@ -130,86 +131,137 @@ export async function signIn(userId: string, now = Date.now()): Promise<SigninRe
   };
 }
 
-export async function useMakeupCard(userId: string, cardId: string, now = Date.now()): Promise<SigninResult> {
-  const todayKey = bjDateStr(now);
-  const yKey = previousDateKey(todayKey);
-  const dayBeforeKey = previousDateKey(yKey);
-  const [today, yesterday, dayBefore] = await Promise.all([
-    PointSigninModel.findOne({ userId, dateKey: todayKey }).lean(),
-    PointSigninModel.findOne({ userId, dateKey: yKey }).lean(),
-    PointSigninModel.findOne({ userId, dateKey: dayBeforeKey }).lean(),
-  ]);
-  if (today) throw new AppError(400, '今天已签到，补签需在今日签到前完成');
-  if (yesterday) throw new AppError(400, '昨天已签到，无需补签');
-  if (!dayBefore) throw new AppError(400, '前天没有签到记录，补签卡只能补前一天且需前天已签到');
-  if (!isObjectIdLike(cardId)) throw new AppError(400, '补签卡不可用或已过期');
+export interface MakeupResult extends SigninResult {
+  /** 重排差额实际入账（被每日上限截断时是实发值，§5.2） */
+  toppedUp: number;
+  /** 本次消耗掉的卡（服务端自己挑的，客户端不传卡 id） */
+  cardId: string;
+}
 
-  const streakDay = dayBefore.streakDay + 1;
-  // 先占「昨天」这一行：防止两张卡（或同卡双击）并发补同一天重复发分、重复烧卡
+/**
+ * 用一张补签卡补窗口内的某个漏签日（设计 §4.1/§4.2/§6）。
+ *
+ * 判定只有一个来源：`getSigninState` 下发的 `cells` 里这一格是不是 `state === 'makeup'`
+ * ——「窗口内」「没签到行」「所在未签段 ≤2 天」都在 `planSigninCells` 里算过，这里不重算一遍。
+ *
+ * 落库顺序（不用事务，先占位、失败逆序回滚、每步带条件）：
+ * 1. 占住 `d` 的签到行（唯一键冲突 = 这一天已被并发补上/签上 → 400「该日已签到」）；
+ * 2. 原子扣卡 `unused → used(usedForDate=d)`，服务端按最早过期挑卡；抢不到卡 → 只撤回第 1 步的行；
+ * 3. 发 `makeup_reward`（bizDate=d，不占今天额度）；实发 0（当日上限已满 / 重放）视为失败 → 退卡 + 撤行；
+ * 4. 把行的 `points` 写成实发分；
+ * 5. 收尾 `creditStreakTopUp(userId, d)`：重排窗口内的 streakDay 并一次补发差额（Ruling D3：
+ *    差额只有一个出口，本函数不自己算「受影响日」）。
+ * 第 3~5 步任一抛错按逆序回滚：扣回已发的当天分（`debitPoints`）→ 卡退回 unused → 撤本次的占位行。
+ *
+ * trigger 必须是**补签日**而不是今天：今天的 `{userId}:makeup_topup:{今天}` 已被 `signIn` 占用，
+ * 同一天用第二张卡时两份欠分会互相吞掉一条流水（PS4c 钉这条）。
+ *
+ * 已接受风险（§5.2/§6.1，设计认下、别在这里补救）：第 5 步被 DAILY_CAP 截断或抛错时，
+ * `reconcileStreaks` 写过的 streakDay 不跟着回滚（读路径永不下修），少发的差额找不回来，
+ * 响应里的 `credited/toppedUp` 报的就是实际入账值。
+ */
+export async function useMakeupCard(
+  userId: string, dateKey: string, now = Date.now(),
+): Promise<MakeupResult> {
+  const todayKey = bjDateStr(now);
+  const key = String(dateKey ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key) || key >= todayKey) throw new AppError(400, '该日期不能补签');
+  if (key < windowStartKey(todayKey)) throw new AppError(400, '该日期不能补签');
+
+  const state = await getSigninState(userId, now);
+  const cell = state.cells.find((c) => c.dateKey === key);
+  if (cell?.state === 'signed') throw new AppError(400, '该日已签到，无需补签');
+  if (cell?.state !== 'makeup') throw new AppError(400, '断签超过 2 天或超出窗口，该日不能补签');
+  if (state.cards <= 0) throw new AppError(400, '没有可用的补签卡，请先兑换');
+
+  const streakDay = cell.streakDay;
+  // 1) 先占这一行：同一天双击/两路并发只有一路能往下发分
   const row = await PointSigninModel.create({
-    userId, dateKey: yKey, streakDay, points: 0, source: 'makeup', createdAt: now,
-  }).catch((e) => {
+    userId, dateKey: key, streakDay, points: 0, source: 'makeup', createdAt: now,
+  }).catch((e: unknown) => {
     if (isDuplicateKey(e)) return null;
     throw e;
   });
-  if (!row) throw new AppError(400, '昨天已签到，无需补签');
+  if (!row) throw new AppError(400, '该日已签到，无需补签');
 
-  // 与签到串行化：开头读 today 到今天补签落库之间，并发 signIn 可能刚建了今天的行
-  // （它当时看不到昨天，streakDay 会是 1）。此时继续补签会留下「今天=1、昨天=3」的错位连签，
-  // 所以先撤回刚占的补签行，按「今天已签到」拒绝，卡不动。
-  const todayAfterClaim = await PointSigninModel.findOne({ userId, dateKey: todayKey }).lean();
-  if (todayAfterClaim) {
-    await PointSigninModel.deleteOne({ _id: row._id });
-    throw new AppError(400, '今天已签到，补签需在今日签到前完成');
-  }
-
+  // 2) 扣卡：条件写（unused 才挑得动），最早过期优先 —— 与 summary 的挑卡口径一致
   const card = await PointCardModel.findOneAndUpdate(
-    { _id: cardId, userId, status: 'unused', expiresAt: { $gt: now } },
-    { $set: { status: 'used', usedForDate: yKey } },
-    { returnDocument: 'after' },
-  ).lean();
+    { userId, status: 'unused', expiresAt: { $gt: now } },
+    { $set: { status: 'used', usedForDate: key } },
+    { sort: { expiresAt: 1, _id: 1 }, returnDocument: 'after' },
+  ).lean().catch(async (e: unknown) => {
+    // 这一枪本身报错（网络/校验）：先把刚占的行撤回再冒泡，否则库里留一条 0 分补签行、卡却还在
+    await deleteOwnRow(row._id);
+    throw e;
+  });
   if (!card) {
-    // 卡不可用：把刚占的补签行撤回，避免用户白白多出一条 0 分的补签
-    await PointSigninModel.deleteOne({ _id: row._id });
-    throw new AppError(400, '补签卡不可用或已过期');
+    // 卡数是开头那次 count 看到的，扣的这一刻已被并发用掉/刚好过期：只撤回本次占的行
+    await deleteOwnRow(row._id);
+    throw new AppError(400, '没有可用的补签卡，请先兑换');
   }
+
+  // 逆序回滚，每步只动本次刚写的行/卡（条件写，别把并发另一路的成果抹掉）
+  const rollback = async () => {
+    await PointCardModel.updateOne(
+      { _id: card._id, status: 'used', usedForDate: key },
+      { $set: { status: 'unused', usedForDate: '' } },
+    ).catch((e: unknown) => logRollbackFailure('退卡', e));
+    await deleteOwnRow(row._id);
+  };
 
   let credited = 0;
+  let toppedUp = 0;
   try {
     const c = await creditPoints(userId, {
       type: 'makeup_reward',
-      title: `补签 ${yKey}`,
+      title: `补签 ${key}`,
       points: rewardForStreakDay(streakDay),
-      bizDate: yKey,
+      bizDate: key, // 补签当天分记在它自己那天：不占今天额度（设计 §2 口径 2）
       refType: 'signin',
-      refId: yKey,
-      idemKey: `${userId}:makeup:${yKey}`,
+      refId: key,
+      // 键带本次占位行的 _id：行被唯一索引钉死，同日重放照样挡得住；
+      // 而回滚成功（行已删、卡已退回）后的重试是「另一次占位行」，不能被上一次已撤回的发放判成重放，
+      // 否则那天永远补不上、退回的卡成了废卡。
+      idemKey: `${userId}:makeup:${key}:${row._id}`,
     }, now);
     credited = c.credited;
+    if (credited <= 0) {
+      // 重放或当天额度已满：卡没白花、账上没多钱，400 让用户稍后再试
+      throw new AppError(400, '补签未入账积分（可能已达每日上限），补签卡未消耗');
+    }
+    // 实际入账可能被每日上限截断，行记实发而不是名义分
+    await PointSigninModel.updateOne({ _id: row._id }, { $set: { points: credited } });
+    toppedUp = await creditStreakTopUp(userId, key, now);
   } catch (e) {
-    // 发分失败：撤回补签行并把卡退回未使用，用户可原卡重试（重复键已由账本兜底）
-    await Promise.all([
-      PointSigninModel.deleteOne({ _id: row._id }),
-      PointCardModel.updateOne({ _id: card._id }, { $set: { status: 'unused', usedForDate: '' } }),
-    ]);
+    if (credited > 0) {
+      // 已入账的当天分要扣回去，否则回滚后账上多一笔、卡却还在（钱是今天还的 → bizDate 今天）
+      await debitPoints(userId, {
+        type: 'makeup_reward_rollback', title: `撤回补签 ${key}`, points: credited,
+        bizDate: todayKey, refType: 'signin', refId: key,
+        idemKey: `${userId}:makeup_rollback:${key}:${row._id}`,
+      }, now).catch((de: unknown) => logRollbackFailure('扣回补签分', de));
+    }
+    await rollback();
     throw e;
   }
-  // credited 为 0（账本判重放或当日已达上限）：不留 0 分补签行、也不能白烧卡。
-  // 与发分失败同一处理：撤回补签行 + 卡退回未使用，400 让用户稍后重试。
-  if (credited <= 0) {
-    await Promise.all([
-      PointSigninModel.deleteOne({ _id: row._id }),
-      PointCardModel.updateOne({ _id: card._id }, { $set: { status: 'unused', usedForDate: '' } }),
-    ]);
-    throw new AppError(400, '补签未入账积分（可能已达每日上限），补签卡未消耗');
-  }
 
-  await PointSigninModel.updateOne({ _id: row._id }, { $set: { points: credited } });
-
+  const after = await getSigninState(userId, now);
   return {
-    alreadySigned: false,
+    ...after,
+    alreadySigned: after.todaySigned,
     credited,
+    toppedUp,
+    cardId: String(card._id),
     balance: await getBalance(userId, now),
-    ...(await getSigninState(userId, now)),
   };
+}
+
+/** 只撤本次刚写的那一行（按 _id 删；删不到也算成功——它可能已被并发路径清掉） */
+async function deleteOwnRow(id: unknown): Promise<void> {
+  await PointSigninModel.deleteOne({ _id: id }).catch((e: unknown) => logRollbackFailure('撤补签行', e));
+}
+
+/** 补偿动作自己失败时不能盖掉原始错误（调用方拿到的仍是失败原因），但也不能无声吞账本脏数据 */
+function logRollbackFailure(step: string, e: unknown): void {
+  console.error(`[points-makeup] 回滚「${step}」失败:`, (e as Error)?.message ?? e);
 }

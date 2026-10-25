@@ -24,7 +24,8 @@ export async function pointsRoutes(fastify: FastifyInstance) {
       getItems(),
       getBalance(userId, now),
       PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: now } }),
-      // 「补签昨天」直接可用的那张卡：最早到期优先，前端无需再猜/换卡
+      // makeupCardId 是旧契约（客户端传卡 id）的残留：改版后由服务端自己挑卡，前端不再需要它。
+      // spec §5.1 要求删掉，随 Task 5 的 summary DTO 接线一起撤，这里只保留字段不再宣称「补签昨天」。
       PointCardModel.findOne({ userId, status: 'unused', expiresAt: { $gt: now } })
         .sort({ expiresAt: 1, _id: 1 })
         .select({ _id: 1 })
@@ -69,10 +70,10 @@ export async function pointsRoutes(fastify: FastifyInstance) {
     return success(await exchangeMakeupCard(request.user.userId, String(requestId || '')));
   });
 
-  // 使用补签卡补签昨天
-  fastify.post('/cards/:id/use', { onRequest: [fastify.authenticate] }, async (request) => {
-    const { id } = request.params as { id: string };
-    return success(await useMakeupCard(request.user.userId, id));
+  // 补签窗口内的某一天（spec §5.2）：只传 dateKey，哪张卡由服务端挑（旧 /cards/:id/use 已撤）
+  fastify.post('/signin/makeup', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { dateKey } = (request.body ?? {}) as { dateKey?: string };
+    return success(await useMakeupCard(request.user.userId, String(dateKey ?? '')));
   });
 
   // 兑换记录（按兑换时间倒序，状态实时推导）
