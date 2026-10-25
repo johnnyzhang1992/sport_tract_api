@@ -76,7 +76,7 @@ test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t)
     subtitle: '恢复连续打卡记录',
     price: 200,
     validDays: 30,
-    description: '每张仅可使用一次；仅用于补签昨天；兑换后 30 天内有效',
+    description: '每张仅可使用一次；可补签近 7 天窗口内的漏签日，补一天用一张；兑换后 30 天内有效',
   });
 
   const r = await exchangeMakeupCard(String(uid), 'req-1', NOW);

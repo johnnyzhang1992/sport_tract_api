@@ -12,10 +12,12 @@ import { LoginLogModel } from '../src/models/login-log.model.js';
 import { POINTS } from '../src/config/points.js';
 import { creditPoints } from '../src/services/points-ledger.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
-import { previousDateKey } from '../src/utils/points-domain.js';
+import { previousDateKey, shiftDateKey } from '../src/utils/points-domain.js';
 
 /**
- * /points/* HTTP 接线：登录闸门、汇总结构、以及「汇总 → 兑换 → 补签 → 签到 → 领任务」全链路。
+ * /points/* HTTP 接线：登录闸门、汇总结构（cells 原样下发、旧 makeupCardId 已撤）、
+ * 「汇总 → 兑换 → 补签 → 签到 → 领任务」全链路，以及补窗口最左日（PR4）与
+ * 差额被 DAILY_CAP 截断报实发值（PR5）两条账本路径。
  *
  * 时间是路由内 Date.now()，所以造数据一律相对「今天（东八区）」：
  * 前天有签到行、昨天/今天留空 → 昨天是窗口内的可补格，补签接口按 dateKey 走。
@@ -43,10 +45,9 @@ interface SigninState {
   todayReward: number;
   nextReward: number;
   cards: number;
-  // 改版口径（spec §5.1）：canMakeUp/makeupDate 已删，可补与否只看 cells 里的 makeup 格。
-  // makeupCardId 是路由层拼的旧字段，Task 5 接线时才撤，这里先按现状断言。
+  // 改版口径（spec §5.1）：canMakeUp/makeupDate/makeupCardId 全部撤掉，
+  // 可补与否只看 cells 里的 makeup 格（makeupCardId 用下面的 undefined 断言钉死）。
   cells: SigninCell[];
-  makeupCardId: string;
 }
 
 const makeupKeys = (s: SigninState) => s.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey);
@@ -200,7 +201,10 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s0.signin.todayReward, 0);
   assert.equal(s0.signin.nextReward, 1, '首签 1 分');
   assert.equal(s0.signin.cards, 0);
-  assert.equal(s0.signin.makeupCardId, '', '没有卡时补签卡 id 为空串');
+  assert.equal(
+    (s0.signin as unknown as { makeupCardId?: string }).makeupCardId, undefined,
+    '旧契约字段 makeupCardId 已撤（spec §5.1），payload 里不该再出现',
+  );
   assert.deepEqual(makeupKeys(s0.signin), [YESTERDAY], '无卡但昨天漏签时仍下发 makeup 格（供前端引导兑换）');
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
@@ -233,17 +237,28 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(data<{ cardId: string; balance: number }>(ex2).cardId, cardId, '同一 requestId 复用同一张卡');
   assert.equal(data<{ cardId: string; balance: number }>(ex2).balance, 0, '不重复扣分');
 
-  // 5) 汇总带出未使用卡数量、可直接使用的那张卡 id；昨天仍是可补格（可补只看 cells，与卡数无关）
+  // 5) 汇总带出七格：昨天那格是补签格，且给出补完今天能拿的分（旧字段 makeupCardId 已撤）
   const s2 = data<Summary>(await get('/points/summary'));
   assert.equal(s2.balance, 0);
   assert.equal(s2.signin.cards, 1);
-  assert.equal(s2.signin.makeupCardId, cardId, '汇总要下发第一张可用补签卡的 id');
+  const makeupCell = s2.signin.cells.find((c) => c.state === 'makeup');
+  assert.ok(makeupCell, '应有一格可补');
+  assert.equal(makeupCell!.dateKey, YESTERDAY);
+  // 造数据是「前天有行、库存 streakDay=2」：补上昨天 → 昨天第 3 天、今天第 4 天（段首取库存锚点）。
+  // 与 spec §4.2 算例（补 24 → 今天 6）不冲突：那条链条已有 4 天连签，这里只有 2 天。
+  assert.equal(makeupCell!.todayRewardAfter, 4, '补完昨天 → 今天第 4 天');
+  assert.equal(
+    (s2.signin as unknown as { makeupCardId?: string }).makeupCardId, undefined,
+    'summary 不再挑卡给客户端传 id（spec §5.2：卡由服务端自选）',
+  );
   assert.deepEqual(makeupKeys(s2.signin), [YESTERDAY]);
 
-  // 6) 非法 dateKey（今天的行不算漏签日）→ service 的 400 原样透出，卡不消耗
+  // 6) 非法/出窗日期 → service 的 400 原样透出，卡不消耗；旧的按卡 id 接口已撤 → 404
   const badDate = await post('/points/signin/makeup', { dateKey: TODAY });
   assert.equal(badDate.statusCode, 400, badDate.body);
   assert.match(badDate.json().message, /不能补签/);
+  assert.equal((await post('/points/signin/makeup', { dateKey: '2020-01-01' })).statusCode, 400, '出窗日期 400');
+  assert.equal((await post(`/points/cards/${cardId}/use`)).statusCode, 404, '旧端点 /points/cards/:id/use 已撤');
   assert.equal((await PointCardModel.findOne({ userId: uid }).lean())?.status, 'unused', '参数错不烧卡');
 
   // 7) 按日期用卡补签昨天：连签接到前天（3），得 3 分；今天仍未签到、没欠分可补 → toppedUp 0
@@ -302,7 +317,6 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s3.signin.todayReward, 4);
   assert.equal(s3.signin.nextReward, 5);
   assert.equal(s3.signin.cards, 0);
-  assert.equal(s3.signin.makeupCardId, '', '卡用掉后汇总不再下发补签卡 id');
   assert.deepEqual(makeupKeys(s3.signin), [], '链已接上，没有可补格');
   const video = s3.tasks.find((t) => t.key === 'daily_video');
   assert.equal(video?.status, 'claimed');
@@ -325,6 +339,93 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   const clamped = data<RecordPage>(await get('/points/records?page=0&pageSize=999'));
   assert.equal(clamped.items.length, 6);
   assert.equal(clamped.total, 6);
+});
+
+/** 账本不变式：Σ record.delta === account.balance === Σ 未过期 lot.remaining */
+async function ledgerTotals(): Promise<{ deltaSum: number; balance: number; lotSum: number }> {
+  const now = Date.now();
+  const [recs, account, lots] = await Promise.all([
+    PointRecordModel.find({ userId: uid }).lean(),
+    PointAccountModel.findOne({ userId: uid }).lean(),
+    PointLotModel.find({ userId: uid, remaining: { $gt: 0 }, expireAt: { $gt: now } }).lean(),
+  ]);
+  return {
+    deltaSum: recs.reduce((s, r) => s + r.delta, 0),
+    balance: account?.balance ?? 0,
+    lotSum: lots.reduce((s, l) => s + l.remaining, 0),
+  };
+}
+
+test('PR4 补窗口最左日：一条 makeup_reward + 一条 makeup_topup，明细分页能查到', async () => {
+  // spec §4.2 算例的路由版：今天-5..今天-2 连签 1..4 天，今天-6 与昨天漏签。
+  // 补最左日（今天-6）：它左边没接任何东西 → 当天分 1（记在它自己那天）；
+  // 重排把 4 个已签日各顶一格 → 差额 4 一次发在今天。
+  await wipe(uid);
+  for (let i = 0; i < 4; i += 1) {
+    await PointSigninModel.create({
+      userId: uid, dateKey: shiftDateKey(TODAY, -5 + i), streakDay: i + 1, points: i + 1,
+      source: 'sign', createdAt: Date.now(),
+    });
+  }
+  await seedPoints(userId, POINTS.MAKEUP_CARD_PRICE);
+  const ex = await post('/points/items/makeup_card/exchange', { requestId: `pr4-${Date.now()}` });
+  assert.equal(ex.statusCode, 200, ex.body);
+
+  const windowLeft = shiftDateKey(TODAY, -6);
+  const m = await post('/points/signin/makeup', { dateKey: windowLeft });
+  assert.equal(m.statusCode, 200, m.body);
+  const r = data<{ credited: number; toppedUp: number; balance: number } & SigninState>(m);
+  assert.equal(r.credited, 1, '最左日按新位置只值第 1 天 1 分');
+  assert.equal(r.toppedUp, 4, '今天-5..今天-2 各被顶高一格，共 4 分差额');
+  assert.equal(r.balance, 5);
+  assert.deepEqual(makeupKeys(r), [YESTERDAY], '补掉最左日后，可补格只剩昨天');
+
+  const page = data<RecordPage>(await get('/points/records?page=1&pageSize=10'));
+  const topup = page.items.find((x) => x.type === 'makeup_topup');
+  assert.ok(page.items.some((x) => x.type === 'makeup_reward'), '明细里有补签当天分');
+  assert.equal(topup?.delta, 4, '明细里另有一条重排差额补发');
+  const ledger = await ledgerTotals();
+  assert.equal(ledger.deltaSum, ledger.balance, 'Σdelta === 余额');
+  assert.equal(ledger.lotSum, ledger.balance, 'Σ未过期 lot.remaining === 余额');
+});
+
+test('PR5 差额被今天 DAILY_CAP 截断：响应报实发值，账本不变式仍成立（已接受风险，不补救）', async () => {
+  await wipe(uid);
+  // 前天（库存第 3 天）与今天（抢跑建成第 1 天）有行、昨天漏签 → 昨天可补；
+  // 补上昨天把今天顶到第 5 天，名义差额 4，但今天额度只剩 2 → 实发 2。
+  await PointSigninModel.create({ userId: uid, dateKey: DAY_BEFORE, streakDay: 3, points: 3, source: 'sign', createdAt: Date.now() });
+  await PointSigninModel.create({ userId: uid, dateKey: TODAY, streakDay: 1, points: 1, source: 'sign', createdAt: Date.now() });
+  await seedPoints(userId, POINTS.MAKEUP_CARD_PRICE);
+  await PointCardModel.create({
+    userId: uid, itemKey: 'makeup_card', status: 'unused',
+    expiresAt: Date.now() + POINTS.MAKEUP_CARD_VALID_DAYS * DAY, createdAt: Date.now(),
+  });
+  // 把今天的额度占到只剩 2：今天签到行对应 1 分流水 + 再发 97 分（1+97=98，上限 100）
+  const c1 = await creditPoints(userId, {
+    type: 'signin', title: '连续签到第 1 天', points: 1, bizDate: TODAY,
+    idemKey: `${userId}:pr5-signin`,
+  });
+  const c2 = await creditPoints(userId, {
+    type: 'seed', title: '占满当日上限', points: 97, bizDate: TODAY,
+    idemKey: `${userId}:pr5-cap`,
+  });
+  assert.equal(c1.credited, 1);
+  assert.equal(c2.credited, 97);
+
+  const m = await post('/points/signin/makeup', { dateKey: YESTERDAY });
+  assert.equal(m.statusCode, 200, m.body);
+  const r = data<{ credited: number; toppedUp: number; balance: number } & SigninState>(m);
+  assert.equal(r.credited, 4, '当天分记在昨天那格自己的 bizDate，不受今天上限影响 → 全额');
+  assert.equal(r.toppedUp, 2, '差额按今天入账，被 DAILY_CAP 截到只剩的 2 分——响应报实发而不是名义 4');
+  assert.equal(r.balance, 200 + 1 + 97 + 4 + 2, '卡是直接发的、没走兑换扣分');
+
+  const page = data<RecordPage>(await get('/points/records?page=1&pageSize=10'));
+  assert.equal(page.items.find((x) => x.type === 'makeup_reward')?.delta, 4);
+  assert.equal(page.items.find((x) => x.type === 'makeup_topup')?.delta, 2, '流水落的也是实发值');
+  assert.equal(page.items.some((x) => x.type === 'makeup_reward_rollback'), false, '截断不是失败，不回滚');
+  const ledger = await ledgerTotals();
+  assert.equal(ledger.deltaSum, ledger.balance);
+  assert.equal(ledger.lotSum, ledger.balance);
 });
 
 test('PR3 路由参数错误透出 service 的 400/404', async () => {

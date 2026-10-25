@@ -79,7 +79,8 @@ export function getItems(): ItemDto[] {
     subtitle: '恢复连续打卡记录',
     price: POINTS.MAKEUP_CARD_PRICE,
     validDays: POINTS.MAKEUP_CARD_VALID_DAYS,
-    description: `每张仅可使用一次；仅用于补签昨天；兑换后 ${POINTS.MAKEUP_CARD_VALID_DAYS} 天内有效`,
+    // 文案由服务端下发（改版口径）：补签窗口从「仅昨天」放宽为近 7 天窗口内的可补日、逐格消耗
+    description: `每张仅可使用一次；可补签近 7 天窗口内的漏签日，补一天用一张；兑换后 ${POINTS.MAKEUP_CARD_VALID_DAYS} 天内有效`,
   }];
 }
 
