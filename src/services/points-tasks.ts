@@ -7,7 +7,9 @@
  * - once 任务 periodKey 恒为 'once'，daily 任务为东八区日期串：同一
  *   (userId, taskKey, periodKey) 唯一键既保证领取幂等，也让每日任务天然跨天重置；
  * - 领取先占任务行再发分：并发/重复提交只有占行成功的那一次会调用账本；
- * - 账本 idemKey 带 userId 前缀（明细表唯一索引是全局的），否则第二个用户领同一任务会被误判为重放。
+ * - 账本 idemKey 带 userId 前缀（明细表唯一索引是全局的），否则第二个用户领同一任务会被误判为重放；
+ * - 发分抛错或实际入账为 0（当日上限/重放）都要撤回任务行并 400：once 任务若留下 claimed 行，
+ *   奖励会永久无法再领（与 T4 补签口径一致）。
  */
 import { POINT_TASKS, type TaskKey } from '../config/points.js';
 import { AppError } from '../utils/app-error.js';
@@ -54,8 +56,10 @@ async function conditionMet(userId: string, key: TaskKey, now: number): Promise<
     case 'newbie_first_activity':
       return (await ActivityModel.countDocuments({ userId, status: 'finished' })) > 0;
     case 'newbie_first_import':
+      // 只认已完成的活动：进行中的导入（filename 已落库但轨迹未收尾）不能提前解锁
       return (await ActivityModel.countDocuments({
         userId,
+        status: 'finished',
         'deviceInfo.filename': { $exists: true, $ne: '' },
       })) > 0;
     case 'daily_activity': {
@@ -117,6 +121,8 @@ export async function claimTask(userId: string, taskKey: string, now: number = D
   });
   if (!row) return { alreadyClaimed: true, credited: 0 };
 
+  let credited: number;
+  let capped: boolean;
   try {
     const c = await creditPoints(userId, {
       type: `task_${key}`,
@@ -128,10 +134,19 @@ export async function claimTask(userId: string, taskKey: string, now: number = D
       // 账本唯一键全局生效，必须带 userId，否则多用户同任务会互相判重放
       idemKey: `${userId}:task:${key}:${periodKey}`,
     }, now);
-    return { alreadyClaimed: false, credited: c.credited };
+    credited = c.credited;
+    capped = c.capped;
   } catch (e) {
     // 发分失败：撤回任务行，允许用户重试（否则 once 任务会永久显示已领取却没得分）
     await PointTaskModel.deleteOne({ _id: row._id });
     throw e;
   }
+
+  // 实际入账为 0（当日已达上限，或账本判重放）：撤回刚占的任务行再 400。
+  // 不撤行的话 once 任务会永久停在「已领取」却没得分，用户无从重试（与 T4 补签同口径）。
+  if (credited <= 0) {
+    await PointTaskModel.deleteOne({ _id: row._id });
+    throw new AppError(400, `${def.title}：${capped ? '今日积分已达上限' : '积分未入账'}，任务未入账，请稍后重试`);
+  }
+  return { alreadyClaimed: false, credited };
 }

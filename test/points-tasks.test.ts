@@ -8,6 +8,9 @@ import {
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { getTaskRows, claimTask, type TaskRow } from '../src/services/points-tasks.js';
+import { creditPoints } from '../src/services/points-ledger.js';
+import { bjDateStr } from '../src/utils/bj-time.js';
+import { AppError } from '../src/utils/app-error.js';
 
 const DAY = 86400000;
 const NOW = Date.UTC(2026, 9, 24, 2, 0, 0); // 2026-10-24 10:00 BJ
@@ -174,4 +177,90 @@ test('PT4 视频任务每日一次：领取后再次返回已领取', async (t) 
   // 次日重置为可领（每日一次）
   const tomorrowRows = await getTaskRows(String(uid), NOW + DAY);
   assert.equal(row(tomorrowRows, 'daily_video').status, 'claimable');
+});
+
+test('PT5 每日上限：领取未入账不留任务行，次日可重试', async (t) => {
+  const uid = newUser();
+  t.after(() => wipe(uid));
+  await makeUser(uid, { nickname: '小明', avatarPreset: 'default-1' });
+
+  // 先把当日 100 分上限占满
+  const seed = await creditPoints(String(uid), {
+    type: 'seed',
+    title: '上限占位',
+    points: 100,
+    bizDate: bjDateStr(NOW),
+    idemKey: `${uid}:seed:cap`,
+  }, NOW);
+  assert.equal(seed.credited, 100);
+
+  // 领取被上限拦下：400，报错带任务标题与原因
+  await assert.rejects(claimTask(String(uid), 'newbie_profile', NOW), (e: Error) => {
+    assert.ok(e instanceof AppError, '应为 AppError');
+    assert.equal((e as AppError).statusCode, 400);
+    assert.match(e.message, /完善头像和昵称/);
+    assert.match(e.message, /今日积分已达上限/);
+    return true;
+  });
+
+  // 关键：不留下 claimed 行（once 任务否则永久丢奖），也不落任务明细，余额不变
+  assert.equal(await PointTaskModel.countDocuments({ userId: uid, taskKey: 'newbie_profile' }), 0);
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'task_newbie_profile' }), 0);
+  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 100);
+  assert.equal(row(await getTaskRows(String(uid), NOW), 'newbie_profile').status, 'claimable');
+
+  // 次日上限重置后重试成功：once 任务没有被这次失败吞噬
+  const retry = await claimTask(String(uid), 'newbie_profile', NOW + DAY);
+  assert.deepEqual(retry, { alreadyClaimed: false, credited: 5 });
+  assert.equal(await PointTaskModel.countDocuments({ userId: uid, taskKey: 'newbie_profile' }), 1);
+  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 105);
+});
+
+test('PT6 首次导入要求 finished：进行中的导入不解锁，收尾后可领', async (t) => {
+  const uid = newUser();
+  t.after(() => wipe(uid));
+  await makeUser(uid);
+
+  // 进行中的导入：filename 已落库，但轨迹未收尾 → 导入/首次运动/每日运动全部 locked
+  const draft = await makeActivity(uid, {
+    status: 'in_progress',
+    endTime: null,
+    deviceInfo: { filename: 'draft.gpx' },
+  });
+  let rows = await getTaskRows(String(uid), NOW);
+  assert.equal(row(rows, 'newbie_first_import').status, 'locked');
+  assert.equal(row(rows, 'newbie_first_activity').status, 'locked');
+  assert.equal(row(rows, 'daily_activity').status, 'locked');
+  await assert.rejects(claimTask(String(uid), 'newbie_first_import', NOW), /任务条件未完成/);
+  assert.equal(await PointTaskModel.countDocuments({ userId: uid }), 0);
+
+  // 收尾成 finished 后三条同时解锁
+  await ActivityModel.updateOne({ _id: draft._id }, { $set: { status: 'finished' } });
+  rows = await getTaskRows(String(uid), NOW);
+  assert.equal(row(rows, 'newbie_first_import').status, 'claimable');
+  assert.equal(row(rows, 'newbie_first_activity').status, 'claimable');
+  assert.equal(row(rows, 'daily_activity').status, 'claimable');
+  assert.deepEqual(await claimTask(String(uid), 'newbie_first_import', NOW), { alreadyClaimed: false, credited: 5 });
+});
+
+test('PT7 空文件名不算导入；未知任务 404', async (t) => {
+  const uid = newUser();
+  t.after(() => wipe(uid));
+  await makeUser(uid);
+
+  // 未知 taskKey：404 且不在任务表留行
+  await assert.rejects(claimTask(String(uid), 'not_a_task', NOW), (e: Error) => {
+    assert.ok(e instanceof AppError, '应为 AppError');
+    assert.equal((e as AppError).statusCode, 404);
+    assert.match(e.message, /任务不存在/);
+    return true;
+  });
+  assert.equal(await PointTaskModel.countDocuments({ userId: uid }), 0);
+
+  // deviceInfo.filename 为空串：不算导入（首次运动仍可领）
+  await makeActivity(uid, { startTime: NOW - 3600000, deviceInfo: { filename: '' } });
+  const rows = await getTaskRows(String(uid), NOW);
+  assert.equal(row(rows, 'newbie_first_import').status, 'locked');
+  assert.equal(row(rows, 'newbie_first_activity').status, 'claimable');
+  await assert.rejects(claimTask(String(uid), 'newbie_first_import', NOW), /任务条件未完成/);
 });
