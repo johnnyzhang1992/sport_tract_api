@@ -2,18 +2,16 @@
  * 七格规划（需求 §4 改版）：窗口 = [今天-6, 今天]，最后一格必含今天；
  * 窗口内「断签 ≤2 天」的漏签日标成可补格，起点按最早可补日 / 当前连签段起点取最早，
  * 且被窗口左界（今天-6）兜住（窗口必须罩住今天，起点不会滑到今天之后）。
- * 纯函数：不查库。调用方需读 [今天-6-PROBE_DAYS, 今天] 的行，段长才不会被窗口左边界骗过。
+ * 段长只数窗口内的日子（Ruling 2026-10-25，spec §4.1 第 3/4 条）：左界截到今天-6、右界截到今天，
+ * 不往窗口外读，所以调用方只需读 [今天-6, 今天] 这 7 天的行。
+ * 纯函数：不查库。
  */
-import { POINTS } from '../config/points.js';
 import { rewardForStreakDay, shiftDateKey } from './points-domain.js';
 
 export { shiftDateKey } from './points-domain.js';
 
 export const WINDOW_DAYS = 7;
 export const MAX_GAP_DAYS = 2;
-/** 段长判定要往窗口左边界之外多读的天数：>MAX_GAP_DAYS 即判不可补，探 3 天足够 */
-export const PROBE_DAYS = MAX_GAP_DAYS + 1;
-void POINTS; // brief 口径声明本模块 Consumes POINTS；分值封顶由 rewardForStreakDay 承担，此处保留引用待后续任务取用
 
 export type CellState = 'signed' | 'today' | 'makeup' | 'missed' | 'future';
 
@@ -39,8 +37,8 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
   const signed = new Map<string, number>();
   for (const r of rows) if (r.dateKey <= todayKey) signed.set(r.dateKey, r.streakDay);
 
-  /** 以 key 结尾的连续已签天数（extra 视作「假想已签」，用于算补完后的位置）；
-   *  只认「有没有行」，行里的 streakDay 可能是并发失真值，分值位置按本函数现算（设计 §6.1 读路径口径）。 */
+  /** 以 key 结尾的连续已签天数（extra 视作「假想已签」，用于算补完后的位置）。
+   *  只用于没有行的格（today/makeup/future）——那些格没有库存值可取，只能按行存在性现算。 */
   const streakAt = (key: string, extra: string[] = []): number => {
     let n = 0;
     let cur = key;
@@ -55,54 +53,29 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     streakAt(shiftDateKey(key, -1), extra) + 1;
 
   const left = windowStartKey(todayKey);
-  const probeFloor = shiftDateKey(left, -PROBE_DAYS);
-  // 再往下一天只为核验「边界上有没有已签日」（锚点恰好落在 probeFloor 前一天时也要抓到，见 MW7）；
-  // 那以下没有行可读，左侧探到那里还没遇到已签日，就按「段头空白」处理（见下），不再多看。
-  const scanFloor = shiftDateKey(probeFloor, -1);
   /**
-   * 含 d 的未签段信息（段内不含今天）：
-   * - 左侧探到已签日（anchored）：段长 = 左侧探过的漏签日 + d + 右侧连续漏签日；
-   * - 左侧探到 scanFloor 也没已签日（段头空白：那之前用户没签过）：左侧不计，
-   *   该日先进 headWindowDays，由「窗口内段头总长 + 连签链是否已断」两条件再判（见下）。
+   * 含 d 的未签段长度（spec §4.1 第 3 条）：向两侧数没有签到行的日子，
+   * 左界截到窗口左缘 `left`、右界截到今天（今天没签不算漏签日），遇到已签日即停。
+   * 超过 MAX_GAP_DAYS 就提前退出——调用方只读窗口内的行，窗外无从判断也无需判断。
    */
-  const gapRunOf = (d: string): { length: number; anchored: boolean } => {
-    let leftMissed = 0;
-    let anchored = false;
-    for (let cur = shiftDateKey(d, -1); cur >= scanFloor; cur = shiftDateKey(cur, -1)) {
-      if (signed.has(cur)) {
-        anchored = true;
-        break;
-      }
-      leftMissed += 1;
-    }
+  const gapRunLength = (d: string): number => {
     let n = 1;
+    for (let cur = shiftDateKey(d, -1); cur >= left && !signed.has(cur); cur = shiftDateKey(cur, -1)) {
+      n += 1;
+      if (n > MAX_GAP_DAYS) return n;
+    }
     for (let cur = shiftDateKey(d, 1); cur < todayKey && !signed.has(cur); cur = shiftDateKey(cur, 1)) {
       n += 1;
+      if (n > MAX_GAP_DAYS) return n;
     }
-    return { length: anchored ? n + leftMissed : n, anchored };
+    return n;
   };
 
-  const hasSignedInWindow = [...signed.keys()].some((k) => k >= left && k <= todayKey);
+  // 全空窗口（全新用户）不用另设闸门：段长=6 > MAX_GAP_DAYS，天然没有可补格（spec §4.1 第 5 条）。
   const makeupable = new Set<string>();
-  const headWindowDays: string[] = [];
-  if (hasSignedInWindow) {
-    for (let i = WINDOW_DAYS - 1; i >= 1; i -= 1) {
-      const d = shiftDateKey(todayKey, -i);
-      if (signed.has(d)) continue;
-      const run = gapRunOf(d);
-      if (!run.anchored) {
-        headWindowDays.push(d);
-        continue;
-      }
-      if (run.length <= MAX_GAP_DAYS) makeupable.add(d);
-    }
-    // 段头空白（首个已签日之前的漏签日）：窗口内合计 ≤MAX_GAP_DAYS 天、且连签链已断（昨天没签）时，
-    // 才视同真实漏签段（用户算例：漏 19 签 20-23、24 又漏 → 19 可补；MW1/MW7）。
-    // 链没断（昨天签了）时段头算「还没开始签」，不开补签入口（MW2：漏 19/20、签满 21-24 → 无补签格）。
-    const chainBroken = !signed.has(shiftDateKey(todayKey, -1));
-    if (chainBroken && headWindowDays.length <= MAX_GAP_DAYS) {
-      for (const d of headWindowDays) makeupable.add(d);
-    }
+  for (let i = WINDOW_DAYS - 1; i >= 1; i -= 1) {
+    const d = shiftDateKey(todayKey, -i);
+    if (!signed.has(d) && gapRunLength(d) <= MAX_GAP_DAYS) makeupable.add(d);
   }
 
   // 当前连签段起点（§4.3）：从今天往回最晚的已签日出发，回走到断口；库里没行时取今天
@@ -115,8 +88,7 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     runStart = shiftDateKey(cur, 1);
   }
   // dateKey 是 'YYYY-MM-DD' 串，取最早一日必须按字符串比，Math.min 会算出 NaN
-  const candidates = [runStart, ...makeupable];
-  const startCand = candidates.reduce((a, b) => (a < b ? a : b));
+  const startCand = [runStart, ...makeupable].reduce((a, b) => (a < b ? a : b));
   const start = startCand < left ? left : startCand;
 
   const todayPos = positionIfSigned(todayKey);
@@ -125,6 +97,9 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     const dateKey = shiftDateKey(start, i);
     const stored = signed.get(dateKey);
     if (stored !== undefined) {
+      // signed 格有意取库存 streakDay 现算分值（spec §6.1）：窗口内按行存在性递推会把连签 30 天
+      // 截成 1..7，反而毁掉每日分值与「已连续 N 天」文案；失真只来自交错写，下一次写路径的
+      // reconcileStreaks 会把库存修回来（Task 2 负责收敛）。
       cells.push({ dateKey, state: 'signed', streakDay: stored, reward: rewardForStreakDay(stored) });
     } else if (dateKey === todayKey) {
       cells.push({ dateKey, state: 'today', streakDay: todayPos, reward: rewardForStreakDay(todayPos) });

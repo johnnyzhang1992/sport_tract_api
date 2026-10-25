@@ -26,12 +26,14 @@ test('MW1 用户算例：20-23 签、19/24 漏 → 起点前移到 19，19 与 2
   assert.equal(at(cells, back(1))!.todayRewardAfter, 6, '补 24 → 24=5、今天=6');
 });
 
-test('MW2 只漏昨天：起点仍是本周期第 1 天', () => {
+test('MW2 昨天签了、窗口左缘空着两天：那两天也算可补（Ruling 2026-10-25 的代价）', () => {
   const cells = planSigninCells([...run(4, 1)], T); // 21..24 已签（昨天签了）
-  assert.equal(cells[0].dateKey, back(4));
-  assert.equal(cells.filter((c) => c.state === 'makeup').length, 0);
-  assert.equal(cells[cells.length - 1].dateKey, shiftDateKey(back(4), 6), '右边补出未来格');
-  assert.equal(at(cells, T)!.state, 'today');
+  assert.equal(cells[0].dateKey, back(6), '起点被 19 的可补格拽到窗口左缘');
+  assert.equal(cells.map((c) => c.state).join(','), 'makeup,makeup,signed,signed,signed,signed,today');
+  assert.equal(at(cells, back(6))!.reward, 1, '19 左边窗口内没行 → 自己第 1 天');
+  assert.equal(at(cells, back(6))!.todayRewardAfter, 5, '只补 19 接不上 21 的链（20 还空着）→ 今天仍 5 分');
+  assert.equal(at(cells, back(5))!.todayRewardAfter, 6, '补 20 接上 21..24 → 今天第 6 天');
+  assert.equal(at(cells, T)!.reward, 5, '今天未签但昨天签了 → 本周期第 5 天');
 });
 
 test('MW3 连漏 2 天：两格都可补，段长只算 2（不含今天）', () => {
@@ -67,15 +69,17 @@ test('MW6 长连签 10 天：起点被今天-6 兜住，分值随位置递增后
   assert.deepEqual(cells.map((c) => c.streakDay), [4, 5, 6, 7, 8, 9, 10], 'streakDay 保留绝对天数');
 });
 
-test('MW7 段长判定要看到窗口外：17/18/19 都漏时，19 不算「段长 1」', () => {
-  // 只有 20..23 签；18、17 也各有一行「未签」= 库里没行，靠多读 3 天判定
-  const cells = planSigninCells([...run(5, 2)], T);
-  assert.equal(at(cells, back(6))!.state, 'makeup', '19 单独漏（18 及更早签过）时可补');
-  const withLongBreak = planSigninCells([...run(5, 2), { dateKey: back(10), streakDay: 1 }], T);
-  // 20..25 之前的 19、18、17 全漏 → 19 所在段长 3（17/18/19）→ 不可补，起点回落到 20
-  assert.equal(withLongBreak.filter((c) => c.state === 'makeup').length, 1, '只剩 24 可补');
-  assert.ok(!at(withLongBreak, back(6)), '19 不可补，起点回落到 20 后 19 已出窗（原断言 at(back(6)).state 与 [0]=back(5) 不可能同时成立，见 task-1-report）');
-  assert.equal(withLongBreak[0].dateKey, back(5));
+test('MW7 段长只数窗口内：左界截到今天-6，窗口外的行不参与判定', () => {
+  // 断签已久：窗口内只有 10-20 一行
+  const dormant: { dateKey: string; streakDay: number }[] = [{ dateKey: back(5), streakDay: 1 }];
+  const cells = planSigninCells(dormant, T);
+  assert.equal(at(cells, back(6))!.state, 'makeup', '19 左侧出窗即停 → 段长 1，可补（Ruling 有意付的代价）');
+  assert.equal(at(cells, back(5))!.state, 'signed');
+  assert.equal(cells.filter((c) => c.state === 'missed').length, 4, '21..24 同属长度 4 的段（今天不计入）→ 都不可补');
+  assert.equal(cells.filter((c) => c.state === 'makeup').length, 1, '只有 19 可补');
+  // 窗口外多出来的行不得改变任何一格：证明判定真的没往窗口外读
+  const withOutside = planSigninCells([...dormant, { dateKey: back(9), streakDay: 1 }], T);
+  assert.deepEqual(withOutside, cells, '10-16 在窗外，读不读都一样');
 });
 
 test('MW8 windowStartKey 是今天-6', () => {
