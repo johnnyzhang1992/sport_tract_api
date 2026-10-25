@@ -44,11 +44,16 @@ export async function reconcileStreaks(userId: string, now = Date.now()): Promis
     const expected = prev > 0 ? prev + 1 : stored; // 段首（含窗口左界）以库存值为锚
     if (stored !== expected) {
       // 带 CAS 的 $set：并发另一路也在改这一行时，谁后写谁读到最新值再校，不会互相抹
-      await PointSigninModel.updateOne(
+      const cas = await PointSigninModel.updateOne(
         { userId, dateKey: cur, streakDay: stored },
         { $set: { streakDay: expected } },
       );
-      fixes.push({ dateKey: cur, from: stored, to: expected });
+      // 只有 CAS 命中（modifiedCount === 1，这次写真正落了 expected）才记这份 fix：
+      // 两个 trigger 竞同一错位时，败者再记一份会让同一欠分被两个幂等键各付一次（RK9）；
+      // 未命中的行已被并发改动，值归位与差额交给胜者/下一次写路径，这里不重复计。
+      if (cas.modifiedCount === 1) {
+        fixes.push({ dateKey: cur, from: stored, to: expected });
+      }
     }
     prev = expected;
   }
