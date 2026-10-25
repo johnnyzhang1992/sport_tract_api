@@ -90,8 +90,12 @@ async function earnedToday(userId: string, bizDate: string): Promise<number> {
 }
 
 /**
- * 结算该用户所有已过期批次：批次 remaining 清零 → 扣余额 → 写一条 expire 明细。
- * 批次用带 remaining>0 条件的原子更新「认领」，并发重复调用只会有一个执行扣减。
+ * 结算该用户所有已过期批次：认领批次 → 带余额闸门扣减余额 → 写一条 expire 明细。
+ * - 批次用带 remaining>0 条件的原子更新「认领」，并发重复调用只会有一个执行扣减；
+ * - 余额扣减带 `balance >= expiring` 条件（且 expiring = min(批次剩余, 当前余额)），
+ *   并发扣减把余额花光时不会把账户扣成负数；条件不匹配则把批次剩余还回去，下次再结算；
+ * - 若批次剩余大于余额（历史脏数据 / 并发窗口留下的孤儿批次），按余额封顶结算，
+ *   差额直接核销（批次清零、不写负数明细），避免余额被扣成负数。
  */
 export async function settleExpired(userId: string, now = Date.now()): Promise<void> {
   const lots = await PointLotModel.find({ userId, remaining: { $gt: 0 }, expireAt: { $lte: now } })
@@ -109,16 +113,29 @@ export async function settleExpired(userId: string, now = Date.now()): Promise<v
     ).lean();
     if (!claimed || claimed.remaining <= 0) continue;
 
-    const account = await PointAccountModel.findOne({ userId }).lean();
-    const balanceAfter = (account?.balance ?? 0) - claimed.remaining;
+    const account = await PointAccountModel.findOne({ userId }).select({ balance: 1 }).lean();
+    const available = account?.balance ?? 0;
+    if (available <= 0) continue; // 余额已被并发扣减花光：批次没有可扣的余额，清零核销即可
+
+    const expiring = Math.min(claimed.remaining, available);
+    const after = await PointAccountModel.findOneAndUpdate(
+      { userId, balance: { $gte: expiring } },
+      { $inc: { balance: -expiring } },
+      { returnDocument: 'after' },
+    ).lean();
+    if (!after) {
+      // 条件不匹配（余额刚被并发扣减花掉）：批次剩余还回去，留给下一次结算
+      await PointLotModel.updateOne({ _id: lot._id }, { $inc: { remaining: claimed.remaining } });
+      continue;
+    }
 
     try {
       await PointRecordModel.create({
         userId,
         type: 'expire',
         title: '积分过期',
-        delta: -claimed.remaining,
-        balanceAfter,
+        delta: -expiring,
+        balanceAfter: after.balance,
         bizDate: bjDateStr(now),
         refType: 'lot',
         refId: String(lot._id),
@@ -126,13 +143,13 @@ export async function settleExpired(userId: string, now = Date.now()): Promise<v
         createdAt: now,
       });
     } catch (e) {
-      if (isDuplicateKey(e)) continue; // 这条批次之前已结算过（明细已存在），不再扣余额
+      // 撤回本次扣减；重复键说明这条批次之前已结算过（明细已存在），回滚后跳过
+      await PointAccountModel.updateOne({ userId }, { $inc: { balance: expiring } });
+      if (isDuplicateKey(e)) continue;
       // 明细写失败：把批次剩余还回去，避免「批次清零但余额没扣」的丢分
       await PointLotModel.updateOne({ _id: lot._id }, { $inc: { remaining: claimed.remaining } });
       throw e;
     }
-
-    await PointAccountModel.updateOne({ userId }, { $inc: { balance: -claimed.remaining } });
   }
 }
 
@@ -150,11 +167,13 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
   const credited = Math.min(requested, Math.max(0, POINTS.DAILY_CAP - used));
   if (credited <= 0) return { credited: 0, balance: await getBalance(userId, now), duplicated: false, capped: true };
 
-  // 先原子加余额，拿到 pre-image 作为 balanceAfter；明细写失败再回滚
+  // 先确保账户存在：否则新用户的首笔并发发放会在 upsert 阶段撞唯一键（E11000）冒到调用方
+  await ensureAccount(userId);
+  // 再原子加余额，拿到 pre-image 作为 balanceAfter；明细写失败再回滚
   const before = await PointAccountModel.findOneAndUpdate(
     { userId },
     { $inc: { balance: credited, totalEarned: credited } },
-    { upsert: true, returnDocument: 'before' },
+    { returnDocument: 'before' },
   ).lean();
   const balanceAfter = (before?.balance ?? 0) + credited;
 
@@ -204,7 +223,8 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
 export async function debitPoints(userId: string, input: DebitInput, now = Date.now()): Promise<DebitResult> {
   await settleExpired(userId, now);
 
-  const dup = await PointRecordModel.findOne({ idemKey: input.idemKey }).lean();
+  // 只看「扣减」明细：同一个 key 若被发放用过（正数 delta），不能当成这次扣减的重放
+  const dup = await PointRecordModel.findOne({ idemKey: input.idemKey, delta: { $lt: 0 } }).lean();
   if (dup) return { balance: dup.balanceAfter, recordId: String(dup._id) };
 
   const points = Math.trunc(input.points);
@@ -239,13 +259,13 @@ export async function debitPoints(userId: string, input: DebitInput, now = Date.
   } catch (e) {
     await PointAccountModel.updateOne({ userId }, { $inc: { balance: points, totalSpent: -points } });
     if (isDuplicateKey(e)) {
-      const again = await PointRecordModel.findOne({ idemKey: input.idemKey }).lean();
+      const again = await PointRecordModel.findOne({ idemKey: input.idemKey, delta: { $lt: 0 } }).lean();
       if (again) return { balance: again.balanceAfter, recordId: String(again._id) };
     }
     throw e;
   }
 
-  // FIFO：按到期时间升序消耗批次
+  // FIFO：按到期时间升序消耗批次；每次扣减带 remaining >= use 条件，避免并发下把批次扣成负数
   let left = points;
   const lots = await PointLotModel.find({ userId, remaining: { $gt: 0 } })
     .sort({ expireAt: 1, _id: 1 })
@@ -254,8 +274,11 @@ export async function debitPoints(userId: string, input: DebitInput, now = Date.
   for (const lot of lots) {
     if (left <= 0) break;
     const use = Math.min(lot.remaining, left);
-    await PointLotModel.updateOne({ _id: lot._id }, { $inc: { remaining: -use } });
-    left -= use;
+    const applied = await PointLotModel.updateOne(
+      { _id: lot._id, remaining: { $gte: use } },
+      { $inc: { remaining: -use } },
+    );
+    if (applied.modifiedCount === 1) left -= use;
   }
 
   return { balance: balanceAfter, recordId: String(record._id) };
