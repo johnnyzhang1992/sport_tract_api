@@ -145,8 +145,20 @@ test('轨迹列表：photoCount 跨 markers 去重（photoUrl 与 photos[0] 同�
   assert.equal(noPhotos.coverPhoto, '');
 });
 
-test('足迹列表：coverPhoto 给签名首图，无图记录给空串', async () => {
-  const res = await req('GET', `/sport-track/api/admin/footprint-records?page=1&pageSize=50&userId=${userId}`);
+test('轨迹列表按是否有图片筛选：hasPhoto=true/false 各回一条', async () => {
+  const idsOf = async (hasPhoto?: string) => {
+    const qs = hasPhoto == null ? '' : `&hasPhoto=${hasPhoto}`;
+    const res = await req('GET', `/sport-track/api/admin/activities?page=1&pageSize=50&userId=${userId}${qs}`);
+    assert.equal(res.statusCode, 200, res.body);
+    return (res.json().data.items as Array<{ id: string }>).map((i) => i.id).sort();
+  };
+  assert.deepEqual(await idsOf('true'), [actWithPhotos].sort(), '有图片只回带照片的那条');
+  assert.deepEqual(await idsOf('false'), [actNoPhotos].sort(), '无图片只回没有照片的那条');
+  assert.deepEqual(await idsOf(), [actNoPhotos, actWithPhotos].sort(), '不传参数不过滤');
+  assert.deepEqual(await idsOf('maybe'), [actNoPhotos, actWithPhotos].sort(), '非法值当未传处理');
+});
+
+test('足迹列表：coverPhoto 给签名首图，无图记录给空串', async () => {  const res = await req('GET', `/sport-track/api/admin/footprint-records?page=1&pageSize=50&userId=${userId}`);
   assert.equal(res.statusCode, 200, res.body);
   const items = res.json().data.items as Array<{
     id: string;
