@@ -29,16 +29,27 @@ const TODAY = bjDateStr(Date.now());
 const YESTERDAY = previousDateKey(TODAY);
 const DAY_BEFORE = previousDateKey(YESTERDAY);
 
+interface SigninCell {
+  dateKey: string;
+  state: string;
+  streakDay: number;
+  reward: number;
+  todayRewardAfter?: number;
+}
+
 interface SigninState {
   todaySigned: boolean;
   streakDay: number;
   todayReward: number;
   nextReward: number;
-  canMakeUp: boolean;
-  makeupDate: string;
   cards: number;
+  // 改版口径（spec §5.1）：canMakeUp/makeupDate 已删，可补与否只看 cells 里的 makeup 格。
+  // makeupCardId 是路由层拼的旧字段，Task 5 接线时才撤，这里先按现状断言。
+  cells: SigninCell[];
   makeupCardId: string;
 }
+
+const makeupKeys = (s: SigninState) => s.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey);
 
 interface TaskRow {
   key: string;
@@ -183,13 +194,13 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   const s0 = data<Summary>(await get('/points/summary'));
   assert.equal(s0.balance, 0);
   assert.equal(s0.signin.todaySigned, false);
-  assert.equal(s0.signin.streakDay, 0);
+  // streakDay 新口径：窗口内最右一个已签格的库存值（前天的行 = 2），不再只看今昨两行
+  assert.equal(s0.signin.streakDay, 2);
   assert.equal(s0.signin.todayReward, 0);
   assert.equal(s0.signin.nextReward, 1, '首签 1 分');
   assert.equal(s0.signin.cards, 0);
   assert.equal(s0.signin.makeupCardId, '', '没有卡时补签卡 id 为空串');
-  assert.equal(s0.signin.canMakeUp, false, '没有卡不能直接补签');
-  assert.equal(s0.signin.makeupDate, YESTERDAY, '无卡但存在漏签空档时仍下发可补日期（供前端引导兑换）');
+  assert.deepEqual(makeupKeys(s0.signin), [YESTERDAY], '无卡但昨天漏签时仍下发 makeup 格（供前端引导兑换）');
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
   assert.equal(s0.items.length, 1, 'summary 下发整张商品表，积分页按它渲染商品卡');
@@ -221,13 +232,12 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(data<{ cardId: string; balance: number }>(ex2).cardId, cardId, '同一 requestId 复用同一张卡');
   assert.equal(data<{ cardId: string; balance: number }>(ex2).balance, 0, '不重复扣分');
 
-  // 5) 汇总带出未使用卡数量、可直接使用的那张卡 id 与可补签日期（昨天）
+  // 5) 汇总带出未使用卡数量、可直接使用的那张卡 id；昨天仍是可补格（可补只看 cells，与卡数无关）
   const s2 = data<Summary>(await get('/points/summary'));
   assert.equal(s2.balance, 0);
   assert.equal(s2.signin.cards, 1);
   assert.equal(s2.signin.makeupCardId, cardId, '汇总要下发第一张可用补签卡的 id');
-  assert.equal(s2.signin.canMakeUp, true);
-  assert.equal(s2.signin.makeupDate, YESTERDAY);
+  assert.deepEqual(makeupKeys(s2.signin), [YESTERDAY]);
 
   // 6) 非法卡 id → service 的 400 原样透出
   const badCard = await post('/points/cards/not-an-object-id/use');
@@ -289,7 +299,7 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s3.signin.nextReward, 5);
   assert.equal(s3.signin.cards, 0);
   assert.equal(s3.signin.makeupCardId, '', '卡用掉后汇总不再下发补签卡 id');
-  assert.equal(s3.signin.canMakeUp, false);
+  assert.deepEqual(makeupKeys(s3.signin), [], '链已接上，没有可补格');
   const video = s3.tasks.find((t) => t.key === 'daily_video');
   assert.equal(video?.status, 'claimed');
   assert.equal(video?.actionText, '已领取');

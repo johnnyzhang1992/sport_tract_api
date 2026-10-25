@@ -15,17 +15,18 @@ import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import { isObjectIdLike } from '../utils/object-id.js';
 import { previousDateKey, rewardForStreakDay } from '../utils/points-domain.js';
+import { planSigninCells, windowStartKey, type SigninCell } from '../utils/points-window.js';
 import { PointCardModel, PointSigninModel } from '../models/point.model.js';
 import { creditPoints, getBalance } from './points-ledger.js';
+import { creditStreakTopUp } from './points-streak.js';
 
 export interface SigninState {
   todaySigned: boolean;
   streakDay: number;
   todayReward: number;
   nextReward: number;
-  canMakeUp: boolean;
-  makeupDate: string;
   cards: number;
+  cells: SigninCell[];
 }
 
 export interface SigninResult extends SigninState {
@@ -41,34 +42,33 @@ function isDuplicateKey(e: unknown): boolean {
 }
 
 /**
- * 签到状态。
- * - `streakDay` 是「当前连签天数」：今天签过取今天的行，否则取昨天的行（今天还没签到，连签停在昨天），
- *   两者都没有则为 0；
+ * 签到状态（spec §5.1）：下发七格 `cells`，可补与否只看 `state === 'makeup'`
+ * （旧字段 canMakeUp/makeupDate 已删，前端不再自己推当前格）。
+ * - `streakDay` 取窗口内最右一个已签格的库存值（今天签过就是今天的行）；
  * - `nextReward` 是「下一次签到的得分」：今天签过就是明天的（连签 7 天时为 7，不是 8），
- *   今天没签就是今天能拿的。
+ *   今天没签就是今天能拿的；
+ * - 读接口只 dryRun：本函数不写库，错位由写路径（signIn / useMakeupCard）收尾的
+ *   `reconcileStreaks` 校正（设计 §6.1）。
  */
 export async function getSigninState(userId: string, now = Date.now()): Promise<SigninState> {
   const todayKey = bjDateStr(now);
-  const yKey = previousDateKey(todayKey);
-  const [today, yesterday, dayBefore, cards] = await Promise.all([
-    PointSigninModel.findOne({ userId, dateKey: todayKey }).lean(),
-    PointSigninModel.findOne({ userId, dateKey: yKey }).lean(),
-    PointSigninModel.findOne({ userId, dateKey: previousDateKey(yKey) }).lean(),
+  // 只读窗口这 7 天：段长判定截在窗口内（spec §4.1 第 4 条 / Ruling 2026-10-25），窗外的行不参与
+  const [rows, cards] = await Promise.all([
+    PointSigninModel.find({ userId, dateKey: { $gte: windowStartKey(todayKey), $lte: todayKey } })
+      .select({ dateKey: 1, streakDay: 1 }).lean(),
     PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: now } }),
   ]);
-  const baseStreak = today?.streakDay ?? yesterday?.streakDay ?? 0;
-  // 「可补签日期」只看漏签空档（今天没签、昨天没签、前天签过），与卡数量无关：
-  // 无卡时也要下发，前端才能引导「去兑换补签卡」；能不能直接补由 canMakeUp 决定。
-  const hasMakeupGap = !today && !yesterday && !!dayBefore;
-  const canMakeUp = hasMakeupGap && cards > 0;
+  const cells = planSigninCells(rows, todayKey);
+  const today = cells.find((c) => c.dateKey === todayKey)!;
+  const signed = today.state === 'signed';
+  const last = [...cells].reverse().find((c) => c.state === 'signed');
   return {
-    todaySigned: !!today,
-    streakDay: baseStreak,
-    todayReward: today?.points ?? 0,
-    nextReward: rewardForStreakDay(baseStreak + 1),
-    canMakeUp,
-    makeupDate: hasMakeupGap ? yKey : '',
+    todaySigned: signed,
+    streakDay: last?.streakDay ?? 0,
+    todayReward: signed ? today.reward : 0,
+    nextReward: rewardForStreakDay(today.streakDay + (signed ? 1 : 0)),
     cards,
+    cells,
   };
 }
 
@@ -103,8 +103,15 @@ export async function signIn(userId: string, now = Date.now()): Promise<SigninRe
   }, now);
   // 实际入账可能被每日上限截断，签到行记实际得分而不是名义得分
   await PointSigninModel.updateOne({ _id: row._id }, { $set: { points: c.credited } });
-
-  return { ...(await state()), alreadySigned: false, credited: c.credited };
+  // 若这次签到正好落在「刚被补签重排」的窗口里，把偏离的 streakDay 校正回来并补差额；
+  // 幂等键用今天，天然一天一次。
+  const toppedUp = await creditStreakTopUp(userId, todayKey, now);
+  return {
+    ...(await state()),
+    alreadySigned: false,
+    credited: c.credited + toppedUp,
+    balance: await getBalance(userId, now),
+  };
 }
 
 export async function useMakeupCard(userId: string, cardId: string, now = Date.now()): Promise<SigninResult> {
