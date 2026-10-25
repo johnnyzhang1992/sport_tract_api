@@ -101,3 +101,19 @@ test('MW9 连签从窗口外带进来：段首按库存值当锚，不按窗口�
   assert.equal(at(cells, back(6))!.streakDay, 1, '19 左边是断口 → 自己第 1 天，不受右边长链影响');
   assert.equal(at(cells, back(6))!.todayRewardAfter, 1, '只补 19 接不上 24 的断口');
 });
+
+test('MW10 signed 格分值取库存 points，缺省才回落名义值（Ruling B）', () => {
+  // 22 被每日上限截断（名义 3 只拿到 1）；23 是没带 points 的旧行；24 是崩溃夹缝留下的 points:0
+  const cells = planSigninCells([
+    { dateKey: back(3), streakDay: 3, points: 1 },
+    { dateKey: back(2), streakDay: 4 },
+    { dateKey: back(1), streakDay: 5, points: 0 },
+  ], T);
+  assert.equal(at(cells, back(3))!.reward, 1, '有库存 points 就报实际入账分，不虚报名义 3');
+  assert.equal(at(cells, back(2))!.reward, 4, '没有 points 才回落 min(streakDay,7)');
+  assert.equal(at(cells, back(1))!.reward, 0, 'points:0 是「那天确实没收到分」，如实报 0');
+  assert.deepEqual(
+    [at(cells, back(3))!.streakDay, at(cells, back(2))!.streakDay, at(cells, back(1))!.streakDay],
+    [3, 4, 5], 'points 只改分值，streakDay 照库存值下发');
+  assert.equal(at(cells, T)!.reward, 6, 'today 格是「签了能拿几分」，仍是名义值');
+});

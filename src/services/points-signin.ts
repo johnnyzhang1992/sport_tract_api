@@ -4,7 +4,8 @@
  * 规则（需求 §4）：
  * - 连续签到第 N 天得 `min(N, 7)` 分；第 8 天起每天 7 分，直到断签才从第 1 天重算；
  * - 断签判定只看「昨天有没有签到行」：有则 streak = 昨天 + 1，没有则从 1 起；
- * - 签到行以 (userId, dateKey) 唯一键落库，重复签到返回 alreadySigned 且不再发分；
+ * - 签到行以 (userId, dateKey) 唯一键落库，重复签到返回 alreadySigned、不再发当天分，
+ *   但仍跑一次差额校正（同一天重试也是「下一次写」，设计 §6.1）；
  * - 补签卡只能补「昨天」，且必须满足：今天还没签到、昨天没签、前天已签；
  *   补签同样写入一条 source='makeup' 的签到行，因此今天再签到会自然接上昨天补出来的连签。
  *
@@ -44,7 +45,11 @@ function isDuplicateKey(e: unknown): boolean {
 /**
  * 签到状态（spec §5.1）：下发七格 `cells`，可补与否只看 `state === 'makeup'`
  * （旧字段 canMakeUp/makeupDate 已删，前端不再自己推当前格）。
- * - `streakDay` 取窗口内最右一个已签格的库存值（今天签过就是今天的行）；
+ * - `streakDay`（前端「已连续 N 天」的唯一来源）**只报接得上的那条链**：今天签了取今天的库存值，
+ *   今天没签但昨天签了取昨天的，昨天也没签就是 0。窗口里最右的已签格如果隔着断口，那是「上一段链
+ *   的长度」，报出去会和同一屏的「今天签到得 1 分」自相矛盾（Ruling 2026-10-25）；
+ * - 已签格的分值取该日**实际入账** `points`（被 `POINTS.DAILY_CAP` 截断过就不虚报，spec §5.1），
+ *   today/makeup/future 格仍是按位置的名义分（那是「签了能拿几分」）；
  * - `nextReward` 是「下一次签到的得分」：今天签过就是明天的（连签 7 天时为 7，不是 8），
  *   今天没签就是今天能拿的；
  * - 读接口只 dryRun：本函数不写库，错位由写路径（signIn / useMakeupCard）收尾的
@@ -55,16 +60,18 @@ export async function getSigninState(userId: string, now = Date.now()): Promise<
   // 只读窗口这 7 天：段长判定截在窗口内（spec §4.1 第 4 条 / Ruling 2026-10-25），窗外的行不参与
   const [rows, cards] = await Promise.all([
     PointSigninModel.find({ userId, dateKey: { $gte: windowStartKey(todayKey), $lte: todayKey } })
-      .select({ dateKey: 1, streakDay: 1 }).lean(),
+      .select({ dateKey: 1, streakDay: 1, points: 1 }).lean(),
     PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: now } }),
   ]);
   const cells = planSigninCells(rows, todayKey);
   const today = cells.find((c) => c.dateKey === todayKey)!;
   const signed = today.state === 'signed';
-  const last = [...cells].reverse().find((c) => c.state === 'signed');
+  // 接得上 = 今天有行就接今天，否则昨天有行接昨天；再往后隔着断口就不算「当前连签」
+  const yesterday = cells.find((c) => c.dateKey === previousDateKey(todayKey));
+  const chain = signed ? today : yesterday?.state === 'signed' ? yesterday : undefined;
   return {
     todaySigned: signed,
-    streakDay: last?.streakDay ?? 0,
+    streakDay: chain?.streakDay ?? 0,
     todayReward: signed ? today.reward : 0,
     nextReward: rewardForStreakDay(today.streakDay + (signed ? 1 : 0)),
     cards,
@@ -76,9 +83,17 @@ export async function signIn(userId: string, now = Date.now()): Promise<SigninRe
   const todayKey = bjDateStr(now);
   const state = async () =>
     ({ alreadySigned: false, credited: 0, balance: await getBalance(userId, now), ...(await getSigninState(userId, now)) });
+  // 「今天已经签了」的两条早退路（读到已有行 / 抢唯一键输了）：不发当天分，但**仍要跑一次校正**。
+  // 上一次可能崩在「今天的行与当天分已落库、差额没发成」的夹缝里，不补就把欠分锁到明天（spec §6.1，
+  // Ruling 2026-10-25「下一次写必须包括同一天重试」）。creditStreakTopUp 按 trigger 幂等、
+  // 链条已正时返回 0，重复调用一分都多发不了。
+  const alreadySigned = async (): Promise<SigninResult> => {
+    const toppedUp = await creditStreakTopUp(userId, todayKey, now);
+    return { ...(await state()), alreadySigned: true, credited: toppedUp };
+  };
 
   const exists = await PointSigninModel.findOne({ userId, dateKey: todayKey }).lean();
-  if (exists) return { ...(await state()), alreadySigned: true };
+  if (exists) return alreadySigned();
 
   const yesterday = await PointSigninModel.findOne({ userId, dateKey: previousDateKey(todayKey) }).lean();
   const streakDay = yesterday ? yesterday.streakDay + 1 : 1;
@@ -90,7 +105,7 @@ export async function signIn(userId: string, now = Date.now()): Promise<SigninRe
     if (isDuplicateKey(e)) return null;
     throw e;
   });
-  if (!row) return { ...(await state()), alreadySigned: true };
+  if (!row) return alreadySigned();
 
   const c = await creditPoints(userId, {
     type: 'signin',

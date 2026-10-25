@@ -18,6 +18,12 @@ export type CellState = 'signed' | 'today' | 'makeup' | 'missed' | 'future';
 export interface SignedRow {
   dateKey: string;
   streakDay: number;
+  /**
+   * 该日**实际入账**分（Ruling 2026-10-25，spec §5.1）：`signIn` 落的是被 `POINTS.DAILY_CAP`
+   * 截断后的实发值，与名义分 `min(streakDay, 7)` 可以不同，格子必须报实际值。
+   * 缺省（调用方没读这一列 / 旧数据）才回落名义值；`0` 是「那天确实一分没拿到」，如实报 0。
+   */
+  points?: number;
 }
 
 export interface SigninCell {
@@ -34,8 +40,8 @@ export function windowStartKey(todayKey: string): string {
 }
 
 export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell[] {
-  const signed = new Map<string, number>();
-  for (const r of rows) if (r.dateKey <= todayKey) signed.set(r.dateKey, r.streakDay);
+  const signed = new Map<string, SignedRow>();
+  for (const r of rows) if (r.dateKey <= todayKey) signed.set(r.dateKey, r);
 
   /**
    * key 这天（`extra` 是「假想已签」的日子，用来算补完之后今天能排第几）在新链条上的位置。
@@ -51,7 +57,7 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
       start = prev;
       prev = shiftDateKey(start, -1);
     }
-    const anchor = signed.has(start) ? (signed.get(start) as number) : 1;
+    const anchor = signed.has(start) ? (signed.get(start) as SignedRow).streakDay : 1;
     return anchor + daysBetween(start, key);
   };
 
@@ -97,10 +103,16 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
   const cells: SigninCell[] = [];
   for (let i = 0; i < WINDOW_DAYS; i += 1) {
     const dateKey = shiftDateKey(start, i);
-    const stored = signed.get(dateKey);
-    if (stored !== undefined) {
-      // 已签格照库存值下发：窗口里重算会把连签 30 天压成 1..7（§6.1 说收敛由写路径负责）
-      cells.push({ dateKey, state: 'signed', streakDay: stored, reward: rewardForStreakDay(stored) });
+    const row = signed.get(dateKey);
+    if (row !== undefined) {
+      // 已签格照库存值下发：窗口里重算会把连签 30 天压成 1..7（§6.1 说收敛由写路径负责）。
+      // 分值取该日实际入账的 `points`（§5.1：被每日上限截断过就不能虚报），没带这一列才回落名义值。
+      cells.push({
+        dateKey,
+        state: 'signed',
+        streakDay: row.streakDay,
+        reward: row.points ?? rewardForStreakDay(row.streakDay),
+      });
     } else if (dateKey === todayKey) {
       cells.push({ dateKey, state: 'today', streakDay: todayPos, reward: rewardForStreakDay(todayPos) });
     } else if (dateKey < todayKey) {
@@ -118,7 +130,7 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
       }
     } else {
       // 未来格：以今天格的位置起（今天已签则以今天实际 streakDay）按一路签下去预测
-      const base = signed.has(todayKey) ? (signed.get(todayKey) as number) : todayPos;
+      const base = signed.has(todayKey) ? (signed.get(todayKey) as SignedRow).streakDay : todayPos;
       const pos = base + (i - daysBetween(start, todayKey));
       cells.push({ dateKey, state: 'future', streakDay: pos, reward: rewardForStreakDay(pos) });
     }

@@ -5,6 +5,7 @@ import { config } from '../src/config/index.js';
 import { PointSigninModel, PointCardModel, PointRecordModel, PointAccountModel, PointLotModel } from '../src/models/point.model.js';
 import { signIn, useMakeupCard, getSigninState } from '../src/services/points-signin.js';
 import { creditStreakTopUp } from '../src/services/points-streak.js';
+import { creditPoints } from '../src/services/points-ledger.js';
 
 const userId = String(new Types.ObjectId());
 const uid = new Types.ObjectId(userId);
@@ -20,6 +21,10 @@ const wipe = (u: Types.ObjectId) => Promise.all([
 ]);
 
 const seed = (dateKey: string, streakDay: number) => PointSigninModel.create({ userId: uid, dateKey, streakDay, points: Math.min(streakDay, 7), source: 'sign', createdAt: NOW });
+
+/** 造一行签到记录，points 显式给（Ruling B 要区分「库存 streakDay」与「实际入账 points」） */
+const row = (u: Types.ObjectId, dateKey: string, streakDay: number, points: number) =>
+  PointSigninModel.create({ userId: u, dateKey, streakDay, points, source: 'sign', createdAt: NOW });
 
 before(async () => {
   // 单文件直跑不会经过 app 的 mongodb 插件，这里自行连接；不连时查询会一直 buffering
@@ -303,4 +308,123 @@ test('PS17 signIn 收尾接校正：库里留着错位行时，签到把校正�
   const lotSum = (await PointLotModel.find({ userId: uid, expireAt: { $gt: NOW } }).lean())
     .reduce((s, l) => s + l.remaining, 0);
   assert.equal(lotSum, 8);
+});
+
+test('PS18 streakDay 只报接得上的那条链：隔着断口的旧链长度不算当前连签', async (t) => {
+  const uA = new Types.ObjectId();
+  const uB = new Types.ObjectId();
+  const uC = new Types.ObjectId();
+  t.after(() => Promise.all([wipe(uA), wipe(uB), wipe(uC)]));
+
+  // (A) 用户实测场景：20-23 签了、24 漏、今天没签。窗口里最右的已签格是 23（库存 4），
+  // 但那是「上一段链的长度」——同一屏报「已连续 4 天」又报「今天签到得 1 分」是自相矛盾。
+  await row(uA, '2026-10-20', 1, 1); await row(uA, '2026-10-21', 2, 2);
+  await row(uA, '2026-10-22', 3, 3); await row(uA, '2026-10-23', 4, 4);
+  const sA = await getSigninState(String(uA), NOW);
+  assert.equal(sA.todaySigned, false);
+  assert.equal(sA.streakDay, 0, '昨天没签 → 当前连签 0');
+  assert.equal(sA.nextReward, 1, '今天签是第 1 天，与 streakDay 0 自洽');
+  assert.equal(sA.cells.find((c) => c.dateKey === '2026-10-24')?.state, 'makeup', '24 仍是可补格');
+
+  // (B) 昨天签了 → 报昨天的库存值（链接得上）
+  await row(uB, '2026-10-21', 1, 1); await row(uB, '2026-10-22', 2, 2);
+  await row(uB, '2026-10-23', 3, 3); await row(uB, '2026-10-24', 4, 4);
+  const sB = await getSigninState(String(uB), NOW);
+  assert.equal(sB.todaySigned, false);
+  assert.equal(sB.streakDay, 4, '昨天(24)的库存值');
+  assert.equal(sB.nextReward, 5);
+
+  // (C) 今天已签 → 报今天的库存值（不是昨天的）
+  await row(uC, '2026-10-23', 1, 1); await row(uC, '2026-10-24', 2, 2);
+  await row(uC, '2026-10-25', 3, 3);
+  const sC = await getSigninState(String(uC), NOW);
+  assert.equal(sC.todaySigned, true);
+  assert.equal(sC.streakDay, 3, '今天的库存值');
+  assert.equal(sC.todayReward, 3);
+  assert.equal(sC.nextReward, 4);
+});
+
+test('PS19 signed 格与 todayReward 报实际入账分，不报名义分（被每日上限截断时不虚报）', async (t) => {
+  const u19 = new Types.ObjectId();
+  t.after(() => wipe(u19));
+  // 24 与今天都被 DAILY_CAP 截断：名义 2 / 3，实拿 1 / 1
+  await row(u19, '2026-10-23', 1, 1);
+  await row(u19, '2026-10-24', 2, 1);
+  await row(u19, '2026-10-25', 3, 1);
+  const s = await getSigninState(String(u19), NOW);
+  assert.equal(s.cells.find((c) => c.dateKey === '2026-10-24')?.reward, 1, '格子报库存 points 1，不是名义 min(2,7)');
+  assert.equal(s.cells.find((c) => c.dateKey === '2026-10-25')?.reward, 1);
+  assert.equal(s.todayReward, 1, 'todayReward 与格子同源：不能一格 1 一格 3');
+  assert.equal(s.streakDay, 3, 'streakDay 仍是库存天数，points 只影响分值');
+  assert.equal(s.nextReward, 4, 'nextReward 是「明天能拿几分」，仍按名义位置');
+});
+
+test('PS20 同一天重试把上次没发成的差额补回来（提前返回路径也走校正）', async (t) => {
+  const u20 = new Types.ObjectId();
+  const id20 = String(u20);
+  t.after(() => wipe(u20));
+  // 复现崩溃夹缝：上一次 signIn 已经把「今天的行 + 当天 2 分」落了库，收尾校正没跑成
+  //（24 该 4 记 1、25 该 5 记 2，欠 6 分）。修法之前用户再点一次走「今天已签」早退，欠分锁到明天。
+  await row(u20, '2026-10-23', 3, 3);
+  await row(u20, '2026-10-24', 1, 1);
+  await row(u20, '2026-10-25', 2, 2);
+  await creditPoints(id20, {
+    type: 'signin', title: '连续签到第 2 天', points: 2, bizDate: '2026-10-25',
+    refType: 'signin', refId: '2026-10-25', idemKey: `${id20}:signin:2026-10-25`,
+  }, NOW);
+
+  const again = await signIn(id20, NOW);
+  assert.equal(again.alreadySigned, true);
+  assert.equal(again.credited, 6, '24:1→4 补 3、25:2→5 补 3');
+  assert.equal(again.balance, 8);
+  assert.equal(again.streakDay, 5, '校正后的链条才是要报给前端的连签天数');
+  assert.equal((await PointSigninModel.findOne({ userId: u20, dateKey: '2026-10-24' }).lean())?.streakDay, 4);
+  assert.equal((await PointSigninModel.findOne({ userId: u20, dateKey: '2026-10-25' }).lean())?.streakDay, 5);
+  const top = await PointRecordModel.findOne({ userId: u20, type: 'makeup_topup' }).lean();
+  assert.equal(top?.delta, 6);
+  assert.equal(top?.idemKey, `${id20}:makeup_topup:2026-10-25`, '幂等键仍是今天的 trigger');
+
+  // 第三次点：链条已正 → 幂等键 + 「已正返回 0」保证一分都不再多发
+  const third = await signIn(id20, NOW);
+  assert.equal(third.alreadySigned, true);
+  assert.equal(third.credited, 0);
+  assert.equal(third.balance, 8);
+  assert.equal(await PointRecordModel.countDocuments({ userId: u20, type: 'makeup_topup' }), 1);
+  // 账本不变式：Σ record.delta === account.balance === Σ 未过期 lot.remaining
+  const recs = await PointRecordModel.find({ userId: u20 }).lean();
+  assert.equal(recs.reduce((s, r) => s + r.delta, 0), 8);
+  assert.equal((await PointAccountModel.findOne({ userId: u20 }).lean())?.balance, 8);
+  const lotSum = (await PointLotModel.find({ userId: u20, expireAt: { $gt: NOW } }).lean())
+    .reduce((s, l) => s + l.remaining, 0);
+  assert.equal(lotSum, 8);
+});
+
+test('PS21 并发重放（唯一键冲突那条早退路）同样不放过欠着的差额', async (t) => {
+  const u21 = new Types.ObjectId();
+  const id21 = String(u21);
+  t.after(() => wipe(u21));
+  await row(u21, '2026-10-23', 3, 3);
+  await row(u21, '2026-10-24', 1, 1); // 错位行：该 4 记 1
+
+  type CreateFn = (...args: unknown[]) => Promise<unknown>;
+  const realCreate = PointSigninModel.create.bind(PointSigninModel) as CreateFn;
+  // 抢赢的那一路：建了今天的行、发了当天 2 分，随后死在收尾校正之前 → 本次请求撞唯一键早退
+  t.mock.method(PointSigninModel as unknown as { create: CreateFn }, 'create', async (...args: unknown[]) => {
+    const doc = args[0] as { source?: string; userId?: unknown; streakDay?: number } | undefined;
+    if (doc?.source === 'sign' && String(doc.userId) === id21) {
+      await realCreate({ userId: u21, dateKey: '2026-10-25', streakDay: doc.streakDay, points: 2, source: 'sign', createdAt: NOW });
+      await creditPoints(id21, {
+        type: 'signin', title: '连续签到第 2 天', points: 2, bizDate: '2026-10-25',
+        refType: 'signin', refId: '2026-10-25', idemKey: `${id21}:signin:2026-10-25`,
+      }, NOW);
+      throw Object.assign(new Error('E11000 duplicate key error'), { code: 11000 });
+    }
+    return realCreate(...args);
+  });
+
+  const r = await signIn(id21, NOW);
+  assert.equal(r.alreadySigned, true);
+  assert.equal(r.credited, 6, '24:1→4 补 3、25:2→5 补 3');
+  assert.equal((await PointSigninModel.findOne({ userId: u21, dateKey: '2026-10-25' }).lean())?.streakDay, 5);
+  assert.equal(await PointRecordModel.countDocuments({ userId: u21, type: 'makeup_topup' }), 1);
 });

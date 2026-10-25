@@ -194,8 +194,9 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   const s0 = data<Summary>(await get('/points/summary'));
   assert.equal(s0.balance, 0);
   assert.equal(s0.signin.todaySigned, false);
-  // streakDay 新口径：窗口内最右一个已签格的库存值（前天的行 = 2），不再只看今昨两行
-  assert.equal(s0.signin.streakDay, 2);
+  // streakDay 只报接得上的那条链（spec §5.1 / Ruling 2026-10-25）：今天没签、昨天也没签 → 0。
+  // 窗口里前天的行（库存 2）是「上一段链的长度」，不能当「现在连了几天」报出去。
+  assert.equal(s0.signin.streakDay, 0);
   assert.equal(s0.signin.todayReward, 0);
   assert.equal(s0.signin.nextReward, 1, '首签 1 分');
   assert.equal(s0.signin.cards, 0);
