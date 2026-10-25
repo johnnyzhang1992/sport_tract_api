@@ -52,7 +52,7 @@ interface Summary {
   balance: number;
   signin: SigninState;
   tasks: TaskRow[];
-  item: { key: string; price: number; validDays: number };
+  items: { key: string; price: number; validDays: number }[];
 }
 
 interface RecordPage {
@@ -192,8 +192,9 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s0.signin.makeupDate, YESTERDAY, '无卡但存在漏签空档时仍下发可补日期（供前端引导兑换）');
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
-  assert.equal(s0.item.key, 'makeup_card');
-  assert.equal(s0.item.price, POINTS.MAKEUP_CARD_PRICE);
+  assert.equal(s0.items.length, 1, 'summary 下发整张商品表，积分页按它渲染商品卡');
+  assert.equal(s0.items[0].key, 'makeup_card');
+  assert.equal(s0.items[0].price, POINTS.MAKEUP_CARD_PRICE);
 
   // 2) 授 200 分后 summary 余额同步
   await seedPoints(userId, POINTS.MAKEUP_CARD_PRICE);

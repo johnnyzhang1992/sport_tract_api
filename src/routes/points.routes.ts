@@ -34,7 +34,8 @@ export async function pointsRoutes(fastify: FastifyInstance) {
       balance,
       signin: { ...signin, cards, makeupCardId: card ? String(card._id) : '' },
       tasks,
-      item: items[0],
+      // 下发整张商品表（不是 items[0]）：积分页按道具列表渲染商品卡，将来加道具不用再改接口
+      items,
     });
   });
 
