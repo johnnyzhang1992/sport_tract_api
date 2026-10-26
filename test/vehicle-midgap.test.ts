@@ -252,7 +252,8 @@ test('M9 finish：含地铁段（60s/400m×3）的步行轨迹，距离/时长�
   const fixed = re.json().data.activity;
   assert.ok(fixed.vehicleM >= 1150, `vehicleM 应含 3×400m，实际 ${fixed.vehicleM}`);
   assert.ok(fixed.vehicleMs >= 175_000, `vehicleMs 应含 3×60s，实际 ${fixed.vehicleMs}`);
-  assert.match(fixed.vehicleNotice, /疑似定位漂移/);
+  // 3 段各 60s/400m 的单步跳变 = 被运载（单步段按位移兜底判搭车）
+  assert.match(fixed.vehicleNotice, /疑似搭车/);
   assert.ok(fixed.duration > 600 && fixed.duration < 700, `纠偏后时长应为 840s 墙钟 - 180s 车程 ≈ 660s，实际 ${fixed.duration}s`);
 });
 

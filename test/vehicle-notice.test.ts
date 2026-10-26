@@ -244,3 +244,21 @@ test('分类：两类都有 → 一句话里分别报（距离按存储总量比
   const nums = got.user.match(/\d+\.\d\d/g)!.map(Number);
   assert.ok(Math.abs(nums.reduce((a: number, b: number) => a + b, 0) - 0.96) < 0.02, `两类之和应≈0.96km，实际 ${nums}`);
 });
+
+test('分类：单步巨步弦（无直线度可测）按位移兜底判搭车，不误归为漂移', async () => {
+  // 实测 47d88a 形态：一个 300s 单步跨 3km（被运载），直线度测不出
+  const mPerDeg = 111194.9;
+  const pts = [
+    { seq: 1, lat: 31.2304, lng: 121.4737, altitude: null, speed: null, accuracy: 5, timestamp: NOW - 3_600_000 },
+    { seq: 2, lat: 31.2304 + 3000 / mPerDeg, lng: 121.4737, altitude: null, speed: null, accuracy: 5, timestamp: NOW - 3_600_000 + 300_000, vehicle: true },
+  ];
+  const act = await ActivityModel.create({
+    userId, type: 'hiking', status: 'finished',
+    startTime: NOW - 3_600_000, endTime: NOW - 1_800_000,
+    duration: 1200, distance: 500,
+    vehicleMs: 300_000, vehicleM: 3000,
+    trackPoints: pts, note: 'single-chord',
+  });
+  const got = await noticeOf(String(act._id));
+  assert.equal(got.user, '约 3.00 公里疑似搭车，未计入', `实际：${got.user}`);
+});

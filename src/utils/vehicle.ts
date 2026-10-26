@@ -354,17 +354,20 @@ const NON_SPORT_CLUSTER_MAX_GAP_POINTS = 5;
 export function classifyNonSportSegments(points: TrackPointLike[] | undefined): NonSportSegment[] {
   const pts = points ?? [];
   const out: NonSportSegment[] = [];
-  type Acc = { first: TrackPointLike; last: TrackPointLike; pathM: number; chordM: number; sec: number; steps: number };
+  // entry = 进入该段的那个点（首个标记步的前一点）：单步段的净位移要从它量起，
+  // 否则「首末都是同一个标记点」会算出 netM=0，被误归为漂移
+  type Acc = { entry: TrackPointLike; last: TrackPointLike; pathM: number; chordM: number; sec: number; steps: number };
   let cur: Acc | null = null;
 
   const flush = () => {
     if (!cur) return;
-    const netM = haversineDistance(cur.first, cur.last);
+    const netM = haversineDistance(cur.entry, cur.last);
     const straight = cur.steps >= 2 && cur.chordM > 0 ? netM / cur.chordM : 0;
+    // 单步段（steps=1，典型是巨步弦）测不出直线度：按「位移够大 + 撑得起时间」兜底判搭车
+    // （实测 47d88a 徒步轨迹一个 300s 单步跨 3km，明显被运载，不能因为没直线度就说是漂移）
+    const straightOk = cur.steps >= 2 ? straight >= VEHICLE_SEGMENT_MIN_STRAIGHT : true;
     const kind: NonSportKind =
-      straight >= VEHICLE_SEGMENT_MIN_STRAIGHT && netM >= VEHICLE_SEGMENT_MIN_NET_M && cur.sec >= VEHICLE_SEGMENT_MIN_SEC
-        ? 'vehicle'
-        : 'drift';
+      straightOk && netM >= VEHICLE_SEGMENT_MIN_NET_M && cur.sec >= VEHICLE_SEGMENT_MIN_SEC ? 'vehicle' : 'drift';
     out.push({ kind, pathM: cur.pathM, netM, straight, sec: cur.sec, steps: cur.steps });
     cur = null;
   };
@@ -386,7 +389,7 @@ export function classifyNonSportSegments(points: TrackPointLike[] | undefined): 
       const gapPoints = i - lastMarkedIdx - 1;
       if (!(gap <= NON_SPORT_CLUSTER_GAP_SEC) || gapPoints >= NON_SPORT_CLUSTER_MAX_GAP_POINTS) flush();
     }
-    if (!cur) cur = { first: b, last: b, pathM: 0, chordM: 0, sec: 0, steps: 0 };
+    if (!cur) cur = { entry: a, last: b, pathM: 0, chordM: stepM, sec: 0, steps: 0 };
     else cur.chordM += haversineDistance(cur.last, b);
     cur.last = b;
     cur.pathM += stepM;
