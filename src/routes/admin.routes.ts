@@ -40,6 +40,7 @@ import {
 } from '../services/notification.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { backfillVehicle } from '../services/vehicle-backfill.js';
+import { backfillDriftScore } from '../services/drift-score-backfill.js';
 import { gapImpact } from '../services/gap-impact.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
@@ -1308,6 +1309,24 @@ export async function adminRoutes(fastify: FastifyInstance) {
         id,
         limit: Math.max(0, Number(body.limit) || 0),
         syncCalories,
+      }),
+    );
+  });
+
+  // driftScore 批量回填（docs/19 §4.3，**默认干跑**）：给 driftScore=null 的 finished 轨迹
+  // 按点集重算漂移置信度分；门禁在线侧查询生效，回填只是把分数补齐让全局榜准确。
+  // 这是线上唯一入口（容器没 tsx、scripts 不进镜像），与 CLI 脚本共用同一份实现
+  fastify.post('/activities/backfill-drift-score', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as {
+      apply?: boolean | string;
+      limit?: number | string;
+      userId?: string;
+    };
+    return success(
+      await backfillDriftScore({
+        apply: body.apply === true || body.apply === 'true',
+        limit: Math.max(0, Number(body.limit) || 0),
+        userId: body.userId ? String(body.userId) : undefined,
       }),
     );
   });
