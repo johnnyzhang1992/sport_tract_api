@@ -254,6 +254,68 @@ test('M9 finish：含地铁段（60s/400m×3）的步行轨迹，距离/时长�
   assert.ok(fixed.duration > 600 && fixed.duration < 700, `纠偏后时长应为 840s 墙钟 - 180s 车程 ≈ 660s，实际 ${fixed.duration}s`);
 });
 
+// ── M18 老版本客户端兼容：无 gapTighten/无 vehicle 标记 + clientDistance 全量虚高 ──
+// 兼容契约：finish 必须 200 正常落库（不得 4xx/5xx），行为与线上现状一致
+//（地铁段距离入账——服务端 markVehicle 不在 finish 跑，等纠偏修）；driftScore 服务端计算
+test('M18 老版本客户端 finish：无标记+虚高 clientDistance 仍正常落库，driftScore 服务端计', async () => {
+  const login = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/auth/login',
+    payload: { code: NS + 'legacy' },
+  });
+  const tk = login.json().data.accessToken;
+  const create = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/activities',
+    headers: { authorization: `Bearer ${tk}` },
+    payload: { type: 'walking', startTime: 1_790_000_000_000 },
+  });
+  const activityId = create.json().data.activityId;
+
+  // 老版本形态：地铁段不标任何东西，clientDistance 报含地铁段的全量距离
+  const steps: Array<Record<string, unknown>> = [];
+  let lat = 30;
+  let ts = 1_790_000_000_000;
+  let seq = 0;
+  const push = (sec: number, mps: number) => {
+    const n = Math.max(1, Math.round(sec / 3));
+    for (let k = 1; k <= n; k++) {
+      lat += (mps * (sec / n)) / 111_194.9;
+      ts += (sec / n) * 1000;
+      steps.push({ seq: ++seq, lat, lng: 114, timestamp: ts, altitude: null, speed: null, accuracy: 10 });
+    }
+  };
+  push(300, 1.4);
+  for (let g = 0; g < 3; g++) {
+    push(60, 400 / 60); // 无标记地铁段（老版本客户端不识别）
+    push(120, 1.4);
+  }
+  const inflated = Math.round(750 + 3 * 400); // 老客户端口径：含全部地铁段
+
+  const finish = await app.inject({
+    method: 'PUT',
+    url: `/sport-track/api/activities/${activityId}/finish`,
+    headers: { authorization: `Bearer ${tk}` },
+    payload: { trackPoints: steps, markers: [], pausedMs: 0, clientDistance: inflated, endTime: ts },
+  });
+  assert.equal(finish.statusCode, 200, finish.body);
+  const act = finish.json().data.activity;
+  assert.equal(act.status, 'finished', '老客户端轨迹必须正常落库（不因无标记被拒）');
+  // 行为与线上现状一致：服务端 finish 不跑 markVehicle，虚高距离照旧入账（纠偏才修）
+  assert.ok(act.distance > 1500, `老客户端口径保留（含地铁段），实际 ${act.distance}`);
+  // driftScore 服务端计算：无标记快弦占比高 → 分数高 → 未来被门禁拦在榜外（防灌水对所有版本生效）
+  assert.ok(typeof act.driftScore === 'number', 'driftScore 应服务端计算');
+
+  // 换类型/纠偏等既有接口对老客户端轨迹照常可用
+  const meta = await app.inject({
+    method: 'PUT',
+    url: `/sport-track/api/activities/${activityId}/meta`,
+    headers: { authorization: `Bearer ${tk}` },
+    payload: { type: 'cycling' },
+  });
+  assert.equal(meta.statusCode, 200, meta.body);
+});
+
 test('M9 teardown', async () => {
   await purge();
   await app.close();
