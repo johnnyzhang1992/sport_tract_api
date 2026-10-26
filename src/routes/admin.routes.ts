@@ -837,6 +837,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
       page?: string; pageSize?: string; userId?: string;
       type?: string; status?: string; keyword?: string;
       minDistance?: string; maxDistance?: string; minDuration?: string; maxDuration?: string;
+      startTimeFrom?: string; startTimeTo?: string;
       hasPhoto?: string;
       sortBy?: string; order?: string;
     };
@@ -861,6 +862,11 @@ export async function adminRoutes(fastify: FastifyInstance) {
     if (q.minDuration) dur.$gte = Math.round(Number(q.minDuration) * 60);
     if (q.maxDuration) dur.$lte = Math.round(Number(q.maxDuration) * 60);
     if (Object.keys(dur).length) filter.duration = dur;
+    // 开始时间区间（ms）：活动详情弹窗按活动时间窗过滤用
+    const startTs: Record<string, unknown> = {};
+    if (q.startTimeFrom) startTs.$gte = Number(q.startTimeFrom);
+    if (q.startTimeTo) startTs.$lte = Number(q.startTimeTo);
+    if (Object.keys(startTs).length) filter.startTime = startTs;
     // 是否有图片：与列表里的 photoCount 同口径——marker.photos 有非空项，或旧字段 photoUrl 非空。
     // 不带参数/非法值不过滤；无图片用 $nor 取反（空 markers 也算无图）
     if (q.hasPhoto === 'true' || q.hasPhoto === 'false') {
