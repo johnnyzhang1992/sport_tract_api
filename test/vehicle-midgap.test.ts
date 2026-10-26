@@ -24,6 +24,7 @@ interface Step {
   mps: number;
   gapJump?: boolean;
   pauseGap?: boolean;
+  altitude?: number;
 }
 
 /** 轨迹构造：沿经线推进，每步 {sec, mps}，可带 gapJump/pauseGap 标记 */
@@ -38,6 +39,7 @@ function buildTrack(steps: Step[], startTs = 1_790_000_000_000) {
       lat,
       lng: 114,
       timestamp: ts,
+      ...(s.altitude != null ? { altitude: s.altitude } : {}),
       ...(s.gapJump ? { gapJump: true } : {}),
       ...(s.pauseGap ? { pauseGap: true } : {}),
     } as TrackPointLike);
@@ -128,6 +130,28 @@ test('M10 游泳 40s 断档 150m（3.75m/s > 3.0）：标（游泳配置了 gapS
   ]);
   const r = markVehicle(pts, 'swimming');
   assert.equal(r.points[2].vehicle, true);
+});
+
+test('M16 服务端骑行滚动窗：5min 均速 54km/h → 窗内步全标 vehicle（§3.6 服务端版）', () => {
+  const pts = buildTrack([
+    { sec: 10, mps: 8 },
+    ...Array.from({ length: 12 }, () => ({ sec: 30, mps: 15 })), // 15m/s = 54km/h > 12.5
+    { sec: 10, mps: 8 },
+  ]);
+  const r = markVehicle(pts, 'cycling');
+  const marked = r.points.filter((p) => p.vehicle).length;
+  assert.ok(marked >= 11, `滚动窗内步应标 vehicle，实际 ${marked}`);
+  assert.ok(r.vehicleM >= 4000, `vehicleM 应含窗内位移，实际 ${r.vehicleM}`);
+});
+
+test('M17 服务端骑行滚动窗下坡豁免：窗内净海拔降 200m → 不标', () => {
+  const pts = buildTrack([
+    { sec: 10, mps: 8, altitude: 1000 },
+    ...Array.from({ length: 12 }, (_, k) => ({ sec: 30, mps: 15, altitude: 1000 - (k + 1) * 20 })),
+    { sec: 10, mps: 8, altitude: 760 },
+  ]);
+  const r = markVehicle(pts, 'cycling');
+  assert.equal(r.points.filter((p) => p.vehicle).length, 0, '长下坡应豁免');
 });
 
 // ── M9 e2e：finish 落库口径（距离不含跳变、时长扣 vehicleMs、vehicleNotice 非空） ──

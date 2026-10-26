@@ -23,7 +23,7 @@ import { TYPE_CONFIGS, DEFAULT_TYPE_CONFIG } from './trajectory-clean.js';
  */
 export function calcDriftScore<
   T extends { timestamp?: number | null; lat?: unknown; lng?: unknown; accBad?: boolean; vehicle?: boolean },
->(points: T[], type?: string): number {
+>(points: T[], type?: string, metrics?: { distance?: number; durationSec?: number }): number {
   const pts = points ?? [];
   const n = pts.length;
   if (n < 2) return 0;
@@ -37,6 +37,7 @@ export function calcDriftScore<
   let slowGapMs = 0;
   let fastGapMs = 0;
   let spanMs = 0;
+  let chordSumM = 0; // 点集弦长合计：距离证据（距离 >> 弦长 = 挂机漂移刷距离/旧版丢弃）
   for (let i = 1; i < n; i++) {
     const a = pts[i - 1];
     const b = pts[i];
@@ -45,6 +46,8 @@ export function calcDriftScore<
     if (!Number.isFinite(ta) || !Number.isFinite(tb)) continue;
     const dtMs = Math.max(0, tb - ta);
     spanMs += dtMs;
+    const chord = chordSpeedMps(a, b, dtMs);
+    if (chord != null) chordSumM += chord * (dtMs / 1000);
     if (b.accBad === true) accBadSteps += 1;
     if (b.vehicle === true) {
       vehicleMs += dtMs; // vehicle 步的时长在 vehicleRatio 里计，不重复进 gap 分档
@@ -57,17 +60,45 @@ export function calcDriftScore<
   }
   const steps = n - 1;
   if (spanMs <= 0 || steps <= 0) return 0;
-  const score =
-    100 *
-    Math.min(
-      1,
-      0.6 * (accBadSteps / steps) +
-        0.2 * (vehicleMs / spanMs) +
-        0.15 * (slowGapMs / spanMs) +
-        1.0 * (fastGapMs / spanMs),
-    );
-  return Math.round(score);
+  let penalty =
+    0.6 * (accBadSteps / steps) +
+    0.2 * (vehicleMs / spanMs) +
+    0.15 * (slowGapMs / spanMs) +
+    1.0 * (fastGapMs / spanMs);
+
+  // 距离证据一致性（dev 库审计新增）：存储距离 >> 点集弦长 = 弦里丢位移
+  // （still 收缩丢失漂移细节 / 旧版客户端丢弃超速点）→ 弦撑不起的距离不可信。
+  // 阈值 0.8：正常轨迹弦长 ≈ 距离（±10% 对账守卫保证）；c10042 实测 11.6/20 = 0.58
+  const dist = metrics?.distance;
+  if (dist != null && dist > 1000 && chordSumM > 0) {
+    const ratio = chordSumM / dist;
+    if (ratio < 0.8) penalty += (0.8 - ratio) * 1.2;
+  }
+
+  // 均速合理性（dev 库审计新增）：存储距离/运动时长 超类型持续上限 → 物理不可能
+  // （c10184 实测：30.6km/h 的「步行」21km；a81e2b：44.7km/h 的「骑行」）。
+  // 上限取「世界级选手可持续全程的均速」：跑步 6.5（马拉松纪录级）、步行类 2.2（竞走级）、
+  // 骑行 11.5（41km/h，职业环法均速级）——业余不可能，宁严勿松
+  const dur = metrics?.durationSec;
+  if (dist != null && dur != null && dur > 60) {
+    const ceil = AVG_SPEED_CEIL_MPS[type ?? ''] ?? AVG_SPEED_CEIL_DEFAULT_MPS;
+    const mps = dist / dur;
+    if (mps > ceil) penalty += Math.min(1, ((mps - ceil) / ceil) * 2);
+  }
+
+  return Math.round(100 * Math.min(1, penalty));
 }
+
+/** 类型均速持续上限（m/s）：判据是「世界级可持续、业余不可能」，宁严勿松 */
+const AVG_SPEED_CEIL_MPS: Record<string, number> = {
+  walking: 2.2, // 7.9km/h 竞走级
+  hiking: 2.2,
+  mountaineering: 2.2,
+  running: 6.5, // 23.4km/h，马拉松世界纪录均速级
+  swimming: 2.0,
+  cycling: 11.5, // 41.4km/h，职业环法均速级
+};
+const AVG_SPEED_CEIL_DEFAULT_MPS = 8;
 
 /** 弦速（m/s）：粗略 haversine，坐标缺失返回 null */
 function chordSpeedMps(

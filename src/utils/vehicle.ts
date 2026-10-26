@@ -44,6 +44,15 @@ export const VEHICLE_MAX_STEP_SEC = 120;
  *  三级阶梯的中档：≤30s 走现行单步/持续判据，>120s 巨步弦无条件标，30-120s 之间
  *  信号刚恢复的首个 fix 不可信、但又够不着巨步弦门槛，地铁进出站就落在这一档 */
 export const GAP_TIGHTEN_MIN_SEC = 30;
+
+/** 骑行「滚动均速天花板」（docs/19 §3.6 服务端版，reprocess/回填旧轨迹用）：
+ *  5min 滑动窗均速超上限且非长下坡 → 窗内步标 vehicle。只对 cycling 生效
+ *  （公交/电驴与骑行速度重叠不判——荣誉制，用户拍板；滑雪下坡同理豁免）。
+ *  ⚠️ 与端上 tracker.js 的 CYCLE_ROLL_* 三常量同值，改一处必须同步另一处。
+ *  dev 库实测抓出：44.7km/h 均速的「骑行」旧公式 0 分全绿通过 */
+export const CYCLE_ROLL_WINDOW_MS = 300_000; // 5 分钟滑动窗
+export const CYCLE_ROLL_CAP_MPS = 12.5;      // 45 km/h = 1'20"/km
+export const CYCLE_ROLL_DROP_EXEMPT_M = 50;  // 窗内净海拔下降 ≥ 该值 = 合法长下坡，豁免
 /** 会做车速判定的类型（人力运动）；其余类型一律不判 */
 export const VEHICLE_TYPES = ['running', 'walking', 'hiking', 'mountaineering'];
 
@@ -156,6 +165,53 @@ export function markVehicle<T extends TrackPointLike>(points: T[], type?: string
       const dt = (b.timestamp - a.timestamp) / 1000;
       if (dt <= GAP_TIGHTEN_MIN_SEC || dt > VEHICLE_MAX_STEP_SEC) continue;
       if (haversineDistance(a, b) / dt > gapSpeed) b.vehicle = true;
+    }
+  }
+
+  // 骑行滚动均速天花板（服务端版）：持续判据对骑行豁免（6.5m/s 是通勤速度），
+  // 但 45km/h+ 的持续均速已是摩托车/汽车领埴——旧轨迹（无端上滚动窗标记）在
+  // 纠偏/回填时由此补拦。窗口/上限/豁免与端上同口径。
+  if (type === 'cycling') {
+    let winFrom = 0;
+    let winMs = 0;
+    let winDist = 0;
+    for (let i = 1; i < out.length; i++) {
+      const a = out[i - 1];
+      const b = out[i];
+      const dtMs =
+        typeof a.timestamp === 'number' && typeof b.timestamp === 'number'
+          ? Math.max(0, b.timestamp - a.timestamp)
+          : 0;
+      winMs += dtMs;
+      winDist += haversineDistance(a, b);
+      // 先判后淘汰：窗口一满立即评估（若先淘汰，头部短步会让窗口永远差一步到满，触发死锁）
+      if (winMs >= CYCLE_ROLL_WINDOW_MS) {
+        if (winDist / (winMs / 1000) > CYCLE_ROLL_CAP_MPS) {
+          const alts: number[] = [];
+          for (let k = winFrom; k <= i; k++) {
+            if (typeof out[k].altitude === 'number') alts.push(out[k].altitude as number);
+          }
+          const drop = alts.length >= 2 ? alts[0] - alts[alts.length - 1] : 0;
+          if (drop < CYCLE_ROLL_DROP_EXEMPT_M) {
+            for (let k = winFrom + 1; k <= i; k++) out[k].vehicle = true;
+            // 清窗重开：已判定段不重复标
+            winFrom = i;
+            winMs = 0;
+            winDist = 0;
+          }
+        }
+      }
+      while (winMs > CYCLE_ROLL_WINDOW_MS && i > winFrom) {
+        const ja = out[winFrom];
+        const jb = out[winFrom + 1];
+        const jdt =
+          typeof ja.timestamp === 'number' && typeof jb.timestamp === 'number'
+            ? Math.max(0, jb.timestamp - ja.timestamp)
+            : 0;
+        winMs -= jdt;
+        winDist -= haversineDistance(ja, jb);
+        winFrom += 1;
+      }
     }
   }
 

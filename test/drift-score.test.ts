@@ -25,7 +25,7 @@ interface Fixture {
 }
 
 /** 步行直线轨迹：steps 步 × 100m，可用 hook 按点下标注入 accBad/vehicle/gap 标记 */
-function walkPoints(steps: number, hook?: (i: number, p: Record<string, unknown>) => void) {
+function walkPoints(steps: number, hook?: (i: number, p: Record<string, unknown>) => void, stepM = 100) {
   const out: Array<Record<string, unknown>> = [];
   let lat = 30;
   let ts = 1_790_000_000_000;
@@ -33,7 +33,7 @@ function walkPoints(steps: number, hook?: (i: number, p: Record<string, unknown>
     const p: Record<string, unknown> = { seq: i + 1, lat, lng: 114, timestamp: ts };
     hook?.(i, p);
     out.push(p);
-    lat += 100 * M_PER_DEG;
+    lat += stepM * M_PER_DEG;
     ts += SEC * 1000;
   }
   return out;
@@ -107,13 +107,13 @@ before(async () => {
   );
 
   // B2 混合：2/20 accBad + 25% 车程 + 25% 断档 → ~16 分，不门禁
-  const b2pts = walkPoints(20, (i, p) => {
-    if (i === 5 || i === 6) p.accBad = true;
+  const b2pts = walkPoints(240, (i, p) => {
+    if (i % 5 === 0) p.accBad = true; // 20% 步 accBad → ~12 分，维持中带语义
     if (i >= 10 && i <= 14) p.vehicle = true;
-  });
-  b2pts[20].timestamp = (b2pts[19].timestamp as number) + 150_000; // 一步 150s 断档
+  }, 30); // 30m/25s = 1.2m/s 真实徒步步长（否则均速项会误伤这个「应通过」夹具）
+  b2pts[240].timestamp = (b2pts[239].timestamp as number) + 150_000; // 一步 150s 断档
   B2 = String(
-    await insertActivity(userB, { provinces: ['漂移测试省'], distance: 7000, duration: 900, startTime: 1_790_100_000_000 }, b2pts),
+    await insertActivity(userB, { provinces: ['漂移测试省'], distance: 7200, duration: 6150, startTime: 1_790_100_000_000 }, b2pts),
   );
 
   // B3 高分 + 半马/链原料：25km、带 pbMarks
@@ -179,7 +179,7 @@ test('D2 高分轨迹被个人最佳五榜排除，榜首落到次优轨迹', as
     (r) => r.type === 'hiking',
   );
   // B1 8000 / B3 25000 都 ≥30 分被门禁 → hiking 榜首 = B2 的 7000
-  assert.equal(walking?.distance, 7000, `榜首应为 B2 7000，实际 ${JSON.stringify(walking)}`);
+  assert.equal(walking?.distance, 7200, `榜首应为 B2 7200，实际 ${JSON.stringify(walking)}`);
 });
 
 test('D2b 保持者链与奖杯墙同样排除高分轨迹', async () => {
@@ -192,7 +192,10 @@ test('D2b 保持者链与奖杯墙同样排除高分轨迹', async () => {
   // B3 带 pbMarks(km5) 但 ≥30 分 → 链里不该出现
   const chainIds = (data.distancePbChain as Array<{ id: string }>).map((r) => String(r.id));
   assert.ok(!chainIds.includes(String(B3)), '保持者链不应含高分轨迹');
-  assert.equal((data.fastestDistanceByKm as unknown[]).length, 0, '当前纪录应为空');
+  // B2（13 分，合法通过门禁）的 km5 里程碑应在；B3（高分）不得出现
+  const curKm = data.fastestDistanceByKm as Array<{ id: string; km: number }>;
+  assert.ok(!curKm.some((r) => String(r.id) === String(B3)), '当前纪录不应含高分轨迹 B3');
+  assert.ok(curKm.some((r) => String(r.id) === String(B2)), '通过门禁的 B2 里程碑应正常在榜');
   // B3 25km ≥ 半马但 ≥30 分 → 半马里程碑不出现
   assert.equal((data.milestones as Record<string, unknown>).half, undefined, '奖杯墙不应含高分轨迹');
 });
@@ -207,7 +210,7 @@ test('D3 混合地铁轨迹（10-30 分）不门禁：仍进榜', async () => {
   const walking = (data.maxDistanceByType as Array<{ type: string; distance: number }>).find(
     (r) => r.type === 'hiking',
   );
-  assert.equal(walking?.distance, 7000, '混合轨迹 B2 7000 应正常进榜');
+  assert.equal(walking?.distance, 7200, '混合轨迹 B2 7200 应正常进榜');
 });
 
 test('D1 干净轨迹 finish 落库 driftScore ≈ 0 且进榜', async () => {
@@ -231,10 +234,10 @@ test('D1 干净轨迹 finish 落库 driftScore ≈ 0 且进榜', async () => {
     url: `/sport-track/api/activities/${activityId}/finish`,
     headers: { authorization: `Bearer ${tk}` },
     payload: {
-      trackPoints: walkPoints(30),
+      trackPoints: walkPoints(30, undefined, 30), // 30m/25s = 1.2m/s 真实步行
       markers: [],
       pausedMs: 0,
-      clientDistance: 3000,
+      clientDistance: 900,
       endTime: 1_790_000_000_000 + 30 * SEC * 1000,
     },
   });
@@ -360,7 +363,7 @@ test('D8 全国榜：farthest/fastestKm 排除高分轨迹；同榜无门禁指�
   const farthest = best.find((r) => r.key === 'farthest');
   const maxClimb = best.find((r) => r.key === 'maxClimb');
   // B1(8000/500) 与 B3(25000/800) 都 ≥30 分 → farthest 榜首 = B2 的 7000
-  assert.equal(farthest?.value, 7000, `farthest 应为 B2 7000（B1/B3 被门禁），实际 ${farthest?.value}`);
+  assert.equal(farthest?.value, 7200, `farthest 应为 B2 7200（B1/B3 被门禁），实际 ${farthest?.value}`);
   // maxClimb 无门禁 → B3 的 800 照常上榜
   assert.equal(maxClimb?.value, 800, `maxClimb 不门禁，应为 B3 800，实际 ${maxClimb?.value}`);
 
@@ -434,6 +437,24 @@ test('D10 老客户端快弦（无标记 >30s 步、弦速超 gapSpeed）→ 重
   // 慢弦对照：同样 3×60s 间隔，但弦速 1.67m/s（真实徒步节奏）→ 轻罚通过
   const slowScore = calcDriftScore(build(100), 'walking');
   assert.ok(slowScore < DRIFT_SCORE_PB_GATE, `慢弦稀疏轨迹应通过，实际 ${slowScore}`);
+});
+
+test('D11 均速物理不可能（c10184 形态：30.6km/h 的「步行」）→ 门禁', () => {
+  // 21km / 41min = 8.5m/s，远超步行持续上限 2.2 —— 距离/时长口径的烟枪信号
+  const score = calcDriftScore(walkPoints(59), 'walking', { distance: 21000, durationSec: 2460 });
+  assert.ok(score >= DRIFT_SCORE_PB_GATE, `均速不可能应门禁，实际 ${score}`);
+  // 对照：同几何 21km / 5.8h（1.0m/s）→ 通过
+  const ok = calcDriftScore(walkPoints(210), 'walking', { distance: 21000, durationSec: 21000 });
+  assert.ok(ok < DRIFT_SCORE_PB_GATE, `合理均速应通过，实际 ${ok}`);
+});
+
+test('D12 距离 >> 弦证据（c10042 形态：存储 20km 弦长只撑 11.6km）→ 门禁', () => {
+  // 稀疏点弦长 500m，存储距离报 5000m：证据撑不起的距离不可信（still 收缩丢漂移细节/旧版丢弃）
+  const score = calcDriftScore(walkPoints(10, undefined, 50), 'walking', { distance: 5000, durationSec: 3000 });
+  assert.ok(score >= DRIFT_SCORE_PB_GATE, `距离证据不足应门禁，实际 ${score}`);
+  // 对照：弦长 ≈ 距离 → 通过
+  const ok = calcDriftScore(walkPoints(10, undefined, 50), 'walking', { distance: 500, durationSec: 3000 });
+  assert.ok(ok < DRIFT_SCORE_PB_GATE, `证据充分应通过，实际 ${ok}`);
 });
 
 test('D0 夹具自证：calcDriftScore 分量公式', () => {

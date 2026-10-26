@@ -371,13 +371,13 @@ export async function bestRecords(userId: ObjectIdLike) {
   // 惰性补算：fastestKm 新字段上线前完成的历史轨迹无该字段 → 批量补算（每次本用户全量，数据量小）
   // 规划路线（无时间信息，1s 补全会造出假配速）永不补算；同循环顺手补 driftScore（老轨迹 null → 计算）
   const missing = await ActivityModel.find({ ...base, fastestKm: null, trackKind: { $ne: 'planned' } })
-    .select('_id trackPoints driftScore')
+    .select('_id trackPoints driftScore distance duration')
     .limit(100)
     .lean();
   for (const a of missing) {
     const fk = calcFastestKm(a.trackPoints ?? [], a.type);
     const patch: Record<string, unknown> = { fastestKm: fk };
-    if (a.driftScore == null) patch.driftScore = calcDriftScore(a.trackPoints ?? [], a.type);
+    if (a.driftScore == null) patch.driftScore = calcDriftScore(a.trackPoints ?? [], a.type, { distance: a.distance ?? undefined, durationSec: a.duration ?? undefined });
     await ActivityModel.updateOne({ _id: a._id }, { $set: patch });
   }
   // 距离里程碑惰性补算：pbMarks 未落库的历史轨迹（补算后写 []，避免反复扫点）
