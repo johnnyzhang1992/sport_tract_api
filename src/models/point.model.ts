@@ -73,6 +73,14 @@ const exchangeSchema = new Schema({
 }, { versionKey: false });
 exchangeSchema.index({ userId: 1, requestId: 1 }, { unique: true });
 
+/** 每日已入账计数器：DAILY_CAP 的原子闸门（$inc 预占 + 超限退回），替代聚合 check-then-act */
+const dailySchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, required: true },
+  bizDate: { type: String, required: true },
+  earned: { type: Number, required: true, min: 0 },
+}, { versionKey: false });
+dailySchema.index({ userId: 1, bizDate: 1 }, { unique: true });
+
 export const PointAccountModel = models.PointAccount ?? model('PointAccount', accountSchema);
 export const PointRecordModel = models.PointRecord ?? model('PointRecord', recordSchema);
 export const PointLotModel = models.PointLot ?? model('PointLot', lotSchema);
@@ -80,3 +88,4 @@ export const PointSigninModel = models.PointSignin ?? model('PointSignin', signi
 export const PointTaskModel = models.PointTask ?? model('PointTask', taskSchema);
 export const PointCardModel = models.PointCard ?? model('PointCard', cardSchema);
 export const PointExchangeModel = models.PointExchange ?? model('PointExchange', exchangeSchema);
+export const PointDailyModel = models.PointDaily ?? model('PointDaily', dailySchema);

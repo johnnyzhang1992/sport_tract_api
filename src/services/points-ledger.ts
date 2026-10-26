@@ -9,12 +9,11 @@
  * 并发口径：账户增减走 findOneAndUpdate 的原子 $inc（读到的 pre-image 即 balanceAfter 的依据），
  * 明细失败时回滚这次 $inc；明细的唯一键兜底同 idemKey 并发双写。
  */
-import { Types } from 'mongoose';
 import { POINTS } from '../config/points.js';
 import { expireAtFor } from '../utils/points-domain.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import { AppError } from '../utils/app-error.js';
-import { PointAccountModel, PointLotModel, PointRecordModel } from '../models/point.model.js';
+import { PointAccountModel, PointDailyModel, PointLotModel, PointRecordModel } from '../models/point.model.js';
 
 export interface CreditInput {
   type: string;
@@ -80,13 +79,34 @@ async function ensureAccount(userId: string) {
   }
 }
 
-/** 该业务日已入账的积分（只算正数明细，过期/扣减不算） */
-async function earnedToday(userId: string, bizDate: string): Promise<number> {
-  const rows = await PointRecordModel.aggregate<{ _id: null; sum: number }>([
-    { $match: { userId: new Types.ObjectId(userId), bizDate, delta: { $gt: 0 } } },
-    { $group: { _id: null, sum: { $sum: '$delta' } } },
-  ]);
-  return rows[0]?.sum ?? 0;
+/**
+ * 当日已入账计数器（原子 $inc 预占）：替代旧的「聚合读 → 算剩余」check-then-act——
+ * 那个口径在并发窗口里会让同日不同类型的发放各自读到旧值、合计突破 DAILY_CAP。
+ * 预占后若超限/最终没入账，由调用方退回差额（见 creditPoints）。
+ */
+async function bumpDailyEarned(userId: string, bizDate: string, amount: number): Promise<number> {
+  try {
+    const row = await PointDailyModel.findOneAndUpdate(
+      { userId, bizDate },
+      { $inc: { earned: amount } },
+      { upsert: true, returnDocument: 'after' },
+    ).lean();
+    return row?.earned ?? amount;
+  } catch (e) {
+    if (!isDuplicateKey(e)) throw e;
+    // 并发首笔 upsert 撞唯一键：退化为普通自增重试一次
+    const again = await PointDailyModel.findOneAndUpdate(
+      { userId, bizDate },
+      { $inc: { earned: amount } },
+      { returnDocument: 'after' },
+    ).lean();
+    return again?.earned ?? amount;
+  }
+}
+
+function refundDailyEarned(userId: string, bizDate: string, amount: number): Promise<void> {
+  if (amount <= 0) return Promise.resolve();
+  return PointDailyModel.updateOne({ userId, bizDate }, { $inc: { earned: -amount } }).then(() => undefined);
 }
 
 /**
@@ -163,9 +183,15 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
   const requested = Math.trunc(input.points);
   if (!Number.isFinite(requested) || requested <= 0) throw new AppError(400, '积分数必须为正整数');
 
-  const used = await earnedToday(userId, input.bizDate);
-  const credited = Math.min(requested, Math.max(0, POINTS.DAILY_CAP - used));
-  if (credited <= 0) return { credited: 0, balance: await getBalance(userId, now), duplicated: false, capped: true };
+  // 每日上限：先原子预占请求数，再按超限差额退回——并发窗口内合计仍 ≤ DAILY_CAP
+  const provisional = await bumpDailyEarned(userId, input.bizDate, requested);
+  const over = Math.max(0, provisional - POINTS.DAILY_CAP);
+  const credited = requested - over;
+  if (credited <= 0) {
+    await refundDailyEarned(userId, input.bizDate, requested);
+    return { credited: 0, balance: await getBalance(userId, now), duplicated: false, capped: true };
+  }
+  if (over > 0) await refundDailyEarned(userId, input.bizDate, over);
 
   // 先确保账户存在：否则新用户的首笔并发发放会在 upsert 阶段撞唯一键（E11000）冒到调用方
   await ensureAccount(userId);
@@ -195,6 +221,7 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
     });
   } catch (e) {
     await PointAccountModel.updateOne({ userId }, { $inc: { balance: -credited, totalEarned: -credited } });
+    await refundDailyEarned(userId, input.bizDate, credited);
     // 并发同 idemKey：另一个请求已入账，本次按重复处理
     if (isDuplicateKey(e)) return { credited: 0, balance: await getBalance(userId, now), duplicated: true, capped: false };
     throw e;
@@ -212,6 +239,7 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
   } catch (e) {
     // 批次写失败：撤销本次发放，避免余额没有对应批次（永不过期/无法 FIFO 扣减）
     await PointAccountModel.updateOne({ userId }, { $inc: { balance: -credited, totalEarned: -credited } });
+    await refundDailyEarned(userId, input.bizDate, credited);
     await PointRecordModel.deleteOne({ _id: record._id });
     throw e;
   }
@@ -279,6 +307,13 @@ export async function debitPoints(userId: string, input: DebitInput, now = Date.
       { $inc: { remaining: -use } },
     );
     if (applied.modifiedCount === 1) left -= use;
+  }
+  if (left > 0) {
+    // 理论不可达（不变量：批次 remaining 之和 = 余额 ≥ 本次扣减）；出现即批次账实不符，
+    // 靠 settleExpired 的余额闸门兜底不会扣成负数，但必须留痕告警
+    console.error('[points-ledger] FIFO 批次扣减残留：余额已扣但批次不足', {
+      userId, points, residue: left,
+    });
   }
 
   return { balance: balanceAfter, recordId: String(record._id) };

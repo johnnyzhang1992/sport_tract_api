@@ -1,17 +1,20 @@
 /**
  * 七格规划（需求 §4 改版）：窗口 = [今天-6, 今天]，最后一格必含今天；
- * 窗口内「断签 ≤2 天」的漏签日标成可补格，起点按最早可补日 / 当前连签段起点取最早，
- * 且被窗口左界（今天-6）兜住（窗口必须罩住今天，起点不会滑到今天之后）。
- * 段长只数窗口内的日子（Ruling 2026-10-25，spec §4.1 第 3/4 条）：左界截到今天-6、右界截到今天，
- * 不往窗口外读，所以调用方只需读 [今天-6, 今天] 这 7 天的行。
+ * 窗口内漏签日标成可补格（段长上限 = MAX_MAKEUP_GAP_DAYS，2026-10-25 用户拍板放宽到 7
+ * = 窗口本身的大小，即"窗口内全部可补"；产品要收紧改 config 一个数字）。
+ * 前提：窗口内至少有一个已签行——补签只能接在已有记录上，新用户/全休眠用户不能凭卡从零买连签。
+ * 起点按最早可补日 / 当前连签段起点取最早，且被窗口左界（今天-6）兜住（窗口必须罩住今天，
+ * 起点不会滑到今天之后）。段长只数窗口内的日子（spec §4.1 第 3/4 条）：左界截到今天-6、
+ * 右界截到今天，不往窗口外读，所以调用方只需读 [今天-6, 今天] 这 7 天的行。
  * 纯函数：不查库。
  */
+import { POINTS } from '../config/points.js';
 import { rewardForStreakDay, shiftDateKey } from './points-domain.js';
 
 export { shiftDateKey } from './points-domain.js';
 
 export const WINDOW_DAYS = 7;
-export const MAX_GAP_DAYS = 2;
+const MAX_GAP_DAYS = POINTS.MAX_MAKEUP_GAP_DAYS;
 
 export type CellState = 'signed' | 'today' | 'makeup' | 'missed' | 'future';
 
@@ -59,7 +62,8 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
   /**
    * 含 d 的未签段长度（spec §4.1 第 3 条）：向两侧数没有签到行的日子，
    * 左界截到窗口左缘 `left`、右界截到今天（今天没签不算漏签日），遇到已签日即停。
-   * 超过 MAX_GAP_DAYS 就提前退出——调用方只读窗口内的行，窗外无从判断也无需判断。
+   * 超过段长上限就提前退出——调用方只读窗口内的行，窗外无从判断也无需判断。
+   * 上限来自 MAX_MAKEUP_GAP_DAYS（2026-10-25 放宽到 7 = 窗口大小：窗口内全部可补）。
    */
   const gapRunLength = (d: string): number => {
     let n = 1;
@@ -74,10 +78,15 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     return n;
   };
 
+  // 前提闸门：窗口内至少有一个已签行才谈"补"——新用户 / 全休眠用户（已签全在窗外）
+  // 不能凭卡从零买连签。有行之后，段长 ≤ 上限的漏签日全部可补。
+  const hasSignedInWindow = rows.some((r) => r.dateKey >= left && r.dateKey <= todayKey);
   const makeupable = new Set<string>();
-  for (let i = WINDOW_DAYS - 1; i >= 1; i -= 1) {
-    const d = shiftDateKey(todayKey, -i);
-    if (!signed.has(d) && gapRunLength(d) <= MAX_GAP_DAYS) makeupable.add(d);
+  if (hasSignedInWindow) {
+    for (let i = WINDOW_DAYS - 1; i >= 1; i -= 1) {
+      const d = shiftDateKey(todayKey, -i);
+      if (!signed.has(d) && gapRunLength(d) <= MAX_GAP_DAYS) makeupable.add(d);
+    }
   }
 
   // 当前连签段起点（§4.3）：从今天往回最晚的已签日出发，回走到断口；库里没行时取今天

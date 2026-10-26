@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
 import {
-  PointAccountModel, PointLotModel, PointRecordModel, PointTaskModel,
+  PointAccountModel, PointDailyModel, PointLotModel, PointRecordModel, PointTaskModel,
 } from '../src/models/point.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
@@ -29,6 +29,7 @@ const wipe = (u: Types.ObjectId) => Promise.all([
   PointRecordModel.deleteMany({ userId: u }),
   PointAccountModel.deleteMany({ userId: u }),
   PointLotModel.deleteMany({ userId: u }),
+  PointDailyModel.deleteMany({ userId: u }),
   ActivityModel.deleteMany({ userId: u }),
   UserModel.deleteMany({ _id: u }),
 ]);

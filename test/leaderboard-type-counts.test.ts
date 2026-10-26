@@ -100,9 +100,9 @@ test('TC3 榜外脏 type 不冒出来、也不影响任何一项', async () => {
   );
 });
 
-test('TC4 未登录 401', async () => {
+test('TC4 未登录可看（2026-10-26 改可选鉴权：游客可浏览榜单）', async () => {
   const res = await app.inject({ method: 'GET', url: '/sport-track/api/stats/leaderboard-type-counts' });
-  assert.equal(res.statusCode, 401);
+  assert.equal(res.statusCode, 200);
 });
 
 

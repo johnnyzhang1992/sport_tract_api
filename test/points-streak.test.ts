@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
-import { PointSigninModel, PointRecordModel, PointAccountModel, PointLotModel } from '../src/models/point.model.js';
+import { PointSigninModel, PointRecordModel, PointAccountModel, PointLotModel, PointDailyModel } from '../src/models/point.model.js';
 import { reconcileStreaks, creditStreakTopUp } from '../src/services/points-streak.js';
 import { shiftDateKey } from '../src/utils/points-domain.js';
 
@@ -19,6 +19,7 @@ const wipe = () => Promise.all([
   PointRecordModel.deleteMany({ userId: uid }),
   PointAccountModel.deleteMany({ userId: uid }),
   PointLotModel.deleteMany({ userId: uid }),
+  PointDailyModel.deleteMany({ userId: uid }),
 ]);
 
 before(async () => {

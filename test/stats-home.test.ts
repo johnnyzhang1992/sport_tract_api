@@ -163,8 +163,10 @@ test('SH8 leaderboard-regions?me=1：一次带回总人数 + 我的名次（没�
   assert.deepEqual(body.me, { period: null, ranks: [] }, '没跑过的人不该编一个名次');
 });
 
-test('SH9 leaderboard-regions?me=1 需要登录', async () => {
-  assert.equal((await get('/stats/leaderboard-regions?me=1')).statusCode, 401);
+test('SH9 leaderboard-regions?me=1 游客可看、me 为 null（2026-10-26 改可选鉴权）', async () => {
+  const res = await get('/stats/leaderboard-regions?me=1');
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().data.me, null, '游客无"我的榜名次"');
 });
 
 test('SH10 首页榜摘要与日历的时间窗互不影响：10 天前的成绩在月榜、不在周榜', async () => {

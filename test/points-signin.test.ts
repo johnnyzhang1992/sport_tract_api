@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
-import { PointSigninModel, PointCardModel, PointRecordModel, PointAccountModel, PointLotModel } from '../src/models/point.model.js';
+import { PointSigninModel, PointCardModel, PointRecordModel, PointAccountModel, PointLotModel, PointDailyModel } from '../src/models/point.model.js';
 import { signIn, useMakeupCard, getSigninState } from '../src/services/points-signin.js';
 import { creditStreakTopUp } from '../src/services/points-streak.js';
 import { creditPoints } from '../src/services/points-ledger.js';
@@ -18,6 +18,7 @@ const wipe = (u: Types.ObjectId) => Promise.all([
   PointRecordModel.deleteMany({ userId: u }),
   PointAccountModel.deleteMany({ userId: u }),
   PointLotModel.deleteMany({ userId: u }),
+  PointDailyModel.deleteMany({ userId: u }), // 每日额度计数器也要清：共享 dev 库里 uid 跨运行复用，残留会顶爆额度
 ]);
 
 const seed = (dateKey: string, streakDay: number) => PointSigninModel.create({ userId: uid, dateKey, streakDay, points: Math.min(streakDay, 7), source: 'sign', createdAt: NOW });
@@ -214,14 +215,23 @@ test('PS4f 位置排到第 8 天时补签当天分封顶 7：用 rewardForStreak
   assert.equal((await PointSigninModel.findOne({ userId: uid, dateKey: '2026-10-24' }).lean())?.streakDay, 8, 'streakDay 记绝对天数，不封顶');
 });
 
-test('PS5 断签 3 天（22/23/24 都漏）不可补，卡不消耗', async () => {
+test('PS5 断签 3 天（22/23/24 都漏）：段长放宽后可补，逐格接回链条', async () => {
   await wipe(uid);
   await seed('2026-10-21', 1);
-  const id = await giveCard();
-  await assert.rejects(() => useMakeupCard(userId, '2026-10-24', NOW), /断签超过 2 天/);
-  assert.equal((await PointCardModel.findById(id).lean())?.status, 'unused');
-  assert.equal((await PointCardModel.findById(id).lean())?.usedForDate, '', '拒绝发生在占行与扣卡之前，卡上不留痕');
-  assert.equal(await PointSigninModel.countDocuments({ userId: uid, dateKey: '2026-10-24' }), 0, '不可补的日子不该被占位行占上');
+  await giveCard(); await giveCard(); await giveCard();
+  // 24 的位置按「只补这一格」算：21 是第 1 天、22/23 空着 → 24 起新段第 1 天（分值 1）
+  const r = await useMakeupCard(userId, '2026-10-24', NOW);
+  assert.equal(r.credited, 1, '新段第 1 天 1 分');
+  assert.equal((await PointSigninModel.findOne({ userId: uid, dateKey: '2026-10-24' }).lean())?.streakDay, 1);
+  assert.equal(await PointCardModel.countDocuments({ userId: uid, status: 'used' }), 1, '卡消耗');
+  // 继续补 22/23：reconcile 会把 22/23/24 接成 2/3/4（21 之后）
+  await useMakeupCard(userId, '2026-10-22', NOW);
+  const row22 = await PointSigninModel.findOne({ userId: uid, dateKey: '2026-10-22' }).lean();
+  assert.equal(row22?.streakDay, 2, '22 接在 21 之后 → 第 2 天');
+  await useMakeupCard(userId, '2026-10-23', NOW);
+  const rows = await PointSigninModel.find({ userId: uid, dateKey: { $in: ['2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24'] } })
+    .sort({ dateKey: 1 }).lean();
+  assert.deepEqual(rows.map((r) => r.streakDay), [1, 2, 3, 4], '整条链被 reconcile 接回 1..4');
 });
 
 test('PS5b 补今天/补窗口外日期/补非法串/补已签日 → 各自文案的 400，且卡不消耗', async () => {
@@ -433,13 +443,15 @@ test('PS22 可补格与卡数量解耦：无卡也下发 makeup 格，供前端�
   await PointSigninModel.create({ userId: uid12, dateKey: '2026-10-23', streakDay: 2, points: 2, source: 'sign', createdAt: NOW });
 
   const noCard = await getSigninState(u12, NOW);
-  assert.deepEqual(noCard.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey), ['2026-10-24'], '无卡也要下发可补格，前端才能引导兑换');
+  assert.deepEqual(noCard.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
+    ['2026-10-19', '2026-10-20', '2026-10-21', '2026-10-22', '2026-10-24'], '无卡也要下发可补格，前端才能引导兑换');
   assert.equal(noCard.cards, 0);
 
   await PointCardModel.create({ userId: uid12, expiresAt: NOW + 86400000, createdAt: NOW });
   const withCard = await getSigninState(u12, NOW);
   // 改版口径（spec §5.1）：可补与否只看 state === 'makeup'，与卡数无关；能不能直接补由 cards 决定
-  assert.deepEqual(withCard.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey), ['2026-10-24']);
+  assert.deepEqual(withCard.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
+    ['2026-10-19', '2026-10-20', '2026-10-21', '2026-10-22', '2026-10-24']);
   assert.equal(withCard.cards, 1);
 });
 
@@ -453,20 +465,22 @@ test('PS23 cells 改版：今天已签仍可补昨天（口径 3）；连漏 3 �
   await PointSigninModel.create({ userId: uid13, dateKey: '2026-10-25', streakDay: 3, points: 3, source: 'sign', createdAt: NOW });
   const signedToday = await getSigninState(String(uid13), NOW);
   assert.equal(signedToday.todaySigned, true);
-  assert.deepEqual(signedToday.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey), ['2026-10-24']);
+  assert.deepEqual(signedToday.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
+    ['2026-10-19', '2026-10-20', '2026-10-21', '2026-10-22', '2026-10-24']);
 
-  // 只有 21 号一行：22/23/24 连漏 3 天 → 昨天段长 3，不可补（missed）；
-  // 19/20 段长 2（左界截在窗口左缘）→ 仍是可补格，这是 Ruling 2026-10-25 认下的口子
+  // 只有 21 号一行：22/23/24 连漏 3 天 → 段长放宽后全部可补；
+  // 19/20 段长 2（左界截在窗口左缘）→ 仍是可补格
   await PointSigninModel.create({ userId: uid14, dateKey: '2026-10-21', streakDay: 1, points: 1, source: 'sign', createdAt: NOW });
   const noDayBefore = await getSigninState(String(uid14), NOW);
-  assert.deepEqual(noDayBefore.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey), ['2026-10-19', '2026-10-20']);
-  assert.equal(noDayBefore.cells.find((c) => c.dateKey === '2026-10-24')?.state, 'missed', '断签超 2 天不可补');
+  assert.deepEqual(noDayBefore.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey), ['2026-10-19', '2026-10-20', '2026-10-22', '2026-10-23', '2026-10-24']);
+  assert.equal(noDayBefore.cells.find((c) => c.dateKey === '2026-10-24')?.state, 'makeup', '段长放宽后连漏 3 天也可补');
 });
 
 test('PS11 补签发分为 0（当日上限已满）→ 400、卡退回未使用、不留 0 分补签行', async () => {
   await wipe(uid);
   await seed('2026-10-23', 2);
-  // 昨天（2026-10-24）已入账 100 分（每日上限），补签只能拿到 0 分
+  // 昨天（2026-10-24）已入账 100 分（每日上限）：额度计数器 + 展示明细各一条，补签只能拿到 0 分
+  await PointDailyModel.create({ userId: uid, bizDate: '2026-10-24', earned: 100 });
   await PointRecordModel.create({
     userId: uid, type: 'task', title: '占满当日上限', delta: 100, balanceAfter: 100,
     bizDate: '2026-10-24', idemKey: `${uid}:seed:cap`, createdAt: NOW,
@@ -483,6 +497,7 @@ test('PS11 补签发分为 0（当日上限已满）→ 400、卡退回未使用
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'makeup_topup' }), 0, '当天分没发成就不许发差额');
   assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 1, '除了占满当日上限那条，账本上什么都没写');
   assert.equal(await PointSigninModel.countDocuments({ userId: uid }), 1, '只剩 seed 的那行，占位行已撤回');
+  assert.equal((await PointDailyModel.findOne({ userId: uid, bizDate: '2026-10-24' }).lean())?.earned, 100, '预占的 7 分已退回，计数器保持 100');
 });
 
 test('PS12 发差额这步抛错：当天分扣回、卡退回、占位行撤回；卡退回后重试真能补上', async (t) => {

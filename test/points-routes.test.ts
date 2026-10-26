@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { buildApp } from '../src/app.js';
 import {
-  PointAccountModel, PointCardModel, PointExchangeModel, PointLotModel, PointRecordModel,
+  PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointLotModel, PointRecordModel,
   PointSigninModel, PointTaskModel,
 } from '../src/models/point.model.js';
 import { UserModel } from '../src/models/user.model.js';
@@ -107,6 +107,7 @@ const wipe = (u: Types.ObjectId) => Promise.all([
   PointTaskModel.deleteMany({ userId: u }),
   PointRecordModel.deleteMany({ userId: u }),
   PointLotModel.deleteMany({ userId: u }),
+  PointDailyModel.deleteMany({ userId: u }),
   PointAccountModel.deleteMany({ userId: u }),
 ]);
 
@@ -205,7 +206,13 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
     (s0.signin as unknown as { makeupCardId?: string }).makeupCardId, undefined,
     '旧契约字段 makeupCardId 已撤（spec §5.1），payload 里不该再出现',
   );
-  assert.deepEqual(makeupKeys(s0.signin), [YESTERDAY], '无卡但昨天漏签时仍下发 makeup 格（供前端引导兑换）');
+  // 段长放宽（2026-10-25）：窗口内全部漏签日都下发 makeup 格（前天有行 → 接得上）。
+  // 日期按 TODAY 相对计算——写死日期会在跨天运行时整窗漂移（2026-10-26 实测踩过）
+  assert.deepEqual(
+    makeupKeys(s0.signin),
+    [6, 5, 4, 3, 1].map((d) => shiftDateKey(TODAY, -d)),
+    '无卡但昨天漏签时仍下发 makeup 格（供前端引导兑换）',
+  );
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
   assert.equal(s0.items.length, 1, 'summary 下发整张商品表，积分页按它渲染商品卡');
@@ -237,21 +244,27 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(data<{ cardId: string; balance: number }>(ex2).cardId, cardId, '同一 requestId 复用同一张卡');
   assert.equal(data<{ cardId: string; balance: number }>(ex2).balance, 0, '不重复扣分');
 
-  // 5) 汇总带出七格：昨天那格是补签格，且给出补完今天能拿的分（旧字段 makeupCardId 已撤）
+  // 5) 汇总带出七格：段长放宽后窗口内漏签日全部可补，最左 = 窗口左界（今天-6）
   const s2 = data<Summary>(await get('/points/summary'));
   assert.equal(s2.balance, 0);
   assert.equal(s2.signin.cards, 1);
   const makeupCell = s2.signin.cells.find((c) => c.state === 'makeup');
   assert.ok(makeupCell, '应有一格可补');
-  assert.equal(makeupCell!.dateKey, YESTERDAY);
-  // 造数据是「前天有行、库存 streakDay=2」：补上昨天 → 昨天第 3 天、今天第 4 天（段首取库存锚点）。
-  // 与 spec §4.2 算例（补 24 → 今天 6）不冲突：那条链条已有 4 天连签，这里只有 2 天。
-  assert.equal(makeupCell!.todayRewardAfter, 4, '补完昨天 → 今天第 4 天');
+  assert.equal(makeupCell!.dateKey, shiftDateKey(TODAY, -6), '最左可补格 = 窗口左界');
+  // 造数据是「前天有行、库存 streakDay=2」：只补窗口左界一格接不上今天 → 今天仍新段 1 分；
+  // 补昨天才是接上链的那格（第 3 天，见下面第 7 步）。
+  assert.equal(makeupCell!.streakDay, 1);
+  assert.equal(makeupCell!.reward, 1);
+  assert.equal(makeupCell!.todayRewardAfter, 1, '只补最左一格接不上今天');
   assert.equal(
     (s2.signin as unknown as { makeupCardId?: string }).makeupCardId, undefined,
     'summary 不再挑卡给客户端传 id（spec §5.2：卡由服务端自选）',
   );
-  assert.deepEqual(makeupKeys(s2.signin), [YESTERDAY]);
+  assert.deepEqual(
+    makeupKeys(s2.signin),
+    [6, 5, 4, 3, 1].map((d) => shiftDateKey(TODAY, -d)),
+    '窗口内全部漏签日可补（段长放宽）',
+  );
 
   // 6) 非法/出窗日期 → service 的 400 原样透出，卡不消耗；旧的按卡 id 接口已撤 → 404
   const badDate = await post('/points/signin/makeup', { dateKey: TODAY });
@@ -317,7 +330,12 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s3.signin.todayReward, 4);
   assert.equal(s3.signin.nextReward, 5);
   assert.equal(s3.signin.cards, 0);
-  assert.deepEqual(makeupKeys(s3.signin), [], '链已接上，没有可补格');
+  // 段长放宽后：窗口里剩余漏签日仍是可补格（卡已用完，点了会引导去兑换）；日期按 TODAY 相对算
+  assert.deepEqual(
+    makeupKeys(s3.signin),
+    [6, 5, 4, 3].map((d) => shiftDateKey(TODAY, -d)),
+    '已签/已补的格子消失，其余漏签日仍标记可补',
+  );
   const video = s3.tasks.find((t) => t.key === 'daily_video');
   assert.equal(video?.status, 'claimed');
   assert.equal(video?.actionText, '已领取');

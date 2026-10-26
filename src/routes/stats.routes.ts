@@ -95,18 +95,21 @@ export async function statsRoutes(fastify: FastifyInstance) {
   // 运动榜：全平台点亮地图（60s 缓存）
   // ?me=1 时额外带回「我的榜名次」（周→月→年→总，服务端一次请求内回退）；
   // 不传时响应形状与原先完全一致，老调用方（运动榜页）零变化。
-  fastify.get('/leaderboard-regions', { onRequest: [fastify.authenticate] }, async (request) => {
+  // 可选鉴权（2026-10-26）：游客可看榜单，me 只在登录时附带
+  fastify.get('/leaderboard-regions', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     const regions = await leaderboardRegions();
     const { me } = request.query as { me?: string };
     if (me !== '1') return success(regions);
+    if (!request.user) return success({ ...regions, me: null });
     return success({ ...regions, me: await homeLeaderboardSummary(request.user.userId) });
   });
 
   // 运动榜：按 运动类型 > 省份 排行（周期 week/month/year/all；TOP10 昵称完整展示 + 当前用户真实排名）
-  fastify.get('/leaderboard', { onRequest: [fastify.authenticate] }, async (request) => {
+  // 可选鉴权（2026-10-26）：游客可看榜单（me 为 null，前端不渲染"我的排名"卡）
+  fastify.get('/leaderboard', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     const query = request.query as { type?: string; province?: string; period?: string };
     const result = await leaderboard(
-      request.user.userId,
+      request.user ? request.user.userId : null,
       query.type || 'running',
       query.province || '全国',
       (query.period || 'all') as 'week' | 'month' | 'year' | 'all',
@@ -115,7 +118,8 @@ export async function statsRoutes(fastify: FastifyInstance) {
   });
 
   // 运动榜：各运动类型上榜轨迹数（前端 chips 按「有数据的排前面」排序）
-  fastify.get('/leaderboard-type-counts', { onRequest: [fastify.authenticate] }, async (request) => {
+  // 可选鉴权（2026-10-26）：游客可看（与榜单本体同口径）
+  fastify.get('/leaderboard-type-counts', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     // chips 排序与当前周期一致：period 缺省 week（榜单默认也是周榜）
     const query = request.query as { period?: string };
     const period = (['week', 'month', 'year', 'all'] as const).includes((query.period ?? '') as never)

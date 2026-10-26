@@ -123,6 +123,8 @@ async function cardOf(cid: string) {
 before(async () => {
   app = await buildApp({ logger: false });
   await app.ready();
+  // 共享 dev 库：上一次运行崩在 after 之前会留下同 openid/_id 的用户，先清场再插
+  await UserModel.deleteMany({ $or: [{ openid: /^campaign-card-members-/ }, { _id: { $in: Object.values(U) } }] });
   await UserModel.insertMany(
     Object.entries(U).map(([label, _id]) => ({
       _id,

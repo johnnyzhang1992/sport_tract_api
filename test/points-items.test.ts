@@ -4,7 +4,7 @@ import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
 import { POINTS } from '../src/config/points.js';
 import {
-  PointAccountModel, PointCardModel, PointExchangeModel, PointLotModel, PointRecordModel,
+  PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointLotModel, PointRecordModel,
 } from '../src/models/point.model.js';
 import { creditPoints, getBalance } from '../src/services/points-ledger.js';
 import { exchangeMakeupCard, getItems, listExchanges } from '../src/services/points-items.js';
@@ -29,6 +29,7 @@ const wipe = (u: Types.ObjectId) => Promise.all([
   PointRecordModel.deleteMany({ userId: u }),
   PointAccountModel.deleteMany({ userId: u }),
   PointLotModel.deleteMany({ userId: u }),
+  PointDailyModel.deleteMany({ userId: u }),
 ]);
 
 /** 造余额：每日上限 100，按业务日拆分发放，凑够 total */

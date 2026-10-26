@@ -45,11 +45,19 @@ test('MW3 连漏 2 天：两格都可补，段长只算 2（不含今天）', ()
   assert.equal(at(cells, back(1))!.todayRewardAfter, 2, '只补 24 时今天只能到第 2 天');
 });
 
-test('MW4 连漏 3 天：一格都不可补，起点不前移', () => {
-  const cells = planSigninCells([...run(6, 4)], T); // 19..21 签，22/23/24 漏
-  assert.equal(cells.filter((c) => c.state === 'makeup').length, 0);
-  assert.equal(cells.filter((c) => c.state === 'missed').length, 3);
-  assert.equal(cells[0].dateKey, back(6), '窗口左界兜住，仍显示 19');
+test('MW4 连漏 3 天：段长上限放宽到窗口大小（2026-10-25），三格全部可补', () => {
+  const cells = planSigninCells([...run(6, 4)], T); // 19..21 签（streak 1..3），22/23/24 漏
+  assert.deepEqual(
+    cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
+    [back(3), back(2), back(1)], '22/23/24 全部可补（窗口内没有 missed 态）',
+  );
+  // 每格按「只补这一格」算位置：22 接在 21 后是第 4 天；23/24 的左邻未签 → 各自起新段第 1 天。
+  // 逐格补齐后由写路径 reconcile 把整条链接回去（22→4、23→5、24→6、今天→7）
+  assert.equal(at(cells, back(3))!.streakDay, 4);
+  assert.equal(at(cells, back(2))!.streakDay, 1);
+  assert.equal(at(cells, back(1))!.streakDay, 1);
+  assert.equal(at(cells, back(3))!.todayRewardAfter, 1, '只补 22：今天仍新段第 1 天');
+  assert.equal(at(cells, back(1))!.todayRewardAfter, 2, '只补 24：今天接在它后面第 2 天');
 });
 
 test('MW5 全新用户（窗口内无已签日）：没有补签格，今天在第 1 格', () => {
@@ -73,13 +81,20 @@ test('MW7 段长只数窗口内：左界截到今天-6，窗口外的行不参�
   // 断签已久：窗口内只有 10-20 一行
   const dormant: { dateKey: string; streakDay: number }[] = [{ dateKey: back(5), streakDay: 1 }];
   const cells = planSigninCells(dormant, T);
-  assert.equal(at(cells, back(6))!.state, 'makeup', '19 左侧出窗即停 → 段长 1，可补（Ruling 有意付的代价）');
+  assert.equal(at(cells, back(6))!.state, 'makeup', '19 左侧出窗即停 → 段长 1，可补');
   assert.equal(at(cells, back(5))!.state, 'signed');
-  assert.equal(cells.filter((c) => c.state === 'missed').length, 4, '21..24 同属长度 4 的段（今天不计入）→ 都不可补');
-  assert.equal(cells.filter((c) => c.state === 'makeup').length, 1, '只有 19 可补');
+  assert.equal(cells.filter((c) => c.state === 'missed').length, 0, '段长放宽后窗口内没有 missed 态');
+  assert.equal(cells.filter((c) => c.state === 'makeup').length, 5, '21..24 段长 4 ≤ 上限 → 全部可补');
   // 窗口外多出来的行不得改变任何一格：证明判定真的没往窗口外读
   const withOutside = planSigninCells([...dormant, { dateKey: back(9), streakDay: 1 }], T);
   assert.deepEqual(withOutside, cells, '10-16 在窗外，读不读都一样');
+});
+
+test('MW7b 全新用户/全休眠用户：窗口内没有已签行 → 无可补格（补签只能接在已有记录上）', () => {
+  assert.equal(planSigninCells([], T).filter((c) => c.state === 'makeup').length, 0, '新用户不能凭卡从零买连签');
+  // 已签行全在窗外（休眠超过 7 天）同样不可补
+  const dormant = planSigninCells([{ dateKey: back(9), streakDay: 3 }], T);
+  assert.equal(dormant.filter((c) => c.state === 'makeup').length, 0);
 });
 
 test('MW8 windowStartKey 是今天-6', () => {
