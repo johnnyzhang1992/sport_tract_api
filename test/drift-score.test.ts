@@ -373,6 +373,41 @@ test('D8 全国榜：farthest/fastestKm 排除高分轨迹；同榜无门禁指�
   assert.equal(runBest.find((r) => r.key === 'fastestKm')?.value, 260, 'fastestKm 应排除高分轨迹取 C2 260');
 });
 
+test('D9 导入轨迹也落 driftScore（非 null，docs/19 §4.3 补遗）', async () => {
+  const login = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/auth/login',
+    payload: { code: 'openid:act-drift-import' },
+  });
+  const tk = login.json().data.accessToken;
+  // GPX（WGS-84）：10 点直线，10s 一采（稀疏导入的分数会偏高但不触发门禁，此处只验落分）
+  const rows: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    const lat = (30 + i * 100 * M_PER_DEG).toFixed(6);
+    const t = new Date(1_790_000_000_000 + i * 10_000).toISOString();
+    rows.push(`    <trkpt lat="${lat}" lon="114"><time>${t}</time></trkpt>`);
+  }
+  const gpx = `<?xml version="1.0"?>\n<gpx version="1.1" creator="test"><trk><trkseg>\n${rows.join('\n')}\n</trkseg></trk></gpx>`;
+  const boundary = '----driftimport';
+  const payload = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="d.gpx"\r\nContent-Type: application/gpx+xml\r\n\r\n`,
+    ),
+    Buffer.from(gpx),
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const imported = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/activities/import',
+    payload,
+    headers: { authorization: `Bearer ${tk}`, 'content-type': `multipart/form-data; boundary=${boundary}` },
+  });
+  assert.equal(imported.statusCode, 200, imported.body);
+  const doc = await ActivityModel.findById(imported.json().data.id).select('driftScore trackKind').lean();
+  assert.ok(doc, '导入活动应落库');
+  assert.ok(typeof doc?.driftScore === 'number', `导入轨迹 driftScore 应为数值，实际 ${doc?.driftScore}`);
+});
+
 test('D0 夹具自证：calcDriftScore 分量公式', () => {
   // 10 步全 accBad → 60 分；20 步一半 vehicle → 10 分
   assert.equal(calcDriftScore(walkPoints(10, (_i, p) => (p.accBad = true))), 60);
