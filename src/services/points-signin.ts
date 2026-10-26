@@ -90,8 +90,31 @@ export async function signIn(userId: string, now = Date.now()): Promise<SigninRe
   // Ruling 2026-10-25「下一次写必须包括同一天重试」）。creditStreakTopUp 按 trigger 幂等、
   // 链条已正时返回 0，重复调用一分都多发不了。
   const alreadySigned = async (): Promise<SigninResult> => {
+    // 崩溃恢复（审计 Finding 1）：行已落库但当天分没发成（进程崩在占位与发分两步之间）→
+    // 重试补发。creditPoints 同 idemKey 天然幂等：已付过返回 duplicated 0，不会双发；
+    // 被当日上限截断的行 points 也是 0，重跑同样安全（再次截断/重复，credited 0）。
+    // 注：makeup 行只会落在过去日期，不会与今天的 sign 行混淆。
+    const unpaid = await PointSigninModel.findOne({
+      userId, dateKey: todayKey, source: 'sign', points: 0,
+    }).select({ _id: 1, streakDay: 1 }).lean();
+    let backCredit = 0;
+    if (unpaid) {
+      const c = await creditPoints(userId, {
+        type: 'signin',
+        title: `连续签到第 ${unpaid.streakDay} 天`,
+        points: rewardForStreakDay(unpaid.streakDay),
+        bizDate: todayKey,
+        refType: 'signin',
+        refId: todayKey,
+        idemKey: `${userId}:signin:${todayKey}`,
+      }, now);
+      if (c.credited > 0) {
+        backCredit = c.credited;
+        await PointSigninModel.updateOne({ _id: unpaid._id }, { $set: { points: c.credited } });
+      }
+    }
     const toppedUp = await creditStreakTopUp(userId, todayKey, now);
-    return { ...(await state()), alreadySigned: true, credited: toppedUp };
+    return { ...(await state()), alreadySigned: true, credited: backCredit + toppedUp };
   };
 
   const exists = await PointSigninModel.findOne({ userId, dateKey: todayKey }).lean();
@@ -170,11 +193,48 @@ export async function useMakeupCard(
 
   const state = await getSigninState(userId, now);
   const cell = state.cells.find((c) => c.dateKey === key);
-  if (cell?.state === 'signed') throw new AppError(400, '该日已签到，无需补签');
-  if (cell?.state !== 'makeup') throw new AppError(400, '断签超过 2 天或超出窗口，该日不能补签');
-  if (state.cards <= 0) throw new AppError(400, '没有可用的补签卡，请先兑换');
+  // 崩溃恢复（审计 Finding 1）：残留的 makeup 行（points=0）说明上次流程没走完——
+  // 正常路径 credited<=0 会连卡带行一起回滚，不会留这种行；先于「已签到」判定处理。
+  const stale = await PointSigninModel.findOne({
+    userId, dateKey: key, source: 'makeup', points: 0,
+  }).lean();
+  if (cell?.state === 'signed' && !stale) throw new AppError(400, '该日已签到，无需补签');
+  if (cell?.state !== 'makeup' && !stale) throw new AppError(400, '断签超过 2 天或超出窗口，该日不能补签');
+  if (state.cards <= 0 && !stale) throw new AppError(400, '没有可用的补签卡，请先兑换');
 
-  const streakDay = cell.streakDay;
+  // 残留恢复：卡已扣（usedForDate=key）→ 从发分步续跑（卡不再扣；credit 同 idemKey 幂等，
+  // 上次已发过则返回 duplicated 0——被每日上限卡住的极窄角落走 400 提示人工）；
+  // 卡未扣 → 清残留行走正常流程（下方占位 create 才不会撞唯一键）
+  if (stale) {
+    const consumed = await PointCardModel.findOne({ userId, status: 'used', usedForDate: key }).lean();
+    if (consumed) {
+      const c = await creditPoints(userId, {
+        type: 'makeup_reward',
+        title: `补签 ${key}`,
+        points: rewardForStreakDay(stale.streakDay),
+        bizDate: key,
+        refType: 'signin',
+        refId: key,
+        idemKey: `${userId}:makeup:${key}:${stale._id}`,
+      }, now);
+      if (c.credited <= 0) throw new AppError(400, '补签未入账积分（可能已达每日上限），请联系客服处理');
+      await PointSigninModel.updateOne({ _id: stale._id }, { $set: { points: c.credited } });
+      const toppedUp = await creditStreakTopUp(userId, key, now);
+      const after = await getSigninState(userId, now);
+      return {
+        ...after,
+        alreadySigned: after.todaySigned,
+        credited: c.credited,
+        toppedUp,
+        cardId: String(consumed._id),
+        balance: await getBalance(userId, now),
+      };
+    }
+    await deleteOwnRow(stale._id);
+  }
+
+  // 残留恢复路径下 cell 可能缺（行已存在→signed 格），位置以残留行库存值为准
+  const streakDay = cell?.streakDay ?? stale?.streakDay ?? 1;
   // 1) 先占这一行：同一天双击/两路并发只有一路能往下发分
   const row = await PointSigninModel.create({
     userId, dateKey: key, streakDay, points: 0, source: 'makeup', createdAt: now,
