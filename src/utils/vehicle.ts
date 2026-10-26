@@ -40,6 +40,10 @@ export const VEHICLE_MIN_STEPS = 5;
 export const VEHICLE_MAX_SLOW_STEPS = 2;
 /** 相邻点间隔超过该秒数视为采样断档，不跨断档连段（丢点后的"瞬移"不是持续移动） */
 export const VEHICLE_MAX_STEP_SEC = 120;
+/** 中短断档收紧下限（秒）：30 < dt ≤ 120 的步允许速度降到 gapSpeed——
+ *  三级阶梯的中档：≤30s 走现行单步/持续判据，>120s 巨步弦无条件标，30-120s 之间
+ *  信号刚恢复的首个 fix 不可信、但又够不着巨步弦门槛，地铁进出站就落在这一档 */
+export const GAP_TIGHTEN_MIN_SEC = 30;
 /** 会做车速判定的类型（人力运动）；其余类型一律不判 */
 export const VEHICLE_TYPES = ['running', 'walking', 'hiking', 'mountaineering'];
 
@@ -131,6 +135,28 @@ export function markVehicle<T extends TrackPointLike>(points: T[], type?: string
     if (typeof a.timestamp !== 'number' || typeof b.timestamp !== 'number') continue;
     const dt = (b.timestamp - a.timestamp) / 1000;
     if (dt > VEHICLE_MAX_STEP_SEC) b.vehicle = true;
+  }
+
+  // 中短断档收紧（30 < dt ≤ 120，三级阶梯中档）：地铁进出站的典型形态——站厅到站台
+  // 30-60s 丢信号后一步跳几百米，速度落在现行单步判据（minHighSpeed）与类型上限之间
+  // 的空档里（如步行 60s 跳 400m = 6.7m/s，双标都够不着）。收紧到 gapSpeed：
+  // 人无法以该速度持续 30s+（均为世界纪录级），地铁/车载任意断档时长都远超它。
+  // 只对配置了 gapSpeed 的类型生效：不配置 = 豁免（骑行下坡/巡航合法速度与乘车重叠；
+  // 未知类型走现行规则）；游泳虽不在 VEHICLE_TYPES（持续判据的人力类型集）里，
+  // 但配置了 gapSpeed 就参与中档收紧。不跨 pauseGap：暂停恢复首点豁免（时长已由
+  // pausedMs 扣过，再剔双扣）。
+  // ⚠️ 与端上 tracker.js 的 gapTighten 判定同口径（GAP_TIGHTEN_MIN_SEC / gapSpeed 同源），改一处必须同步。
+  const gapSpeed = (type ? (TYPE_CONFIGS[type] ?? DEFAULT_TYPE_CONFIG).gapSpeed : undefined) ?? undefined;
+  if (gapSpeed != null) {
+    for (let i = 1; i < out.length; i++) {
+      if (out[i].vehicle || out[i].pauseGap) continue;
+      const a = out[i - 1];
+      const b = out[i];
+      if (typeof a.timestamp !== 'number' || typeof b.timestamp !== 'number') continue;
+      const dt = (b.timestamp - a.timestamp) / 1000;
+      if (dt <= GAP_TIGHTEN_MIN_SEC || dt > VEHICLE_MAX_STEP_SEC) continue;
+      if (haversineDistance(a, b) / dt > gapSpeed) b.vehicle = true;
+    }
   }
 
   // 时长/位移/段数按最终标记统一结算（检测段 + 端上预标记 + 巨步弦的并集），逐「入段步」累加

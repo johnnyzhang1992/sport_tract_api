@@ -7,7 +7,7 @@
 import { ActivityModel } from '../models/activity.model.js';
 import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
-import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
+import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM, DRIFT_SCORE_PB_GATE } from '../config/constants.js';
 import type { ActivityType } from '../config/constants.js';
 import { getAvatarUrl } from './oss.js';
 import { bjIsoWeekStart, bjMonthStart, bjYearStart } from '../utils/bj-time.js';
@@ -248,11 +248,13 @@ export async function leaderboard(
     const spec = BEST_METRIC_SPEC[key];
     facet[key] = [
       // 越小越好 = 配速类：低于可信下限的（GPS 漂移、把乘车段算进运动量）不当纪录挂着
-      // 另：最长距离 / 最快配速要求整条轨迹没检出疑似搭车（见 NO_VEHICLE_METRICS）
+      // 另：最长距离 / 最快配速要求整条轨迹没检出疑似搭车（见 NO_VEHICLE_METRICS），
+      // 且漂移置信度分不超门禁（docs/19 §4.2：缺字段 = 可信，与 vehicleMs 同一惯用法）
       {
         $match: {
           [spec.field]: { $gt: spec.dir === 1 ? MIN_PLAUSIBLE_PACE_SEC_PER_KM : 0 },
           ...(NO_VEHICLE_METRICS.has(key) ? { vehicleMs: { $not: { $gt: 0 } } } : {}),
+          ...(NO_VEHICLE_METRICS.has(key) ? { driftScore: { $not: { $gt: DRIFT_SCORE_PB_GATE } } } : {}),
         },
       },
       { $sort: { [spec.field]: spec.dir } },

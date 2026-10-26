@@ -71,15 +71,21 @@ export interface TypeConfig {
   maxAbsSpeed: number;
   /** 单侧高速下限（m/s）：相对局部速度判定的绝对基线 */
   minHighSpeed: number;
+  /** 中短断档（30s < dt ≤ 120s）收紧阈值（m/s）：信号刚恢复的首个 fix 不可信，
+   *  允许速度从类型上限收紧到该值——人无法以该速度持续 30s+（均为世界纪录级），
+   *  而地铁/车载任意断档时长都远超它（地铁 30s ≥ 500m）。
+   *  不配置 = 该类型豁免（骑行下坡/巡航 10-15m/s 合法速度与乘车重叠，与持续判据豁免同口径）。
+   *  ⚠️ 与小程序 tracker.js#TYPE_TRACKER_CONFIG.gapSpeed 两端同值，改一处必须同步另一处。 */
+  gapSpeed?: number;
 }
 
 export const TYPE_CONFIGS: Record<string, TypeConfig> = {
-  walking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7 }, // 步行 ~1.5m/s
-  hiking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7 }, // 徒步 ~1.5m/s
-  running: { minSpikeSpeed: 8, maxAbsSpeed: 18, minHighSpeed: 10 }, // 跑步 ~3-5m/s，冲刺 8m/s
-  cycling: { minSpikeSpeed: 12, maxAbsSpeed: 30, minHighSpeed: 14 }, // 骑行 ~8m/s，冲刺 12m/s，下坡可 25m/s
-  mountaineering: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7 }, // 登山慢，信号差
-  swimming: { minSpikeSpeed: 3, maxAbsSpeed: 8, minHighSpeed: 5 }, // 游泳 ~1.5m/s
+  walking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 4.0 }, // 步行 ~1.5m/s；4m/s = 竞走级，不可持续 30s
+  hiking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 4.0 }, // 徒步 ~1.5m/s
+  mountaineering: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 4.0 }, // 登山慢，信号差
+  running: { minSpikeSpeed: 8, maxAbsSpeed: 18, minHighSpeed: 10, gapSpeed: 6.5 }, // 跑步 ~3-5m/s，冲刺 8m/s；6.5 = 2'34"/km 省队级
+  cycling: { minSpikeSpeed: 12, maxAbsSpeed: 30, minHighSpeed: 14 }, // 骑行 ~8m/s，冲刺 12m/s，下坡可 25m/s；gapSpeed 不配置 = 豁免
+  swimming: { minSpikeSpeed: 3, maxAbsSpeed: 8, minHighSpeed: 5, gapSpeed: 3.0 }, // 游泳 ~1.5m/s；3m/s 公开水域世界级
 };
 
 export const DEFAULT_TYPE_CONFIG: TypeConfig = {

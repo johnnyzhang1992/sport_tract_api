@@ -65,6 +65,9 @@ const activitySchema = new Schema(
     fastestKm: { type: Number, default: null }, // 轨迹内最快 1km 分段（秒/公里）
     // 表现分（ITRA 风格幂律评分，仅类跑步类型；utils/perf-score.ts）
     perfScore: { type: Number, default: null },
+    // 漂移置信度分（0-100，utils/drift-score.ts）：PB/榜单进榜资格门禁用，
+    // null = 未评估（导入/planned/老数据，视为可信）；≥ DRIFT_SCORE_PB_GATE 不进榜
+    driftScore: { type: Number, default: null },
     // 实跑/规划判别（导入时判定；采集的轨迹恒为 recorded）
     trackKind: { type: String, enum: ['recorded', 'planned', 'uncertain'], default: 'recorded' },
     // 距离里程碑 PB：到达 5/10/15…公里的累计用时（秒）；finish/reprocess 时算出落库，

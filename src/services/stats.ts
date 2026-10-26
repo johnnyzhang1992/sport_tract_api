@@ -3,8 +3,9 @@ import { ActivityModel } from '../models/activity.model.js';
 import { locateRegion } from './region.js';
 import { calcFastestKm, calcPbMarks } from '../utils/pace.js';
 import { calcPerfScore } from '../utils/perf-score.js';
+import { calcDriftScore } from '../utils/drift-score.js';
 import { streakDays } from '../utils/campaign-streak.js';
-import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
+import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM, DRIFT_SCORE_PB_GATE } from '../config/constants.js';
 import { AppError } from '../utils/app-error.js';
 import {
   bjDayStart,
@@ -364,15 +365,20 @@ export async function trend(
  */
 export async function bestRecords(userId: ObjectIdLike) {
   const base = { userId: toObjectId(userId), status: 'finished' };
+  // PB 门禁（设计 docs/19 §4.2）：driftScore 超阈值不进榜；$not/$gt 惯用法缺字段 = 可信
+  // （与 vehicleMs 排除集合同一逻辑）；不用进 base —— base 还被惰性补算查询共用，门禁会挡住补算
+  const pbGate = { driftScore: { $not: { $gt: DRIFT_SCORE_PB_GATE } } };
   // 惰性补算：fastestKm 新字段上线前完成的历史轨迹无该字段 → 批量补算（每次本用户全量，数据量小）
-  // 规划路线（无时间信息，1s 补全会造出假配速）永不补算
+  // 规划路线（无时间信息，1s 补全会造出假配速）永不补算；同循环顺手补 driftScore（老轨迹 null → 计算）
   const missing = await ActivityModel.find({ ...base, fastestKm: null, trackKind: { $ne: 'planned' } })
-    .select('_id trackPoints')
+    .select('_id trackPoints driftScore')
     .limit(100)
     .lean();
   for (const a of missing) {
     const fk = calcFastestKm(a.trackPoints ?? [], a.type);
-    await ActivityModel.updateOne({ _id: a._id }, { $set: { fastestKm: fk } });
+    const patch: Record<string, unknown> = { fastestKm: fk };
+    if (a.driftScore == null) patch.driftScore = calcDriftScore(a.trackPoints ?? []);
+    await ActivityModel.updateOne({ _id: a._id }, { $set: patch });
   }
   // 距离里程碑惰性补算：pbMarks 未落库的历史轨迹（补算后写 []，避免反复扫点）
   const missingMarks = await ActivityModel.find({ ...base, pbMarks: { $exists: false }, trackKind: { $ne: 'planned' } })
@@ -409,7 +415,7 @@ export async function bestRecords(userId: ObjectIdLike) {
       : null;
   const byTypeAgg = (sortField: string, dir: 1 | -1, extraMatch: Record<string, unknown> = {}) =>
     ActivityModel.aggregate([
-      { $match: { ...base, ...extraMatch } },
+      { $match: { ...base, ...pbGate, ...extraMatch } },
       { $sort: { [sortField]: dir } },
       {
         $project: {
@@ -433,7 +439,7 @@ export async function bestRecords(userId: ObjectIdLike) {
     byTypeAgg('perfScore', -1, { perfScore: { $gt: 0 } }),
     // 距离里程碑保持者链原料：所有 (type, 轨迹, km, 用时, 开始时间)，重放在 JS 侧做
     ActivityModel.aggregate([
-      { $match: base },
+      { $match: { ...base, ...pbGate } },
       { $unwind: '$pbMarks' },
       { $match: { 'pbMarks.sec': { $gt: 0 } } },
       { $project: { type: 1, startTime: 1, km: '$pbMarks.km', sec: '$pbMarks.sec' } },
@@ -442,6 +448,7 @@ export async function bestRecords(userId: ObjectIdLike) {
     // 半马/全马奖杯原料：距离达标的轨迹（疑似乘车段的不算）
     ActivityModel.find({
       ...base,
+      ...pbGate,
       distance: { $gte: HALF_MARATHON_M },
       trackKind: { $ne: 'planned' },
       vehicleMs: { $not: { $gt: 0 } },

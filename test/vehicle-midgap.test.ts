@@ -1,0 +1,236 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import type { FastifyInstance } from 'fastify';
+import { markVehicle, GAP_TIGHTEN_MIN_SEC } from '../src/utils/vehicle.js';
+import { TYPE_CONFIGS } from '../src/utils/trajectory-clean.js';
+import { buildApp } from '../src/app.js';
+import { UserModel } from '../src/models/user.model.js';
+import { ActivityModel } from '../src/models/activity.model.js';
+import { LoginLogModel } from '../src/models/login-log.model.js';
+import type { TrackPointLike } from '../src/utils/pace.js';
+
+/**
+ * 中短断档速度收紧（三级阶梯中档：30 < dt ≤ 120，设计 docs/19 §3.1-3.2）
+ *
+ * 盲区：地铁进出站 30-120s 丢信号后一步跳几百米，速度落在现行单步判据
+ * （minHighSpeed）与类型上限（maxAbsSpeed）之间的空档——如步行 60s 跳 400m = 6.7m/s，
+ * 双标都够不着，假距离全额入账。收紧到 gapSpeed（人无法持续 30s+，车载远超）。
+ */
+
+const M_PER_DEG = 180 / (Math.PI * 6371000);
+
+interface Step {
+  sec: number;
+  mps: number;
+  gapJump?: boolean;
+  pauseGap?: boolean;
+}
+
+/** 轨迹构造：沿经线推进，每步 {sec, mps}，可带 gapJump/pauseGap 标记 */
+function buildTrack(steps: Step[], startTs = 1_790_000_000_000) {
+  let lat = 30;
+  let ts = startTs;
+  const pts: TrackPointLike[] = [{ lat, lng: 114, timestamp: ts }];
+  for (const s of steps) {
+    lat += (s.mps * s.sec) / 111_194.9;
+    ts += s.sec * 1000;
+    pts.push({
+      lat,
+      lng: 114,
+      timestamp: ts,
+      ...(s.gapJump ? { gapJump: true } : {}),
+      ...(s.pauseGap ? { pauseGap: true } : {}),
+    } as TrackPointLike);
+  }
+  return pts;
+}
+
+const walk = { sec: 5, mps: 1.4 };
+
+test('M1 步行 60s 断档 400m（6.7m/s > gapSpeed 4）：标 vehicle，vehicleM 含 400m', () => {
+  const pts = buildTrack([walk, walk, { sec: 60, mps: 400 / 60, gapJump: true }, walk, walk]);
+  const r = markVehicle(pts, 'walking');
+  assert.equal(r.points[3].vehicle, true, '断档落点应标 vehicle');
+  assert.ok(r.vehicleM >= 399, `vehicleM 应含跳变位移，实际 ${r.vehicleM}`);
+  assert.ok(r.vehicleMs >= 59_000, `vehicleMs 应含 60s，实际 ${r.vehicleMs}`);
+});
+
+test('M2 步行 60s 断档 200m（3.3m/s < 4）：不标', () => {
+  const pts = buildTrack([walk, walk, { sec: 60, mps: 200 / 60, gapJump: true }, walk, walk]);
+  const r = markVehicle(pts, 'walking');
+  assert.equal(r.points[3].vehicle, undefined);
+});
+
+test('M3 跑步 45s 断档 250m（5.6m/s < 6.5）：不标（真实穿越隧道保留）', () => {
+  const pts = buildTrack([
+    { sec: 10, mps: 3.5 },
+    { sec: 10, mps: 3.5 },
+    { sec: 45, mps: 250 / 45, gapJump: true },
+    { sec: 10, mps: 3.5 },
+    { sec: 10, mps: 3.5 },
+  ]);
+  const r = markVehicle(pts, 'running');
+  assert.equal(r.points[3].vehicle, undefined);
+});
+
+test('M4 跑步 45s 断档 400m（8.9m/s > 6.5）：标', () => {
+  const pts = buildTrack([
+    { sec: 10, mps: 3.5 },
+    { sec: 10, mps: 3.5 },
+    { sec: 45, mps: 400 / 45, gapJump: true },
+    { sec: 10, mps: 3.5 },
+    { sec: 10, mps: 3.5 },
+  ]);
+  const r = markVehicle(pts, 'running');
+  assert.equal(r.points[3].vehicle, true);
+});
+
+test('M5 dt=30s 整边界（跑步 10m/s）：不走新档，仍由现行单步判据标（回归）', () => {
+  assert.equal(GAP_TIGHTEN_MIN_SEC, 30);
+  // 300m/30s = 10m/s = 跑步 minHighSpeed：现行单步规则命中
+  const pts = buildTrack([
+    { sec: 10, mps: 3.5 },
+    { sec: 30, mps: 10, gapJump: true },
+    { sec: 10, mps: 3.5 },
+  ]);
+  const r = markVehicle(pts, 'running');
+  assert.equal(r.points[2].vehicle, true, '10m/s ≥ minHighSpeed(10)，现行单步规则应标');
+});
+
+test('M6 骑行 60s 断档 800m（13.3m/s）：不标（gapSpeed 不配置 = 豁免）', () => {
+  assert.equal(TYPE_CONFIGS.cycling.gapSpeed, undefined, '骑行必须保持豁免');
+  const pts = buildTrack([
+    { sec: 10, mps: 8 },
+    { sec: 60, mps: 800 / 60, gapJump: true },
+    { sec: 10, mps: 8 },
+  ]);
+  const r = markVehicle(pts, 'cycling');
+  assert.equal(r.points[2].vehicle, undefined, '骑行断档跳变不应被标（下坡/巡航合法速度重叠）');
+});
+
+test('M7 dt=121s 巨步弦：无条件标（与新档上界不重叠不遗漏，回归）', () => {
+  const pts = buildTrack([walk, walk, { sec: 121, mps: 0.8, gapJump: true }, walk]);
+  const r = markVehicle(pts, 'walking');
+  assert.equal(r.points[3].vehicle, true, '>120s 巨步弦无条件标');
+});
+
+test('M8 pauseGap 恢复首点 + 60s 断档跳变：不标（暂停时长已由 pausedMs 扣过，防双扣）', () => {
+  const pts = buildTrack([walk, walk, { sec: 60, mps: 400 / 60, pauseGap: true }, walk, walk]);
+  const r = markVehicle(pts, 'walking');
+  assert.equal(r.points[3].vehicle, undefined);
+});
+
+test('M10 游泳 40s 断档 150m（3.75m/s > 3.0）：标（游泳配置了 gapSpeed，虽不在 VEHICLE_TYPES）', () => {
+  const pts = buildTrack([
+    { sec: 10, mps: 1.5 },
+    { sec: 40, mps: 150 / 40, gapJump: true },
+    { sec: 10, mps: 1.5 },
+  ]);
+  const r = markVehicle(pts, 'swimming');
+  assert.equal(r.points[2].vehicle, true);
+});
+
+// ── M9 e2e：finish 落库口径（距离不含跳变、时长扣 vehicleMs、vehicleNotice 非空） ──
+
+let app: FastifyInstance;
+let token = '';
+const NS = 'openid:act-midgap-';
+
+async function purge() {
+  const ids = (
+    await UserModel.find({ openid: /^act-midgap-/ }).select('_id').lean()
+  ).map((u) => u._id);
+  if (!ids.length) return;
+  await ActivityModel.deleteMany({ userId: { $in: ids } });
+  await LoginLogModel.deleteMany({ userId: { $in: ids } });
+  await UserModel.deleteMany({ _id: { $in: ids } });
+}
+
+test('M9 setup：起服务 + 登录', async () => {
+  app = await buildApp({ logger: false });
+  await app.ready();
+  await purge();
+  const res = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/auth/login',
+    payload: { code: NS + 'user' },
+  });
+  token = res.json().data.accessToken;
+});
+
+test('M9 finish：含地铁段（60s/400m×3）的步行轨迹，距离/时长剔除跳变段', async () => {
+  const create = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/activities',
+    headers: { authorization: `Bearer ${token}` },
+    payload: { type: 'walking', startTime: 1_790_000_000_000 },
+  });
+  const activityId = create.json().data.activityId;
+
+  // 5min 正常步行（~420m）+ 3 段「60s 跳 400m」地铁形态 + 段间 5min 步行
+  const steps: Array<Record<string, unknown>> = [];
+  let lat = 30;
+  let ts = 1_790_000_000_000;
+  let seq = 0;
+  const push = (sec: number, mps: number, flag?: 'gapJump') => {
+    const n = flag ? 1 : Math.max(1, Math.round(sec / 3));
+    for (let k = 1; k <= n; k++) {
+      const stepSec = flag ? sec : sec / n;
+      lat += (mps * stepSec) / 111_194.9;
+      ts += stepSec * 1000;
+      steps.push({
+        seq: ++seq,
+        lat,
+        lng: 114,
+        timestamp: ts,
+        altitude: null,
+        speed: null,
+        accuracy: 10,
+        // 真实客户端行为：tracker 在采点时命中 gapTighten 即标 vehicle（gapJump 是服务端纠偏才打的标）
+        ...(flag ? { vehicle: true } : {}),
+      });
+    }
+  };
+  push(300, 1.4);
+  for (let g = 0; g < 3; g++) {
+    push(60, 400 / 60, 'gapJump');
+    push(120, 1.4);
+  }
+
+  const finish = await app.inject({
+    method: 'PUT',
+    url: `/sport-track/api/activities/${activityId}/finish`,
+    headers: { authorization: `Bearer ${token}` },
+    payload: {
+      trackPoints: steps,
+      markers: [],
+      pausedMs: 0,
+      // 不传 clientDistance → 服务端按新口径重算（vehicle 步不计）
+      endTime: ts,
+    },
+  });
+  assert.equal(finish.statusCode, 200, finish.body);
+  const act = finish.json().data.activity;
+  assert.equal(act.status, 'finished');
+  // finish 落库距离：重算跳过 vehicle 步 → 3×400m 假位移不入账（正常步行 ~750m）
+  assert.ok(act.distance < 1200, `finish 距离应剔除地铁段，实际 ${act.distance}`);
+  assert.ok(act.distance > 500, `正常步行段应保留，实际 ${act.distance}`);
+
+  // 纠偏：服务端 markVehicle（含中短断档收紧）重打标 → vehicleM/vehicleMs/时长/文案全部就位
+  const re = await app.inject({
+    method: 'POST',
+    url: `/sport-track/api/activities/${activityId}/reprocess`,
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(re.statusCode, 200, re.body);
+  const fixed = re.json().data.activity;
+  assert.ok(fixed.vehicleM >= 1150, `vehicleM 应含 3×400m，实际 ${fixed.vehicleM}`);
+  assert.ok(fixed.vehicleMs >= 175_000, `vehicleMs 应含 3×60s，实际 ${fixed.vehicleMs}`);
+  assert.match(fixed.vehicleNotice, /疑似搭车/);
+  assert.ok(fixed.duration > 600 && fixed.duration < 700, `纠偏后时长应为 840s 墙钟 - 180s 车程 ≈ 660s，实际 ${fixed.duration}s`);
+});
+
+test('M9 teardown', async () => {
+  await purge();
+  await app.close();
+});
