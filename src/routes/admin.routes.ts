@@ -1416,11 +1416,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.get('/campaigns/:id', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
     const q = request.query as Record<string, string | undefined>;
-    // 成员表分页；汇总/排行榜始终按全员算，不受分页影响
+    // 成员表分页 + 排序；汇总/排行榜始终按全员算，不受分页与排序影响
     return success(
       await adminGetCampaign(id, {
         page: Math.max(1, Number(q.page) || 1),
         pageSize: Math.min(100, Math.max(1, Number(q.pageSize) || 20)),
+        sortBy: q.sortBy?.trim() || undefined,
+        order: q.order?.trim() || undefined,
       }),
     );
   });

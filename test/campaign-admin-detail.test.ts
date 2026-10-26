@@ -294,3 +294,88 @@ test('CAD4 成员表分页：page/pageSize 生效、总数与全量口径一致'
   assert.equal(bad.members.length, 1);
 });
 
+const membersOf = async (qs: string) =>
+  (await getDetail(`${cid}?${qs}`)).json().data.members as Array<{
+    userId: string;
+    joinedAt: number;
+    count: number;
+    distance: number;
+    duration: number;
+  }>;
+
+test('CAD5 成员表按距离降序：同分保持加入时间升序（翻页才稳定）', async () => {
+  const rows = await membersOf('page=1&pageSize=100&sortBy=distance&order=desc');
+  const dist = rows.map((r) => r.distance);
+  assert.deepEqual(dist, [...dist].sort((a, b) => b - a), '距离应降序');
+  assert.equal(rows[0].userId, joiner.id, 'joiner 30000 居首');
+  assert.equal(rows[1].distance, 15000, '已离开成员的距离仍排在其人行上（成员表含历史段）');
+  assert.equal(rows[2].userId, creator.id, '发起人 10000 第三');
+  assert.deepEqual(
+    rows.slice(3).map((r) => r.userId),
+    idle.map((u) => u.id),
+    '9 条零距离同分，必须按加入时间/_id 的稳定序，别乱',
+  );
+});
+
+test('CAD6 成员表按次数降序、按时长升序', async () => {
+  const byCount = await membersOf('page=1&pageSize=100&sortBy=count&order=desc');
+  assert.deepEqual(byCount.slice(0, 3).map((r) => r.count), [3, 2, 1], '发起人 3 / joiner 2 / 已离开 1');
+
+  const byDuration = await membersOf('page=1&pageSize=100&sortBy=duration&order=asc');
+  const dur = byDuration.map((r) => r.duration);
+  assert.deepEqual(dur, [...dur].sort((a, b) => a - b), '时长应升序');
+  assert.deepEqual(dur.slice(-3), [3900, 4000, 6000], '末尾三条 = 发起人 3900 / 已离开 4000 / joiner 6000');
+});
+
+test('CAD7 成员表按加入时间降序；非法排序字段 400 并给出可选值', async () => {
+  const bad = await getDetail(`${cid}?page=1&pageSize=100&sortBy=openid&order=desc`);
+  assert.equal(bad.statusCode, 400, bad.body);
+  assert.match(bad.json().message, /sortBy 不合法：openid/, '别静默当成没传，写错要看得见');
+  assert.match(bad.json().message, /joinedAt/, '提示要带可选值');
+  // 空串＝未传，走默认序（前端「取消排序」就是这么发的）
+  const empty = await membersOf('page=1&pageSize=100&sortBy=&order=');
+  assert.deepEqual(
+    empty.map((r) => `${r.userId}-${r.joinedAt}`),
+    (await membersOf('page=1&pageSize=100')).map((r) => `${r.userId}-${r.joinedAt}`),
+    '不传排序就是默认的加入时间升序',
+  );
+
+  const desc = await membersOf('page=1&pageSize=100&sortBy=joinedAt&order=desc');
+  const times = desc.map((r) => r.joinedAt);
+  assert.deepEqual(times, [...times].sort((a, b) => b - a), 'joinedAt 应降序');
+  const minJ = Math.min(...times);
+  assert.deepEqual(desc.slice(-2).map((r) => r.joinedAt), [minJ, minJ], '末尾两条是最早加入那一拍（发起人与已离开同刻）');
+  assert.equal(desc[desc.length - 2].userId, creator.id, '同刻仍按 _id 升序兜底，翻页才稳定');
+});
+
+test('CAD8 排序只动成员表：总数、排行、分类型、逐页拼接都不受影响', async () => {
+  const base = (await getDetail(`${cid}?page=1&pageSize=100`)).json().data;
+  const q = 'sortBy=distance&order=desc';
+  const p1 = await membersOf(`page=1&pageSize=5&${q}`);
+  const p2 = await membersOf(`page=2&pageSize=5&${q}`);
+  const p3 = await membersOf(`page=3&pageSize=5&${q}`);
+  assert.deepEqual(
+    [...p1, ...p2, ...p3].map((r) => `${r.userId}-${r.joinedAt}`),
+    (await membersOf(`page=1&pageSize=100&${q}`)).map((r) => `${r.userId}-${r.joinedAt}`),
+    '三页拼起来应与排序后的全量同序',
+  );
+
+  const page2 = (await getDetail(`${cid}?page=2&pageSize=5&${q}`)).json().data;
+  assert.equal(page2.membersTotal, base.membersTotal);
+  assert.deepEqual(page2.leaderboard, base.leaderboard);
+  assert.deepEqual(page2.typeSummary, base.typeSummary);
+  assert.deepEqual(page2.totals, base.totals);
+
+  // 只在本页内排序（先切片再排）也能拼出「看起来有序」的三页，
+  // 所以再钉一条：按加入时间倒序翻页，整条序列必须全局不升
+  const jd = 'sortBy=joinedAt&order=desc';
+  const pages = [
+    await membersOf(`page=1&pageSize=5&${jd}`),
+    await membersOf(`page=2&pageSize=5&${jd}`),
+    await membersOf(`page=3&pageSize=5&${jd}`),
+  ];
+  const flat = pages.flat().map((r) => r.joinedAt);
+  assert.equal(flat.length, 12, '三页应覆盖全员');
+  assert.deepEqual(flat, [...flat].sort((a, b) => b - a), '翻页拼起来要全局倒序，不能只在页内有序');
+});
+

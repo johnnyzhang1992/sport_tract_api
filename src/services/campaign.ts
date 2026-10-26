@@ -1246,9 +1246,35 @@ export async function adminListCampaigns(query: {
  * 成员列表取「加入过的行」（`joinedAt` 非空），即**含已离开/被踢的历史成员**（state 一并下发），
  * 后台需要看得到这类痕迹；pending 申请人不在其中（未加入，无贡献时段）。
  */
+/** 成员表可排序字段（webAdmin 活动详情页点表头） */
+const MEMBER_SORT_FIELDS = ['joinedAt', 'count', 'distance', 'duration'] as const;
+
+/**
+ * 成员表排序：不传（或空串）＝默认序；白名单外直接 400 并列出可选值——
+ * 静默回落会让「sortBy 写错」看起来像「排序没生效」，排查的人只能猜。
+ * 默认序就是调用方查出来的 joinedAt 升序、同刻按 _id；同分靠 Array.sort 的稳定性
+ * 不再二次打乱，翻页才不漏不重。
+ */
+function sortMembers<T extends { userId: unknown; joinedAt: number | null }>(
+  rows: T[],
+  stats: Map<string, MemberStats>,
+  sortBy: string | undefined,
+  order: string | undefined,
+): T[] {
+  const field = sortBy?.trim();
+  if (!field) return rows;
+  if (!(MEMBER_SORT_FIELDS as readonly string[]).includes(field)) {
+    throw new AppError(400, `sortBy 不合法：${field}（仅支持 ${MEMBER_SORT_FIELDS.join(' / ')}）`);
+  }
+  const key = field as (typeof MEMBER_SORT_FIELDS)[number];
+  const valueOf = (r: T) => (key === 'joinedAt' ? (r.joinedAt ?? 0) : stats.get(String(r.userId))?.[key] ?? 0);
+  const dir = order === 'desc' ? -1 : 1;
+  return [...rows].sort((a, b) => dir * (valueOf(a) - valueOf(b)));
+}
+
 export async function adminGetCampaign(
   id: string,
-  query: { page?: number; pageSize?: number } = {},
+  query: { page?: number; pageSize?: number; sortBy?: string; order?: string } = {},
 ) {
   const page = query.page ?? 1;
   const pageSize = query.pageSize ?? 20;
@@ -1259,7 +1285,6 @@ export async function adminGetCampaign(
     .lean();
   const membersTotal = members.length;
   const from = (page - 1) * pageSize;
-  const pageMembers = members.slice(from, from + pageSize);
   const uids = members.map((m) => String(m.userId));
   const users = await UserModel.find({ _id: { $in: uids } })
     .select('nickname uid')
@@ -1267,6 +1292,9 @@ export async function adminGetCampaign(
   const uMap = new Map(users.map((u) => [String(u._id), u]));
   const segs = await loadSegments(String(c._id));
   const stats = await statsForMembers(c, segs, uids);
+  // 次数/距离/时长来自 stats，所以汇总算完才能排序、排完再切片；排序只动成员表，
+  // 汇总/排行/分类型始终按全员算
+  const pageMembers = sortMembers(members, stats, query.sortBy, query.order).slice(from, from + pageSize);
   // 汇总与排行榜只算当前在队（成员表则刻意含历史段）；排行复用同一条 byDistanceThenJoin，与小程序榜一致
   const joined = members.filter((m) => m.state === 'joined');
   const joinedUids = joined.map((m) => String(m.userId));
