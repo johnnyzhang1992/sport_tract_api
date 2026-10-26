@@ -16,6 +16,41 @@ import { ActivityModel } from '../models/activity.model.js';
 import { CampaignMemberModel } from '../models/campaign-member.model.js';
 import { streakDays } from '../utils/campaign-streak.js';
 import { DRIFT_SCORE_PB_GATE } from '../config/constants.js';
+
+/**
+ * 按成员统计「被 driftScore 门禁排除」的轨迹数（2026-10-26 用户要求在活动页给出说明）：
+ * 计入条件与 baseMatch 完全同源，但 driftScore 条件反过来（> 门禁）。
+ * 这些轨迹**数据完整保留**（用户端距离/时长照常显示），只是不计入活动统计与排行；
+ * 成员面板给出「N 条未计入」能解释「我明明跑了 21 公里，活动里怎么只有 12」。
+ */
+export async function excludedCountForMembers(
+  campaign: CampaignDoc,
+  uids: string[],
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  if (uids.length === 0) return map;
+  const segsByUid = await loadSegments(String(campaign._id));
+  const or: Record<string, unknown>[] = [];
+  for (const uid of uids) {
+    const segs = segsByUid.get(uid) ?? [];
+    or.push(...timeOr(uid, segs, campaign.startAt));
+  }
+  if (or.length === 0) return map;
+  const rows = await ActivityModel.aggregate<{ _id: string; n: number }>([
+    {
+      $match: {
+        status: 'finished' as const,
+        vehicleMs: { $not: { $gt: 0 } }, // 只数被 driftScore 挡掉的那批（vehicle 已单列不算）
+        driftScore: { $gt: DRIFT_SCORE_PB_GATE },
+        ...(campaign.allowedTypes.length > 0 ? { type: { $in: campaign.allowedTypes } } : {}),
+        $or: or,
+      },
+    },
+    { $group: { _id: '$userId', n: { $sum: 1 } } },
+  ]);
+  for (const r of rows) map.set(String(r._id), r.n);
+  return map;
+}
 import type { Campaign } from '../models/campaign.model.js';
 
 /** 一个「贡献时段」＝ 一行成员记录（加入过的段，含已离开/被踢） */

@@ -5,7 +5,7 @@ import { buildApp } from '../src/app.js';
 import { CampaignModel } from '../src/models/campaign.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
-import { loadSegments, memberActivityMatch, statsForMembers, streakForUser } from '../src/services/campaign-stats.js';
+import { excludedCountForMembers, loadSegments, memberActivityMatch, statsForMembers, streakForUser } from '../src/services/campaign-stats.js';
 
 /**
  * 一起运动活动：轨迹计入判据（Spec §4.1）与汇总聚合。
@@ -152,4 +152,28 @@ test('CS-D1 漂移门禁：超 driftScore 门禁的轨迹不计入活动（汇�
 
   await CampaignMemberModel.deleteMany({ userId: U6 });
   await ActivityModel.deleteMany({ userId: U6 });
+});
+
+test('CS-D2 excludedCount：按成员统计被 driftScore 门禁排除的条数', async () => {
+  const { DRIFT_SCORE_PB_GATE } = await import('../src/config/constants.js');
+  const U7 = new mongoose.Types.ObjectId();
+  await CampaignMemberModel.create({ campaignId, userId: U7, role: 'member', state: 'joined', joinedAt: bjMs(2026, 10, 1), leftAt: null });
+  const at = (h: number) => bjMs(2026, 10, 6, h);
+  const mk = async (score: number | null, distance: number, hour: number) => {
+    const doc = await ActivityModel.create({
+      userId: U7, type: 'running', status: 'finished',
+      startTime: at(hour), endTime: at(hour) + 600_000, distance, duration: 600,
+      ...(score == null ? {} : { driftScore: score }),
+    });
+    return String(doc._id);
+  };
+  await mk(5, 3000, 8);                            // 正常
+  await mk(DRIFT_SCORE_PB_GATE + 40, 20000, 10);   // 超门禁 → 应计数
+  await mk(DRIFT_SCORE_PB_GATE + 10, 1500, 12);    // 超门禁 → 应计数
+  await mk(null, 1000, 14);                        // 缺字段 = 可信 → 不计
+  const campaign = (await CampaignModel.findById(campaignId).lean())!;
+  const map = await excludedCountForMembers(campaign, [String(U7)]);
+  assert.equal(map.get(String(U7)), 2, '应统计到 2 条被门禁排除');
+  await CampaignMemberModel.deleteMany({ userId: U7 });
+  await ActivityModel.deleteMany({ userId: U7 });
 });

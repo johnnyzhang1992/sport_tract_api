@@ -23,6 +23,7 @@ import {
   dailyDistanceByType,
   type CampaignDoc,
   type MemberStats,
+  excludedCountForMembers,
 } from './campaign-stats.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { getAvatarUrl } from './oss.js';
@@ -56,6 +57,9 @@ export interface MemberRow {
   count: number;
   distance: number;
   duration: number;
+  /** 被 driftScore 门禁排除的轨迹条数（数据保留但不计入活动；0/缺省不展示）。
+   *  没有它用户会困惑「我明明跑了 21 公里，活动里怎么只算 12」。 */
+  excludedCount?: number;
 }
 export interface CampaignDetailDto {
   id: string;
@@ -548,6 +552,8 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
     .lean();
   const uMap = new Map(users.map((u) => [String(u._id), u]));
   const stats = await statsForMembers(c, segs, uids);
+  // 被 driftScore 门禁排除的条数（成员面板「N 条未计入」说明的数据来源）
+  const excluded = await excludedCountForMembers(c, uids);
 
   const memberList: MemberRow[] = members.map((m) => {
     const u = uMap.get(String(m.userId));
@@ -559,6 +565,7 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
       avatarPreset: u?.avatarPreset || '',
       joinedAt: m.joinedAt ?? null,
       ...(stats.get(String(m.userId)) ?? emptyStats()),
+      excludedCount: excluded.get(String(m.userId)) ?? 0,
     };
   });
   const totals = memberList.reduce<MemberStats>(
