@@ -10,7 +10,7 @@ import { config, isOssConfigured } from '../src/config/index.js';
 
 /**
  * 管理端图片 URL 下发口径：bucket 私有，裸链直连实测 403，凡是要给 <img> 用的地址都得签名
- * - /admin/users/:id 头像
+ * - /admin/users 列表头像 + /admin/users/:id 详情头像
  * - /admin/activities 列表的 photoCount（跨 markers 去重）+ coverPhoto（缩略图）
  * - /admin/footprint-records 列表的 coverPhoto
  * 外部 URL（微信头像等）签名逻辑原样放行，但计数照算。
@@ -72,6 +72,8 @@ before(async () => {
     avatarUrl: `${OSS}/avatar.png`,
   });
   userId = String(user._id);
+  // 没传微信头像的用户：列表要回空串（前端拿首字占位），别回 undefined
+  await UserModel.create({ openid: 'imgurl_openid-u2', nickname: '图片链路测试无头像' });
 
   const a1 = await ActivityModel.create({
     userId: user._id,
@@ -129,7 +131,39 @@ after(async () => {
 test('用户详情头像签名下发：私有桶裸链 403，管理端必须给签名地址', async () => {
   const res = await req('GET', `/sport-track/api/admin/users/${userId}`);
   assert.equal(res.statusCode, 200, res.body);
-  expectSigned(res.json().data.user.avatarUrl, `${OSS}/avatar.png`);
+  const url = res.json().data.user.avatarUrl as string;
+  expectSigned(url, `${OSS}/avatar.png`);
+  if (isOssConfigured()) {
+    // 详情页头像位 56px，没必要拉原图（实测原图宽 998）；与列表同一个档位
+    assert.match(
+      decodeURIComponent(url),
+      /x-oss-process=image\/resize,m_fill,w_160,h_160/,
+      '详情头像也要走头像档位',
+    );
+  }
+});
+
+test('用户列表头像：与详情同口径（签名 + 头像档位），无头像回空串', async () => {
+  const res = await req('GET', '/sport-track/api/admin/users?page=1&pageSize=50&keyword=图片链路测试');
+  assert.equal(res.statusCode, 200, res.body);
+  const items = res.json().data.items as Array<{ id: string; nickname: string; avatarUrl?: string }>;
+  const withAvatar = items.find((i) => i.id === userId);
+  assert.ok(withAvatar, `列表应能搜到种子用户：${JSON.stringify(items.map((i) => i.nickname))}`);
+  if (isOssConfigured()) {
+    assert.ok(withAvatar!.avatarUrl!.startsWith(`${OSS}/avatar.png?`), `应是签名链，实际 ${withAvatar!.avatarUrl}`);
+    assert.match(withAvatar!.avatarUrl!, /[?&]Signature=/, '签名链要带 Signature');
+    // 列表是几十个小圆，必须走头像档位（方图裁切），别把原图拉进后台
+    assert.match(
+      decodeURIComponent(withAvatar!.avatarUrl!),
+      /x-oss-process=image\/resize,m_fill,w_160,h_160/,
+      '列表头像要用头像档位',
+    );
+  } else {
+    assert.equal(withAvatar!.avatarUrl, `${OSS}/avatar.png`);
+  }
+  const noAvatar = items.find((i) => i.nickname === '图片链路测试无头像');
+  assert.ok(noAvatar, '列表应能搜到无头像用户');
+  assert.equal(noAvatar!.avatarUrl, '', '无头像要给空串，别留 undefined');
 });
 
 test('轨迹列表：photoCount 跨 markers 去重（photoUrl 与 photos[0] 同图不双计），外链图也计数', async () => {

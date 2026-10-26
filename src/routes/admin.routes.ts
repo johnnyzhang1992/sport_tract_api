@@ -44,7 +44,7 @@ import { backfillDriftScore } from '../services/drift-score-backfill.js';
 import { gapImpact } from '../services/gap-impact.js';
 import { leaderboard, leaderboardRegions } from '../services/leaderboard.js';
 import { calcStats, calcFastestKm, type TrackPointLike } from '../utils/pace.js';
-import { getSignedUrl, cleanUrl, getThumbUrl, uploadBuffer } from '../services/oss.js';
+import { getSignedUrl, cleanUrl, getThumbUrl, getAvatarUrl, uploadBuffer } from '../services/oss.js';
 import { bjToday0, bjDateStr, bjIsoWeekLabel, bjIsoWeekStart, bjYearMonth } from '../utils/bj-time.js';
 
 /**
@@ -694,6 +694,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
         return {
           id: String(u._id),
           nickname: u.nickname,
+          // 列表里的头像是几十个小圆，走头像档位（方图裁切）+ 签名，别把裸链/原图拉进后台
+          avatarUrl: u.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
           gender: u.gender ?? 0, // 0 未知 1 男 2 女
           uid: u.uid != null ? String(u.uid) : '', // 用户唯一编号（openid 敏感不下发）
           weightKg: u.weightKg,
@@ -1147,7 +1149,8 @@ export async function adminRoutes(fastify: FastifyInstance) {
       user: {
         id,
         nickname: user.nickname ?? '',
-        avatarUrl: user.avatarUrl ? getSignedUrl(user.avatarUrl) : '',
+        // 头像一律走头像档位（列表 28px / 详情 56px 都用不上原图）
+        avatarUrl: user.avatarUrl ? getAvatarUrl(user.avatarUrl) : '',
         gender: user.gender ?? 0,
         openid: user.openid,
         weightKg: user.weightKg ?? null,
