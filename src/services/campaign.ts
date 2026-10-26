@@ -1290,6 +1290,12 @@ export async function adminGetCampaign(
     { count: 0, distance: 0, duration: 0 },
   );
   const excludedTotal = joinedUids.reduce((sum, uid) => sum + (excluded.get(uid) ?? 0), 0);
+  // 末位成员（在队、距离最少）：管理端详情页一键看 TA 的全部轨迹
+  const lastPlace = joined.length
+    ? [...joined]
+        .map((m) => ({ m, s: stats.get(String(m.userId)) ?? { count: 0, distance: 0, duration: 0 } }))
+        .sort((x, y) => x.s.distance - y.s.distance)[0]
+    : null;
   const leaderboard = [...joined]
     .map((m) => ({ m, s: stats.get(String(m.userId))! }))
     .sort((x, y) =>
@@ -1323,6 +1329,13 @@ export async function adminGetCampaign(
     trend,
     totals,
     excludedTotal,
+    lastPlace: lastPlace
+      ? {
+          userId: String(lastPlace.m.userId),
+          name: uMap.get(String(lastPlace.m.userId))?.nickname || '微信用户',
+          distance: lastPlace.s.distance,
+        }
+      : null,
     leaderboard,
     membersTotal,
     membersPage: page,
