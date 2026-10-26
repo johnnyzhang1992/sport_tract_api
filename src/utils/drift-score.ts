@@ -32,11 +32,12 @@ export function calcDriftScore<
   const pts = points ?? [];
   const n = pts.length;
   if (n < 2) return 0;
-  // 快弦阈值 = 类型 gapSpeed（与中短断档收紧同源：人类无法持续 30s+ 的速度）；
-  // 未配置类型（含骑行）退化为车流速度 6.5——骑行隧道真实弦 5m/s 不误伤，汽车 15m/s 照拦
-  const fastGapMps =
-    (type ? (TYPE_CONFIGS[type] ?? DEFAULT_TYPE_CONFIG).gapSpeed : undefined) ??
-    VEHICLE_MIN_SPEED_MPS;
+  // 快弦阈值 = 类型 gapSpeed（与中短断档收紧同源：人类无法持续 30s+ 的速度）
+  const typeGapSpeed = type ? (TYPE_CONFIGS[type] ?? DEFAULT_TYPE_CONFIG).gapSpeed : VEHICLE_MIN_SPEED_MPS;
+  // 骑行不配 gapSpeed = 不做速度追责（可能是摩托）：所有长断档只按「慢弦」轻罚，
+  // 其余类型未配置时退化为车流速度 6.5
+  const noSpeedPolicing = type === 'cycling';
+  const fastGapMps = typeGapSpeed ?? VEHICLE_MIN_SPEED_MPS;
   let accBadSteps = 0;
   let vehicleMs = 0;
   let slowGapMs = 0;
@@ -59,8 +60,8 @@ export function calcDriftScore<
     } else if (dtMs > GAP_TIGHTEN_MIN_SEC * 1000) {
       // 未标记的长间隔步：按弦速分档（相对时间戳/绝对时间戳差值口径等价）
       const chordMps = chordSpeedMps(a, b, dtMs);
-      if (chordMps != null && chordMps > fastGapMps) fastGapMs += dtMs;
-      else slowGapMs += dtMs; // 坐标缺失无法算弦速：按慢弦处理（不加重罚）
+      if (!noSpeedPolicing && chordMps != null && chordMps > fastGapMps) fastGapMs += dtMs;
+      else slowGapMs += dtMs; // 骑行 / 坐标缺失：按慢弦处理（不加重罚）
     }
   }
   const steps = n - 1;
@@ -86,9 +87,15 @@ export function calcDriftScore<
   // 骑行 11.5（41km/h，职业环法均速级）——业余不可能，宁严勿松
   const dur = metrics?.durationSec;
   if (dist != null && dur != null && dur > 60) {
-    const ceil = SUSTAINED_SPEED_CEIL_MPS[type ?? ''] ?? SUSTAINED_SPEED_CEIL_DEFAULT_MPS;
-    const mps = dist / dur;
-    if (mps > ceil) penalty += Math.min(1, ((mps - ceil) / ceil) * 2);
+    // 该类型不设上限（如骑行：可能是摩托）= 跳过均速判罚
+    const ceil = type != null ? SUSTAINED_SPEED_CEIL_MPS[type] : SUSTAINED_SPEED_CEIL_DEFAULT_MPS;
+    if (ceil != null) {
+      const mps = dist / dur;
+      // 斜率 ×4（原 ×2）：既然步行类上限已放到跑步级（23.4km/h），超过它的就不再是
+      // 「快一点」而是物理上不可能——25.3km/h 的步行 20km（实测 25.8km/61min）必须拦住，
+      // 而 9-10km/h 的快走/慢跑完全不该被罚（用户拍板）
+      if (mps > ceil) penalty += Math.min(1, ((mps - ceil) / ceil) * 4);
+    }
   }
 
   return Math.round(100 * Math.min(1, penalty));
@@ -117,4 +124,18 @@ function chordSpeedMps(
     Math.sin(dLat / 2) ** 2 + Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
   const dist = 2 * R * Math.asin(Math.sqrt(s));
   return dtMs > 0 ? dist / (dtMs / 1000) : null;
+}
+
+/**
+ * 「未计入个人最佳与排行榜」的说明句（服务端拼好下发，两端只渲染）：
+ * 与 vehicleNotice 同一套做法——各端各拼一遍必然走偏，且门禁阈值只在一个地方定义。
+ *
+ * 什么时候给：driftScore 超过门禁（DRIFT_SCORE_PB_GATE）时。文案避开「漂移分/门禁」这类内部
+ * 术语，只说用户能理解的因果：这条轨迹定位质量存疑，所以不计入个人最佳与榜单。
+ * 为什么需要这句（2026-10-26 用户要求）：数据本身完整保留（保轨迹），但进不了榜——不给说明
+ * 的话用户会以为“我明明跑了 25 公里，为什么 PB 说他最佳是 12 公里”。
+ */
+export function formatDriftNotice(driftScore: number | null | undefined, gate: number): string {
+  if (driftScore == null || driftScore <= gate) return '';
+  return '该轨迹定位质量存在异常（疑似漂移或非运动段较多），未计入个人最佳与排行榜';
 }

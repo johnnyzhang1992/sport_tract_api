@@ -1321,12 +1321,15 @@ export async function adminRoutes(fastify: FastifyInstance) {
       apply?: boolean | string;
       limit?: number | string;
       userId?: string;
+      rescore?: boolean | string;
     };
     return success(
       await backfillDriftScore({
         apply: body.apply === true || body.apply === 'true',
         limit: Math.max(0, Number(body.limit) || 0),
         userId: body.userId ? String(body.userId) : undefined,
+        // 公式调整后必须 rescore=true 才能重算存量（默认只补 null）
+        rescore: body.rescore === true || body.rescore === 'true',
       }),
     );
   });

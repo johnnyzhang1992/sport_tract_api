@@ -44,7 +44,7 @@ export const VEHICLE_MAX_STEP_SEC = 120;
 /**
  * 各类型「可持续均速上限」（m/s）：判据是「世界级选手可持续、业余不可能」——
  * 跑步 6.5（马拉松纪录均速级）、步行类 2.2（竞走级）、骑行 11.5（41km/h 职业环法均速级）。
- * 两处消费方（口径同源，改这里一处即可）：
+ * 消费方（口径同源，改这里一处即可）：
  * 1) 巨步弦（dt>120s 的长断档）：弦速超过它是「被运载」而不是本运动——实测 2026-10-26：
  *    - dev 步行轨迹 212s 只移 3.9m（0.02m/s）与 126s 移 108m（0.86m/s）：室内信号差，
  *      旧规则只看时间就标 vehicle，白吞 338s 时长；
@@ -53,12 +53,16 @@ export const VEHICLE_MAX_STEP_SEC = 120;
  * 2) driftScore 的均速合理性项（utils/drift-score.ts 复用本表）。
  */
 export const SUSTAINED_SPEED_CEIL_MPS: Record<string, number> = {
-  walking: 2.2,
-  hiking: 2.2,
-  mountaineering: 2.2,
+  // 步行/徒步/登山一律用跑步上限（23.4km/h）：产品上「步行」类目允许跑步速度
+  // （2026-10-26 用户拍板）——按 7.9km/h 判罚会把快走/慢跑误伤成异常轨迹。
+  // 真正不可能的速度（>23.4km/h 的步行）仍由 driftScore 的斜率罚分拦住。
+  walking: 6.5,
+  hiking: 6.5,
+  mountaineering: 6.5,
   running: 6.5,
   swimming: 2.0,
-  cycling: 11.5,
+  // cycling 不再设上限：骑行可能是自行车也可能是摩托车，不做速度追责（用户拍板）；
+  // 未配置 = driftScore 跳过均速项
 };
 export const SUSTAINED_SPEED_CEIL_DEFAULT_MPS = 8;
 /** 中短断档收紧下限（秒）：30 < dt ≤ 120 的步允许速度降到 gapSpeed——
@@ -66,20 +70,7 @@ export const SUSTAINED_SPEED_CEIL_DEFAULT_MPS = 8;
  *  信号刚恢复的首个 fix 不可信、但又够不着巨步弦门槛，地铁进出站就落在这一档 */
 export const GAP_TIGHTEN_MIN_SEC = 30;
 
-/** 骑行「滚动均速天花板」（docs/19 §3.6 服务端版，reprocess/回填旧轨迹用）：
- *  5min 滑动窗均速超上限且非长下坡 → 窗内步标 vehicle。只对 cycling 生效
- *  （公交/电驴与骑行速度重叠不判——荣誉制，用户拍板；滑雪下坡同理豁免）。
- *  ⚠️ 与端上 tracker.js 的 CYCLE_ROLL_* 三常量同值，改一处必须同步另一处。
- *  dev 库实测抓出：44.7km/h 均速的「骑行」旧公式 0 分全绿通过 */
-export const CYCLE_ROLL_WINDOW_MS = 300_000; // 5 分钟滑动窗
-export const CYCLE_ROLL_CAP_MPS = 12.5;      // 45 km/h = 1'20"/km
-export const CYCLE_ROLL_DROP_EXEMPT_M = 50;  // 窗内净海拔下降 ≥ 该值 = 合法长下坡，豁免
-/** 滚动窗只采信的单步间隔上限（秒）：超过它是断档（切后台/隧道/稀疏采样），
- *  既不算速度证据也作为窗口边界。实测不加这条会让一条 358s 大断档填满 300s 窗口、
- *  把整窗正常步误标 vehicle（线上 192279 一次误标 77 分钟） */
-export const CYCLE_ROLL_MAX_STEP_SEC = 30;
-/** 窗口成判所需最少有效步：300s 窗配 ≤30s 步长天然需要 ≥10 步，稀疏采样不触发 */
-export const CYCLE_ROLL_MIN_STEPS = 10;
+
 /** 会做车速判定的类型（人力运动）；其余类型一律不判 */
 export const VEHICLE_TYPES = ['running', 'walking', 'hiking', 'mountaineering'];
 
@@ -169,8 +160,10 @@ export function markVehicle<T extends TrackPointLike>(points: T[], type?: string
   // 人几乎原地站着」的长空窗当乘车（实测 212s/3.9m 被吞整段时长）。慢于 CHORD_VEHICLE_MIN_MPS
   // 的步不仅不新标，还要**清除**已有标记（旧规则或旧版端上标的同一误判；只有这一档能安全清：
   // 端上 overSpeed 标的步弦速必 > maxAbsSpeed，gapTighten 只管 30<dt≤120，都不会被误清）。
-  const ceilMps = SUSTAINED_SPEED_CEIL_MPS[type ?? ''] ?? SUSTAINED_SPEED_CEIL_DEFAULT_MPS;
-  for (let i = 1; i < out.length; i++) {
+  // 骑行整体豁免（产品决策 2026-10-26：骑行可能是自行车也可能是摩托车，不做速度追责）——
+  // 距离/时长一律不扣，是否进榜交给 driftScore 门禁。
+  const ceilMps = type === 'cycling' ? null : SUSTAINED_SPEED_CEIL_MPS[type ?? ''] ?? SUSTAINED_SPEED_CEIL_DEFAULT_MPS;
+  for (let i = 1; ceilMps != null && i < out.length; i++) {
     if (out[i].pauseGap) continue;
     const a = out[i - 1];
     const b = out[i];
@@ -201,70 +194,6 @@ export function markVehicle<T extends TrackPointLike>(points: T[], type?: string
       const dt = (b.timestamp - a.timestamp) / 1000;
       if (dt <= GAP_TIGHTEN_MIN_SEC || dt > VEHICLE_MAX_STEP_SEC) continue;
       if (haversineDistance(a, b) / dt > gapSpeed) b.vehicle = true;
-    }
-  }
-
-  // 骑行滚动均速天花板（服务端版）：持续判据对骑行豁免（6.5m/s 是通勤速度），
-  // 但 45km/h+ 的持续均速已是摩托车/汽车领域——旧轨迹（无端上滚动窗标记）在
-  // 纠偏/回填时由此补拦。窗口/上限/豁免与端上同口径。
-  //
-  // 只用「密集采样的步」当速度证据（2026-10-26 实测修正）：线上 192279 骑行轨迹
-  // 123 点 / 129 分钟，采样间隔 P50=4s 但 P90=192s、最大 1010s——旧实现让一条 358s
-  // 大断档就把 300s 窗口填满，再按窗口均速超限把整窗（含大量正常步）标 vehicle，
-  // 一次误标掉 77 分钟。改为：dt > CYCLE_ROLL_MAX_STEP_SEC 的步既是窗口边界也不参与
-  // 累加；窗口填满需要 ≥10 个有效步，稀疏采样自然不触发。
-  if (type === 'cycling') {
-    let winIdx: number[] = [];
-    let winMs = 0;
-    let winDist = 0;
-    const flush = () => {
-      winIdx = [];
-      winMs = 0;
-      winDist = 0;
-    };
-    for (let i = 1; i < out.length; i++) {
-      const a = out[i - 1];
-      const b = out[i];
-      if (b.pauseGap) {
-        flush();
-        continue;
-      }
-      const dtMs =
-        typeof a.timestamp === 'number' && typeof b.timestamp === 'number'
-          ? Math.max(0, b.timestamp - a.timestamp)
-          : 0;
-      const dtSec = dtMs / 1000;
-      // 断档（含切后台/隧道/稀疏采样）：不算速度证据，同时作为窗口边界重开
-      if (!(dtSec > 0 && dtSec <= CYCLE_ROLL_MAX_STEP_SEC)) {
-        flush();
-        continue;
-      }
-      winIdx.push(i);
-      winMs += dtMs;
-      winDist += haversineDistance(a, b);
-      while (winMs > CYCLE_ROLL_WINDOW_MS && winIdx.length > 1) {
-        const oldest = winIdx.shift() as number;
-        const oa = out[oldest - 1];
-        const ob = out[oldest];
-        const odt =
-          typeof oa.timestamp === 'number' && typeof ob.timestamp === 'number'
-            ? Math.max(0, ob.timestamp - oa.timestamp)
-            : 0;
-        winMs -= odt;
-        winDist -= haversineDistance(oa, ob);
-      }
-      if (winMs < CYCLE_ROLL_WINDOW_MS || winIdx.length < CYCLE_ROLL_MIN_STEPS) continue;
-      if (winDist / (winMs / 1000) <= CYCLE_ROLL_CAP_MPS) continue;
-      const alts: number[] = [];
-      for (const idx of winIdx) {
-        const p = out[idx - 1];
-        if (typeof p.altitude === 'number') alts.push(p.altitude as number);
-        if (typeof out[idx].altitude === 'number') alts.push(out[idx].altitude as number);
-      }
-      const drop = alts.length >= 2 ? alts[0] - alts[alts.length - 1] : 0;
-      if (drop >= CYCLE_ROLL_DROP_EXEMPT_M) continue; // 长下坡豁免（海拔缺失保守不豁免）
-      for (const idx of winIdx) out[idx].vehicle = true;
-      flush(); // 已判定段不重复标
     }
   }
 

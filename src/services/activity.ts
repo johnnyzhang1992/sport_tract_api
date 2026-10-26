@@ -12,7 +12,7 @@ import { markVehicle, formatVehicleNotice } from '../utils/vehicle.js';
 import { smoothTrackSmart } from '../utils/smooth.js';
 import { cleanAltitudeSpikes } from '../utils/altitude-clean.js';
 import { cleanTrajectory } from '../utils/trajectory-clean.js';
-import { calcDriftScore } from '../utils/drift-score.js';
+import { calcDriftScore, formatDriftNotice } from '../utils/drift-score.js';
 import { markFootprintDirty } from './footprint.js';
 import { provincesOfPoints } from './region.js';
 import { monthlyAggForMonths, type ActivityMonthlyRow } from './stats.js';
@@ -28,7 +28,14 @@ import type {
   ListActivitiesQueryInput,
   UpdateMarkerInput,
 } from '../utils/validators.js';
-import { ACTIVITY_TYPES, MAX_TRACK_POINTS, MIN_EFFECTIVE_DISTANCE_M, MIN_EFFECTIVE_POINTS, type ActivityType } from '../config/constants.js';
+import {
+  ACTIVITY_TYPES,
+  MAX_TRACK_POINTS,
+  MIN_EFFECTIVE_DISTANCE_M,
+  MIN_EFFECTIVE_POINTS,
+  DRIFT_SCORE_PB_GATE,
+  type ActivityType,
+} from '../config/constants.js';
 
 type ObjectIdLike = Types.ObjectId | string;
 
@@ -80,6 +87,10 @@ export interface ActivityDto {
   perfScore: number | null;
   /** 漂移置信度分（0-100）：≥ DRIFT_SCORE_PB_GATE 不进 PB/榜单；null = 未评估（可信） */
   driftScore: number | null;
+  /** 是否计入个人最佳与排行榜（false 时详情页展示 driftNotice 说明） */
+  pbEligible: boolean;
+  /** 未计入榜单的说明句（服务端拼好，空串 = 计入或无需说明） */
+  driftNotice: string;
   /** 实跑/规划判别（导入文件可能为规划路线） */
   trackKind: 'recorded' | 'planned' | 'uncertain';
   /** 距离里程碑 PB：到达 5/10/15…公里的累计用时（秒），每 5km 一项 */
@@ -137,6 +148,8 @@ export function toActivityDto(doc: Record<string, any>): ActivityDto {
     fastestKm: doc.fastestKm ?? null,
     perfScore: doc.perfScore ?? null,
     driftScore: doc.driftScore ?? null,
+    pbEligible: doc.driftScore == null ? true : doc.driftScore <= DRIFT_SCORE_PB_GATE,
+    driftNotice: formatDriftNotice(doc.driftScore, DRIFT_SCORE_PB_GATE),
     trackKind: doc.trackKind ?? 'recorded',
     pbMarks: doc.pbMarks ?? [],
     calories: doc.calories ?? 0,

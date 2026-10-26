@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
+import { DRIFT_SCORE_PB_GATE } from '../src/config/constants.js';
 import { periodStartMs } from '../src/services/leaderboard.js';
 
 /**
@@ -146,9 +147,17 @@ test('本榜最佳：骑行最快均速按 distance/duration 计算（avgPace �
   const avg = bestRows.find((b) => b.key === 'fastestAvg');
   assert.ok(avg, '骑行应返回 fastestAvg 最佳（旧口径用 avgPace，恒为空）');
 
-  // 与库内同口径计算的最快均速比对
+  // 与库内同口径计算的最快均速比对（含 driftScore 门禁：超门禁轨迹不得占榜）
   const [expected] = await ActivityModel.aggregate<{ speedKmh: number }>([
-    { $match: { status: 'finished', type: 'cycling', duration: { $gt: 0 }, distance: { $gt: 0 } } },
+    {
+      $match: {
+        status: 'finished',
+        type: 'cycling',
+        duration: { $gt: 0 },
+        distance: { $gt: 0 },
+        driftScore: { $not: { $gt: DRIFT_SCORE_PB_GATE } },
+      },
+    },
     { $addFields: { speedKmh: { $divide: [{ $multiply: ['$distance', 3.6] }, '$duration'] } } },
     { $sort: { speedKmh: -1 } },
     { $limit: 1 },

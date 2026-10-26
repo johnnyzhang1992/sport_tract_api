@@ -18,6 +18,8 @@ export interface DriftScoreBackfillOptions {
   limit?: number;
   /** 可选：只回填该用户（测试封闭用；运维上也可单用户重跑） */
   userId?: string;
+  /** 重算已打分的轨迹（公式调整后必须用它，否则只扫 driftScore=null 的漏掉了存量） */
+  rescore?: boolean;
 }
 
 export interface DriftScoreBackfillReport {
@@ -34,7 +36,9 @@ const bucketOf = (score: number): string =>
 export async function backfillDriftScore(opts: DriftScoreBackfillOptions = {}): Promise<DriftScoreBackfillReport> {
   const apply = opts.apply === true;
   const limit = Number(opts.limit ?? 0);
-  const q: Record<string, unknown> = { status: 'finished', driftScore: null };
+  const q: Record<string, unknown> = opts.rescore
+    ? { status: 'finished' } // 公式改了要重算存量（否则已打分的永远不会更新）
+    : { status: 'finished', driftScore: null };
   if (opts.userId) {
     // 非法 ObjectId 直接空结果（不抛）：管理端传错 id 不该 500
     if (!Types.ObjectId.isValid(opts.userId)) {

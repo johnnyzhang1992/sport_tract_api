@@ -5,7 +5,7 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { LoginLogModel } from '../src/models/login-log.model.js';
-import { calcDriftScore } from '../src/utils/drift-score.js';
+import { calcDriftScore, formatDriftNotice } from '../src/utils/drift-score.js';
 import { DRIFT_SCORE_PB_GATE } from '../src/config/constants.js';
 
 /**
@@ -353,7 +353,7 @@ test('D7 /stats/best 惰性回填：老轨迹访问后 driftScore 落库', async
   assert.ok(typeof doc?.driftScore === 'number', `driftScore 应被回填，实际 ${doc?.driftScore}`);
 });
 
-test('D8 全国榜：farthest/fastestKm 排除高分轨迹；同榜无门禁指标不受影响', async () => {
+test('D8 全国榜：超门禁轨迹不占任何指标（farthest/fastestKm/maxClimb 全覆盖）', async () => {
   const res = await app.inject({
     method: 'GET',
     url: '/sport-track/api/stats/leaderboard?type=hiking&province=%E6%BC%82%E7%A7%BB%E6%B5%8B%E8%AF%95%E7%9C%81&period=all',
@@ -364,8 +364,9 @@ test('D8 全国榜：farthest/fastestKm 排除高分轨迹；同榜无门禁指�
   const maxClimb = best.find((r) => r.key === 'maxClimb');
   // B1(8000/500) 与 B3(25000/800) 都 ≥30 分 → farthest 榜首 = B2 的 7000
   assert.equal(farthest?.value, 7200, `farthest 应为 B2 7200（B1/B3 被门禁），实际 ${farthest?.value}`);
-  // maxClimb 无门禁 → B3 的 800 照常上榜
-  assert.equal(maxClimb?.value, 800, `maxClimb 不门禁，应为 B3 800，实际 ${maxClimb?.value}`);
+  // 门禁覆盖全部指标（2026-10-26 扩展）：B3 的 800 爬升也不该占榜——
+  // 否则详情页「未计入个人最佳与排行榜」与榜单自相矛盾
+  assert.ok(!maxClimb || maxClimb.value !== 800, `超门禁轨迹不得占 maxClimb 榜，实际 ${JSON.stringify(maxClimb)}`);
 
   // fastestKm：B1 250 比 C2 260 更快，但被门禁 → 榜首 = C2 260
   const run = await app.inject({
@@ -419,7 +420,7 @@ test('D13 换类型重算类型相关判定：步行→骑行 driftScore 回落�
   });
   const tk = login.json().data.accessToken;
   const uid = (await UserModel.findOne({ openid: 'act-drift-retype' }).select('_id').lean())!._id;
-  // 弦速 5m/s ∈ (步行 gapSpeed 4.0, 骑行退化 6.5)：步行口径是快弦、骑行口径是慢弦
+  // 弦速 8.33m/s = 30km/h：步行口径超过 6.5 上限=快弦；骑行不做速度追责=慢弦
   const pts: Array<Record<string, unknown>> = [{ seq: 1, lat: 30, lng: 114, timestamp: 0 }];
   let lat = 30;
   let ts = 0;
@@ -430,7 +431,7 @@ test('D13 换类型重算类型相关判定：步行→骑行 driftScore 回落�
     pts.push({ seq: seq++, lat, lng: 114, timestamp: ts });
   }
   for (let k = 0; k < 3; k++) {
-    lat += 300 * M_PER_DEG;
+    lat += 500 * M_PER_DEG;
     ts += 60_000;
     pts.push({ seq: seq++, lat, lng: 114, timestamp: ts });
   }
@@ -516,4 +517,71 @@ test('D0 夹具自证：calcDriftScore 分量公式', () => {
   assert.equal(calcDriftScore(walkPoints(20, (i, p) => (p.vehicle = i > 10))), 10);
   assert.equal(calcDriftScore([]), 0);
   assert.equal(calcDriftScore([{ lat: 1, lng: 1, timestamp: 0 }]), 0);
+});
+
+// ── 未计入榜单的说明句（详情页展示用，服务端拼好下发）──
+
+test('N1 超门禁才有说明句；未评估/达标为空串', () => {
+  assert.equal(formatDriftNotice(null, 30), '', '未评估（老数据/导入）不提示');
+  assert.equal(formatDriftNotice(0, 30), '');
+  assert.equal(formatDriftNotice(29, 30), '');
+  assert.equal(formatDriftNotice(30, 30), '', '等于门禁仍算计入（与查询 $gt 口径一致）');
+  assert.match(formatDriftNotice(31, 30), /定位质量|漂移/);
+  assert.match(formatDriftNotice(100, 30), /未计入个人最佳与排行榜/);
+});
+
+test('N2 详情 DTO 下发 pbEligible 与 driftNotice（门槛两侧）', async () => {
+  const mk = (score: number, offset: number) =>
+    ActivityModel.create({
+      userId: userB,
+      type: 'hiking',
+      status: 'finished',
+      startTime: 1_700_000_000_000 + offset,
+      endTime: 1_700_000_600_000 + offset,
+      distance: 5000,
+      duration: 3000,
+      driftScore: score,
+      trackPoints: walkPoints(10) as never,
+    });
+  const ok = await mk(11, 0);
+  const bad = await mk(62, 40_000_000);
+  const readAs = async (id: unknown) => {
+    const r = await app.inject({
+      method: 'GET',
+      url: `/sport-track/api/activities/${id}`,
+      headers: { authorization: `Bearer ${tokenB}` },
+    });
+    assert.equal(r.statusCode, 200, r.body);
+    return r.json().data;
+  };
+  const okDto = await readAs(ok._id);
+  assert.equal(okDto.pbEligible, true, '11 分应计入');
+  assert.equal(okDto.driftNotice, '');
+  const badDto = await readAs(bad._id);
+  assert.equal(badDto.pbEligible, false, '62 分不应计入');
+  assert.match(badDto.driftNotice, /未计入个人最佳与排行榜/);
+});
+
+test('N3 超门禁轨迹不得占任何榜单指标（含均速榜 fastestAvg）', async () => {
+  // 线上实例：骑行 62.1km/h（driftScore 100）曾占着骑行均速榜首，而详情页说它「未计入排行榜」
+  await ActivityModel.create({
+    userId: userB,
+    type: 'cycling',
+    status: 'finished',
+    startTime: 1_700_000_100_000,
+    endTime: 1_700_000_160_000,
+    distance: 5760, // 5.76km / 5.6min = 62km/h
+    duration: 334,
+    driftScore: 100,
+    trackPoints: walkPoints(10) as never,
+  });
+  const res = await app.inject({
+    method: 'GET',
+    url: '/sport-track/api/stats/leaderboard?type=cycling&province=%E5%85%A8%E5%9B%BD&period=all',
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const best = res.json().data.best as Array<{ key: string; value: number }>;
+  const avg = best.find((b) => b.key === 'fastestAvg');
+  // 门禁生效后，62km/h 不能再作为骑行均速纪录出现
+  assert.ok(!avg || avg.value < 60, `超门禁轨迹不得占均速榜，实际 ${JSON.stringify(avg)}`);
 });

@@ -80,9 +80,12 @@ export interface TypeConfig {
 }
 
 export const TYPE_CONFIGS: Record<string, TypeConfig> = {
-  walking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 4.0 }, // 步行 ~1.5m/s；4m/s = 竞走级，不可持续 30s
-  hiking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 4.0 }, // 徒步 ~1.5m/s
-  mountaineering: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 4.0 }, // 登山慢，信号差
+  // 步行/徒步/登山的 gapSpeed 与「可持续均速上限」统一到跑步级 6.5（23.4km/h）：
+  // 「步行」类目允许跑步速度（2026-10-26 用户拍板），按 4.0（14.4km/h = 慢跑）判会把
+  // 慢跑速度的断档误标成被运载。地铁 60s/400m = 6.7m/s 仍高于 6.5，照旧能抓到。
+  walking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 6.5 },
+  hiking: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 6.5 },
+  mountaineering: { minSpikeSpeed: 5, maxAbsSpeed: 12, minHighSpeed: 7, gapSpeed: 6.5 },
   running: { minSpikeSpeed: 8, maxAbsSpeed: 18, minHighSpeed: 10, gapSpeed: 6.5 }, // 跑步 ~3-5m/s，冲刺 8m/s；6.5 = 2'34"/km 省队级
   cycling: { minSpikeSpeed: 12, maxAbsSpeed: 30, minHighSpeed: 14 }, // 骑行 ~8m/s，冲刺 12m/s，下坡可 25m/s；gapSpeed 不配置 = 豁免
   swimming: { minSpikeSpeed: 3, maxAbsSpeed: 8, minHighSpeed: 5, gapSpeed: 3.0 }, // 游泳 ~1.5m/s；3m/s 公开水域世界级

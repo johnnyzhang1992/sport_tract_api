@@ -237,7 +237,16 @@ export async function leaderboard(
     if (key === 'fastestAvg') {
       // 最快均速 = distance/duration（km/h）：骑行/游泳 avgPace 为 null，不能用 avgPace
       facet[key] = [
-        { $match: { distance: { $gt: 0 }, duration: { $gt: 0 } } },
+        {
+          $match: {
+            distance: { $gt: 0 },
+            duration: { $gt: 0 },
+            // 漂移分门禁对所有榜单指标生效（含均速榜）：详情页对超门禁轨迹会明说
+            // 「未计入个人最佳与排行榜」，若这里漏放行就与那句自相矛盾——
+            // 实测线上 6ad9eaaf 骑行 62.1km/h（driftScore 100）占着骑行均速榜首。
+            driftScore: { $not: { $gt: DRIFT_SCORE_PB_GATE } },
+          },
+        },
         { $addFields: { speedKmh: { $divide: [{ $multiply: ['$distance', 3.6] }, '$duration'] } } },
         { $sort: { speedKmh: -1 } },
         { $limit: 1 },
@@ -248,13 +257,15 @@ export async function leaderboard(
     const spec = BEST_METRIC_SPEC[key];
     facet[key] = [
       // 越小越好 = 配速类：低于可信下限的（GPS 漂移、把乘车段算进运动量）不当纪录挂着
-      // 另：最长距离 / 最快配速要求整条轨迹没检出疑似搭车（见 NO_VEHICLE_METRICS），
-      // 且漂移置信度分不超门禁（docs/19 §4.2：缺字段 = 可信，与 vehicleMs 同一惯用法）
+      // - driftScore 门禁对**所有**指标生效（docs/19 §4.2）：详情页对超门禁轨迹明说
+      //   「未计入个人最佳与排行榜」，任一榜漏放行就自相矛盾；缺字段 = 可信（与 vehicleMs 同惯用法）
+      // - vehicleMs 排除仍只对 longest-distance / fastest-km 生效（NO_VEHICLE_METRICS）：
+      //   骑行可能是摩托车（产品决策），不因检出车速段就剥骑行纪录
       {
         $match: {
           [spec.field]: { $gt: spec.dir === 1 ? MIN_PLAUSIBLE_PACE_SEC_PER_KM : 0 },
+          driftScore: { $not: { $gt: DRIFT_SCORE_PB_GATE } },
           ...(NO_VEHICLE_METRICS.has(key) ? { vehicleMs: { $not: { $gt: 0 } } } : {}),
-          ...(NO_VEHICLE_METRICS.has(key) ? { driftScore: { $not: { $gt: DRIFT_SCORE_PB_GATE } } } : {}),
         },
       },
       { $sort: { [spec.field]: spec.dir } },
