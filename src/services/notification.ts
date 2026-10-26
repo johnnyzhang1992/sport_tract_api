@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 import { NotificationModel } from '../models/notification.model.js';
 import { NotificationReadModel } from '../models/notification-read.model.js';
+import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
 
@@ -29,30 +30,67 @@ async function readIdSet(userId: string | undefined, ids: Types.ObjectId[]): Pro
   return new Set(rows.map((r) => String(r.notificationId)));
 }
 
+/**
+ * 用户注册时刻（ms）；游客/畸形 userId 返 0（= 不过滤，全部按未读，与历史行为一致）
+ */
+async function registeredAtOf(userId: string | undefined): Promise<number> {
+  if (!userId || !isObjectIdLike(userId)) return 0;
+  const row = await UserModel.findById(userId).select({ createdAt: 1 }).lean();
+  return row?.createdAt ? new Date(row.createdAt).getTime() : 0;
+}
+
+/**
+ * 未读口径（2026-10-26 用户拍板，只作用于刚注册的用户）：
+ * - 注册后发布的：正常未读（显式已读除外）——存量用户不受影响（他们的注册时刻早已过去）；
+ * - 注册前发布的：默认已读，否则新用户一进来就是一堆历史未读；
+ *   例外：其中最新一条保留未读（发现入口，引导点进消息中心一次）。
+ * 游客（userId 缺）：不判已读，isUnread 恒 true（调用方对游客未读数恒 0）。
+ */
+async function unreadState<T extends { _id: Types.ObjectId; publishedAt?: number | null }>(
+  userId: string | undefined,
+  rows: T[],
+): Promise<{ unreadRows: T[]; isUnread: (r: T) => boolean }> {
+  const readIds = await readIdSet(userId, rows.map((r) => r._id));
+  const regAt = await registeredAtOf(userId);
+  // 注册前最新一条：保留未读的发现入口（无则不过例外）
+  let preRegLatest: (typeof rows)[number] | undefined;
+  for (const r of rows) {
+    const pa = r.publishedAt ?? 0;
+    if (pa < regAt && (!preRegLatest || pa > (preRegLatest.publishedAt ?? 0))) preRegLatest = r;
+  }
+  const preRegLatestId = preRegLatest ? String(preRegLatest._id) : '';
+  const isUnread = (r: { _id: Types.ObjectId; publishedAt?: number | null }): boolean => {
+    if (readIds.has(String(r._id))) return false;
+    if ((r.publishedAt ?? 0) >= regAt) return true;
+    return String(r._id) === preRegLatestId;
+  };
+  const unreadRows = rows.filter(isUnread);
+  return { unreadRows, isUnread };
+}
+
 /** 首页单行：登录用户取最新未读（没有则 null）；游客取最新已发布，未读数恒 0 */
 export async function notificationSummary(userId?: string) {
   const rows = await publishedRows();
-  const readIds = await readIdSet(userId, rows.map((r) => r._id));
-  const unread = userId ? rows.filter((r) => !readIds.has(String(r._id))) : rows;
-  const latest = unread[0];
+  const { unreadRows } = await unreadState(userId, rows);
+  const latest = unreadRows[0];
   return {
     item: latest ? { id: String(latest._id), title: latest.title } : null,
-    unreadCount: userId ? unread.length : 0,
+    unreadCount: userId ? unreadRows.length : 0,
   };
 }
 
 /** 历史列表：已发布全量，倒序；游客 read 一律 false、unreadCount=0 */
 export async function listNotifications(userId?: string) {
   const rows = await publishedRows();
-  const readIds = await readIdSet(userId, rows.map((r) => r._id));
+  const { unreadRows, isUnread } = await unreadState(userId, rows);
   return {
     items: rows.map((r) => ({
       id: String(r._id),
       title: r.title,
       publishedAt: r.publishedAt ?? 0,
-      read: userId ? readIds.has(String(r._id)) : false,
+      read: userId ? !isUnread(r) : false,
     })),
-    unreadCount: userId ? rows.filter((r) => !readIds.has(String(r._id))).length : 0,
+    unreadCount: userId ? unreadRows.length : 0,
   };
 }
 
@@ -86,8 +124,8 @@ export async function markNotificationRead(userId: string, id: string) {
   }
 
   const rows = await publishedRows();
-  const readIds = await readIdSet(userId, rows.map((r) => r._id));
-  return { unreadCount: rows.filter((r) => !readIds.has(String(r._id))).length };
+  const { unreadRows } = await unreadState(userId, rows);
+  return { unreadCount: unreadRows.length };
 }
 
 // ==================== 管理端 ====================

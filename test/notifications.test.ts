@@ -115,46 +115,54 @@ test('NT1 游客 summary：最新已发布 + unreadCount=0', async () => {
   assert.equal(data.unreadCount, 0, '游客没有已读概念');
 });
 
-test('NT2 登录 summary：未读 = 已发布数，按已读递减，读完为空', async () => {
-  const total = await publishedCount();
+test('NT2 登录 summary：注册前默认已读（最新一条保留未读），注册后正常未读', async () => {
+  // 测试用户注册于 before() 开头：A（now-10s）在其之前 → 默认已读但作为「注册前最新一条」保留未读；
+  // B（now+100s）在其之后 → 正常未读；库里其余历史通知全部默认已读
   const first = (await get('/notifications/summary')).json().data;
-  assert.equal(first.item.id, noticeB, '最新一条未读');
-  assert.equal(first.unreadCount, total, '新用户一条都没读过');
+  assert.equal(first.item.id, noticeB, '最新未读 = B（注册后发布）');
+  assert.equal(first.unreadCount, 2, 'B + 注册前最新一条 A；其余历史默认已读');
 
+  // 读掉 A（注册前钩子）→ 只剩 B
   const r1 = await post(`/notifications/${noticeA}/read`);
   assert.equal(r1.statusCode, 200, r1.body);
-  assert.equal(r1.json().data.unreadCount, total - 1);
+  assert.equal(r1.json().data.unreadCount, 1);
 
   const second = (await get('/notifications/summary')).json().data;
-  assert.equal(second.item.id, noticeB, '读掉较早那条不影响最新未读');
-  assert.equal(second.unreadCount, total - 1);
+  assert.equal(second.item.id, noticeB);
+  assert.equal(second.unreadCount, 1);
 
   await post(`/notifications/${noticeB}/read`);
   const third = (await get('/notifications/summary')).json().data;
-  assert.equal(third.unreadCount, total - 2);
-  if (total - 2 === 0) {
-    assert.equal(third.item, null, '全部读完 → 首页条消失');
-  } else {
-    assert.ok(third.item, '还有别的未读 → 顶上一条');
-    assert.notEqual(third.item.id, noticeA);
-    assert.notEqual(third.item.id, noticeB);
-  }
+  assert.equal(third.unreadCount, 0);
+  assert.equal(third.item, null, '全部读完 → 首页条消失');
 });
 
-test('NT3 列表：只含已发布、publishedAt 倒序、read 标记正确；草稿不可见', async () => {
-  // 自己先把两条读掉，不依赖 NT2 的执行顺序（重复上报是幂等的）
-  await post(`/notifications/${noticeA}/read`);
-  await post(`/notifications/${noticeB}/read`);
+test('NT3 列表：注册前默认已读、注册后正常未读；草稿不可见', async () => {
+  // NT2 已把 A/B 都读掉：注册前通知（含历史）一律 read:true、未读数归零
+  const pre = await get('/notifications');
+  const preData = pre.json().data;
+  assert.equal(preData.items.find((i: { id: string }) => i.id === noticeA)?.read, true);
+  assert.equal(preData.items.find((i: { id: string }) => i.id === noticeB)?.read, true);
+  assert.equal(preData.unreadCount, 0, '注册前通知全部默认已读（钩子已读后）');
+
+  // 注册后新发布一条 → 正常未读（已注册用户发布的通知未读就未读）
+  const c = await adminReq('POST', '/notifications', {
+    title: `${PREFIX}C`,
+    content: '注册后发布',
+    published: true,
+  });
+  assert.equal(c.statusCode, 200, c.body);
+  madeNotices.push(c.json().data.id);
+
   const res = await get('/notifications');
+  assert.equal(res.statusCode, 200, res.body);
   const data = res.json().data;
   const ids = data.items.map((i: { id: string }) => i.id);
-  assert.ok(ids.indexOf(noticeB) < ids.indexOf(noticeA), 'B 比 A 新，排在前面');
+  // 排序：B 夹具 publishedAt = now+100s（未来）> C（now）> A（now-10s）
+  assert.deepEqual(ids.slice(0, 3), [noticeB, c.json().data.id, noticeA], 'B(未来) > C(刚发) > A(最早)');
   assert.ok(!ids.includes(noticeDraft), '未发布通知不能出现在列表');
-  const a = data.items.find((i: { id: string }) => i.id === noticeA);
-  const b = data.items.find((i: { id: string }) => i.id === noticeB);
-  assert.equal(a.read, true, '上面已标读 A');
-  assert.equal(b.read, true, '上面已标读 B');
-  assert.equal(data.unreadCount, (await publishedCount()) - 2);
+  assert.equal(data.items.find((i: { id: string }) => i.id === c.json().data.id)?.read, false, '注册后发布的通知未读就未读');
+  assert.equal(data.unreadCount, 1);
 });
 
 test('NT4 详情：已发布返回正文（换行原样）；未发布/非法 id → 404', async () => {
