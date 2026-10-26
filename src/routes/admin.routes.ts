@@ -23,7 +23,7 @@ import {
 import { autoFinishStaleActivities, toActivityDto, reprocessActivity } from '../services/activity.js';
 import { purgeCancelledActivities } from '../services/cancelled-purge.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
-import { adminListCampaigns, adminGetCampaign } from '../services/campaign.js';
+import { adminListCampaigns, adminGetCampaign, adminMemberActivities } from '../services/campaign.js';
 import {
   adminListTopics,
   createTopic,
@@ -1416,6 +1416,21 @@ export async function adminRoutes(fastify: FastifyInstance) {
     // 成员表分页；汇总/排行榜始终按全员算，不受分页影响
     return success(
       await adminGetCampaign(id, {
+        page: Math.max(1, Number(q.page) || 1),
+        pageSize: Math.min(100, Math.max(1, Number(q.pageSize) || 20)),
+      }),
+    );
+  });
+
+  // 成员轨迹弹窗：某成员在活动窗口内的全部轨迹 + 逐条归属（计入/搭车/漂移/未完成/活动外）。
+  // 归属由服务端判（靠成员的全部贡献时段），前端只渲染，别再自己算一遍。
+  fastify.get('/campaigns/:id/member-activities', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const q = request.query as Record<string, string | undefined>;
+    return success(
+      await adminMemberActivities(id, {
+        userId: q.userId?.trim() ?? '',
+        type: q.type?.trim() || undefined,
         page: Math.max(1, Number(q.page) || 1),
         pageSize: Math.min(100, Math.max(1, Number(q.pageSize) || 20)),
       }),

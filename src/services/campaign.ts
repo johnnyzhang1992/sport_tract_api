@@ -31,7 +31,7 @@ import { bjDateStr, bjDayStart, bjToday0 } from '../utils/bj-time.js';
 import { config } from '../config/index.js';
 import { checkText } from './wechat-sec.js';
 import { AppError } from '../utils/app-error.js';
-import { ACTIVITY_TYPES } from '../config/constants.js';
+import { ACTIVITY_TYPES, DRIFT_SCORE_PB_GATE } from '../config/constants.js';
 import type { CreateCampaignInput, ListCampaignQueryInput, UpdateCampaignInput } from '../utils/validators.js';
 
 const DAY_MS = 86400000;
@@ -1356,5 +1356,121 @@ export async function adminGetCampaign(
         excludedCount: excluded.get(String(m.userId)) ?? 0,
       };
     }),
+  };
+}
+
+/** 成员轨迹弹窗的行归属：与活动计入判据一一对应 */
+export type MemberActivityReason = 'counted' | 'vehicle' | 'drift' | 'unfinished' | 'outside';
+
+export interface MemberActivityRow {
+  id: string;
+  type: string;
+  status: string;
+  startTime: number;
+  distance: number;
+  duration: number;
+  vehicleMs: number;
+  driftScore: number | null;
+  reason: MemberActivityReason;
+}
+
+export interface MemberActivitySummary {
+  counted: number;
+  vehicle: number;
+  drift: number;
+  unfinished: number;
+  outside: number;
+}
+
+/**
+ * 管理端「成员轨迹弹窗」数据源：某成员在活动窗口内的全部轨迹 + 逐条归属。
+ *
+ * 归属必须在服务端判：计入判据要看该成员**所有**贡献时段（离开后复归＝多段），
+ * 前端手上只有成员表当前一行的 joinedAt/leftAt，判不出入队前/离队后的轨迹属于「活动外」。
+ * 判据与 `statsForMembers` 同源（finished、类型白名单、无搭车、未超漂移门禁、
+ * startTime 落在某个贡献时段内），这样弹窗的「计入」条数能和成员表的次数对得上。
+ *
+ * 列表范围取活动整体窗口 [startAt, endAt] 而不是贡献时段：成员可能先跑后报名，
+ * 那些轨迹要列出来标成「活动外」，而不是从列表里静默消失。
+ * 单个成员在活动窗口内的轨迹量级很小（一年也就几百条），一次取回内存分类，
+ * 避免同一套判据在 Mongo 与 JS 各写一遍。
+ */
+export async function adminMemberActivities(
+  id: string,
+  query: { userId: string; type?: string; page?: number; pageSize?: number },
+) {
+  const c = await loadCampaignOr404(id);
+  const uid = query.userId?.trim() ?? '';
+  if (!uid) throw new AppError(400, '请指定成员');
+  assertObjectIdLike(uid, '用户不存在');
+
+  const segs = (await loadSegments(String(c._id))).get(uid) ?? [];
+  if (segs.length === 0) throw new AppError(404, '该用户不是活动成员');
+
+  // 类型范围 = 活动白名单 ∩ 筛选；白名单为空＝不限
+  let types: string[] | null = c.allowedTypes.length > 0 ? [...c.allowedTypes] : null;
+  if (query.type) types = types ? types.filter((t) => t === query.type) : [query.type];
+
+  const page = Math.max(1, query.page ?? 1);
+  const pageSize = Math.max(1, query.pageSize ?? 20);
+
+  let items: MemberActivityRow[] = [];
+  if (!types || types.length > 0) {
+    const docs = await ActivityModel.find({
+      userId: new mongoose.Types.ObjectId(uid),
+      startTime: { $gte: c.startAt, $lte: c.endAt },
+      ...(types ? { type: { $in: types } } : {}),
+    })
+      .select('type status startTime distance duration vehicleMs driftScore')
+      .sort({ startTime: -1, _id: -1 })
+      .lean();
+
+    // 贡献时段并集（左闭右开；leftAt=null 视为至今），下限取 max(startAt, joinedAt)
+    const inContribution = (t: number) =>
+      segs.some((s) => t >= Math.max(c.startAt, s.joinedAt) && (s.leftAt == null || t < s.leftAt));
+
+    items = docs.map((a) => {
+      const reason: MemberActivityReason =
+        a.status !== 'finished'
+          ? 'unfinished'
+          : !inContribution(a.startTime)
+            ? 'outside'
+            : (a.vehicleMs ?? 0) > 0
+              ? 'vehicle'
+              : (a.driftScore ?? 0) > DRIFT_SCORE_PB_GATE
+                ? 'drift'
+                : 'counted';
+      return {
+        id: String(a._id),
+        type: a.type,
+        status: a.status,
+        startTime: a.startTime,
+        distance: a.distance ?? 0,
+        duration: a.duration ?? 0,
+        vehicleMs: a.vehicleMs ?? 0,
+        driftScore: a.driftScore ?? null,
+        reason,
+      };
+    });
+  }
+
+  // 摘要按全量算（前端头部要显示全量条数，不能随分页变化）
+  const summary: MemberActivitySummary = { counted: 0, vehicle: 0, drift: 0, unfinished: 0, outside: 0 };
+  for (const it of items) summary[it.reason] += 1;
+
+  const user = await UserModel.findById(uid).select('nickname').lean();
+  const from = (page - 1) * pageSize;
+  return {
+    campaignId: String(c._id),
+    userId: uid,
+    name: user?.nickname || '微信用户',
+    allowedTypes: c.allowedTypes,
+    startAt: c.startAt,
+    endAt: c.endAt,
+    summary,
+    total: items.length,
+    page,
+    pageSize,
+    items: items.slice(from, from + pageSize),
   };
 }
