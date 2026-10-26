@@ -408,6 +408,34 @@ test('D9 导入轨迹也落 driftScore（非 null，docs/19 §4.3 补遗）', as
   assert.ok(typeof doc?.driftScore === 'number', `导入轨迹 driftScore 应为数值，实际 ${doc?.driftScore}`);
 });
 
+test('D10 老客户端快弦（无标记 >30s 步、弦速超 gapSpeed）→ 重罚门禁；慢弦稀疏轨迹通过', () => {
+  // 老版本客户端把超速点整批丢弃后，残留点之间的直线弦藏着被丢弃的超速位移——
+  // 弦速超人类持续上限就是证据（2026-10-26 用户拍板：宁错拦不放过）
+  const build = (gapM: number) => {
+    const pts: Array<Record<string, unknown>> = [{ seq: 1, lat: 30, lng: 114, timestamp: 0 }];
+    let lat = 30;
+    let ts = 0;
+    let seq = 2;
+    for (let k = 0; k < 6; k++) {
+      lat += 50 * M_PER_DEG;
+      ts += 25_000;
+      pts.push({ seq: seq++, lat, lng: 114, timestamp: ts });
+    }
+    for (let k = 0; k < 3; k++) {
+      lat += gapM * M_PER_DEG;
+      ts += 60_000;
+      pts.push({ seq: seq++, lat, lng: 114, timestamp: ts });
+    }
+    return pts;
+  };
+  // 快弦：3×60s 步各 400m（6.7m/s > 跑/走 gapSpeed 4）→ fastGap 占 span 54.5% → 重罚超门禁
+  const fastScore = calcDriftScore(build(400), 'walking');
+  assert.ok(fastScore >= DRIFT_SCORE_PB_GATE, `快弦轨迹应门禁，实际 ${fastScore}`);
+  // 慢弦对照：同样 3×60s 间隔，但弦速 1.67m/s（真实徒步节奏）→ 轻罚通过
+  const slowScore = calcDriftScore(build(100), 'walking');
+  assert.ok(slowScore < DRIFT_SCORE_PB_GATE, `慢弦稀疏轨迹应通过，实际 ${slowScore}`);
+});
+
 test('D0 夹具自证：calcDriftScore 分量公式', () => {
   // 10 步全 accBad → 60 分；20 步一半 vehicle → 10 分
   assert.equal(calcDriftScore(walkPoints(10, (_i, p) => (p.accBad = true))), 60);

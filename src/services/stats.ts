@@ -377,7 +377,7 @@ export async function bestRecords(userId: ObjectIdLike) {
   for (const a of missing) {
     const fk = calcFastestKm(a.trackPoints ?? [], a.type);
     const patch: Record<string, unknown> = { fastestKm: fk };
-    if (a.driftScore == null) patch.driftScore = calcDriftScore(a.trackPoints ?? []);
+    if (a.driftScore == null) patch.driftScore = calcDriftScore(a.trackPoints ?? [], a.type);
     await ActivityModel.updateOne({ _id: a._id }, { $set: patch });
   }
   // 距离里程碑惰性补算：pbMarks 未落库的历史轨迹（补算后写 []，避免反复扫点）

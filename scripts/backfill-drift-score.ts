@@ -33,7 +33,7 @@ async function main() {
   const buckets = new Map<string, number>();
   for (let doc = await cursor.next(); doc != null; doc = await cursor.next()) {
     scanned += 1;
-    const score = calcDriftScore((doc.trackPoints ?? []) as Array<Record<string, unknown>>);
+    const score = calcDriftScore((doc.trackPoints ?? []) as Array<Record<string, unknown>>, doc.type);
     const bucket = score >= 70 ? '70+' : score >= 40 ? '40-69' : score >= 30 ? '30-39(门禁)' : score >= 15 ? '15-29' : '0-14';
     buckets.set(bucket, (buckets.get(bucket) ?? 0) + 1);
     if (apply) {

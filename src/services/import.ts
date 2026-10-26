@@ -370,7 +370,7 @@ export async function importActivity(
     perfScore: perf?.score ?? null,
     // 漂移置信度分（docs/19 §4）：导入轨迹也计分——稀疏采样会推高 gapRatio（实测 ~20 分，
     // 不会触发 30 分门禁），但真漂移的导入文件照样能被拦在榜外；planned 同样落分（门禁看数值不看 trackKind）
-    driftScore: calcDriftScore(storedPoints),
+    driftScore: calcDriftScore(storedPoints, type),
     trackKind: kindInfo.kind,
     provinces: regions.provinces,
     startProvince: regions.startProvince,
