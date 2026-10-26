@@ -1269,11 +1269,27 @@ export async function adminGetCampaign(
   const stats = await statsForMembers(c, segs, uids);
   // 汇总与排行榜只算当前在队（成员表则刻意含历史段）；排行复用同一条 byDistanceThenJoin，与小程序榜一致
   const joined = members.filter((m) => m.state === 'joined');
-  const typeSummary = await typeSummaryForMembers(
-    c,
-    segs,
-    joined.map((m) => String(m.userId)),
+  const joinedUids = joined.map((m) => String(m.userId));
+  const typeSummary = await typeSummaryForMembers(c, segs, joinedUids);
+  // 逐日距离趋势（全队合计，活动跨度内每天一行；管理端详情页图表用）
+  const dailyRows = await dailyDistanceForMembers(c, segs, joinedUids);
+  const byDate = new Map<string, number>();
+  for (const r of dailyRows) byDate.set(r.date, (byDate.get(r.date) ?? 0) + r.distance);
+  const trend = [...byDate.entries()].sort((x, y) => (x[0] < y[0] ? -1 : 1)).map(([date, distance]) => ({ date, distance }));
+  // 按成员统计被 driftScore 门禁排除的条数（成员表「异常数量」列）
+  const excluded = await excludedCountForMembers(c, uids);
+  const totals = joined.reduce(
+    (acc, m) => {
+      const st = stats.get(String(m.userId));
+      return {
+        count: acc.count + (st?.count ?? 0),
+        distance: acc.distance + (st?.distance ?? 0),
+        duration: acc.duration + (st?.duration ?? 0),
+      };
+    },
+    { count: 0, distance: 0, duration: 0 },
   );
+  const excludedTotal = joinedUids.reduce((sum, uid) => sum + (excluded.get(uid) ?? 0), 0);
   const leaderboard = [...joined]
     .map((m) => ({ m, s: stats.get(String(m.userId))! }))
     .sort((x, y) =>
@@ -1304,6 +1320,9 @@ export async function adminGetCampaign(
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
     typeSummary,
+    trend,
+    totals,
+    excludedTotal,
     leaderboard,
     membersTotal,
     membersPage: page,
@@ -1321,6 +1340,7 @@ export async function adminGetCampaign(
         count: s.count,
         distance: s.distance,
         duration: s.duration,
+        excludedCount: excluded.get(String(m.userId)) ?? 0,
       };
     }),
   };
