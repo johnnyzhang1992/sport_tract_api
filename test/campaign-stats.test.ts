@@ -5,7 +5,7 @@ import { buildApp } from '../src/app.js';
 import { CampaignModel } from '../src/models/campaign.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
-import { loadSegments, statsForMembers, streakForUser } from '../src/services/campaign-stats.js';
+import { loadSegments, memberActivityMatch, statsForMembers, streakForUser } from '../src/services/campaign-stats.js';
 
 /**
  * 一起运动活动：轨迹计入判据（Spec §4.1）与汇总聚合。
@@ -109,4 +109,47 @@ test('CS-S4 连续天数：只数本人在该活动内的有效轨迹（东八�
   assert.equal(await streakForUser(campaign as any, segs.get(String(U5))!, String(U5), now), 2);
   await CampaignMemberModel.deleteMany({ userId: U5 });
   await ActivityModel.deleteMany({ userId: U5 });
+});
+
+test('CS-D1 漂移门禁：超 driftScore 门禁的轨迹不计入活动（汇总与明细同源）', async () => {
+  const { DRIFT_SCORE_PB_GATE } = await import('../src/config/constants.js');
+  const U6 = new mongoose.Types.ObjectId();
+  await CampaignMemberModel.create({ campaignId, userId: U6, role: 'member', state: 'joined', joinedAt: bjMs(2026, 10, 1), leftAt: null });
+  const at = (h: number) => bjMs(2026, 10, 5, h);
+  const mk = async (score: number | null, distance: number, hour: number) => {
+    const doc = await ActivityModel.create({
+      userId: U6,
+      type: 'running',
+      status: 'finished',
+      startTime: at(hour),
+      endTime: at(hour) + 600_000,
+      distance,
+      duration: 600,
+      ...(score == null ? {} : { driftScore: score }),
+    });
+    return String(doc._id);
+  };
+  const clean = await mk(5, 3000, 8);
+  const gated = await mk(DRIFT_SCORE_PB_GATE + 40, 20000, 10);
+  const legacy = await mk(null, 2000, 12); // 缺字段 = 可信
+
+  const segs = await loadSegments(String(campaignId));
+  const campaign = (await CampaignModel.findById(campaignId).lean())!;
+  const stats = await statsForMembers(campaign as any, segs, [String(U6)]);
+  assert.deepEqual(
+    stats.get(String(U6)),
+    { count: 2, distance: 5000, duration: 1200 },
+    '超门禁轨迹不得计入（汇总应为 2 条 / 5000m）',
+  );
+
+  // 成员明细同源：走 memberActivityMatch（有贡献时段时必非空）
+  assert.ok(true);
+  const match = memberActivityMatch(campaign as any, String(U6), segs.get(String(U6))!)!;
+  const ids = (await ActivityModel.find(match).select('_id').lean()).map((r) => String(r._id));
+  assert.ok(ids.includes(clean), '正常轨迹应在明细里');
+  assert.ok(ids.includes(legacy), '缺字段老轨迹应在明细里');
+  assert.ok(!ids.includes(gated), '超门禁轨迹不得出现在明细里');
+
+  await CampaignMemberModel.deleteMany({ userId: U6 });
+  await ActivityModel.deleteMany({ userId: U6 });
 });

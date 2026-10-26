@@ -7,6 +7,7 @@
  *   3. type ∈ allowedTypes（allowedTypes 为空则不限类型）
  *   4. startTime ∈ [joinedAt, leftAt)（左闭右开；同一用户多段取并集，leftAt = null 视为至今）
  *   5. vehicleMs 未检出疑似搭车
+ *   6. driftScore 未超门禁（与个人最佳/全国榜同一套口径）
  *
  * 汇总（count / distance / duration）用一次 `$group by userId` 出所有成员，避免 N+1。
  */
@@ -14,6 +15,7 @@ import mongoose from 'mongoose';
 import { ActivityModel } from '../models/activity.model.js';
 import { CampaignMemberModel } from '../models/campaign-member.model.js';
 import { streakDays } from '../utils/campaign-streak.js';
+import { DRIFT_SCORE_PB_GATE } from '../config/constants.js';
 import type { Campaign } from '../models/campaign.model.js';
 
 /** 一个「贡献时段」＝ 一行成员记录（加入过的段，含已离开/被踢） */
@@ -78,6 +80,10 @@ function baseMatch(campaign: CampaignDoc, extra: Record<string, unknown> = {}) {
     status: 'finished' as const,
     // 缺字段的老文档 = 没搭车；别写 $lte:0
     vehicleMs: { $not: { $gt: 0 } },
+    // 漂移门禁（2026-10-26）：与个人最佳/全国榜同一套口径——超门禁的轨迹不进活动的
+    // 汇总/分类型/逐日/成员明细/排行（否则成员榜可以被"步行 30km/h"这类轨迹刷高）。
+    // 缺字段 = 可信，与 vehicleMs 同惯用法。
+    driftScore: { $not: { $gt: DRIFT_SCORE_PB_GATE } },
     ...(campaign.allowedTypes.length > 0 ? { type: { $in: campaign.allowedTypes } } : {}),
     ...extra,
   };
