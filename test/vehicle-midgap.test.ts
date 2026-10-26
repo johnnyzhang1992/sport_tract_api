@@ -141,7 +141,8 @@ test('M16 服务端骑行滚动窗：5min 均速 54km/h → 窗内步全标 vehi
   ]);
   const r = markVehicle(pts, 'cycling');
   const marked = r.points.filter((p) => p.vehicle).length;
-  assert.ok(marked >= 11, `滚动窗内步应标 vehicle，实际 ${marked}`);
+  // 窗口满 300s 时先淘汰最老的步再评估（新实现），故标 10 步而非 11 步
+  assert.ok(marked >= 10, `滚动窗内步应标 vehicle，实际 ${marked}`);
   assert.ok(r.vehicleM >= 4000, `vehicleM 应含窗内位移，实际 ${r.vehicleM}`);
 });
 
@@ -286,6 +287,32 @@ test('M20 巨步弦位移闸门：126s 移 108m（0.86m/s 慢走）→ 不标；
   const t = markVehicle(tunnel, 'walking');
   assert.equal(t.points[1].vehicle, true, '真被运载的长断档仍要标');
   assert.ok(t.vehicleMs >= 300_000);
+});
+
+test('M21 巨步弦类型感知：骑行 358s/3805m（38km/h 合法）→ 不标；300s/6000m（20m/s 机动车）→ 标', () => {
+  const legit = buildTrack([{ sec: 358, mps: 3805 / 358 }]);
+  const r1 = markVehicle(legit, 'cycling');
+  assert.equal(r1.points[1].vehicle, undefined, '低于骑行可持续上限 11.5m/s 的长断档是真实骑行');
+  assert.equal(r1.vehicleMs, 0);
+
+  const moto = buildTrack([{ sec: 300, mps: 20 }]);
+  const r2 = markVehicle(moto, 'cycling');
+  assert.equal(r2.points[1].vehicle, true, '超过 11.5m/s 上限即被运载');
+  assert.ok(r2.vehicleMs >= 300_000);
+
+  // 步行：同为 10m/s 则超 2.2 上限 → 标（同一几何按类型判定不同结果）
+  const walkCar = buildTrack([{ sec: 300, mps: 10 }]);
+  assert.equal(markVehicle(walkCar, 'walking').points[1].vehicle, true);
+});
+
+test('M22 骑行滚动窗不用稀疏采样当证据：4 个快跳 + 长断档不应整窗标 vehicle', () => {
+  // 复现线上 192279：P50=4s 密集段里夹着 358s 长断档 + 几步 GPS 跳点
+  const steps: Array<{ sec: number; mps: number }> = [];
+  for (let k = 0; k < 20; k++) steps.push({ sec: 4, mps: 2.7 }); // 正常骑行 4s/步
+  steps.push({ sec: 358, mps: 10.6 }); // 长断档（合法高速骑行）
+  for (let k = 0; k < 20; k++) steps.push({ sec: 4, mps: 2.7 });
+  const r = markVehicle(buildTrack(steps), 'cycling');
+  assert.equal(r.vehicleMs, 0, `稀疏采样+长断档不应产生 vehicleMs，实际 ${r.vehicleMs}`);
 });
 
 // ── M18 老版本客户端兼容：无 gapTighten/无 vehicle 标记 + clientDistance 全量虚高 ──

@@ -1,4 +1,9 @@
-import { GAP_TIGHTEN_MIN_SEC, VEHICLE_MIN_SPEED_MPS } from './vehicle.js';
+import {
+  GAP_TIGHTEN_MIN_SEC,
+  VEHICLE_MIN_SPEED_MPS,
+  SUSTAINED_SPEED_CEIL_MPS,
+  SUSTAINED_SPEED_CEIL_DEFAULT_MPS,
+} from './vehicle.js';
 import { TYPE_CONFIGS, DEFAULT_TYPE_CONFIG } from './trajectory-clean.js';
 
 /**
@@ -81,7 +86,7 @@ export function calcDriftScore<
   // 骑行 11.5（41km/h，职业环法均速级）——业余不可能，宁严勿松
   const dur = metrics?.durationSec;
   if (dist != null && dur != null && dur > 60) {
-    const ceil = AVG_SPEED_CEIL_MPS[type ?? ''] ?? AVG_SPEED_CEIL_DEFAULT_MPS;
+    const ceil = SUSTAINED_SPEED_CEIL_MPS[type ?? ''] ?? SUSTAINED_SPEED_CEIL_DEFAULT_MPS;
     const mps = dist / dur;
     if (mps > ceil) penalty += Math.min(1, ((mps - ceil) / ceil) * 2);
   }
@@ -89,16 +94,7 @@ export function calcDriftScore<
   return Math.round(100 * Math.min(1, penalty));
 }
 
-/** 类型均速持续上限（m/s）：判据是「世界级可持续、业余不可能」，宁严勿松 */
-const AVG_SPEED_CEIL_MPS: Record<string, number> = {
-  walking: 2.2, // 7.9km/h 竞走级
-  hiking: 2.2,
-  mountaineering: 2.2,
-  running: 6.5, // 23.4km/h，马拉松世界纪录均速级
-  swimming: 2.0,
-  cycling: 11.5, // 41.4km/h，职业环法均速级
-};
-const AVG_SPEED_CEIL_DEFAULT_MPS = 8;
+
 
 /** 弦速（m/s）：粗略 haversine，坐标缺失返回 null */
 function chordSpeedMps(
