@@ -1109,8 +1109,28 @@ export async function updateActivityMeta(
     });
     patch.type = input.type;
     patch.avgPace = stats.avgPace;
-    patch.fastestKm = calcFastestKm(activity.trackPoints ?? [], activity.type);
+    patch.fastestKm = calcFastestKm(activity.trackPoints ?? [], input.type);
     patch.calories = stats.calories;
+    // 类型相关判定重算（2026-10-26 补）：类型决定物理阈值，改动后这几个字段不能留旧类型的值。
+    // - perfScore：仅类跑步类型有分（步行→骑行应归零，骑行→跑步应首算）
+    // - driftScore：快弦阈值按类型（gapSpeed），换类型分数不同
+    // 注：vehicle/standstill 标记不在此重判——重判需要动点/改口径，属纠偏语义
+    // （reprocess 读的就是新类型），改类型后由用户主动纠偏触发
+    patch.perfScore =
+      calcPerfScore(
+        input.type as never,
+        activity.distance ?? 0,
+        activity.elevationGain ?? 0,
+        activity.duration ?? 0,
+      )?.score ?? null;
+    patch.driftScore = calcDriftScore(
+      activity.trackPoints ?? [],
+      input.type,
+      {
+        distance: activity.distance ?? undefined,
+        durationSec: activity.duration ?? undefined,
+      },
+    );
   }
   if (input.note != null) {
     patch.note = String(input.note).slice(0, 500);

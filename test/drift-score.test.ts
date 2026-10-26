@@ -411,6 +411,59 @@ test('D9 导入轨迹也落 driftScore（非 null，docs/19 §4.3 补遗）', as
   assert.ok(typeof doc?.driftScore === 'number', `导入轨迹 driftScore 应为数值，实际 ${doc?.driftScore}`);
 });
 
+test('D13 换类型重算类型相关判定：步行→骑行 driftScore 回落、perfScore 归零', async () => {
+  const login = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/auth/login',
+    payload: { code: 'openid:act-drift-retype' },
+  });
+  const tk = login.json().data.accessToken;
+  const uid = (await UserModel.findOne({ openid: 'act-drift-retype' }).select('_id').lean())!._id;
+  // 弦速 5m/s ∈ (步行 gapSpeed 4.0, 骑行退化 6.5)：步行口径是快弦、骑行口径是慢弦
+  const pts: Array<Record<string, unknown>> = [{ seq: 1, lat: 30, lng: 114, timestamp: 0 }];
+  let lat = 30;
+  let ts = 0;
+  let seq = 2;
+  for (let k = 0; k < 6; k++) {
+    lat += 50 * M_PER_DEG;
+    ts += 25_000;
+    pts.push({ seq: seq++, lat, lng: 114, timestamp: ts });
+  }
+  for (let k = 0; k < 3; k++) {
+    lat += 300 * M_PER_DEG;
+    ts += 60_000;
+    pts.push({ seq: seq++, lat, lng: 114, timestamp: ts });
+  }
+  const created = await ActivityModel.create({
+    userId: uid,
+    type: 'walking',
+    status: 'finished',
+    startTime: 1_790_000_000_000,
+    endTime: 1_790_000_000_000 + 330_000,
+    distance: 1200,
+    duration: 330,
+    perfScore: 200, // 步行旧表现分
+    driftScore: calcDriftScore(pts, 'walking', { distance: 1200, durationSec: 330 }),
+    trackPoints: pts as never,
+  });
+  assert.ok((created.driftScore ?? 0) >= DRIFT_SCORE_PB_GATE, '夹具：步行口径应 ≥30（快弦）');
+
+  const re = await app.inject({
+    method: 'PUT',
+    url: `/sport-track/api/activities/${created._id}/meta`,
+    headers: { authorization: `Bearer ${tk}` },
+    payload: { type: 'cycling' },
+  });
+  assert.equal(re.statusCode, 200, re.body);
+  const doc = await ActivityModel.findById(created._id).select('type driftScore perfScore').lean();
+  assert.equal(doc?.type, 'cycling');
+  assert.equal(doc?.perfScore, null, '骑行不应有表现分（旧步行分应归零）');
+  assert.ok(
+    (doc?.driftScore ?? 0) < DRIFT_SCORE_PB_GATE,
+    `骑行口径下 5m/s 是慢弦，分数应回落，实际 ${doc?.driftScore}`,
+  );
+});
+
 test('D10 老客户端快弦（无标记 >30s 步、弦速超 gapSpeed）→ 重罚门禁；慢弦稀疏轨迹通过', () => {
   // 老版本客户端把超速点整批丢弃后，残留点之间的直线弦藏着被丢弃的超速位移——
   // 弦速超人类持续上限就是证据（2026-10-26 用户拍板：宁错拦不放过）
