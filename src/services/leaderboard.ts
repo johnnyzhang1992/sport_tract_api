@@ -47,6 +47,10 @@ export interface RankRow {
   distanceKm: number;
   /** 轨迹条数 */
   count: number;
+  /** 运动时长合计（秒）：筛选范围内 Σ duration，与活动榜/运动时长同源 */
+  durationSec: number;
+  /** 加权平均配速（秒/公里）= Σduration ÷ Σdistance，取整；无可信距离时为 null */
+  paceSecPerKm: number | null;
   /** 用户 id（仅管理端 includeUserId 时下发，用户端不暴露） */
   userId?: string;
 }
@@ -220,9 +224,18 @@ export async function leaderboard(
     _id: unknown;
     distance: number;
     count: number;
+    duration: number;
   }>([
     { $match: match },
-    { $group: { _id: '$userId', distance: { $sum: '$distance' }, count: { $sum: 1 } } },
+    {
+      $group: {
+        _id: '$userId',
+        distance: { $sum: '$distance' },
+        count: { $sum: 1 },
+        // 缺 duration 的老文档 $sum 视为 0（与其它聚合口径一致）
+        duration: { $sum: '$duration' },
+      },
+    },
     { $sort: { distance: -1 } },
   ]);
 
@@ -304,8 +317,12 @@ export async function leaderboard(
     ]),
   );
 
-  const toRow = (r: { _id: unknown; distance: number; count: number }, rank: number): RankRow => {
+  const toRow = (
+    r: { _id: unknown; distance: number; count: number; duration: number },
+    rank: number,
+  ): RankRow => {
     const info = infoById.get(String(r._id));
+    const durationSec = Math.round(r.duration || 0);
     return {
       rank,
       name: (info && info.nickname) || '运动用户',
@@ -314,6 +331,9 @@ export async function leaderboard(
       avatarPreset: (info && info.avatarPreset) || '',
       distanceKm: Math.round((r.distance / 1000) * 100) / 100,
       count: r.count,
+      durationSec,
+      // 按合计距离加权，不是逐条配速平均；缺距离或时长就没可信配速（前端显示「—」）
+      paceSecPerKm: r.distance > 0 && durationSec > 0 ? Math.round(durationSec / (r.distance / 1000)) : null,
       ...(includeUserId ? { userId: String(r._id) } : {}),
     };
   };
