@@ -40,6 +40,15 @@ export const VEHICLE_MIN_STEPS = 5;
 export const VEHICLE_MAX_SLOW_STEPS = 2;
 /** 相邻点间隔超过该秒数视为采样断档，不跨断档连段（丢点后的"瞬移"不是持续移动） */
 export const VEHICLE_MAX_STEP_SEC = 120;
+
+/** 巨步弦的位移闸门（m/s）：dt > 120s 的断档还要弦速达该值才判「被运载」。
+ *  只看时间不看位移是一个实测出来的误判源（2026-10-26，dev 库 6adef2dd 步行轨迹）：
+ *  室内信号差连续丢点，重现点几乎在同位置（212s 只移 3.9m = 0.02m/s）与慢走（126s 移 108m
+ *  = 0.86m/s），均被无条件下标 vehicle → 7.1min 时长被当「乘车」扣掉（其中 338s = 80%）。
+ *  语义上「断档 ≠ 乘车」：慢于快走的断档是原地/信号丢失，不标 vehicle（markGapJumps 会另外
+ *  标 gapJump 做断线渲染，不扣距离与时长）。阈值 2.0 = 快走上限，低于它不可能是在车上。
+ *  ⚠️ 与端上 tracker.js#CHORD_VEHICLE_MIN_MPS 同值，改一处必须同步。 */
+export const CHORD_VEHICLE_MIN_MPS = 2.0;
 /** 中短断档收紧下限（秒）：30 < dt ≤ 120 的步允许速度降到 gapSpeed——
  *  三级阶梯的中档：≤30s 走现行单步/持续判据，>120s 巨步弦无条件标，30-120s 之间
  *  信号刚恢复的首个 fix 不可信、但又够不着巨步弦门槛，地铁进出站就落在这一档 */
@@ -132,18 +141,25 @@ export function markVehicle<T extends TrackPointLike>(points: T[], type?: string
     close();
   }
 
-  // 巨步弦（隧道/地下车库/挂机等长时间无定位后的重现点）：单步间隔远超采样节奏（>120s），
+  // 巨步弦（隧道/地下车库/移动到家等长时间无定位后的重现点）：单步间隔远超采样节奏（>120s），
   // 意味着这段完全没有任何采样，落点间直线是被运载/凭空连出来的 → 标 vehicle：
   // 灰线渲染、距离与时长都不计入（与端上 tracker 的 chord 标记同口径）。
-  // 持续判据只管"开着记录坐车"，这里管"关着被运过去"；任何运动类型都判（坐车不分类型）。
+  // 持续判据只管"开着记录坐车"，这里管"关着被运过去"；任何运动类型都评（坐车不分类型）。
   // 不跨 pauseGap：暂停时长已由 pausedMs 扣过，再剔就是双扣。
+  //
+  // 位移闸门 + 双向权威（2026-10-26）：dt>120 的步一律按弦速重定——只看时间会把「室内信号差、
+  // 人几乎原地站着」的长空窗当乘车（实测 212s/3.9m 被吞整段时长）。慢于 CHORD_VEHICLE_MIN_MPS
+  // 的步不仅不新标，还要**清除**已有标记（旧规则或旧版端上标的同一误判；只有这一档能安全清：
+  // 端上 overSpeed 标的步弦速必 > maxAbsSpeed，gapTighten 只管 30<dt≤120，都不会被误清）。
   for (let i = 1; i < out.length; i++) {
-    if (out[i].vehicle || out[i].pauseGap) continue;
+    if (out[i].pauseGap) continue;
     const a = out[i - 1];
     const b = out[i];
     if (typeof a.timestamp !== 'number' || typeof b.timestamp !== 'number') continue;
     const dt = (b.timestamp - a.timestamp) / 1000;
-    if (dt > VEHICLE_MAX_STEP_SEC) b.vehicle = true;
+    if (dt <= VEHICLE_MAX_STEP_SEC) continue;
+    if (haversineDistance(a, b) / dt >= CHORD_VEHICLE_MIN_MPS) b.vehicle = true;
+    else if (b.vehicle) delete (b as { vehicle?: boolean }).vehicle;
   }
 
   // 中短断档收紧（30 < dt ≤ 120，三级阶梯中档）：地铁进出站的典型形态——站厅到站台
@@ -252,20 +268,127 @@ function countVehicleSpans(points: TrackPointLike[] | undefined): number {
   return spans;
 }
 
+/** 非运动段的分类（2026-10-26 用户拍板：按「是否直线」分语文，不是全局改名）：
+ * - 'vehicle'（疑似搭车）：被运载时轨迹基本是**直线**（净位移 / 路径长 接近 1）；
+ * - 'drift'（疑似定位漂移）：室内弱信号、GPS 噪声基本**不是直线**（来回跳、折返）。
+ * 辅助条件（防单步大跳误判为搭车）：净位移 ≥ 200m 且持续 ≥ 30s。
+ * dev 库实测标定：
+ *   真搭车（8m/s×180s 构造）直线度 1.00 / 净位移 1424m / 178s；
+ *   来回跳漂移（±80m 交替）直线度 0.00 / 净位移 0m；
+ *   室内漂移（Redmi Android 15 实测）6 段直线度 0.65/0.14/0/0/0/1.0，净位移均 < 175m。
+ * 注：单个标记点（n=1）测不出直线度 → 按漂移处理（孤立尖点不是搭车）。 */
+export const VEHICLE_SEGMENT_MIN_NET_M = 200;
+export const VEHICLE_SEGMENT_MIN_SEC = 30;
+/** 直线度下限：净位移 / 路径长 ≥ 该值才算「被运载」（0.85 是实测两类之间的空档） */
+export const VEHICLE_SEGMENT_MIN_STRAIGHT = 0.85;
+
+export type NonSportKind = 'vehicle' | 'drift';
+
+export interface NonSportSegment {
+  kind: NonSportKind;
+  /** 段内各步弦长之和（米，与被剔除的 vehicleM 同口径） */
+  pathM: number;
+  /** 首末点直线净位移（米） */
+  netM: number;
+  /** 直线度 = netM / 标记点串起来的路径长（0~1，1 = 笔直） */
+  straight: number;
+  /** 段时长（秒） */
+  sec: number;
+  /** 段内步数 */
+  steps: number;
+}
+
+const tsNum = (p: TrackPointLike): number | null =>
+  typeof p.timestamp === 'number' && Number.isFinite(p.timestamp) ? p.timestamp : null;
+
+/** 相邻标记点间隔超过该秒数视为两个独立事件（不跨断档聚合，否则直线度会被长空窗污染） */
+const NON_SPORT_CLUSTER_GAP_SEC = 30;
+/** 两个标记点之间夹的未标记点数 ≥ 该值也算两个独立事件：
+ *  采样密（2~6s/点）时，夹着 5 个以上正常点说明中间人在正常走，不该并进同一段
+ *  （实测夹具：搭车段后步行 60s 再接漂移段，只按时间合并会把两类混成一段、直线度被拉低） */
+const NON_SPORT_CLUSTER_MAX_GAP_POINTS = 5;
+
 /**
- * 「约 X 公里疑似搭车，未计入」——整句由服务端拼好随活动下发（DTO 的 vehicleNotice），
- * 两端只渲染不自己拼：各拼一遍必然走偏（webAdmin 原先只画灰线没这句，小程序那句是本地算的）。
- * 只报距离：时长已经体现在「运动时长」比墙钟短这件事上，一句里摆两个数反而要解释谁是谁。
- * 段数不进句子（用户不关心分了几段），但仍参与判定：没有车速段就返回空串，客户端据此不渲染。
- * 单位固定公制：设置项里的「英制」目前没有任何渲染消费它，全站距离都按 km 显示。
+ * 把 vehicle 标记点聚成「事件段」，并按直线度归类为搭车 / 漂移。
+ * 纯几何分类：不改标记、不影响指标，只决定文案怎么说。
+ * 聚合口径：标记点在时间上间隔 ≤120s 归同一段（漂移的标记点之间常夹着正常点，
+ * 按「连续标记步」切会碎成单点段、测不出直线度）。
  */
+export function classifyNonSportSegments(points: TrackPointLike[] | undefined): NonSportSegment[] {
+  const pts = points ?? [];
+  const out: NonSportSegment[] = [];
+  type Acc = { first: TrackPointLike; last: TrackPointLike; pathM: number; chordM: number; sec: number; steps: number };
+  let cur: Acc | null = null;
+
+  const flush = () => {
+    if (!cur) return;
+    const netM = haversineDistance(cur.first, cur.last);
+    const straight = cur.steps >= 2 && cur.chordM > 0 ? netM / cur.chordM : 0;
+    const kind: NonSportKind =
+      straight >= VEHICLE_SEGMENT_MIN_STRAIGHT && netM >= VEHICLE_SEGMENT_MIN_NET_M && cur.sec >= VEHICLE_SEGMENT_MIN_SEC
+        ? 'vehicle'
+        : 'drift';
+    out.push({ kind, pathM: cur.pathM, netM, straight, sec: cur.sec, steps: cur.steps });
+    cur = null;
+  };
+
+  let lastMarkedIdx = -1;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    if (!b?.vehicle) continue;
+    const ta = tsNum(a);
+    const tb = tsNum(b);
+    const dt = ta != null && tb != null ? Math.max(0, (tb - ta) / 1000) : 0;
+    const stepM = haversineDistance(a, b);
+    // 与上一个标记点隔太久、或中间夹了太多正常点（或还没有段）→ 收尾重开
+    if (cur) {
+      const lastTs = tsNum(cur.last);
+      const gap = lastTs != null && tb != null ? (tb - lastTs) / 1000 : Infinity;
+      // i - lastIdx - 1 = 两个标记点之间的未标记点数
+      const gapPoints = i - lastMarkedIdx - 1;
+      if (!(gap <= NON_SPORT_CLUSTER_GAP_SEC) || gapPoints >= NON_SPORT_CLUSTER_MAX_GAP_POINTS) flush();
+    }
+    if (!cur) cur = { first: b, last: b, pathM: 0, chordM: 0, sec: 0, steps: 0 };
+    else cur.chordM += haversineDistance(cur.last, b);
+    cur.last = b;
+    cur.pathM += stepM;
+    cur.sec += dt;
+    cur.steps += 1;
+    lastMarkedIdx = i;
+  }
+  flush();
+  return out;
+}
+
 export function formatVehicleNotice(
   points: TrackPointLike[] | undefined,
-  vehicleMs: number | undefined,
-  vehicleM: number | undefined,
+  vehicleMs?: number,
+  vehicleM?: number,
 ): string {
-  if (countVehicleSpans(points) <= 0 || Math.round((vehicleMs ?? 0) / 1000) <= 0) {
-    return '';
+  // 脏数据保护：有标记但没量（时长 0），不编一句话出来
+  if (countVehicleSpans(points) <= 0 || Math.round((vehicleMs ?? 0) / 1000) <= 0) return '';
+
+  const segs = classifyNonSportSegments(points);
+  if (segs.length === 0) return '';
+
+  // 总量以**存储的 vehicleM** 为准（那是真被剔除的距离，与指标同口径）；
+  // 几何分类只决定这句话怎么拆开说。两者不一致时按比例分摊，不改变总距离。
+  const computedTotal = segs.reduce((sum, s) => sum + s.pathM, 0);
+  const totalM = (vehicleM ?? 0) > 0 ? (vehicleM as number) : computedTotal;
+  const carPathM = segs.filter((s) => s.kind === 'vehicle').reduce((sum, s) => sum + s.pathM, 0);
+  const driftPathM = segs.filter((s) => s.kind === 'drift').reduce((sum, s) => sum + s.pathM, 0);
+  const share = (part: number) => (computedTotal > 0 ? (totalM * part) / computedTotal : 0);
+  const carM = share(carPathM);
+  const driftM = share(driftPathM);
+
+  const km = (m: number) => (m / 1000).toFixed(2);
+  // 四舍五入到厘米后仍可能有一侧变 0（极短段）：只有真为 0 才省略该类
+  const carText = km(carM);
+  const driftText = km(driftM);
+  if (Number(carText) > 0 && Number(driftText) > 0) {
+    return `约 ${carText} 公里疑似搭车、${driftText} 公里疑似定位漂移，未计入`;
   }
-  return `约 ${((vehicleM ?? 0) / 1000).toFixed(2)} 公里疑似搭车，未计入`;
+  if (Number(carText) > 0) return `约 ${carText} 公里疑似搭车，未计入`;
+  return `约 ${driftText} 公里疑似定位漂移，未计入`;
 }

@@ -110,10 +110,11 @@ test('M6 骑行 60s 断档 800m（13.3m/s）：不标（gapSpeed 不配置 = 豁
   assert.equal(r.points[2].vehicle, undefined, '骑行断档跳变不应被标（下坡/巡航合法速度重叠）');
 });
 
-test('M7 dt=121s 巨步弦：无条件标（与新档上界不重叠不遗漏，回归）', () => {
-  const pts = buildTrack([walk, walk, { sec: 121, mps: 0.8, gapJump: true }, walk]);
+test('M7 dt=121s 巨步弦：弦速达闸门（3m/s）即标——与中档 120s 上界不遗漏（回归）', () => {
+  const pts = buildTrack([walk, walk, { sec: 121, mps: 3, gapJump: true }, walk]);
   const r = markVehicle(pts, 'walking');
-  assert.equal(r.points[3].vehicle, true, '>120s 巨步弦无条件标');
+  assert.equal(r.points[3].vehicle, true, '>120s 且弦速达闸门应标');
+  assert.ok(r.vehicleMs >= 121_000);
 });
 
 test('M8 pauseGap 恢复首点 + 60s 断档跳变：不标（暂停时长已由 pausedMs 扣过，防双扣）', () => {
@@ -250,8 +251,41 @@ test('M9 finish：含地铁段（60s/400m×3）的步行轨迹，距离/时长�
   const fixed = re.json().data.activity;
   assert.ok(fixed.vehicleM >= 1150, `vehicleM 应含 3×400m，实际 ${fixed.vehicleM}`);
   assert.ok(fixed.vehicleMs >= 175_000, `vehicleMs 应含 3×60s，实际 ${fixed.vehicleMs}`);
-  assert.match(fixed.vehicleNotice, /疑似搭车/);
+  assert.match(fixed.vehicleNotice, /疑似定位漂移/);
   assert.ok(fixed.duration > 600 && fixed.duration < 700, `纠偏后时长应为 840s 墙钟 - 180s 车程 ≈ 660s，实际 ${fixed.duration}s`);
+});
+
+test('M19 巨步弦位移闸门：212s 只移 3.9m（室内信号丢失原地）→ 不标 vehicle', () => {
+  // dev 库 6adef2dd 步行轨迹的真实误判形态：室内长时间丢点、人几乎原地，
+  // 旧规则只看 dt>120 就标 → 212s 时长被当乘车扣掉
+  const pts = buildTrack([
+    { sec: 5, mps: 1.4 },
+    { sec: 5, mps: 1.4 },
+    { sec: 212, mps: 3.9 / 212 }, // 0.02 m/s
+    { sec: 5, mps: 1.4 },
+  ]);
+  const r = markVehicle(pts, 'walking');
+  assert.equal(r.points[3].vehicle, undefined, '原地长空窗不得当乘车');
+  assert.equal(r.vehicleMs, 0, '不应扣任何时长');
+});
+
+test('M20 巨步弦位移闸门：126s 移 108m（0.86m/s 慢走）→ 不标；同时清掉旧规则残留标记', () => {
+  const slow = buildTrack([
+    { sec: 5, mps: 1.4 },
+    { sec: 126, mps: 108 / 126 },
+    { sec: 5, mps: 1.4 },
+  ]);
+  // 模拟旧规则/旧版端上已标的错误 vehicle（双向权威要能清除）
+  (slow[2] as { vehicle?: boolean }).vehicle = true;
+  const r = markVehicle(slow, 'walking');
+  assert.equal(r.points[2].vehicle, undefined, '慢速长空窗应清除已有标记');
+  assert.equal(r.vehicleMs, 0, '清除后不再扣时长');
+
+  // 真隧道回归：300s / 3000m = 10m/s 仍必须标
+  const tunnel = buildTrack([{ sec: 300, mps: 10 }]);
+  const t = markVehicle(tunnel, 'walking');
+  assert.equal(t.points[1].vehicle, true, '真被运载的长断档仍要标');
+  assert.ok(t.vehicleMs >= 300_000);
 });
 
 // ── M18 老版本客户端兼容：无 gapTighten/无 vehicle 标记 + clientDistance 全量虚高 ──
