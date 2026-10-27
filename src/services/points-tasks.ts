@@ -27,6 +27,10 @@ export interface TaskRow {
   points: number;
   status: TaskStatus;
   actionText: string;
+  /** 每日可领次数（多数任务为 1，看视频 3） */
+  times: number;
+  /** 今天还剩几次（已领满为 0） */
+  timesLeft: number;
 }
 
 export interface ClaimResult {
@@ -44,6 +48,22 @@ function isDuplicateKey(e: unknown): boolean {
 /** once 任务全生命周期一个周期；daily 任务以东八区日期串为周期 */
 function periodKeyFor(key: TaskKey, todayKey: string): string {
   return POINT_TASKS[key].period === 'once' ? 'once' : todayKey;
+}
+
+/** 每天可领几次：多领的任务把次数写在任务定义上（看视频 3 次），没写就是 1 */
+function dailyTimesOf(key: TaskKey): number {
+  const times = (POINT_TASKS[key] as { dailyTimes?: number }).dailyTimes;
+  return times && times > 0 ? times : 1;
+}
+
+/** 一天里第 n 次的周期键；单次任务仍用纯日期（与历史行、once 行为保持一致） */
+function slotKeyFor(todayKey: string, times: number, n: number): string {
+  return times > 1 ? `${todayKey}#${n}` : todayKey;
+}
+
+/** 今天已领几次：改版前留下的「periodKey = 纯日期」行也要算一次，不能让人当天多领 */
+function claimedToday(rows: { taskKey: string; periodKey: string }[], key: TaskKey, todayKey: string): number {
+  return rows.filter((r) => r.taskKey === key && (r.periodKey === todayKey || r.periodKey.startsWith(`${todayKey}#`))).length;
 }
 
 async function conditionMet(userId: string, key: TaskKey, now: number): Promise<boolean> {
@@ -85,14 +105,21 @@ export async function getTaskRows(userId: string, now: number = Date.now()): Pro
 
   return Promise.all((Object.keys(POINT_TASKS) as TaskKey[]).map(async (key): Promise<TaskRow> => {
     const def = POINT_TASKS[key];
-    if (claimed.has(`${key}:${periodKeyFor(key, todayKey)}`)) {
-      return { key, title: def.title, points: def.points, status: 'claimed', actionText: '已领取' };
+    const times = dailyTimesOf(key);
+    const used = def.period === 'once' ? 0 : claimedToday(rows, key, todayKey);
+    const timesLeft = Math.max(0, times - used);
+    const base = { times, timesLeft };
+    // 一次性的（once/单次每日）按「该周期行是否存在」判；多领任务看今天还剩几次
+    const exhausted = timesLeft === 0 || (times === 1 && claimed.has(`${key}:${periodKeyFor(key, todayKey)}`));
+    if (exhausted) {
+      return { key, title: def.title, points: def.points, ...base, timesLeft: 0, status: 'claimed', actionText: '已领取' };
     }
     const ok = await conditionMet(userId, key, now);
     return {
       key,
       title: def.title,
       points: def.points,
+      ...base,
       status: ok ? 'claimable' : 'locked',
       actionText: ok ? (key === 'daily_video' ? '去观看' : '领取') : (key === 'daily_activity' ? '去运动' : '未完成'),
     };
@@ -106,19 +133,43 @@ export async function claimTask(userId: string, taskKey: string, now: number = D
   // 先校验条件再占行：条件不满足时不能在任务表留下 claimed 行
   if (!(await conditionMet(userId, key, now))) throw new AppError(400, '任务条件未完成');
 
-  const periodKey = periodKeyFor(key, bjDateStr(now));
-  // 唯一键 (userId, taskKey, periodKey) 先占位：并发/重复领取只有一次能继续发分
-  const row = await PointTaskModel.create({
+  const todayKey = bjDateStr(now);
+  const times = dailyTimesOf(key);
+  const slotKeys = def.period === 'once'
+    ? [periodKeyFor(key, todayKey)]
+    : Array.from({ length: times }, (_, i) => slotKeyFor(todayKey, times, i + 1));
+  // 已占的槽（含改版前留下的纯日期行）：次数用完就走幂等返回，不占行也不再发分
+  const occupied = new Set((await PointTaskModel.find({
     userId,
     taskKey: key,
-    periodKey,
-    status: 'claimed',
-    points: def.points,
-    claimedAt: now,
-  }).catch((e: unknown) => {
-    if (isDuplicateKey(e)) return null;
-    throw e;
-  });
+    periodKey: times > 1 ? { $in: [todayKey, ...slotKeys] } : { $in: slotKeys },
+  }).select({ periodKey: 1 }).lean()).map((r) => r.periodKey));
+  const usedToday = times > 1 ? occupied.size : (occupied.has(slotKeys[0]) ? 1 : 0);
+  if (usedToday >= times) return { alreadyClaimed: true, credited: 0 };
+
+  // 唯一键 (userId, taskKey, periodKey) 逐槽占位：并发/重复领取只有一次能继续发分，
+  // 被并发抢走的槽跳过、继续试下一个，不会把这次机会吞掉
+  let row: { _id: unknown } | null = null;
+  let periodKey = slotKeys[0];
+  for (const slotKey of slotKeys) {
+    if (occupied.has(slotKey)) continue;
+    const created = await PointTaskModel.create({
+      userId,
+      taskKey: key,
+      periodKey: slotKey,
+      status: 'claimed',
+      points: def.points,
+      claimedAt: now,
+    }).catch((e: unknown) => {
+      if (isDuplicateKey(e)) return null;
+      throw e;
+    });
+    if (created) {
+      row = created;
+      periodKey = slotKey;
+      break;
+    }
+  }
   if (!row) return { alreadyClaimed: true, credited: 0 };
 
   let credited: number;

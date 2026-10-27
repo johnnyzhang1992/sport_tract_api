@@ -158,26 +158,61 @@ test('PT3 每日运动 +1：当天 finished 轨迹才可领，次日不可领', 
   assert.equal(await PointTaskModel.countDocuments({ userId: uid, taskKey: 'daily_activity' }), 1);
 });
 
-test('PT4 视频任务每日一次：领取后再次返回已领取', async (t) => {
+test('PT4 视频任务每日三次：前三次各发 5 分、第四次幂等、次日重置', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
   await makeUser(uid);
 
-  const first = await claimTask(String(uid), 'daily_video', NOW);
-  assert.deepEqual(first, { alreadyClaimed: false, credited: 5 });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  // 第四次：当天机会用完，和「重复领取」同样走幂等返回，不再发分
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: true, credited: 0 });
 
-  const again = await claimTask(String(uid), 'daily_video', NOW);
-  assert.deepEqual(again, { alreadyClaimed: true, credited: 0 });
+  // 三次各占一个槽：periodKey = 今天#1..#3，唯一键 (userId,taskKey,periodKey) 逐槽幂等
+  const slots = (await PointTaskModel.find({ userId: uid, taskKey: 'daily_video' }).lean())
+    .map((r) => r.periodKey).sort();
+  assert.deepEqual(slots, [1, 2, 3].map((n) => `${bjDateStr(NOW)}#${n}`));
+  assert.equal(await PointTaskModel.countDocuments({ userId: uid, taskKey: 'daily_video' }), 3);
+  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 15);
 
-  assert.equal(await PointTaskModel.countDocuments({ userId: uid, taskKey: 'daily_video' }), 1);
-  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 5);
+  const video = row(await getTaskRows(String(uid), NOW), 'daily_video');
+  assert.equal(video.status, 'claimed');
+  assert.equal(video.actionText, '已领取');
+  assert.equal(video.times, 3);
+  assert.equal(video.timesLeft, 0);
 
-  const rows = await getTaskRows(String(uid), NOW);
-  assert.equal(row(rows, 'daily_video').status, 'claimed');
+  // 次日重置为 3 次
+  const tomorrow = row(await getTaskRows(String(uid), NOW + DAY), 'daily_video');
+  assert.equal(tomorrow.status, 'claimable');
+  assert.equal(tomorrow.times, 3);
+  assert.equal(tomorrow.timesLeft, 3);
+  assert.equal(tomorrow.actionText, '去观看');
+});
 
-  // 次日重置为可领（每日一次）
-  const tomorrowRows = await getTaskRows(String(uid), NOW + DAY);
-  assert.equal(row(tomorrowRows, 'daily_video').status, 'claimable');
+test('PT4b 视频任务中间次数可见；老口径的行（periodKey 无 #n）也算用掉一次', async (t) => {
+  const uid = newUser();
+  t.after(() => wipe(uid));
+  await makeUser(uid);
+
+  // 改版前留下的今天行（periodKey = 纯日期）：当作第 1 次已用，不能让人当天多出一次
+  await PointTaskModel.create({
+    userId: uid, taskKey: 'daily_video', periodKey: bjDateStr(NOW),
+    status: 'claimed', points: 5, claimedAt: NOW,
+  });
+  const legacy = row(await getTaskRows(String(uid), NOW), 'daily_video');
+  assert.equal(legacy.status, 'claimable');
+  assert.equal(legacy.timesLeft, 2);
+
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  const mid = row(await getTaskRows(String(uid), NOW), 'daily_video');
+  assert.equal(mid.status, 'claimable', '还剩一次，不能提前显示已领取');
+  assert.equal(mid.timesLeft, 1);
+  assert.equal(mid.actionText, '去观看');
+
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  assert.equal(row(await getTaskRows(String(uid), NOW), 'daily_video').status, 'claimed');
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: true, credited: 0 });
 });
 
 test('PT5 每日上限：领取未入账不留任务行，次日可重试', async (t) => {

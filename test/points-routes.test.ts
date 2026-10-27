@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { buildApp } from '../src/app.js';
 import {
-  PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointLotModel, PointRecordModel,
+  PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointItemModel, PointLotModel, PointRecordModel,
   PointSigninModel, PointTaskModel,
 } from '../src/models/point.model.js';
 import { UserModel } from '../src/models/user.model.js';
@@ -30,6 +30,16 @@ const DAY = 86400000;
 const TODAY = bjDateStr(Date.now());
 const YESTERDAY = previousDateKey(TODAY);
 const DAY_BEFORE = previousDateKey(YESTERDAY);
+
+/**
+ * 目录是后台可增删的共享表：断「下发集合 == 库内在架集合」而不锁条数，
+ * 后台多上一件在架商品不该打挂全链路；反向（在架项漏发）与「下架项混进来」
+ * 都由集合相等抓住——后者靠库里恒有的三条 active:false 种子当对照。
+ */
+const activeCatalogKeys = async (): Promise<string[]> => (
+  (await PointItemModel.find({ active: true }).select({ key: 1 }).lean())
+    .map((i) => String(i.key)).sort()
+);
 
 interface SigninCell {
   dateKey: string;
@@ -190,6 +200,8 @@ after(async () => {
 });
 
 test('PR1 未登录访问 /points/* 全部 401', async () => {
+  // 清单 = points.routes.ts 里注册的全部用户侧路由（实物批次加了 orders 两条），
+  // 少一条就是那条没挂 authenticate —— 新增路由必须同步进这张表
   const cases = [
     ['GET', '/points/summary'],
     ['POST', '/points/sign-in'],
@@ -197,10 +209,13 @@ test('PR1 未登录访问 /points/* 全部 401', async () => {
     ['POST', '/points/tasks/daily_video/claim'],
     ['GET', '/points/items'],
     ['POST', '/points/items/makeup_card/exchange'],
+    ['GET', '/points/orders'],
+    ['POST', '/points/orders/000000000000000000000000/confirm'],
     ['POST', '/points/signin/makeup'],
     ['POST', '/points/cards/000000000000000000000000/activate'],
     ['GET', '/points/exchanges'],
   ] as const;
+  assert.equal(cases.length, 11, '用户侧 /points 路由共 11 条，漏一条就是漏一道登录闸门');
   for (const [method, url] of cases) {
     const res = await app.inject({ method, url: `${API}${url}` });
     assert.equal(res.statusCode, 401, `${method} ${url} 游客应 401`);
@@ -235,8 +250,11 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
   // 目录驱动后仍只下发在架项：三条 ad_free_* 种子 active:false，老端商品区不该多出点不动的卡
-  assert.equal(s0.items.length, 1, 'summary 下发整张商品表（只含在架项），积分页按它渲染商品卡');
-  assert.equal(s0.items[0].key, 'makeup_card');
+  assert.deepEqual(
+    s0.items.map((i) => i.key).sort(), await activeCatalogKeys(),
+    'summary 下发整张在架目录，积分页按它渲染商品卡',
+  );
+  assert.equal(s0.items[0].key, 'makeup_card', 'sortOrder 排第一的补签卡必须在首位（老端读 items[0]）');
   assert.equal(s0.items[0].price, POINTS.MAKEUP_CARD_PRICE);
   // 新 DTO 字段（spec §7.3）：notes/effect/imageUrl 必须随列表下发
   assert.deepEqual(s0.items[0].effect, { kind: 'makeup', days: 0 }, '补签卡 effect 快照');
@@ -253,7 +271,7 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
 
   // 3) 商品列表（/items 与 summary.items 同一路口径：目录在架项 + notes/effect/imageUrl）
   const items = data<ItemRow[]>(await get('/points/items'));
-  assert.equal(items.length, 1);
+  assert.deepEqual(items.map((i) => i.key).sort(), await activeCatalogKeys(), '/points/items 与 summary.items 同一在架口径');
   assert.equal(items[0].key, 'makeup_card');
   assert.equal(items[0].price, 200);
   assert.equal(items[0].validDays, POINTS.MAKEUP_CARD_VALID_DAYS);
@@ -344,20 +362,21 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(again.credited, 0);
   assert.equal(again.balance, 7);
 
-  // 10) 领取每日任务（看广告视频 5 分），重复领取幂等
-  const claim = await post('/points/tasks/daily_video/claim');
-  assert.equal(claim.statusCode, 200, claim.body);
-  const claimData = data<{ alreadyClaimed: boolean; credited: number }>(claim);
-  assert.equal(claimData.alreadyClaimed, false);
-  assert.equal(claimData.credited, POINTS.VIDEO_REWARD);
-
+  // 10) 领取每日任务（看广告视频，每天三次机会 × 5 分）：前三次各发一次，第四次幂等
+  for (let i = 1; i <= 3; i += 1) {
+    const claim = await post('/points/tasks/daily_video/claim');
+    assert.equal(claim.statusCode, 200, claim.body);
+    const claimData = data<{ alreadyClaimed: boolean; credited: number }>(claim);
+    assert.equal(claimData.alreadyClaimed, false, `第 ${i} 次应当真发分`);
+    assert.equal(claimData.credited, POINTS.VIDEO_REWARD);
+  }
   const claimAgain = data<{ alreadyClaimed: boolean; credited: number }>(await post('/points/tasks/daily_video/claim'));
-  assert.equal(claimAgain.alreadyClaimed, true);
+  assert.equal(claimAgain.alreadyClaimed, true, '当天三次用完后走幂等返回');
   assert.equal(claimAgain.credited, 0);
 
-  // 11) 收尾 summary：余额 12（-200 +3 +4 +5）、卡已用掉、任务状态已领取
+  // 11) 收尾 summary：余额 22（-200 +3 +4 +15，视频三次各 5）、卡已用掉、任务状态已领取
   const s3 = data<Summary>(await get('/points/summary'));
-  assert.equal(s3.balance, 12);
+  assert.equal(s3.balance, 22);
   assert.equal(s3.signin.todaySigned, true);
   assert.equal(s3.signin.streakDay, 4);
   assert.equal(s3.signin.todayReward, 4);
@@ -373,23 +392,23 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(video?.status, 'claimed');
   assert.equal(video?.actionText, '已领取');
 
-  // 12) 明细分页：6 条（2 条种子发放、兑换、补签、签到、任务），余额与 summary 一致
+  // 12) 明细分页：8 条（2 条种子发放、兑换、补签、签到、视频任务三次），余额与 summary 一致
   const p1 = data<RecordPage>(await get('/points/records?page=1&pageSize=2'));
-  assert.equal(p1.total, 6);
+  assert.equal(p1.total, 8);
   assert.equal(p1.items.length, 2);
-  assert.equal(p1.balance, 12);
-  assert.deepEqual(p1.items.map((i) => i.type), ['task_daily_video', 'signin'], '按时间倒序');
+  assert.equal(p1.balance, 22);
+  assert.deepEqual(p1.items.map((i) => i.type), ['task_daily_video', 'task_daily_video'], '按时间倒序');
   assert.equal(p1.items[0].delta, 5);
-  assert.equal(p1.items[0].balanceAfter, 12);
+  assert.equal(p1.items[0].balanceAfter, 22);
 
-  const p3 = data<RecordPage>(await get('/points/records?page=3&pageSize=2'));
+  const p3 = data<RecordPage>(await get('/points/records?page=4&pageSize=2'));
   assert.equal(p3.items.length, 2);
   assert.deepEqual(p3.items.map((i) => i.type), ['seed', 'seed']);
 
   // 非法分页参数回落默认值，pageSize 上限 50
   const clamped = data<RecordPage>(await get('/points/records?page=0&pageSize=999'));
-  assert.equal(clamped.items.length, 6);
-  assert.equal(clamped.total, 6);
+  assert.equal(clamped.items.length, 8);
+  assert.equal(clamped.total, 8);
 });
 
 /** 账本不变式：Σ record.delta === account.balance === Σ 未过期 lot.remaining */
