@@ -60,8 +60,15 @@ const cardSchema = new Schema({
   expiresAt: { type: Number, required: true },
   usedForDate: { type: String, default: '' },
   createdAt: { type: Number, required: true },
+  source: { type: String, enum: ['exchange', 'admin', 'system'], default: 'exchange' },
+  grantedBy: { type: String, default: '' },
+  note: { type: String, default: '' },
+  activatedAt: { type: Number, default: 0 },
+  benefitDays: { type: Number, default: 0 },
 }, { versionKey: false });
 cardSchema.index({ userId: 1, status: 1, expiresAt: 1 });
+// 导出免广告名单：按道具 + 已激活扫全表，避免 {status,benefitDays} 组合走错索引
+cardSchema.index({ itemKey: 1, status: 1, activatedAt: 1 });
 
 const exchangeSchema = new Schema({
   userId: { type: Schema.Types.ObjectId, required: true },
@@ -81,6 +88,29 @@ const dailySchema = new Schema({
 }, { versionKey: false });
 dailySchema.index({ userId: 1, bizDate: 1 }, { unique: true });
 
+/**
+ * 道具目录：一条 = 一种可兑换/可发放的道具。
+ * 价格与有效期以前写死在 points-items.ts + config/points.ts，落库后那两个常量退化为种子值。
+ */
+const itemSchema = new Schema({
+  key: { type: String, required: true, unique: true },
+  name: { type: String, required: true },
+  subtitle: { type: String, default: '' },
+  description: { type: String, default: '' },
+  notes: { type: [String], default: [] },
+  price: { type: Number, required: true, min: 1 },
+  validDays: { type: Number, required: true, min: 1 },
+  effect: {
+    kind: { type: String, enum: ['makeup', 'ad_free'], required: true },
+    days: { type: Number, default: 0, min: 0 },
+  },
+  stock: { type: Number, default: 9999, min: 0 },
+  unlimited: { type: Boolean, default: false },
+  active: { type: Boolean, default: true },
+  sortOrder: { type: Number, default: 0 },
+  image: { type: String, default: '' },
+}, { timestamps: true, versionKey: false });
+
 export const PointAccountModel = models.PointAccount ?? model('PointAccount', accountSchema);
 export const PointRecordModel = models.PointRecord ?? model('PointRecord', recordSchema);
 export const PointLotModel = models.PointLot ?? model('PointLot', lotSchema);
@@ -89,3 +119,4 @@ export const PointTaskModel = models.PointTask ?? model('PointTask', taskSchema)
 export const PointCardModel = models.PointCard ?? model('PointCard', cardSchema);
 export const PointExchangeModel = models.PointExchange ?? model('PointExchange', exchangeSchema);
 export const PointDailyModel = models.PointDaily ?? model('PointDaily', dailySchema);
+export const PointItemModel = models.PointItem ?? model('PointItem', itemSchema);

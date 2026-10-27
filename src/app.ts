@@ -21,6 +21,7 @@ import { pointsRoutes } from './routes/points.routes.js';
 import { footprintRecordRoutes } from './routes/footprint-record.routes.js';
 import { adminRoutes } from './routes/admin.routes.js';
 import { AdminModel, hashPassword } from './models/admin.model.js';
+import { seedPointItems } from './services/points-catalog.js';
 
 export interface BuildAppOptions {
   /** 日志开关（测试传 false；默认 dev 用 pino-pretty，prod 用 JSON） */
@@ -102,6 +103,9 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
       });
       fastify.log.info(`初始管理员已创建: ${config.adminUsername}`);
     }
+    // 道具目录种子：$setOnInsert，重跑不覆盖后台改动
+    const seeded = await seedPointItems();
+    fastify.log.info(`道具目录已就绪：${seeded} 条`);
   });
 
   // 健康检查（含 MongoDB 状态）
