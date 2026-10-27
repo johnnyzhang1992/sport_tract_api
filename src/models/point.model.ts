@@ -80,6 +80,41 @@ const exchangeSchema = new Schema({
 }, { versionKey: false });
 exchangeSchema.index({ userId: 1, requestId: 1 }, { unique: true });
 
+/**
+ * 实物订单状态机：pending_ship → shipped → completed（无取消/退分）。
+ * 文案与顺序只写这一份，service 的 ORDER_STATUS 也从这里再导出，避免两处各写一张表。
+ */
+export const ORDER_STATUS = ['pending_ship', 'shipped', 'completed'] as const;
+export type OrderStatus = typeof ORDER_STATUS[number];
+
+/**
+ * 实物兑换订单：虚拟道具不会写这张表（兑换只发 PointCard）。
+ * itemName / cost / address 都是下单快照（后台改目录名/价格、用户改默认地址都不追认）。
+ * (userId, requestId) 唯一：与虚拟兑换共用同一个客户端幂等键空间，并发同键只落一张。
+ */
+const orderSchema = new Schema({
+  userId: { type: Schema.Types.ObjectId, required: true, index: true },
+  itemKey: { type: String, required: true },
+  itemName: { type: String, required: true },
+  cost: { type: Number, required: true },
+  address: {
+    receiver: { type: String, required: true },
+    phone: { type: String, required: true },
+    detail: { type: String, required: true },
+  },
+  status: { type: String, enum: ORDER_STATUS, default: 'pending_ship' },
+  trackingNo: { type: String, default: '' },
+  trackingCompany: { type: String, default: '' },
+  shippedAt: { type: Number, default: 0 },
+  shippedBy: { type: String, default: '' },
+  completedAt: { type: Number, default: 0 },
+  requestId: { type: String, required: true },
+  createdAt: { type: Number, required: true },
+  updatedAt: { type: Number, required: true },
+}, { versionKey: false });
+orderSchema.index({ userId: 1, requestId: 1 }, { unique: true });
+orderSchema.index({ status: 1, createdAt: -1 });
+
 /** 每日已入账计数器：DAILY_CAP 的原子闸门（$inc 预占 + 超限退回），替代聚合 check-then-act */
 const dailySchema = new Schema({
   userId: { type: Schema.Types.ObjectId, required: true },
@@ -139,5 +174,6 @@ export const PointSigninModel = models.PointSignin ?? model('PointSignin', signi
 export const PointTaskModel = models.PointTask ?? model('PointTask', taskSchema);
 export const PointCardModel = models.PointCard ?? model('PointCard', cardSchema);
 export const PointExchangeModel = models.PointExchange ?? model('PointExchange', exchangeSchema);
+export const PointOrderModel = models.PointOrder ?? model('PointOrder', orderSchema);
 export const PointDailyModel = models.PointDaily ?? model('PointDaily', dailySchema);
 export const PointItemModel = models.PointItem ?? model('PointItem', itemSchema);

@@ -3,6 +3,7 @@ import { getBalance, listPointRecords, settleExpired } from '../services/points-
 import { getSigninState, signIn, useMakeupCard } from '../services/points-signin.js';
 import { getTaskRows, claimTask } from '../services/points-tasks.js';
 import { listActiveItems, exchangeItem, listExchanges } from '../services/points-items.js';
+import { confirmReceipt, listMyOrders } from '../services/points-orders.js';
 import { activateCard, adFreeUntilOf, countUnusedCards } from '../services/points-cards.js';
 import { success } from '../utils/response.js';
 
@@ -68,12 +69,25 @@ export async function pointsRoutes(fastify: FastifyInstance) {
   fastify.get('/items', { onRequest: [fastify.authenticate] }, async () =>
     success(await listActiveItems()));
 
-  // 兑换：requestId 由客户端生成，同一 requestId 连点只扣一次分、只发一张卡、只扣一次库存
+  // 兑换：requestId 由客户端生成，同一 requestId 连点只扣一次分、只发一张卡/一张订单、只扣一次库存
   // 路径泛化为 /items/:itemKey/exchange：/items/makeup_card/exchange 是它的实例，老客户端不用改
+  // 实物道具必须带 address（服务层校验；虚拟道具忽略它）
   fastify.post('/items/:itemKey/exchange', { onRequest: [fastify.authenticate] }, async (request) => {
     const { itemKey } = request.params as { itemKey: string };
-    const { requestId } = (request.body ?? {}) as { requestId?: string };
-    return success(await exchangeItem(request.user.userId, itemKey, String(requestId || '')));
+    const { requestId, address } = (request.body ?? {}) as { requestId?: string; address?: unknown };
+    return success(await exchangeItem(
+      request.user.userId, itemKey, String(requestId || ''), Date.now(), address,
+    ));
+  });
+
+  // 我的实物订单（只含本人，按下单时间倒序）
+  fastify.get('/orders', { onRequest: [fastify.authenticate] }, async (request) =>
+    success(await listMyOrders(request.user.userId)));
+
+  // 确认收货：只能 shipped → completed（状态不对 400、非本人/不存在 404）
+  fastify.post('/orders/:id/confirm', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await confirmReceipt(request.user.userId, id));
   });
 
   // 补签窗口内的某一天（spec §5.2）：只传 dateKey，哪张卡由服务端挑（旧 /cards/:id/use 已撤）
