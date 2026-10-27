@@ -55,7 +55,11 @@ export interface ExchangeResult {
 const DAY_MS = 86400000;
 const DUPLICATE_KEY = 11000;
 
-const STATUS_TEXT: Record<CardStatus, string> = {
+/**
+ * 卡状态文案：兑换记录与管理端发放记录共用这一份（Task 5 的 listIssuances 引用它，
+ * 别再抄第二张表——两边文案不一致用户在同一个后台里会看到两种说法）。
+ */
+export const STATUS_TEXT: Record<CardStatus, string> = {
   unused: '未使用',
   used: '已使用',
   expired: '已过期',
@@ -70,8 +74,8 @@ function isInsufficientBalance(e: unknown): boolean {
   return e instanceof AppError && e.statusCode === 400 && e.message.startsWith('积分不足');
 }
 
-/** 卡状态：used/expired 以落库为准；unused 但已过有效期按过期展示 */
-function cardStatus(card: { status?: string; expiresAt?: number }, now: number): CardStatus {
+/** 卡状态：used/expired 以落库为准；unused 但已过有效期按过期展示（管理端发放记录同样引用，不另写一份） */
+export function cardStatus(card: { status?: string; expiresAt?: number }, now: number): CardStatus {
   if (card.status === 'used') return 'used';
   if (card.status === 'expired') return 'expired';
   return (card.expiresAt ?? 0) <= now ? 'expired' : 'unused';

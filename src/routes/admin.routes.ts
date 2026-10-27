@@ -45,6 +45,11 @@ import {
   setItemStock,
   type ItemInput,
 } from '../services/points-catalog-admin.js';
+import {
+  grantItem,
+  listIssuances,
+  type GrantInput,
+} from '../services/points-grant.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { backfillVehicle } from '../services/vehicle-backfill.js';
 import { backfillDriftScore } from '../services/drift-score-backfill.js';
@@ -128,8 +133,7 @@ function toHourBuckets(rows: Array<{ _id: number; count: number }>) {
 
 /** admin token 校验 */
 async function adminAuth(request: FastifyRequest, reply: FastifyReply) {
-  const auth = request.headers.authorization ?? '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const token = adminTokenOf(request);
   if (!token) throw new AppError(401, '缺少管理员凭证');
   try {
     const payload = jsonwebtoken.verify(token, config.adminJwtSecret) as { role?: string; id?: string };
@@ -138,6 +142,26 @@ async function adminAuth(request: FastifyRequest, reply: FastifyReply) {
     if (e instanceof AppError) throw e;
     throw new AppError(401, '管理员凭证无效或已过期');
   }
+}
+
+/** 从 authorization 头剥出裸 token（adminAuth 与取管理员身份两处共用同一口径） */
+function adminTokenOf(request: FastifyRequest): string {
+  const auth = request.headers.authorization ?? '';
+  return auth.startsWith('Bearer ') ? auth.slice(7) : '';
+}
+
+/**
+ * 当前管理员身份（发放留痕用的 grantedBy）。
+ * adminAuth 只验签、不往 request 挂任何东西（也没有 request.admin / request.username），
+ * 而 /login 签发的 payload 就是 { role, id, username }——所以在这枚已经过闸的 token 里取 id，
+ * 与 PUT /password 取管理员同一口径。username 只作为缺 id 的历史 token 兜底。
+ * 路由的 onRequest 已先跑过 adminAuth，这里再验一次不会把无效凭证放到写库之后。
+ */
+function adminIdOf(request: FastifyRequest): string {
+  const payload = jsonwebtoken.verify(adminTokenOf(request), config.adminJwtSecret) as {
+    id?: string; username?: string;
+  };
+  return String(payload.id ?? payload.username ?? '');
 }
 
 export async function adminRoutes(fastify: FastifyInstance) {
@@ -1550,6 +1574,32 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const key = `${config.oss.baseDir}/items/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     const url = await uploadBuffer(buf, key, file.mimetype || 'image/png');
     return success({ url, previewUrl: getSignedUrl(url) });
+  });
+
+  // ==================== 积分管理 · 道具发放与发放记录 ====================
+  // 口径见 spec §6.1/§6.4：三来源（exchange 由用户端兑换写入，admin/system 由下面这条 grant 写入），
+  // 发放不动积分账本、但照样扣库存（白送也算出货）。
+
+  // 后台发放：userIds 是名单、count 是每个用户几张，source 只接受 admin / system
+  // 整单库存闸门不足 400，单个用户不存在跳过并记进 failed[]，末尾回补多占的库存
+  fastify.post('/points/items/:id/grant', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    assertObjectIdLike(id, '道具不存在');
+    const b = (request.body ?? {}) as GrantInput;
+    return success(await grantItem(id, b, adminIdOf(request)));
+  });
+
+  // 发放记录：以卡为主体，可按道具/来源/用户筛，老行物理缺 source 的按 exchange 归类。
+  // query 全是字符串，page/pageSize 在这层就转成数字交给 service（别让 service 猜入参形态）
+  fastify.get('/points/issuances', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { itemKey?: string; source?: string; userId?: string; page?: string; pageSize?: string };
+    return success(await listIssuances({
+      itemKey: q.itemKey,
+      source: q.source,
+      userId: q.userId,
+      page: Math.max(1, Number(q.page) || 1),
+      pageSize: Number(q.pageSize) || 20,
+    }));
   });
 }
 
