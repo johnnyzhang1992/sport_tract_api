@@ -41,11 +41,13 @@ export async function pointsRoutes(fastify: FastifyInstance) {
 
   // 积分明细（分页；pageSize 上限由 service 统一收紧到 50）
   fastify.get('/records', { onRequest: [fastify.authenticate] }, async (request) => {
-    const q = request.query as { page?: string; pageSize?: string };
+    const q = request.query as { page?: string; pageSize?: string; type?: string };
     return success(await listPointRecords(
       request.user.userId,
       Math.max(1, Number(q.page) || 1),
       Math.min(50, Number(q.pageSize) || 20),
+      Date.now(),
+      q.type ? String(q.type) : undefined,
     ));
   });
 

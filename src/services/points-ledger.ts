@@ -332,18 +332,23 @@ export async function listPointRecords(
   page = 1,
   pageSize = 20,
   now = Date.now(),
+  /** 明细类型筛选（如 'exchange' = 兑换记录）；不传 = 全部 */
+  type?: string,
 ): Promise<{ items: PointRecordDto[]; total: number; balance: number }> {
   await settleExpired(userId, now);
 
   const safePage = Math.max(1, Math.trunc(page) || 1);
   const safeSize = Math.min(50, Math.max(1, Math.trunc(pageSize) || 20));
+  // 类型筛选（2026-10-26）：积分明细页「兑换记录」入口按 type=exchange 过滤
+  const filter: Record<string, unknown> = { userId };
+  if (type) filter.type = type;
   const [rows, total, account] = await Promise.all([
-    PointRecordModel.find({ userId })
+    PointRecordModel.find(filter)
       .sort({ createdAt: -1, _id: -1 })
       .skip((safePage - 1) * safeSize)
       .limit(safeSize)
       .lean(),
-    PointRecordModel.countDocuments({ userId }),
+    PointRecordModel.countDocuments(filter),
     PointAccountModel.findOne({ userId }).select({ balance: 1 }).lean(),
   ]);
 

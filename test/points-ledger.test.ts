@@ -110,6 +110,19 @@ test('PL5 明细按时间倒序且带余额', async () => {
   assert.equal(agg.sum, r.balance);
 });
 
+test('PL5b 明细类型筛选：type=exchange 只返回兑换记录（兑换记录入口）', async () => {
+  const r = await listPointRecords(userId, 1, 20, NOW, 'exchange');
+  assert.ok(r.items.length >= 1, '主用户应有兑换记录');
+  assert.ok(r.items.every((it) => it.type === 'exchange'), '筛选后必须全是 exchange');
+  // 全量对照：确实混有非 exchange 类型，说明筛选真的生效
+  const all = await listPointRecords(userId, 1, 20, NOW);
+  assert.ok(all.items.some((it) => it.type !== 'exchange'));
+  // 不存在的类型：返回空但不报错
+  const none = await listPointRecords(userId, 1, 20, NOW, 'no_such_type');
+  assert.equal(none.items.length, 0);
+  assert.equal(none.total, 0);
+});
+
 test('PL6 扣减幂等：同 idemKey 只扣一次，重放返回同一条明细', async () => {
   const input = { type: 'exchange', title: '兑换', points: 3, bizDate: '2026-10-24', idemKey: key('ex:replay') };
   const first = await debitPoints(userId, input, NOW);
