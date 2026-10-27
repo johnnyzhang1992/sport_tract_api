@@ -77,6 +77,9 @@ interface Summary {
   signin: SigninState;
   tasks: TaskRow[];
   items: ItemRow[];
+  // Task 3 新增（spec §7.3）：免广告到期时刻（0=从未激活）与按道具分组的持卡数
+  adFreeUntil: number;
+  cards: { itemKey: string; unused: number }[];
 }
 
 interface RecordPage {
@@ -195,6 +198,7 @@ test('PR1 未登录访问 /points/* 全部 401', async () => {
     ['GET', '/points/items'],
     ['POST', '/points/items/makeup_card/exchange'],
     ['POST', '/points/signin/makeup'],
+    ['POST', '/points/cards/000000000000000000000000/activate'],
     ['GET', '/points/exchanges'],
   ] as const;
   for (const [method, url] of cases) {
@@ -207,6 +211,9 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   // 1) 新用户空态：无余额、未签到、无卡；任务全量下发且都未领取
   const s0 = data<Summary>(await get('/points/summary'));
   assert.equal(s0.balance, 0);
+  // Task 3：新用户在 summary 上也必须看到两个新字段（0 与空数组是「从未激活/无卡」的显式口径，不许缺省）
+  assert.equal(s0.adFreeUntil, 0, '空态 adFreeUntil=0（0=从未激活）');
+  assert.deepEqual(s0.cards, [], '空态持卡数组为空');
   assert.equal(s0.signin.todaySigned, false);
   // streakDay 只报接得上的那条链（spec §5.1 / Ruling 2026-10-25）：今天没签、昨天也没签 → 0。
   // 窗口里前天的行（库存 2）是「上一段链的长度」，不能当「现在连了几天」报出去。
@@ -271,6 +278,9 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   const s2 = data<Summary>(await get('/points/summary'));
   assert.equal(s2.balance, 0);
   assert.equal(s2.signin.cards, 1);
+  // 持卡分组口径：兑换来的补签卡在 cards 里按 itemKey 出现（补签卡不占免广告期）
+  assert.deepEqual(s2.cards, [{ itemKey: 'makeup_card', unused: 1 }]);
+  assert.equal(s2.adFreeUntil, 0, '补签卡 benefitDays=0，不该推高 adFreeUntil');
   const makeupCell = s2.signin.cells.find((c) => c.state === 'makeup');
   assert.ok(makeupCell, '应有一格可补');
   assert.equal(makeupCell!.dateKey, shiftDateKey(TODAY, -6), '最左可补格 = 窗口左界');

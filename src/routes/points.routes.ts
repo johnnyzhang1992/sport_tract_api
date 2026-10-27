@@ -3,6 +3,7 @@ import { getBalance, listPointRecords, settleExpired } from '../services/points-
 import { getSigninState, signIn, useMakeupCard } from '../services/points-signin.js';
 import { getTaskRows, claimTask } from '../services/points-tasks.js';
 import { listActiveItems, exchangeItem, listExchanges } from '../services/points-items.js';
+import { activateCard, adFreeUntilOf, countUnusedCards } from '../services/points-cards.js';
 import { success } from '../utils/response.js';
 
 /**
@@ -17,11 +18,14 @@ export async function pointsRoutes(fastify: FastifyInstance) {
     // 先结算过期批次，保证余额/卡数与后续各接口看到的口径一致
     await settleExpired(userId);
     const now = Date.now();
-    const [signin, tasks, items, balance] = await Promise.all([
+    const [signin, tasks, items, balance, adFreeUntil, cardsByItem] = await Promise.all([
       getSigninState(userId, now),
       getTaskRows(userId),
       listActiveItems(),
       getBalance(userId, now),
+      // 免广告到期时刻与持卡数都是现推不落字段（spec §5.4），与卡行永远同一口径
+      adFreeUntilOf(userId),
+      countUnusedCards(userId, now),
     ]);
     return success({
       balance,
@@ -32,6 +36,9 @@ export async function pointsRoutes(fastify: FastifyInstance) {
       tasks,
       // 下发整张商品表（不是 items[0]）：积分页按道具列表渲染商品卡，将来加道具不用再改接口
       items,
+      // 端上按 adFreeUntil > now 跳过自主代码位广告；cards 给卡包页/「我的补签卡 N 张」用（spec §7.3）
+      adFreeUntil,
+      cards: cardsByItem,
     });
   });
 
@@ -73,6 +80,12 @@ export async function pointsRoutes(fastify: FastifyInstance) {
   fastify.post('/signin/makeup', { onRequest: [fastify.authenticate] }, async (request) => {
     const { dateKey } = (request.body ?? {}) as { dateKey?: string };
     return success(await useMakeupCard(request.user.userId, String(dateKey ?? '')));
+  });
+
+  // 激活免广告卡（补签卡不走这条路，见 POST /signin/makeup）
+  fastify.post('/cards/:cardId/activate', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { cardId } = request.params as { cardId: string };
+    return success(await activateCard(request.user.userId, cardId));
   });
 
   // 兑换记录（按兑换时间倒序，状态实时推导）
