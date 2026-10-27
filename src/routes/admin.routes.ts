@@ -50,6 +50,7 @@ import {
   listIssuances,
   type GrantInput,
 } from '../services/points-grant.js';
+import { listOrders, shipOrder, completeOrder } from '../services/points-orders.js';
 import { pointsOverview, pointsTrend, itemsOverview } from '../services/points-admin-stats.js';
 import { adFreeRoster } from '../services/points-roster.js';
 import {
@@ -1611,6 +1612,33 @@ export async function adminRoutes(fastify: FastifyInstance) {
       page: Math.max(1, Number(q.page) || 1),
       pageSize: Number(q.pageSize) || 20,
     }));
+  });
+
+  // ==================== 积分管理 · 实物订单（列表 / 发货 / 代确认） ====================
+  // 状态机 pending_ship → shipped → completed；列表只下发打码手机号（完整号码不出后台列表）。
+
+  // 订单列表：status 筛 + keyword 搜持单人昵称/UID，newest first，pageSize 上限 100
+  fastify.get('/points/orders', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { status?: string; keyword?: string; page?: string; pageSize?: string };
+    return success(await listOrders({
+      status: q.status,
+      keyword: q.keyword,
+      page: q.page,
+      pageSize: q.pageSize,
+    }));
+  });
+
+  // 发货：快递公司 + 单号，只允许 pending_ship → shipped；重复发货 400 点名当前状态
+  fastify.patch('/points/orders/:id/ship', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const b = (request.body ?? {}) as { trackingCompany?: string; trackingNo?: string };
+    return success(await shipOrder(id, b, adminIdOf(request)));
+  });
+
+  // 代确认收货：只允许 shipped → completed（用户忘了点确认时由客服代收）
+  fastify.patch('/points/orders/:id/complete', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await completeOrder(id, adminIdOf(request)));
   });
 
   // ==================== 积分管理 · 概况与双趋势 ====================
