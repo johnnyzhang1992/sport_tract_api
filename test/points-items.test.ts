@@ -4,10 +4,11 @@ import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
 import { POINTS } from '../src/config/points.js';
 import {
-  PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointLotModel, PointRecordModel,
+  PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointItemModel, PointLotModel, PointRecordModel,
 } from '../src/models/point.model.js';
 import { creditPoints, getBalance } from '../src/services/points-ledger.js';
-import { exchangeMakeupCard, getItems, listExchanges } from '../src/services/points-items.js';
+import { seedPointItems } from '../src/services/points-catalog.js';
+import { exchangeItem, listActiveItems, listExchanges } from '../src/services/points-items.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { AppError } from '../src/utils/app-error.js';
 
@@ -54,7 +55,12 @@ before(async () => {
   // 单文件直跑不会经过 app 的 mongodb 插件，这里自行连接；不连时查询会一直 buffering
   await mongoose.connect(config.mongodbUri, { serverSelectionTimeoutMS: 5000 });
   // 兑换记录唯一索引 (userId, requestId) 是异步建的，幂等/并发断言必须先等 init 完成
-  await Promise.all([PointExchangeModel.init(), PointRecordModel.init(), PointAccountModel.init()]);
+  await Promise.all([
+    PointExchangeModel.init(), PointRecordModel.init(), PointAccountModel.init(),
+    PointDailyModel.init(), PointItemModel.init(),
+  ]);
+  // 兑换链路改读道具目录：makeup_card 行必须在（幂等种子）
+  await seedPointItems();
 });
 
 after(async () => {
@@ -68,19 +74,27 @@ test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t)
   await seedPoints(uid, POINTS.MAKEUP_CARD_PRICE);
   assert.equal(await getBalance(String(uid), NOW), 200);
 
-  // 商品列表：固定一张补签卡
-  const items = getItems();
-  assert.equal(items.length, 1);
-  assert.deepEqual(items[0], {
+  // 商品列表：道具目录驱动，只下发在架项（ad_free_* 种子 active:false，这里只有补签卡）
+  const items = await listActiveItems();
+  const makeup = items.find((i) => i.key === 'makeup_card');
+  assert.ok(makeup, '在架列表里应能查到补签卡');
+  assert.deepEqual(makeup, {
     key: 'makeup_card',
     name: '补签卡',
     subtitle: '恢复连续打卡记录',
     price: 200,
     validDays: 30,
     description: '每张仅可使用一次；可补签近 7 天窗口内的漏签日，补一天用一张；兑换后 30 天内有效',
+    notes: [
+      '每张补签卡仅可使用一次，每个漏签日最多补一次',
+      '兑换后 30 天内有效，过期作废',
+      '兑换后不退积分',
+    ],
+    effect: { kind: 'makeup', days: 0 },
+    imageUrl: '',
   });
 
-  const r = await exchangeMakeupCard(String(uid), 'req-1', NOW);
+  const r = await exchangeItem(String(uid), 'makeup_card', 'req-1', NOW);
   assert.equal(r.balance, 0);
 
   const card = await PointCardModel.findById(r.cardId).lean();
@@ -121,8 +135,8 @@ test('PI2 同 requestId 重复兑换幂等，不重复扣分/发卡', async (t) 
   t.after(() => wipe(uid));
   await seedPoints(uid, POINTS.MAKEUP_CARD_PRICE);
 
-  const first = await exchangeMakeupCard(String(uid), 'req-1', NOW);
-  const again = await exchangeMakeupCard(String(uid), 'req-1', NOW + 60000);
+  const first = await exchangeItem(String(uid), 'makeup_card', 'req-1', NOW);
+  const again = await exchangeItem(String(uid), 'makeup_card', 'req-1', NOW + 60000);
 
   assert.equal(again.cardId, first.cardId);
   assert.equal(again.balance, 0);
@@ -139,7 +153,7 @@ test('PI3 余额不足 400，文案包含当前值与所需值', async (t) => {
   t.after(() => wipe(uid));
   await seedPoints(uid, 50);
 
-  await assert.rejects(exchangeMakeupCard(String(uid), 'req-low', NOW), (e: Error) => {
+  await assert.rejects(exchangeItem(String(uid), 'makeup_card', 'req-low', NOW), (e: Error) => {
     assert.ok(e instanceof AppError, '应为 AppError');
     assert.equal((e as AppError).statusCode, 400);
     assert.match(e.message, /积分不足（当前 50，需要 200）/);
@@ -153,7 +167,7 @@ test('PI3 余额不足 400，文案包含当前值与所需值', async (t) => {
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 0);
 
   // 缺少 requestId：直接 400，不触碰账本
-  await assert.rejects(exchangeMakeupCard(String(uid), '  ', NOW), /缺少兑换请求 ID/);
+  await assert.rejects(exchangeItem(String(uid), 'makeup_card', '  ', NOW), /缺少兑换请求 ID/);
   assert.equal(await getBalance(String(uid), NOW), 50);
 });
 
@@ -200,8 +214,8 @@ test('PI5 并发同 requestId 只扣一次分、只发一张卡', async (t) => {
   await seedPoints(uid, 2 * POINTS.MAKEUP_CARD_PRICE);
 
   const [a, b] = await Promise.all([
-    exchangeMakeupCard(String(uid), 'req-race', NOW),
-    exchangeMakeupCard(String(uid), 'req-race', NOW),
+    exchangeItem(String(uid), 'makeup_card', 'req-race', NOW),
+    exchangeItem(String(uid), 'makeup_card', 'req-race', NOW),
   ]);
 
   assert.equal(a.cardId, b.cardId);
@@ -248,7 +262,7 @@ test('PI6 余额恰好用尽的双击：后到请求命中在途兑换记录，�
   };
   t.after(() => { model.findOne = realFindOne as unknown as typeof model.findOne; });
 
-  const r = await exchangeMakeupCard(String(uid), 'req-dbl', NOW);
+  const r = await exchangeItem(String(uid), 'makeup_card', 'req-dbl', NOW);
 
   // 命中在途记录：返回 A 的卡，而不是抛 400「积分不足」
   assert.equal(r.cardId, String(cardA._id));
@@ -273,7 +287,7 @@ test('PI7 兑换记录写失败不留孤儿卡，重试仍只对应一次扣分'
 
   // 非重复键失败：卡已发出但兑换记录写不进去
   model.create = async () => { throw new Error('exchange write boom'); };
-  await assert.rejects(exchangeMakeupCard(String(uid), 'req-orphan', NOW), /exchange write boom/);
+  await assert.rejects(exchangeItem(String(uid), 'makeup_card', 'req-orphan', NOW), /exchange write boom/);
 
   // 扣分已发生（先扣后发，本轮不引入事务），但卡必须撤回，否则重试等于白得一张
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0);
@@ -282,7 +296,7 @@ test('PI7 兑换记录写失败不留孤儿卡，重试仍只对应一次扣分'
 
   // 恢复后重试：账本按 idemKey 重放（不二次扣分），一扣分对应一卡一记录
   restore();
-  const r = await exchangeMakeupCard(String(uid), 'req-orphan', NOW);
+  const r = await exchangeItem(String(uid), 'makeup_card', 'req-orphan', NOW);
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1);
   assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 1);
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 1);

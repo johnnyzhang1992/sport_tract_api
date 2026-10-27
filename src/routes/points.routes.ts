@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { getBalance, listPointRecords, settleExpired } from '../services/points-ledger.js';
 import { getSigninState, signIn, useMakeupCard } from '../services/points-signin.js';
 import { getTaskRows, claimTask } from '../services/points-tasks.js';
-import { getItems, exchangeMakeupCard, listExchanges } from '../services/points-items.js';
+import { listActiveItems, exchangeItem, listExchanges } from '../services/points-items.js';
 import { success } from '../utils/response.js';
 
 /**
@@ -20,7 +20,7 @@ export async function pointsRoutes(fastify: FastifyInstance) {
     const [signin, tasks, items, balance] = await Promise.all([
       getSigninState(userId, now),
       getTaskRows(userId),
-      getItems(),
+      listActiveItems(),
       getBalance(userId, now),
     ]);
     return success({
@@ -57,14 +57,16 @@ export async function pointsRoutes(fastify: FastifyInstance) {
     return success(await claimTask(request.user.userId, taskKey));
   });
 
-  // 商品列表（当前固定一张补签卡，价格/有效期来自配置）
+  // 商品列表（读道具目录，只下发在架项；老客户端读 items[0] 仍是补签卡）
   fastify.get('/items', { onRequest: [fastify.authenticate] }, async () =>
-    success(getItems()));
+    success(await listActiveItems()));
 
-  // 兑换补签卡：requestId 由客户端生成，同一 requestId 连点只扣一次分、只发一张卡
-  fastify.post('/items/makeup_card/exchange', { onRequest: [fastify.authenticate] }, async (request) => {
+  // 兑换：requestId 由客户端生成，同一 requestId 连点只扣一次分、只发一张卡、只扣一次库存
+  // 路径泛化为 /items/:itemKey/exchange：/items/makeup_card/exchange 是它的实例，老客户端不用改
+  fastify.post('/items/:itemKey/exchange', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { itemKey } = request.params as { itemKey: string };
     const { requestId } = (request.body ?? {}) as { requestId?: string };
-    return success(await exchangeMakeupCard(request.user.userId, String(requestId || '')));
+    return success(await exchangeItem(request.user.userId, itemKey, String(requestId || '')));
   });
 
   // 补签窗口内的某一天（spec §5.2）：只传 dateKey，哪张卡由服务端挑（旧 /cards/:id/use 已撤）

@@ -60,11 +60,23 @@ interface TaskRow {
   actionText: string;
 }
 
+interface ItemRow {
+  key: string;
+  name: string;
+  subtitle: string;
+  price: number;
+  validDays: number;
+  description: string;
+  notes: string[];
+  effect: { kind: string; days: number };
+  imageUrl: string;
+}
+
 interface Summary {
   balance: number;
   signin: SigninState;
   tasks: TaskRow[];
-  items: { key: string; price: number; validDays: number }[];
+  items: ItemRow[];
 }
 
 interface RecordPage {
@@ -215,21 +227,32 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   );
   assert.equal(s0.tasks.length, 5);
   assert.ok(s0.tasks.every((t) => t.status !== 'claimed'), '新用户没有已领取任务');
-  assert.equal(s0.items.length, 1, 'summary 下发整张商品表，积分页按它渲染商品卡');
+  // 目录驱动后仍只下发在架项：三条 ad_free_* 种子 active:false，老端商品区不该多出点不动的卡
+  assert.equal(s0.items.length, 1, 'summary 下发整张商品表（只含在架项），积分页按它渲染商品卡');
   assert.equal(s0.items[0].key, 'makeup_card');
   assert.equal(s0.items[0].price, POINTS.MAKEUP_CARD_PRICE);
+  // 新 DTO 字段（spec §7.3）：notes/effect/imageUrl 必须随列表下发
+  assert.deepEqual(s0.items[0].effect, { kind: 'makeup', days: 0 }, '补签卡 effect 快照');
+  assert.ok(
+    Array.isArray(s0.items[0].notes) && s0.items[0].notes.includes('兑换后不退积分'),
+    'notes 由服务端下发（商品详情提示文案）',
+  );
+  assert.equal(s0.items[0].imageUrl, '', '种子未配图 → 空串（私有桶裸链会 403，不如有图时给缩略档签名链）');
 
   // 2) 授 200 分后 summary 余额同步
   await seedPoints(userId, POINTS.MAKEUP_CARD_PRICE);
   const s1 = data<Summary>(await get('/points/summary'));
   assert.equal(s1.balance, 200);
 
-  // 3) 商品列表
-  const items = data<{ key: string; price: number; validDays: number }[]>(await get('/points/items'));
+  // 3) 商品列表（/items 与 summary.items 同一路口径：目录在架项 + notes/effect/imageUrl）
+  const items = data<ItemRow[]>(await get('/points/items'));
   assert.equal(items.length, 1);
   assert.equal(items[0].key, 'makeup_card');
   assert.equal(items[0].price, 200);
   assert.equal(items[0].validDays, POINTS.MAKEUP_CARD_VALID_DAYS);
+  assert.deepEqual(items[0].effect, { kind: 'makeup', days: 0 });
+  assert.ok(Array.isArray(items[0].notes) && items[0].notes.length >= 3, 'notes 至少含三条使用提示');
+  assert.equal(items[0].imageUrl, '');
 
   // 4) 兑换补签卡：同一 requestId 连点只扣一次、只发一张卡
   const requestId = `routes-${Date.now()}`;
@@ -450,6 +473,11 @@ test('PR3 路由参数错误透出 service 的 400/404', async () => {
   const noRequestId = await post('/points/items/makeup_card/exchange', {});
   assert.equal(noRequestId.statusCode, 400, noRequestId.body);
   assert.match(noRequestId.json().message, /兑换请求 ID/);
+
+  // 兑换路径已泛化为 /items/:itemKey/exchange：不存在的 key 走 404 文案含 key
+  const unknownItem = await post('/points/items/not_an_item/exchange', { requestId: 'pr3-nope' });
+  assert.equal(unknownItem.statusCode, 404, unknownItem.body);
+  assert.match(unknownItem.json().message, /道具不存在：not_an_item/);
 
   const unknownTask = await post('/points/tasks/not_a_task/claim');
   assert.equal(unknownTask.statusCode, 404, unknownTask.body);
