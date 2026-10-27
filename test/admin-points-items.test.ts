@@ -432,3 +432,60 @@ test('AI-9 PUT 只拥有内容字段：绝不写 stock/unlimited，缺内容字�
   assert.equal(emptyPatch.statusCode, 400, `PATCH 空 body 要 400：${emptyPatch.body}`);
   assert.match(emptyPatch.json().message, /stock/);
 });
+
+test('AI-10 effect.days 非数字与 notes 非数组：400 点名对象+实际值，不是 500 内部报错', async (t) => {
+  t.after(cleanupItems);
+
+  // 闸门本身：两类入参都必须在 assertItemInput 被拦下（schema 只会抛 CastError/TypeError → 500）
+  const direct: Array<{ patch: Partial<ItemInput>; copy: RegExp }> = [
+    // makeup 分支不查 days，'abc' 会一路走到 Number('abc')=NaN → Mongoose CastError（500）
+    { patch: { effect: { kind: 'makeup', days: 'abc' as never } }, copy: /道具效果天数 effect\.days 必须是 ≥0 的有限数字（收到「abc」）/ },
+    // 负数同样过不了 schema 的 min:0（也是 500），文案要带收到的值
+    { patch: { effect: { kind: 'makeup', days: -5 } }, copy: /道具效果天数 effect\.days 必须是 ≥0 的有限数字（收到「-5」）/ },
+    // notes 非数组：normalize 里的 .map 会 TypeError（500）
+    { patch: { notes: 'not-an-array' as never }, copy: /兑换说明 notes 必须是字符串数组，最多 8 条（收到「not-an-array」）/ },
+    { patch: { notes: {} as never }, copy: /兑换说明 notes 必须是字符串数组，最多 8 条（收到「\{\}」）/ },
+  ];
+  for (const { patch, copy } of direct) {
+    assert.throws(() => assertItemInput({ ...validInput, ...patch }), (e) =>
+      e instanceof AppError && e.statusCode === 400 && copy.test(e.message),
+    `应报「${copy}」：${JSON.stringify(patch)}`);
+  }
+
+  // POST 经路由：状态码必须是 400 而不是 500（error-handler 的通用分支还会回显内部原文）
+  const badDays = await req('POST', '/sport-track/api/admin/points/items', {
+    ...validInput, key: 't_bad_effect_days', effect: { kind: 'makeup', days: 'abc' },
+  });
+  assert.equal(badDays.statusCode, 400, `非数字 effect.days 应 400 而非 500：${badDays.body}`);
+  assert.match(badDays.json().message, /effect\.days/);
+  assert.match(badDays.json().message, /「abc」/);
+  assert.equal(await PointItemModel.countDocuments({ key: 't_bad_effect_days' }), 0, '被拒的入参不许落库');
+
+  const badNotes = await req('POST', '/sport-track/api/admin/points/items', {
+    ...validInput, key: 't_bad_notes', notes: 'not-an-array',
+  });
+  assert.equal(badNotes.statusCode, 400, `notes 非数组应 400 而非 500：${badNotes.body}`);
+  assert.match(badNotes.json().message, /notes/);
+  assert.match(badNotes.json().message, /「not-an-array」/);
+  assert.equal(await PointItemModel.countDocuments({ key: 't_bad_notes' }), 0, '被拒的入参不许落库');
+
+  // PUT 走同一条闸门：库里原值一个字都不许被半截写入
+  const created = await req('POST', '/sport-track/api/admin/points/items', validInput);
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data._id as string;
+  const putBadDays = await req('PUT', `/sport-track/api/admin/points/items/${id}`, {
+    ...validInput, effect: { kind: 'makeup', days: 'abc' },
+  });
+  assert.equal(putBadDays.statusCode, 400, `PUT 非数字 effect.days 应 400 而非 500：${putBadDays.body}`);
+  assert.match(putBadDays.json().message, /effect\.days/);
+  const putBadNotes = await req('PUT', `/sport-track/api/admin/points/items/${id}`, {
+    ...validInput, notes: {},
+  });
+  assert.equal(putBadNotes.statusCode, 400, `PUT notes 非数组应 400 而非 500：${putBadNotes.body}`);
+  assert.match(putBadNotes.json().message, /notes/);
+
+  const db = await readItem(id);
+  assert.equal(db!.effect.kind, 'ad_free', '被拒的 PUT 不许改写 effect');
+  assert.equal(db!.effect.days, 5);
+  assert.deepEqual(db!.notes, []);
+});

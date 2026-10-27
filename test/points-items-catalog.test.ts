@@ -202,3 +202,75 @@ test('PC-7 发卡后记录落库失败：卡撤回、库存回补，重试只对
   assert.equal(await getBalance(String(u)), 0);
   assert.equal(r.cardId, String((await PointExchangeModel.findOne({ userId: u }).lean())!.cardId));
 });
+
+test('PC-8 目录行 validDays 非法（0）→ 400 点名道具，校验先于库存与发卡', async (t) => {
+  const key = 't_dirty_valid_days';
+  const u = new Types.ObjectId();
+  t.after(async () => {
+    await wipe(u);
+    await PointItemModel.deleteMany({ key });
+  });
+  // raw insert 绕过 schema 的 min:1：模拟历史脏目录行（validDays=0 会让 expiresAt=now，卡发出去即过期）
+  await PointItemModel.collection.insertOne({
+    key, name: '脏目录道具', subtitle: '', description: '', notes: [],
+    price: 100, validDays: 0, effect: { kind: 'ad_free', days: 7 },
+    stock: 5, unlimited: false, active: true, sortOrder: 999, image: '',
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+
+  await assert.rejects(() => exchangeItem(String(u), key, `${u}-dirty`), (e) => {
+    const err = e as AppError;
+    // 文案点名道具 + 实际值 + 限制（与发放路径 validDays 校验同一口径）
+    return err.statusCode === 400 && /脏目录道具/.test(err.message)
+      && /validDays/.test(err.message) && /（validDays=0/.test(err.message);
+  });
+  assert.equal(await PointCardModel.countDocuments({ userId: u }), 0, '校验先于发卡');
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 5, '校验先于库存闸门，库存一分不动');
+});
+
+test('PC-9 回补库存失败要报出来：缺口进 data.refundFailed，不再只打日志', async (t) => {
+  await seedPointItems();
+  await PointItemModel.updateOne({ key: 'ad_free_30d' }, { $set: { unlimited: false, stock: 3 } });
+  await onShelf('ad_free_30d');
+  const u = new Types.ObjectId();
+  const model = PointItemModel as unknown as { updateOne: (...args: unknown[]) => Promise<unknown> };
+  const realUpdateOne = model.updateOne.bind(PointItemModel);
+  const originalError = console.error;
+  // 还原必须排在清场之前：清场自己也要用 PointItemModel.updateOne 刷回种子库存，
+  // 若先跑清场会再撞一次被 mock 的抛错（PC-9b 的 before 就会连带红）
+  t.after(async () => {
+    model.updateOne = realUpdateOne;
+    console.error = originalError;
+    await wipe(u);
+    // 刷回种子形态：unlimited 道具的 stock 只是展示位
+    await PointItemModel.updateOne({ key: 'ad_free_30d' }, { $set: { unlimited: true, stock: 9999 } });
+  });
+  // 只让「回补库存」那一笔 updateOne 失败（抢库存走 findOneAndUpdate，不受影响）；控制台输出在用例里静音
+  model.updateOne = async () => { throw new Error('stock refund boom'); };
+  console.error = () => {};
+
+  // 余额 0 → 扣分失败 → 回补库存；回补这一笔抛错。主文案仍是「积分不足」（前端据此引导赚分），
+  // 但库存缺口必须进 data 与文案尾注，不许被 .catch(console.error) 吞掉。
+  await assert.rejects(() => exchangeItem(String(u), 'ad_free_30d', `${u}-refund`), (e) => {
+    const err = e as AppError;
+    return err.statusCode === 400
+      && /积分不足/.test(err.message)
+      && /库存回补失败 1 张/.test(err.message)
+      && err.extra?.refundFailed === 1;
+  });
+  assert.equal((await PointItemModel.findOne({ key: 'ad_free_30d' }).lean())!.stock, 2,
+    '库存确实停在「扣了 1 张没退回」的状态（正常回补后应是 3）：这条断言证明刚才报出的缺口是真的');
+  assert.equal(await PointCardModel.countDocuments({ userId: u }), 0);
+});
+
+test('PC-9b 正常兑换结果带 refundFailed: 0（成功路径也要有缺口字段）', async (t) => {
+  await seedPointItems();
+  await PointItemModel.updateOne({ key: 'makeup_card' }, { $set: { unlimited: true, stock: 9999 } });
+  const u = new Types.ObjectId();
+  t.after(() => wipe(u));
+  await seedBalance(u, 200);
+
+  const r = await exchangeItem(String(u), 'makeup_card', `${u}-ok`);
+  assert.equal(r.refundFailed, 0, '没有回滚就没有缺口，字段仍要在（前端只是展示，不做缺失判断）');
+  assert.equal(r.balance, 0);
+});

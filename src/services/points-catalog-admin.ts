@@ -123,10 +123,25 @@ export function assertItemInput(input: ItemInput): void {
   if (!ITEM_EFFECT_KINDS.includes(effect.kind as ItemEffectKind)) {
     throw new AppError(400, `道具效果类型只能是 ${ITEM_EFFECT_KINDS.join(' 或 ')}（收到「${shown(effect.kind)}」）`);
   }
-  if (effect.kind === 'ad_free' && !(Number(effect.days) >= 1)) {
-    throw new AppError(400, '免广告道具必须填天数（effect.days ≥ 1）');
+  // effect.days：schema 的 min:0 拦不住 'abc'（Number('abc')=NaN → Mongoose CastError → 500），
+  // 所以在这道闸门统一要求「有限数字且 ≥0」。undefined/null 仍允许（makeup 可省略，落库默认 0）。
+  const rawDays = effect.days;
+  if (rawDays !== undefined && rawDays !== null) {
+    const days = Number(rawDays);
+    if (!Number.isFinite(days) || days < 0) {
+      throw new AppError(400, `道具效果天数 effect.days 必须是 ≥0 的有限数字（收到「${shown(rawDays)}」）`);
+    }
   }
-  if ((input.notes?.length ?? 0) > 8) throw new AppError(400, `兑换说明最多 8 条（当前 ${input.notes!.length} 条）`);
+  if (effect.kind === 'ad_free' && !(Number(effect.days) >= 1)) {
+    throw new AppError(400, `免广告道具必须填天数 effect.days ≥ 1（收到「${shown(effect.days)}」）`);
+  }
+  // notes：schema 的 [String] 只在 Mongoose 写入时生效，非数组会先在 normalize 的 .map 上 TypeError（500）
+  const rawNotes = (input as { notes?: unknown }).notes;
+  if (rawNotes !== undefined && rawNotes !== null && !Array.isArray(rawNotes)) {
+    throw new AppError(400, `兑换说明 notes 必须是字符串数组，最多 8 条（收到「${shown(rawNotes)}」）`);
+  }
+  const notes = Array.isArray(rawNotes) ? rawNotes : [];
+  if (notes.length > 8) throw new AppError(400, `兑换说明最多 8 条（当前 ${notes.length} 条）`);
 }
 
 /**

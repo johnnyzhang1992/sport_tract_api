@@ -50,10 +50,22 @@ export interface ExchangeDto {
 export interface ExchangeResult {
   cardId: string;
   balance: number;
+  /**
+   * 回滚时库存没能原路退回的张数。>0 表示账实有缺口（卡/分已撤回，但库存少了一张），
+   * 调用方必须能看到并人工核对——不再像以前那样只 `.catch(console.error)` 打一行日志。
+   */
+  refundFailed: number;
 }
 
 const DAY_MS = 86400000;
 const DUPLICATE_KEY = 11000;
+
+/** 错误文案里回显收到的值：空值写成「空」，对象给 JSON，别把 undefined 直接拼进句子（同 points-grant） */
+function shown(value: unknown): string {
+  if (value === undefined || value === null || value === '') return '空';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
 
 /**
  * 卡状态文案：兑换记录与管理端发放记录共用这一份（Task 5 的 listIssuances 引用它，
@@ -121,11 +133,18 @@ export async function exchangeItem(
   if (!rid) throw new AppError(400, '缺少兑换请求 ID');
 
   const exists = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
-  if (exists) return { cardId: String(exists.cardId), balance: await getBalance(userId, now) };
+  if (exists) return { cardId: String(exists.cardId), balance: await getBalance(userId, now), refundFailed: 0 };
 
   const item = await PointItemModel.findOne({ key: String(itemKey ?? '').trim() }).lean() as ItemDoc | null;
   if (!item) throw new AppError(404, `道具不存在：${itemKey}`);
   if (!item.active) throw new AppError(400, `「${item.name}」已下架`);
+
+  // 有效期先归一：存量目录行可能没有 validDays / 被写脏，`undefined * DAY_MS` 会发出 expiresAt=NaN 的卡。
+  // 校验必须在库存闸门之前——不然坏目录行会先扣库存再报错（与 points-grant 的发卡校验同一口径）。
+  const validDays = Number(item.validDays);
+  if (!Number.isFinite(validDays) || validDays <= 0) {
+    throw new AppError(400, `「${item.name}」的卡有效期不合法（validDays=${shown(item.validDays)}，应为正数）`);
+  }
 
   // 闸门 1：库存。unlimited 分支既不筛 stock 也不 $inc —— 写成 $or + 无条件 $inc 会把不限量道具的库存悄悄扣掉
   const gate = item.unlimited ? { _id: item._id } : { _id: item._id, stock: { $gt: 0 } };
@@ -133,10 +152,36 @@ export async function exchangeItem(
   const write = item.unlimited ? { $set: {} } : { $inc: { stock: -1 } };
   const taken = await PointItemModel.findOneAndUpdate(gate, write, { returnDocument: 'after' }).lean();
   if (!taken) throw new AppError(400, `「${item.name}」已兑完（当前库存 0）`);
-  const backStock = async () => {
-    if (item.unlimited) return;
-    await PointItemModel.updateOne({ _id: item._id }, { $inc: { stock: 1 } })
-      .catch((e) => console.error('[points] 库存回补失败', item.key, e));
+  let refundFailed = 0;
+  // 回补成功与否要返回值：以前 `.catch(console.error)` 把库存缺口吞成一行日志，
+  // 账实不符（卡撤了、库存没退）没有任何调用方能看见（与 points-grant 的 refundFailed 同一口径）。
+  const backStock = async (): Promise<boolean> => {
+    if (item.unlimited) return true;
+    try {
+      const res = await PointItemModel.updateOne({ _id: item._id }, { $inc: { stock: 1 } });
+      // matchedCount=0：目录行并发消失，这一张也没退回去，同样算缺口
+      return (res?.matchedCount ?? 0) > 0;
+    } catch (e) {
+      console.error('[points] 库存回补失败', item.key, e);
+      return false;
+    }
+  };
+  const rollbackStock = async () => {
+    if (!(await backStock())) refundFailed += 1;
+  };
+  /**
+   * 回滚有缺口时再抛：保留原状态码与主文案（前端可能按「积分不足」引导去赚分），
+   * 把缺口同时写进 message 尾注与 data.refundFailed，异常路径也不许静默。
+   */
+  const rethrowWithRefund = (e: unknown): never => {
+    if (refundFailed === 0) throw e;
+    const note = `（另：库存回补失败 ${refundFailed} 张，请人工核对）`;
+    if (e instanceof AppError) {
+      throw new AppError(e.statusCode, `${e.message}${note}`, { ...(e.extra ?? {}), refundFailed });
+    }
+    const err = e as Error;
+    if (err && typeof err.message === 'string') err.message = `${err.message}${note}`;
+    throw err;
   };
 
   try {
@@ -148,13 +193,13 @@ export async function exchangeItem(
       idemKey: `exchange:${userId}:${rid}`,
     }, now);
   } catch (e) {
-    await backStock();
-    if (!isInsufficientBalance(e)) throw e;
+    await rollbackStock();
+    if (!isInsufficientBalance(e)) rethrowWithRefund(e);
     // 余额恰好够一次的连点：A 扣光余额后、兑换记录落库前，B 会先撞余额闸门。
     // 补查在途记录：命中说明是同一笔点击，返回 A 那张卡（不再扣分/发卡）；否则才是真的余额不足。
     const inFlight = await findInFlightExchange(userId, rid);
-    if (!inFlight) throw e;
-    return { cardId: String(inFlight.cardId), balance: await getBalance(userId, now) };
+    if (!inFlight) rethrowWithRefund(e);
+    return { cardId: String(inFlight.cardId), balance: await getBalance(userId, now), refundFailed };
   }
 
   const card = await PointCardModel.create({
@@ -164,26 +209,26 @@ export async function exchangeItem(
     source: 'exchange',
     // 发卡时固化权益天数：后台把 7 天改成 10 天不该影响已售出的卡
     benefitDays: item.effect?.kind === 'ad_free' ? item.effect.days : 0,
-    expiresAt: now + item.validDays * DAY_MS,
+    expiresAt: now + validDays * DAY_MS,
     createdAt: now,
-  }).catch(async (e: unknown) => { await backStock(); throw e; });
+  }).catch(async (e: unknown) => { await rollbackStock(); rethrowWithRefund(e); });
 
   try {
     const exchange = await PointExchangeModel.create({
       userId, itemKey: item.key, cost: item.price, cardId: card._id, requestId: rid, createdAt: now,
     });
-    return { cardId: String(exchange.cardId), balance: await getBalance(userId, now) };
+    return { cardId: String(exchange.cardId), balance: await getBalance(userId, now), refundFailed };
   } catch (e) {
     // 兑换记录没落下（含并发 E11000 落败）：本次刚发的卡无人认领，一律撤回并回补库存，
     // 否则重试等于一次点击消耗两张库存/两张卡。
     await PointCardModel.deleteOne({ _id: card._id });
-    await backStock();
-    if (!isDuplicateKey(e)) throw e;
+    await rollbackStock();
+    if (!isDuplicateKey(e)) rethrowWithRefund(e);
     // 并发同一 requestId：另一请求已先落兑换记录（账本已按 idemKey 去重，不会重复扣分），
     // 返回胜出方那张卡。
     const winner = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
-    if (!winner) throw e;
-    return { cardId: String(winner.cardId), balance: await getBalance(userId, now) };
+    if (!winner) rethrowWithRefund(e);
+    return { cardId: String(winner.cardId), balance: await getBalance(userId, now), refundFailed };
   }
 }
 
