@@ -25,7 +25,7 @@ import {
 } from '../models/point.model.js';
 import { debitPoints, getBalance, reverseDebit, type DebitResult } from './points-ledger.js';
 import { limitError, limitReached, validateAddress } from './points-orders.js';
-import { getThumbUrl } from './oss.js';
+import { getMediumUrl, getThumbUrl } from './oss.js';
 import type { ItemDoc } from './points-catalog.js';
 
 export interface ItemDto {
@@ -136,7 +136,8 @@ export async function listActiveItems(): Promise<ItemDto[]> {
     // 本批次之前入库的目录行物理上没有 kind/detailImages/perUserLimit：按虚拟/无图/不限的
     // 默认口径兜底，别把 undefined 漏给端上（端上会当成实物或者限购 0 张）
     kind: (r.kind ?? 'virtual') as ItemKind,
-    detailImages: (r.detailImages ?? []).map((u: string) => (u ? getThumbUrl(u) : '')),
+    // 详情图在商品页整宽渲染（widthFix），w_240 会被拉糊 → 走 medium 档；后台表单的小预览仍是 thumb
+    detailImages: (r.detailImages ?? []).map((u: string) => (u ? getMediumUrl(u) : '')),
     perUserLimit: Number(r.perUserLimit ?? 0),
     // spec §7.3：unlimited 下发 null（端上显示「不限量」）；限量道具给实际剩余，别把 undefined 漏给端上
     stockLeft: r.unlimited ? null : Number(r.stock ?? 0),

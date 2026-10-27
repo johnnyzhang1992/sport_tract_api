@@ -313,7 +313,8 @@ test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走
   if (isOssConfigured()) {
     for (const url of row.detailImages) {
       assert.match(url, /[?&]Signature=/, `详情图必须签名下发（私有桶裸链进 <img> 会 403），实际 ${url}`);
-      assert.match(decodeURIComponent(url), /x-oss-process=image\/resize,w_240/, '下发必须走缩略档位（原图灌列表会卡）');
+      // 详情图在商品页整宽渲染（mode=widthFix），w_240 会被拉糊 → 走 medium 档；后台表单预览仍是 thumb
+      assert.match(decodeURIComponent(url), /x-oss-process=image\/resize,w_800/, '详情图要走 medium 档（整宽显示）');
     }
   } else {
     assert.deepEqual(row.detailImages, detailImages, '未配 OSS 时 getThumbUrl 原样返回裸链');
