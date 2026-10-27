@@ -4,20 +4,22 @@
  * 口径（spec §6.1/§6.2/§7.3）：
  * - 商品来自 PointItem 目录表（后台可增删改档），只下发在架项；老客户端读 items[0]，
  *   makeup_card 靠 sortOrder 排第一保持兼容；
- * - 兑换写序固定：读目录 → 扣库存 → 扣分 → 发卡 → 落兑换记录，失败按逆序回滚。
- *   先扣库存后扣分：退分会在账本留下补偿明细，而回补库存只是一次 $inc；
+ * - 兑换写序固定：读目录 → 扣库存 → 扣分 → 发卡 → 落兑换记录。**不变量 A（all-or-nothing）**：
+ *   过了库存闸门之后的任何失败，余额、totalSpent、批次、库存、卡、兑换记录都回到调用前——
+ *   发卡/落记录失败时用 points-ledger.reverseDebit 真正撤销扣分（补偿行成对，不进发放/消耗口径）；
  * - 库存闸门：unlimited 分支既不筛 stock 也不 $inc（写成 $or + 无条件 $inc 会把
  *   不限量道具的库存悄悄扣掉）；非 unlimited 用带 stock>0 条件的原子 findOneAndUpdate 抢库存；
  * - 兑换幂等键 `exchange:${userId}:${requestId}`：先查兑换记录短路重放；并发同一 requestId
  *   由账本 idemKey + 兑换记录唯一索引 (userId, requestId) 双重兜底，只扣一次分、只发一张卡、
- *   只扣一次库存——落败方删卡、退分（其扣分走账本重放实际未落账）、回补库存；
+ *   只扣一次库存——落败方删卡、回补库存，但绝不动那笔真实扣分（它的权益是胜出方的卡）；
+ * - 短路重放要确认卡还在：记录指向已删除的卡时丢掉脏记录重跑，账本重放不二次扣分、补发新卡；
  * - benefitDays 发卡时从目录快照：后台把 7 天改成 10 天不该影响已售出的卡；
  * - 兑换记录状态实时推导：卡仍是 unused 但已过 expiresAt 时返回 expired，不依赖离线结算任务。
  */
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import { PointCardModel, PointExchangeModel, PointItemModel, type ItemKind } from '../models/point.model.js';
-import { debitPoints, getBalance } from './points-ledger.js';
+import { debitPoints, getBalance, reverseDebit, type DebitResult } from './points-ledger.js';
 import { getThumbUrl } from './oss.js';
 import type { ItemDoc } from './points-catalog.js';
 
@@ -35,6 +37,8 @@ export interface ItemDto {
   detailImages: string[];
   /** 0 = 不限购；实物默认 1 */
   perUserLimit: number;
+  /** 剩余库存（spec §7.3）：unlimited 为 null（端上显示「不限量」），限量道具给实际剩余数 */
+  stockLeft: number | null;
   imageUrl: string;
 }
 
@@ -126,6 +130,8 @@ export async function listActiveItems(): Promise<ItemDto[]> {
     kind: (r.kind ?? 'virtual') as ItemKind,
     detailImages: (r.detailImages ?? []).map((u: string) => (u ? getThumbUrl(u) : '')),
     perUserLimit: Number(r.perUserLimit ?? 0),
+    // spec §7.3：unlimited 下发 null（端上显示「不限量」）；限量道具给实际剩余，别把 undefined 漏给端上
+    stockLeft: r.unlimited ? null : Number(r.stock ?? 0),
     // 私有桶裸链进 <img> 会 403；一期端上还不画图，先只给缩略档签名链
     imageUrl: r.image ? getThumbUrl(r.image) : '',
   }));
@@ -134,7 +140,7 @@ export async function listActiveItems(): Promise<ItemDto[]> {
 /**
  * 兑换道具（/items/:itemKey/exchange 的服务端；makeup_card 也是它的一个实例）。
  * - 同一 (userId, requestId) 视为同一次点击：直接返回原卡与当前余额，不再扣分/发卡/扣库存；
- * - 写序：读目录 → 扣库存 → 扣分 → 发卡 → 落兑换记录；扣分/发卡/落记录失败按逆序回滚。
+ * - 写序：读目录 → 扣库存 → 扣分 → 发卡 → 落兑换记录；扣分之后的失败用 reverseDebit 撤销扣分。
  */
 export async function exchangeItem(
   userId: string, itemKey: string, requestId: string, now = Date.now(),
@@ -143,7 +149,15 @@ export async function exchangeItem(
   if (!rid) throw new AppError(400, '缺少兑换请求 ID');
 
   const exists = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
-  if (exists) return { cardId: String(exists.cardId), balance: await getBalance(userId, now), refundFailed: 0 };
+  if (exists) {
+    // M2：兑换记录存在不等于卡还在（脏数据/旧版本回滚删过卡）。卡缺失时丢掉这条记录重跑：
+    // 账本同 idemKey 会重放、不会二次扣分，随后补发一张真实存在的卡；绝不再返回死 id。
+    const card = await PointCardModel.findById(exists.cardId).select({ _id: 1 }).lean();
+    if (card) {
+      return { cardId: String(exists.cardId), balance: await getBalance(userId, now), refundFailed: 0 };
+    }
+    await PointExchangeModel.deleteOne({ _id: exists._id });
+  }
 
   const item = await PointItemModel.findOne({ key: String(itemKey ?? '').trim() }).lean() as ItemDoc | null;
   if (!item) throw new AppError(404, `道具不存在：${itemKey}`);
@@ -154,6 +168,13 @@ export async function exchangeItem(
   const validDays = Number(item.validDays);
   if (!Number.isFinite(validDays) || validDays <= 0) {
     throw new AppError(400, `「${item.name}」的卡有效期不合法（validDays=${shown(item.validDays)}，应为正数）`);
+  }
+  // 权益天数同样归一：effect.days 被写脏成 NaN 时，Mongoose 会在发卡那一步抛 ValidationError（500），
+  // 且扣分已经发生。校验同样排在库存闸门之前。
+  const benefitDays = item.effect?.kind === 'ad_free' ? Number(item.effect.days) : 0;
+  if (!Number.isFinite(benefitDays) || benefitDays < 0) {
+    throw new AppError(400,
+      `「${item.name}」的权益天数不合法（effect.days=${shown(item.effect?.days)}，应为非负数）`);
   }
 
   // 闸门 1：库存。unlimited 分支既不筛 stock 也不 $inc —— 写成 $or + 无条件 $inc 会把不限量道具的库存悄悄扣掉
@@ -194,9 +215,10 @@ export async function exchangeItem(
     throw err;
   };
 
+  let debit: DebitResult;
   try {
     // 闸门 2：余额（沿用账本，失败文案已带当前值与所需值）
-    await debitPoints(userId, {
+    debit = await debitPoints(userId, {
       type: 'exchange', title: `兑换${item.name}`, points: item.price,
       bizDate: bjDateStr(now), refType: 'item', refId: item.key,
       // 明细表 idemKey 全局唯一，必须带 userId
@@ -212,32 +234,59 @@ export async function exchangeItem(
     return { cardId: String(inFlight.cardId), balance: await getBalance(userId, now), refundFailed };
   }
 
-  const card = await PointCardModel.create({
-    userId,
-    itemKey: item.key,
-    status: 'unused',
-    source: 'exchange',
-    // 发卡时固化权益天数：后台把 7 天改成 10 天不该影响已售出的卡
-    benefitDays: item.effect?.kind === 'ad_free' ? item.effect.days : 0,
-    expiresAt: now + validDays * DAY_MS,
-    createdAt: now,
-  }).catch(async (e: unknown) => { await rollbackStock(); rethrowWithRefund(e); });
+  /**
+   * 补偿这次真实扣分（账本重放不算）：余额/totalSpent/批次一起回滚，并留下 ±撤销对。
+   * 重放（duplicated）绝不退钱——那笔钱属于另一个请求已经发出的卡。
+   */
+  const undoDebit = async () => {
+    if (!debit.duplicated) await reverseDebit(userId, debit, bjDateStr(now), now);
+  };
+
+  let card;
+  try {
+    card = await PointCardModel.create({
+      userId,
+      itemKey: item.key,
+      status: 'unused',
+      source: 'exchange',
+      // 发卡时固化权益天数：后台把 7 天改成 10 天不该影响已售出的卡
+      benefitDays,
+      expiresAt: now + validDays * DAY_MS,
+      createdAt: now,
+    });
+  } catch (e) {
+    // M1：扣分已经落账，发卡失败必须把这次扣分真正撤销，否则用户被扣分却没有卡。
+    await rollbackStock();
+    await undoDebit();
+    rethrowWithRefund(e);
+  }
 
   try {
     const exchange = await PointExchangeModel.create({
       userId, itemKey: item.key, cost: item.price, cardId: card._id, requestId: rid, createdAt: now,
     });
-    return { cardId: String(exchange.cardId), balance: await getBalance(userId, now), refundFailed };
+    // 余额直接用 debitPoints 的 balanceAfter：不再在成功路径多调一次 getBalance（它会写库结算）。
+    return { cardId: String(exchange.cardId), balance: debit.balance, refundFailed };
   } catch (e) {
-    // 兑换记录没落下（含并发 E11000 落败）：本次刚发的卡无人认领，一律撤回并回补库存，
-    // 否则重试等于一次点击消耗两张库存/两张卡。
-    await PointCardModel.deleteOne({ _id: card._id });
+    // 兑换记录没落下（含并发 E11000 落败）：本次刚发的卡无人认领，一律撤回并回补库存。
+    // S4：删卡失败不能阻断库存回补与胜者查询——只记日志，后面照常退库存/找 winner。
+    try {
+      await PointCardModel.deleteOne({ _id: card._id });
+    } catch (delErr) {
+      console.error('[points] 撤回兑换卡失败', item.key, String(card._id), delErr);
+    }
     await rollbackStock();
-    if (!isDuplicateKey(e)) rethrowWithRefund(e);
+    if (!isDuplicateKey(e)) {
+      await undoDebit();
+      rethrowWithRefund(e);
+    }
     // 并发同一 requestId：另一请求已先落兑换记录（账本已按 idemKey 去重，不会重复扣分），
-    // 返回胜出方那张卡。
+    // 返回胜出方那张卡。胜者的卡就是这笔扣分的权益，本次无论是否重放都不能退钱。
     const winner = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
-    if (!winner) rethrowWithRefund(e);
+    if (!winner) {
+      await undoDebit();
+      rethrowWithRefund(e);
+    }
     return { cardId: String(winner.cardId), balance: await getBalance(userId, now), refundFailed };
   }
 }

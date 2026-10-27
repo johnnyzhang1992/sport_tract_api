@@ -45,6 +45,11 @@ export interface CreditResult {
 export interface DebitResult {
   balance: number;
   recordId: string;
+  /** 本次调用是否只是账本重放（true = 没有真正扣分，补偿时绝不能退这笔钱） */
+  duplicated: boolean;
+  /** 本次实际扣到的批次数（含金额），补偿时按此原路还回批次 */
+  points: number;
+  lotUses: { lotId: string; use: number }[];
 }
 
 export interface PointRecordDto {
@@ -253,7 +258,12 @@ export async function debitPoints(userId: string, input: DebitInput, now = Date.
 
   // 只看「扣减」明细：同一个 key 若被发放用过（正数 delta），不能当成这次扣减的重放
   const dup = await PointRecordModel.findOne({ idemKey: input.idemKey, delta: { $lt: 0 } }).lean();
-  if (dup) return { balance: dup.balanceAfter, recordId: String(dup._id) };
+  if (dup) {
+    return {
+      balance: dup.balanceAfter, recordId: String(dup._id), duplicated: true,
+      points: Math.abs(dup.delta), lotUses: [],
+    };
+  }
 
   const points = Math.trunc(input.points);
   if (!Number.isFinite(points) || points <= 0) throw new AppError(400, '积分数必须为正整数');
@@ -288,13 +298,19 @@ export async function debitPoints(userId: string, input: DebitInput, now = Date.
     await PointAccountModel.updateOne({ userId }, { $inc: { balance: points, totalSpent: -points } });
     if (isDuplicateKey(e)) {
       const again = await PointRecordModel.findOne({ idemKey: input.idemKey, delta: { $lt: 0 } }).lean();
-      if (again) return { balance: again.balanceAfter, recordId: String(again._id) };
+      if (again) {
+        return {
+          balance: again.balanceAfter, recordId: String(again._id), duplicated: true,
+          points: Math.abs(again.delta), lotUses: [],
+        };
+      }
     }
     throw e;
   }
 
   // FIFO：按到期时间升序消耗批次；每次扣减带 remaining >= use 条件，避免并发下把批次扣成负数
   let left = points;
+  const lotUses: { lotId: string; use: number }[] = [];
   const lots = await PointLotModel.find({ userId, remaining: { $gt: 0 } })
     .sort({ expireAt: 1, _id: 1 })
     .select({ _id: 1, remaining: 1 })
@@ -306,7 +322,10 @@ export async function debitPoints(userId: string, input: DebitInput, now = Date.
       { _id: lot._id, remaining: { $gte: use } },
       { $inc: { remaining: -use } },
     );
-    if (applied.modifiedCount === 1) left -= use;
+    if (applied.modifiedCount === 1) {
+      left -= use;
+      lotUses.push({ lotId: String(lot._id), use });
+    }
   }
   if (left > 0) {
     // 理论不可达（不变量：批次 remaining 之和 = 余额 ≥ 本次扣减）；出现即批次账实不符，
@@ -316,7 +335,90 @@ export async function debitPoints(userId: string, input: DebitInput, now = Date.
     });
   }
 
-  return { balance: balanceAfter, recordId: String(record._id) };
+  return { balance: balanceAfter, recordId: String(record._id), duplicated: false, points, lotUses };
+}
+
+/** 撤销类型：兑换失败时把扣分原路退回。既不进「发放」，也不进「消耗」（见 points-admin-stats）。 */
+export const EXCHANGE_REFUND_TYPE = 'exchange_refund';
+/** 被撤销的原始扣分行降级成这个类型：保留审计痕迹，但不再计入 exchange 口径，也不再占用原 idemKey */
+export const EXCHANGE_REVERSED_TYPE = 'exchange_reversed';
+
+/**
+ * 撤销一笔真实扣分（M1/M2 的 all-or-nothing 补偿）。
+ * - 账户：balance / totalSpent 同时回滚，不会只加余额留下「花过钱」的假消耗；
+ * - 批次：按 debitPoints 返回的 lotUses 原路 $inc，剩余量与调用前一致；
+ * - 账本：写一条 +N 的 exchange_refund（Σdelta 仍等于余额），并把原扣分行降级成
+ *   exchange_reversed + 换 idemKey —— 这样同一个 requestId 重试时能重新走一次真实扣分，
+ *   而不是命中旧扣分行白拿一张卡；
+ * - 幂等：补偿行已存在（同一 recordId 重复调用）直接返回它的 balanceAfter。
+ *
+ * 只用于「刚扣完就失败」的请求内补偿，不做跨进程崩溃恢复。
+ */
+export async function reverseDebit(userId: string, debit: DebitResult, bizDate: string, now = Date.now()): Promise<number> {
+  if (debit.duplicated || debit.points <= 0) return debit.balance;
+
+  const original = await PointRecordModel.findById(debit.recordId).lean();
+  if (!original) return (await PointAccountModel.findOne({ userId }).lean())?.balance ?? 0;
+  const refundKey = `refund:${debit.recordId}`;
+  const existing = await PointRecordModel.findOne({ idemKey: refundKey }).lean();
+  if (existing) return existing.balanceAfter;
+
+  const after = await PointAccountModel.findOneAndUpdate(
+    { userId },
+    { $inc: { balance: debit.points, totalSpent: -debit.points } },
+    { returnDocument: 'after' },
+  ).lean();
+  if (!after) throw new AppError(500, '积分账户不存在，无法撤销本次扣减');
+  const balanceAfter = after.balance;
+
+  for (const use of debit.lotUses) {
+    await PointLotModel.updateOne({ _id: use.lotId }, { $inc: { remaining: use.use } });
+  }
+
+  // 先把原扣分行降级：释放原 idemKey，重试才能重新扣分；改名失败就不写补偿行，避免账实错位
+  const demoted = await PointRecordModel.updateOne(
+    { _id: debit.recordId, type: { $ne: EXCHANGE_REVERSED_TYPE } },
+    { $set: { type: EXCHANGE_REVERSED_TYPE, idemKey: `reversed:${debit.recordId}` } },
+  );
+  if ((demoted?.matchedCount ?? 0) === 0) {
+    await PointAccountModel.updateOne({ userId }, { $inc: { balance: -debit.points, totalSpent: debit.points } });
+    for (const use of debit.lotUses) {
+      await PointLotModel.updateOne({ _id: use.lotId }, { $inc: { remaining: -use.use } });
+    }
+    throw new AppError(500, '撤销扣分失败：原扣分明细状态异常');
+  }
+
+  try {
+    await PointRecordModel.create({
+      userId,
+      type: EXCHANGE_REFUND_TYPE,
+      title: `撤销${original.title}`,
+      delta: debit.points,
+      balanceAfter,
+      bizDate,
+      refType: original.refType ?? '',
+      refId: original.refId ?? '',
+      idemKey: refundKey,
+      createdAt: now,
+    });
+  } catch (e) {
+    // 补偿行没落下：账户/批次回滚，并把原扣分行恢复成 exchange（否则余额已复原、账本却少一条）
+    await PointAccountModel.updateOne({ userId }, { $inc: { balance: -debit.points, totalSpent: debit.points } });
+    for (const use of debit.lotUses) {
+      await PointLotModel.updateOne({ _id: use.lotId }, { $inc: { remaining: -use.use } });
+    }
+    await PointRecordModel.updateOne(
+      { _id: debit.recordId, type: EXCHANGE_REVERSED_TYPE },
+      { $set: { type: original.type, idemKey: original.idemKey } },
+    );
+    if (isDuplicateKey(e)) {
+      const again = await PointRecordModel.findOne({ idemKey: refundKey }).lean();
+      if (again) return again.balanceAfter;
+    }
+    throw e;
+  }
+
+  return balanceAfter;
 }
 
 /** 余额（先结算过期）；没有账户视为 0 */

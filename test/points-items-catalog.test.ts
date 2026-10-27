@@ -38,6 +38,12 @@ before(async () => {
 
 after(async () => {
   await PointItemModel.updateMany({ key: /^ad_free_/ }, { $set: { active: false } });
+  // 单文件直跑时没有第二个用例替你把库存刷回来：四个种子统一恢复成「不限量 + 9999」，
+  // 否则上一次跑 PC-2/PC-3 改过的 stock/unlimited 会留在共享 dev 库里（ad_free_7d 售罄等）。
+  await PointItemModel.updateMany(
+    { key: { $in: ['makeup_card', 'ad_free_7d', 'ad_free_15d', 'ad_free_30d'] } },
+    { $set: { unlimited: true, stock: 9999 } },
+  );
   await mongoose.disconnect().catch(() => {});
 });
 
@@ -302,6 +308,7 @@ test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走
   const row = items.find((i) => i.key === key)!;
   assert.equal(row.kind, 'physical');
   assert.equal(row.perUserLimit, 2);
+  assert.equal(row.stockLeft, 5, '限量道具下发剩余库存（spec §7.3）');
   assert.equal(row.detailImages.length, 2, '详情图要逐张下发');
   if (isOssConfigured()) {
     for (const url of row.detailImages) {

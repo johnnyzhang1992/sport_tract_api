@@ -6,10 +6,14 @@
  *   不是「用户花了分」，混进账本会把 §6.5 的发放/消耗不变式搅浑；
  * - 发放照样出货（spec §6.1 裁定）：库存语义是「这个道具总共能出去多少张」，白送也算，
  *   unlimited: true 时既不筛 stock 也不 $inc；
- * - 整单闸门 all-or-nothing：一次性按 `userIds.length × count` 预占，不足直接 400 点名
+ * - 整单闸门 all-or-nothing：一次性按 `去重后 userIds.length × count` 预占，不足直接 400 点名
  *   「需要 N，当前 M」，绝不发部分——半单发出去的库存/名单要人工对账，比拒绝一次难得多；
+ * - 入参有上界：名单 ≤200 人、每人 ≤100 张、单次总数 ≤2000 张；userIds 归一后去重再算 need，
+ *   否则同一 id 重复出现会把一次发放放大成 N 倍；
  * - 逐用户失败只跳过：某个用户不存在不能让整单回滚（前面的人已经拿到卡了），
- *   失败记进返回的 failed[] 让操作台看得见，末尾按实际发出数回补多占的库存（need - granted）；
+ *   失败记进返回的 failed[] 让操作台看得见；预占之后用 try/finally 按实际发出数回补（need - granted），
+ *   连「循环本身意外抛错」也不会把预占的库存丢掉；
+ * - 用户查询放在库存预占之前：查人失败时库存一分未动，不需要事后补偿；
  * - 下架不影响发放：客服补发/活动补偿恰恰要发已经下架的卡，所以这里只校验存在性，不看 active；
  * - count 是「每个用户发几张」（默认 1），不是总量；
  * - source 只有 admin / system 两个值可选，差别只在台账归类（spec §6.4），行为完全一致；
@@ -111,6 +115,10 @@ function shown(value: unknown): string {
 
 /** 名单最多 200 人（spec §7.2）：一批发太多人等于把一次误操作放大成 200 倍 */
 const MAX_GRANT_USERS = 200;
+/** 每个用户最多发 100 张：补偿/客服场景远超这个数一定是误操作（1e8 会直接撑爆内存与插库） */
+const MAX_GRANT_COUNT = 100;
+/** 单次发放总数上限：200 人 × 100 张会把一次点击放大成两万张卡，再高没有合理业务场景 */
+const MAX_GRANT_TOTAL = 2000;
 
 /**
  * 入参闸门：全部校验都在读目录与预占库存之前。
@@ -127,12 +135,20 @@ function assertGrantInput(input: GrantInput): { userIds: string[]; count: number
     if (!isObjectIdLike(id)) throw new AppError(400, `用户 ID 不合法：${id}`);
   }
   // 形态闸门通过后归一成小写 String(ObjectId)：下面 known 集合按 String(user._id) 建、failed 也按它比对，
-  // isObjectIdLike 接受大写 hex（/i），不归一就会把真用户记成「用户不存在」并把库存退回去
-  const userIds = rawIds.map((id) => String(new Types.ObjectId(id)));
+  // isObjectIdLike 接受大写 hex（/i），不归一就会把真用户记成「用户不存在」并把库存退回去。
+  // 归一后去重：名单里同一个 id 出现三次只发一份，need 也按去重后人数算。
+  const userIds = [...new Set(rawIds.map((id) => String(new Types.ObjectId(id))))];
 
   const count = input.count === undefined || input.count === null ? 1 : Number(input.count);
   if (!Number.isInteger(count) || count < 1) {
     throw new AppError(400, `每次发放张数必须是 ≥1 的整数（收到「${shown(input.count)}」）`);
+  }
+  if (count > MAX_GRANT_COUNT) {
+    throw new AppError(400, `每次发放张数不能超过 ${MAX_GRANT_COUNT}（收到「${shown(input.count)}」）`);
+  }
+  const need = userIds.length * count;
+  if (need > MAX_GRANT_TOTAL) {
+    throw new AppError(400, `单次发放总数不能超过 ${MAX_GRANT_TOTAL} 张（当前 ${need}）`);
   }
 
   // 路由交上来的是没经校验的外部 body，source 按 unknown 读回来判：
@@ -169,6 +185,19 @@ export async function grantItem(
   if (!Number.isFinite(validDays) || validDays <= 0) {
     throw new AppError(400, `「${item.name}」的卡有效期不合法（validDays=${shown(item.validDays)}，应为正数）`);
   }
+  // 权益天数同口径：NaN 会让 insertMany 在发卡那一步抛 ValidationError，此时库存已经预占
+  const benefitDays = item.effect?.kind === 'ad_free' ? Number(item.effect.days) : 0;
+  if (!Number.isFinite(benefitDays) || benefitDays < 0) {
+    throw new AppError(400,
+      `「${item.name}」的权益天数不合法（effect.days=${shown(item.effect?.days)}，应为非负数）`);
+  }
+
+  // 用户查询放在库存预占之前（S5）：查人失败时库存一分都没动，不需要事后补偿。
+  // 一次查出名单里存在的用户：不存在的逐个记进 failed，而不是让 create() 去撞 required 校验。
+  const existing = await UserModel.find({ _id: { $in: userIds.map((id) => new Types.ObjectId(id)) } })
+    .select({ _id: 1 })
+    .lean();
+  const known = new Set(existing.map((u) => String(u._id)));
 
   const need = userIds.length * count;
   if (!item.unlimited) {
@@ -182,55 +211,53 @@ export async function grantItem(
     }
   }
 
-  // 一次查出名单里存在的用户：不存在的逐个记进 failed，而不是让 create() 去撞 required 校验
-  const existing = await UserModel.find({ _id: { $in: userIds.map((id) => new Types.ObjectId(id)) } })
-    .select({ _id: 1 })
-    .lean();
-  const known = new Set(existing.map((u) => String(u._id)));
-
   const failed: GrantResult['failed'] = [];
   let granted = 0;
-  for (const userId of userIds) {
-    if (!known.has(userId)) {
-      failed.push({ userId, reason: '用户不存在' });
-      continue;
-    }
-    try {
-      await PointCardModel.insertMany(
-        Array.from({ length: count }, () => ({
-          userId,
-          itemKey: item.key,
-          status: 'unused',
-          source,
-          grantedBy: String(grantedBy ?? ''),
-          note,
-          // 发卡时固化权益天数：后台把 7 天改成 10 天不该影响已经发出去的卡
-          benefitDays: item.effect?.kind === 'ad_free' ? item.effect.days : 0,
-          expiresAt: now + validDays * DAY_MS,
-          createdAt: now,
-        })),
-      );
-      granted += count;
-    } catch (e) {
-      // insertMany 是 ordered 的：可能已经落了前几张再抛（校验撞在第 N 张）。已落库的张数必须算进
-      // granted，否则末尾按「这个人一张没发」回补，等于白退库存、卡却留在库里。
-      const partial = (e as { insertedDocs?: unknown[] })?.insertedDocs?.length ?? 0;
-      granted += partial;
-      failed.push({ userId, reason: (e as Error)?.message ?? '发卡失败' });
-    }
-  }
-
-  // 回补多占的库存：预占按名单长度算，跳过的人数 × count 那张数要原路退回（不补就是白扣库存）。
-  // 此时卡已经落库，不能为了回补失败把整单抛成失败——把缺口放进 refundFailed 让操作台人工核对。
   let refundFailed = 0;
-  if (!item.unlimited && need > granted) {
-    const refund = need - granted;
-    try {
-      const res = await PointItemModel.updateOne({ _id: item._id }, { $inc: { stock: refund } });
-      if ((res?.matchedCount ?? 0) === 0) refundFailed = refund;
-    } catch (e) {
-      refundFailed = refund;
-      console.error('[points] 发放回补库存失败', item.key, refund, e);
+  // 预占之后的任何非预期抛错都要回补 need - granted（S5）：逐用户失败已在循环内记账，
+  // 这里的 finally 只兜「循环本身炸了」的情况；正常路径同样走它，不另写一份回补逻辑。
+  try {
+    for (const userId of userIds) {
+      if (!known.has(userId)) {
+        failed.push({ userId, reason: '用户不存在' });
+        continue;
+      }
+      try {
+        await PointCardModel.insertMany(
+          Array.from({ length: count }, () => ({
+            userId,
+            itemKey: item.key,
+            status: 'unused',
+            source,
+            grantedBy: String(grantedBy ?? ''),
+            note,
+            // 发卡时固化权益天数：后台把 7 天改成 10 天不该影响已经发出去的卡
+            benefitDays,
+            expiresAt: now + validDays * DAY_MS,
+            createdAt: now,
+          })),
+        );
+        granted += count;
+      } catch (e) {
+        // insertMany 是 ordered 的：可能已经落了前几张再抛（校验撞在第 N 张）。已落库的张数必须算进
+        // granted，否则末尾按「这个人一张没发」回补，等于白退库存、卡却留在库里。
+        const partial = (e as { insertedDocs?: unknown[] })?.insertedDocs?.length ?? 0;
+        granted += partial;
+        failed.push({ userId, reason: (e as Error)?.message ?? '发卡失败' });
+      }
+    }
+  } finally {
+    // 回补多占的库存：预占按名单长度算，跳过的人数 × count 那张数要原路退回（不补就是白扣库存）。
+    // 此时卡已经落库，不能为了回补失败把整单抛成失败——把缺口放进 refundFailed 让操作台人工核对。
+    if (!item.unlimited && need > granted) {
+      const refund = need - granted;
+      try {
+        const res = await PointItemModel.updateOne({ _id: item._id }, { $inc: { stock: refund } });
+        if ((res?.matchedCount ?? 0) === 0) refundFailed = refund;
+      } catch (e) {
+        refundFailed = refund;
+        console.error('[points] 发放回补库存失败', item.key, refund, e);
+      }
     }
   }
 

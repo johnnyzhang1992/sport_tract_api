@@ -478,3 +478,109 @@ test('GR-11 回补库存失败不吞错：refundFailed 报出没退回去的张�
   assert.equal(r.refundFailed, 1, '回补失败的那 1 张必须报出来，不许假装回补成功');
   assert.equal(await readStock('ad_free_15d'), 3, '库存确实停在「多扣了 1」的状态（正常回补后应是 4）');
 });
+
+/** 用例私有的发放目录行：不碰四条种子，库存断言不受并行/历史用例影响 */
+let grantTempSeq = 0;
+async function tempGrantItem(stock = 10, unlimited = false) {
+  const key = `t_grant_cap_${Date.now()}_${grantTempSeq++}`;
+  const row = await PointItemModel.create({
+    key, name: '发放上限道具', subtitle: '', description: '', notes: [],
+    price: 100, validDays: 30, effect: { kind: 'makeup', days: 0 },
+    kind: 'virtual', stock, unlimited, active: true, sortOrder: 999, image: '',
+  });
+  return { key, id: String(row._id) };
+}
+
+const cardCountFor = (ids: string[]) =>
+  PointCardModel.countDocuments({ userId: { $in: ids.map((id) => new Types.ObjectId(id)) } });
+
+test('GR-12 count 上限 100：超限直接 400 点名收到值与上限，不发卡不动库存', async (t) => {
+  const item = await tempGrantItem(10);
+  const u = new Types.ObjectId();
+  t.after(async () => {
+    await cleanupUser(u);
+    await PointItemModel.deleteMany({ key: item.key });
+  });
+
+  for (const bad of [101, 1e8]) {
+    await assert.rejects(() => grantItem(item.id, { userIds: [String(u)], count: bad }, 'admin-1'), (e) => {
+      const err = e as AppError;
+      return err.statusCode === 400
+        && /每次发放张数不能超过 100/.test(err.message)
+        && err.message.includes(String(bad));
+    }, `count=${bad} 必须 400 并点名收到的值与上限`);
+  }
+  assert.equal(await cardCountFor([String(u)]), 0);
+  assert.equal((await PointItemModel.findOne({ key: item.key }).lean())!.stock, 10, '入参闸门被拒不动库存');
+});
+
+test('GR-13 userIds 先去重再算 need：同一 id 重复出现只发一次', async (t) => {
+  const item = await tempGrantItem(10);
+  const u = new Types.ObjectId();
+  await UserModel.create({ _id: u, openid: `t-grant13-${u}`, nickname: '重复名单用户' });
+  t.after(async () => {
+    await cleanupUser(u);
+    await PointItemModel.deleteMany({ key: item.key });
+  });
+
+  const r = await grantItem(item.id, { userIds: [String(u), String(u).toUpperCase(), String(u)], count: 2 }, 'admin-1');
+  assert.equal(r.granted, 2, '去重后 1 人 × 2 张');
+  assert.equal(r.failed.length, 0);
+  assert.equal(await PointCardModel.countDocuments({ userId: u }), 2, '不能因为名单重复发 6 张');
+  assert.equal((await PointItemModel.findOne({ key: item.key }).lean())!.stock, 8, 'need 按去重后人数算');
+});
+
+test('GR-14 单次发放总数上限：需要 2100 张直接 400，不预占库存', async (t) => {
+  const item = await tempGrantItem(9999, true);
+  const ids = Array.from({ length: 21 }, () => String(new Types.ObjectId()));
+  t.after(() => PointItemModel.deleteMany({ key: item.key }));
+
+  await assert.rejects(() => grantItem(item.id, { userIds: ids, count: 100 }, 'admin-1'), (e) => {
+    const err = e as AppError;
+    return err.statusCode === 400
+      && /单次发放总数不能超过 2000/.test(err.message)
+      && err.message.includes('2100');
+  });
+  assert.equal(await cardCountFor(ids), 0, '闸门被拒一张都不发');
+});
+
+test('GR-15 用户查询失败不丢库存预占：lookup 抛错时库存原样', async (t) => {
+  const item = await tempGrantItem(10);
+  const u = new Types.ObjectId();
+  t.after(async () => {
+    await cleanupUser(u);
+    await PointItemModel.deleteMany({ key: item.key });
+  });
+
+  const box = UserModel as unknown as { find: unknown };
+  const realFind = UserModel.find.bind(UserModel);
+  box.find = () => { throw new Error('lookup boom'); };
+  try {
+    await assert.rejects(() => grantItem(item.id, { userIds: [String(u)] }, 'admin-1'), /lookup boom/);
+  } finally {
+    box.find = realFind;
+  }
+  assert.equal((await PointItemModel.findOne({ key: item.key }).lean())!.stock, 10,
+    '预占之后抛错必须回补，否则白扣一张库存');
+  assert.equal(await cardCountFor([String(u)]), 0);
+});
+
+test('GR-16 effect.days 非有限数：400 点名道具，先于库存预占与发卡', async (t) => {
+  const id = new Types.ObjectId();
+  const key = `t_grant_nan_days_${Date.now()}`;
+  t.after(() => PointItemModel.deleteMany({ key }));
+  await PointItemModel.collection.insertOne({
+    _id: id, key, name: '脏权益天数道具', price: 100, validDays: 30, effect: { kind: 'ad_free', days: NaN },
+    stock: 5, unlimited: false, active: true, sortOrder: 999,
+  });
+  const u = new Types.ObjectId();
+  t.after(() => cleanupUser(u));
+
+  await assert.rejects(() => grantItem(String(id), { userIds: [String(u)] }, 'admin-1'), (e) => {
+    const err = e as AppError;
+    return err.statusCode === 400 && /脏权益天数道具/.test(err.message)
+      && /effect\.days/.test(err.message) && /NaN/.test(err.message);
+  });
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 5, '校验先于库存预占');
+  assert.equal(await cardCountFor([String(u)]), 0);
+});

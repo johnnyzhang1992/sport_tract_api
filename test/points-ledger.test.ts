@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
 import { PointAccountModel, PointLotModel, PointRecordModel } from '../src/models/point.model.js';
-import { creditPoints, debitPoints, settleExpired, getBalance, listPointRecords } from '../src/services/points-ledger.js';
+import { creditPoints, debitPoints, settleExpired, getBalance, listPointRecords, reverseDebit } from '../src/services/points-ledger.js';
 
 const userId = String(new Types.ObjectId());
 const uid = new Types.ObjectId(userId);
@@ -228,4 +228,58 @@ test('PL10 扣减重放只认扣减明细：发放用过的 idemKey 不会被当
   assert.equal(rows.length, 1);
   assert.ok(rows[0].delta > 0, '库里只有原来那条发放明细');
   assert.equal(await assertLotsMatchBalance(userId), balanceBefore);
+});
+
+test('PL11 reverseDebit：余额/totalSpent/批次复原，补偿行成对且幂等；重放不退款', async (t) => {
+  const u = new Types.ObjectId();
+  const us = String(u);
+  t.after(async () => {
+    await Promise.all([
+      PointAccountModel.deleteMany({ userId: u }),
+      PointLotModel.deleteMany({ userId: u }),
+      PointRecordModel.deleteMany({ userId: u }),
+    ]);
+  });
+  await creditPoints(us, { type: 'signin', title: '签到', points: 100, bizDate: '2026-10-24', idemKey: key('rev:seed') }, NOW);
+  await creditPoints(us, { type: 'signin', title: '签到', points: 60, bizDate: '2026-10-25', idemKey: key('rev:seed2') }, NOW);
+  const beforeLots = await PointLotModel.find({ userId: u }).sort({ _id: 1 }).lean();
+
+  const d = await debitPoints(us, {
+    type: 'exchange', title: '兑换补签卡', points: 70, bizDate: '2026-10-25', idemKey: key('rev:debit'),
+  }, NOW);
+  assert.equal(d.balance, 90);
+  assert.equal(d.duplicated, false);
+
+  const restored = await reverseDebit(us, d, '2026-10-25', NOW);
+  assert.equal(restored, 160);
+  const acc = await PointAccountModel.findOne({ userId: u }).lean();
+  assert.equal(acc?.balance, 160);
+  assert.equal(acc?.totalSpent, 0, 'totalSpent 一起回滚');
+  const lots = await PointLotModel.find({ userId: u }).sort({ _id: 1 }).lean();
+  assert.deepEqual(lots.map((l) => l.remaining), beforeLots.map((l) => l.remaining), '批次原路复原');
+  // 补偿对：原扣分行降级 + 一条正数补偿，两个类型都不在 exchange / rollback 口径里
+  assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'exchange' }), 0);
+  assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'exchange_reversed' }), 1);
+  assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'exchange_refund' }), 1);
+  const [sum] = await PointRecordModel.aggregate<{ sum: number }>([
+    { $match: { userId: u } }, { $group: { _id: null, sum: { $sum: '$delta' } } },
+  ]);
+  assert.equal(sum.sum, 160, 'Σdelta 仍等于余额');
+
+  // 幂等：同一 recordId 再撤一次，不再加钱/不再写第二条补偿
+  assert.equal(await reverseDebit(us, d, '2026-10-25', NOW), 160);
+  assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'exchange_refund' }), 1);
+
+  // 重放（duplicated=true）绝不退款：只返回当时的余额
+  const d2 = await debitPoints(us, {
+    type: 'exchange', title: '再兑换', points: 30, bizDate: '2026-10-25', idemKey: key('rev:debit2'),
+  }, NOW);
+  const replay = await debitPoints(us, {
+    type: 'exchange', title: '再兑换', points: 30, bizDate: '2026-10-25', idemKey: key('rev:debit2'),
+  }, NOW);
+  assert.equal(replay.duplicated, true);
+  assert.equal(await reverseDebit(us, replay, '2026-10-25', NOW), replay.balance,
+    '重放没有真实扣分，补偿必须跳过');
+  assert.equal((await PointAccountModel.findOne({ userId: u }).lean())?.balance, d2.balance);
+  assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'exchange_refund' }), 1);
 });

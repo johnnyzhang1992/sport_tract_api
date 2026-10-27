@@ -22,7 +22,7 @@ import { userKeywordFilter } from '../utils/user-keyword.js';
 import { STATUS_TEXT, cardStatus, type CardStatus } from './points-items.js';
 import { SOURCE_TEXT } from './points-grant.js';
 import { adFreeUntilOf } from './points-cards.js';
-import { listPointRecords } from './points-ledger.js';
+import { EXCHANGE_REFUND_TYPE, listPointRecords } from './points-ledger.js';
 import { getSigninState } from './points-signin.js';
 import { ROLLBACK_RE } from './points-admin-stats.js';
 
@@ -161,12 +161,14 @@ async function metricsOf(ids: Types.ObjectId[], now: number): Promise<Map<string
       {
         $group: {
           _id: '$userId',
-          earnedGross: { $sum: { $cond: [{ $gt: ['$delta', 0] }, '$delta', 0] } },
+          // 撤销补偿行（exchange_refund）不是发放：排除后失败兑换不会把用户算成「赚过这笔」
+          earnedGross: { $sum: { $cond: [{ $and: [{ $gt: ['$delta', 0] }, { $ne: ['$type', EXCHANGE_REFUND_TYPE] }] }, '$delta', 0] } },
           rolledBack: { $sum: { $cond: [{ $regexMatch: { input: '$type', regex: ROLLBACK_RE.source } }, { $multiply: ['$delta', -1] }, 0] } },
           spentExchange: { $sum: { $cond: [{ $eq: ['$type', 'exchange'] }, { $multiply: ['$delta', -1] }, 0] } },
           spentExpire: { $sum: { $cond: [{ $eq: ['$type', 'expire'] }, { $multiply: ['$delta', -1] }, 0] } },
+          // 被撤销的扣分行会降级成 exchange_reversed，因此这里天然只数真正成功的兑换
           exchanges: { $sum: { $cond: [{ $eq: ['$type', 'exchange'] }, 1, 0] } },
-          lastEarnedAt: { $max: { $cond: [{ $gt: ['$delta', 0] }, '$createdAt', 0] } },
+          lastEarnedAt: { $max: { $cond: [{ $and: [{ $gt: ['$delta', 0] }, { $ne: ['$type', EXCHANGE_REFUND_TYPE] }] }, '$createdAt', 0] } },
         },
       },
     ]),

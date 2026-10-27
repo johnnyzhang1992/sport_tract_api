@@ -6,9 +6,10 @@ import { POINTS } from '../src/config/points.js';
 import {
   PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointItemModel, PointLotModel, PointRecordModel,
 } from '../src/models/point.model.js';
-import { creditPoints, getBalance } from '../src/services/points-ledger.js';
+import { creditPoints, debitPoints, getBalance } from '../src/services/points-ledger.js';
 import { seedPointItems } from '../src/services/points-catalog.js';
 import { exchangeItem, listActiveItems, listExchanges } from '../src/services/points-items.js';
+import { pointsOverview } from '../src/services/points-admin-stats.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { AppError } from '../src/utils/app-error.js';
 
@@ -49,6 +50,19 @@ async function seedPoints(u: Types.ObjectId, total: number): Promise<void> {
     assert.equal(r.credited, points);
     left -= points;
   }
+}
+
+let tempSeq = 0;
+/** 用例私有的限量目录行：不去改种子行的 stock/unlimited，避免污染共享库里的其它用例 */
+async function tempItem(overrides: Record<string, unknown> = {}): Promise<string> {
+  const key = `t_items_${Date.now()}_${tempSeq++}`;
+  await PointItemModel.create({
+    key, name: '测试道具', subtitle: '', description: '', notes: [],
+    price: 200, validDays: 30, effect: { kind: 'makeup', days: 0 },
+    kind: 'virtual', stock: 3, unlimited: false, active: true, sortOrder: 999, image: '',
+    ...overrides,
+  });
+  return key;
 }
 
 before(async () => {
@@ -95,6 +109,8 @@ test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t)
     kind: 'virtual',
     detailImages: [],
     perUserLimit: 0,
+    // spec §7.3：unlimited 下发 null（端上显示「不限量」），限量道具下发剩余数
+    stockLeft: null,
     imageUrl: '',
   });
 
@@ -293,12 +309,14 @@ test('PI7 兑换记录写失败不留孤儿卡，重试仍只对应一次扣分'
   model.create = async () => { throw new Error('exchange write boom'); };
   await assert.rejects(exchangeItem(String(uid), 'makeup_card', 'req-orphan', NOW), /exchange write boom/);
 
-  // 扣分已发生（先扣后发，本轮不引入事务），但卡必须撤回，否则重试等于白得一张
+  // M1/M2 不变量（A）：扣分必须真正撤销，卡与库存一起回滚——不能留下「扣了分没卡」
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0);
   assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 0);
-  assert.equal(await getBalance(String(uid), NOW), 0);
+  assert.equal(await getBalance(String(uid), NOW), POINTS.MAKEUP_CARD_PRICE, '失败后余额回到扣分前');
+  const failedAcc = await PointAccountModel.findOne({ userId: uid }).lean();
+  assert.equal(failedAcc?.totalSpent, 0, 'totalSpent 也必须回滚');
 
-  // 恢复后重试：账本按 idemKey 重放（不二次扣分），一扣分对应一卡一记录
+  // 恢复后重试：原扣分行已撤销，重新扣一次分；净结果仍是一扣分对应一卡一记录
   restore();
   const r = await exchangeItem(String(uid), 'makeup_card', 'req-orphan', NOW);
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1);
@@ -306,4 +324,217 @@ test('PI7 兑换记录写失败不留孤儿卡，重试仍只对应一次扣分'
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 1);
   assert.equal(r.balance, 0);
   assert.equal(String((await PointExchangeModel.findOne({ userId: uid, requestId: 'req-orphan' }).lean())?.cardId), r.cardId);
+});
+
+/**
+ * M1/M2 不变量（A：all-or-nothing）：
+ * 过了库存闸门之后的任何失败，balance / totalSpent / 批次 / 库存 / 卡 / 兑换记录都必须回到调用前。
+ * 失败注入只打「发卡」与「兑换记录」两步；补偿走账本里的 exchange_reversed（原扣分行降级）+
+ * exchange_refund（+N），两者都不进概况的发放/消耗口径。
+ */
+const patchModel = (model: object, method: string) => {
+  const box = model as Record<string, unknown>;
+  const real = (box[method] as (...args: unknown[]) => unknown).bind(model);
+  return {
+    set: (impl: unknown) => { box[method] = impl; },
+    restore: () => { box[method] = real; },
+  };
+};
+
+test('X1 发卡失败：余额/累计消耗/批次/库存/卡/兑换记录全部回到调用前', async (t) => {
+  const uid = newUser();
+  const key = await tempItem();
+  t.after(async () => { await wipe(uid); await PointItemModel.deleteMany({ key }); });
+  await seedPoints(uid, 200);
+  const beforeLots = await PointLotModel.find({ userId: uid }).sort({ _id: 1 }).lean();
+  assert.equal(beforeLots.length, 2, '前置条件：两笔 100 的批次');
+
+  const cardCreate = patchModel(PointCardModel, 'create');
+  cardCreate.set(async () => { throw new Error('card create boom'); });
+  try {
+    await assert.rejects(() => exchangeItem(String(uid), key, 'rid-x1', NOW), /card create boom/);
+  } finally {
+    cardCreate.restore();
+  }
+
+  const acc = await PointAccountModel.findOne({ userId: uid }).lean();
+  assert.equal(acc?.balance, 200, '余额必须回到扣分前');
+  assert.equal(acc?.totalSpent, 0, 'totalSpent 必须一起回滚（不是只把余额加回来）');
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0, '不许留孤儿卡');
+  assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 0, '不许落兑换记录');
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 3, '库存回到调用前');
+  const lots = await PointLotModel.find({ userId: uid }).sort({ _id: 1 }).lean();
+  assert.deepEqual(lots.map((l) => l.remaining), beforeLots.map((l) => l.remaining), '批次剩余原样恢复');
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 0,
+    '失败的扣分不能留在 exchange 口径里');
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange_refund' }), 1,
+    '必须留下补偿明细');
+  const [sum] = await PointRecordModel.aggregate<{ sum: number }>([
+    { $match: { userId: uid } }, { $group: { _id: null, sum: { $sum: '$delta' } } },
+  ]);
+  assert.equal(sum.sum, 200, 'Σdelta 仍等于余额（补偿行必须真实入账）');
+});
+
+test('X2 兑换记录写失败：同一不变量成立（全部回到调用前）', async (t) => {
+  const uid = newUser();
+  const key = await tempItem();
+  t.after(async () => { await wipe(uid); await PointItemModel.deleteMany({ key }); });
+  await seedPoints(uid, 200);
+  const beforeLots = await PointLotModel.find({ userId: uid }).sort({ _id: 1 }).lean();
+
+  const exCreate = patchModel(PointExchangeModel, 'create');
+  exCreate.set(async () => { throw new Error('exchange write boom'); });
+  try {
+    await assert.rejects(() => exchangeItem(String(uid), key, 'rid-x2', NOW), /exchange write boom/);
+  } finally {
+    exCreate.restore();
+  }
+
+  const acc = await PointAccountModel.findOne({ userId: uid }).lean();
+  assert.equal(acc?.balance, 200);
+  assert.equal(acc?.totalSpent, 0);
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0);
+  assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 0);
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 3);
+  const lots = await PointLotModel.find({ userId: uid }).sort({ _id: 1 }).lean();
+  assert.deepEqual(lots.map((l) => l.remaining), beforeLots.map((l) => l.remaining));
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 0);
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange_refund' }), 1);
+});
+
+test('X3 部分失败后同 requestId 重放：至多一卡、一次扣分、一条兑换记录', async (t) => {
+  const uid = newUser();
+  const key = await tempItem();
+  t.after(async () => { await wipe(uid); await PointItemModel.deleteMany({ key }); });
+  await seedPoints(uid, 200);
+
+  const exCreate = patchModel(PointExchangeModel, 'create');
+  const realCreate = PointExchangeModel.create.bind(PointExchangeModel);
+  let calls = 0;
+  exCreate.set(async (...args: unknown[]) => {
+    calls += 1;
+    if (calls === 1) throw new Error('exchange write boom');
+    return (realCreate as unknown as (...a: unknown[]) => Promise<unknown>)(...args);
+  });
+  try {
+    await assert.rejects(() => exchangeItem(String(uid), key, 'rid-x3', NOW), /exchange write boom/);
+    const r = await exchangeItem(String(uid), key, 'rid-x3', NOW);
+    const card = await PointCardModel.findById(r.cardId).lean();
+    assert.ok(card, '重放必须返回真实存在的卡');
+  } finally {
+    exCreate.restore();
+  }
+
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1);
+  assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 1);
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 1,
+    '只有成功那次留在 exchange 口径里');
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange_refund' }), 1);
+  const acc = await PointAccountModel.findOne({ userId: uid }).lean();
+  assert.equal(acc?.balance, 0);
+  assert.equal(acc?.totalSpent, 200, '净扣仍只有一次');
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 2, '库存只扣成功那张');
+});
+
+test('X4 补偿行不污染管理端口径：失败兑换前后概况增量全 0，不变式仍成立', async (t) => {
+  const uid = newUser();
+  const key = await tempItem();
+  t.after(async () => { await wipe(uid); await PointItemModel.deleteMany({ key }); });
+  await seedPoints(uid, 200);
+  const before = await pointsOverview(NOW);
+
+  const exCreate = patchModel(PointExchangeModel, 'create');
+  exCreate.set(async () => { throw new Error('exchange write boom'); });
+  try {
+    await assert.rejects(() => exchangeItem(String(uid), key, 'rid-x4', NOW), /exchange write boom/);
+  } finally {
+    exCreate.restore();
+  }
+
+  const after = await pointsOverview(NOW);
+  assert.deepEqual({
+    earnedGross: after.earnedGross - before.earnedGross,
+    rolledBack: after.rolledBack - before.rolledBack,
+    spentExchange: after.spentExchange - before.spentExchange,
+    spentExpire: after.spentExpire - before.spentExpire,
+    balance: after.balance - before.balance,
+  }, { earnedGross: 0, rolledBack: 0, spentExchange: 0, spentExpire: 0, balance: 0 },
+  '撤销对（exchange_reversed + exchange_refund）既不是发放也不是消耗，余额也复原');
+  assert.equal(after.earnedGross - after.rolledBack - after.spentExchange - after.spentExpire, after.balance,
+    'spec §6.5 不变式在补偿之后仍成立');
+});
+
+test('X5 兑换记录指向已删除的卡：重放不返回死 id，按账本重放补发一张卡', async (t) => {
+  const uid = newUser();
+  const key = await tempItem();
+  t.after(async () => { await wipe(uid); await PointItemModel.deleteMany({ key }); });
+  await seedPoints(uid, 200);
+  const r = await debitPoints(String(uid), {
+    type: 'exchange', title: '兑换测试道具', points: 200, bizDate: bjDateStr(NOW),
+    refType: 'item', refId: key, idemKey: `exchange:${uid}:rid-x5`,
+  }, NOW);
+  assert.equal(r.balance, 0);
+  const dead = await PointCardModel.create({
+    userId: uid, itemKey: key, status: 'unused', expiresAt: NOW + 30 * DAY, createdAt: NOW,
+  });
+  await PointCardModel.deleteOne({ _id: dead._id });
+  await PointExchangeModel.create({
+    userId: uid, itemKey: key, cost: 200, cardId: dead._id, requestId: 'rid-x5', createdAt: NOW,
+  });
+
+  const again = await exchangeItem(String(uid), key, 'rid-x5', NOW);
+  assert.notEqual(again.cardId, String(dead._id), '不能把已删除卡的 id 返回给端上');
+  assert.ok(await PointCardModel.findById(again.cardId).lean(), '返回的卡必须真实存在');
+  assert.equal(again.balance, 0, '账本重放不二次扣分');
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1);
+  assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 1);
+  assert.equal(String((await PointExchangeModel.findOne({ userId: uid }).lean())!.cardId), again.cardId);
+});
+
+test('X6 effect.days 非有限数：400 点名道具，先于库存闸门与发卡', async (t) => {
+  const uid = newUser();
+  const key = `t_items_nan_days_${Date.now()}`;
+  t.after(async () => { await wipe(uid); await PointItemModel.deleteMany({ key }); });
+  await seedPoints(uid, 200);
+  await PointItemModel.collection.insertOne({
+    key, name: '脏权益天数道具', subtitle: '', description: '', notes: [],
+    price: 200, validDays: 30, effect: { kind: 'ad_free', days: NaN },
+    stock: 5, unlimited: false, active: true, sortOrder: 999, image: '',
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+
+  await assert.rejects(() => exchangeItem(String(uid), key, 'rid-x6', NOW), (e) => {
+    const err = e as AppError;
+    return err.statusCode === 400 && /脏权益天数道具/.test(err.message)
+      && /effect\.days/.test(err.message) && /NaN/.test(err.message);
+  });
+  assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0);
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 5, '校验先于库存闸门');
+});
+
+test('X7 删卡失败不阻断库存回补与扣分撤销（S4）', async (t) => {
+  const uid = newUser();
+  const key = await tempItem();
+  t.after(async () => { await wipe(uid); await PointItemModel.deleteMany({ key }); });
+  await seedPoints(uid, 200);
+
+  const exCreate = patchModel(PointExchangeModel, 'create');
+  const cardDelete = patchModel(PointCardModel, 'deleteOne');
+  const originalError = console.error;
+  exCreate.set(async () => { throw new Error('exchange write boom'); });
+  cardDelete.set(async () => { throw new Error('card delete boom'); });
+  console.error = () => {};
+  try {
+    await assert.rejects(() => exchangeItem(String(uid), key, 'rid-x7', NOW), /exchange write boom/);
+  } finally {
+    exCreate.restore();
+    cardDelete.restore();
+    console.error = originalError;
+  }
+
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 3,
+    '删卡失败也必须先把库存退回来，不能把异常冒泡到库存回补之前');
+  const acc = await PointAccountModel.findOne({ userId: uid }).lean();
+  assert.equal(acc?.balance, 200, '扣分撤销不依赖删卡成功');
+  assert.equal(acc?.totalSpent, 0);
 });

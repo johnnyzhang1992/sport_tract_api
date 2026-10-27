@@ -18,6 +18,7 @@ import {
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import { shiftDateKey } from '../utils/points-domain.js';
+import { EXCHANGE_REFUND_TYPE, EXCHANGE_REVERSED_TYPE } from './points-ledger.js';
 import { adFreeRoster } from './points-roster.js';
 
 const DAY_MS = 86400000;
@@ -31,11 +32,16 @@ export const ROLLBACK_RE = /_rollback$/;
 /**
  * 负 delta 的全部已知族；新增扣分类型必须同步进 pointsOverview 的口径式（AS-2 钉这条）。
  * 管道的 `$regexMatch` 用 `ROLLBACK_RE.source`，与这里的判定共用同一份正则，不许散成两份。
+ *
+ * reversal = 兑换失败的补偿对：exchange_reversed（原扣分行降级，负）+ exchange_refund（正）。
+ * 它们是「撤销」不是「撤回」也不能算「消耗」：两个类型都不进 earnedGross / spentExchange，
+ * 否则失败兑换会同时虚增发放与消耗（AS-1/X4 钉这条）。
  */
 export const DEBIT_FAMILIES = {
   exchange: (t: string) => t === 'exchange',
   expire: (t: string) => t === 'expire',
   rollback: (t: string) => ROLLBACK_RE.test(t),
+  reversal: (t: string) => t === EXCHANGE_REVERSED_TYPE || t === EXCHANGE_REFUND_TYPE,
 } as const;
 
 export interface PointsOverview {
@@ -79,12 +85,20 @@ interface RecordSums {
   spentExpire: number;
 }
 
-/** 一条 `$group` 全表扫：正 delta 归毛发放，三族负 delta 各归各的桶 */
+/** 一条 `$group` 全表扫：正 delta 归毛发放，三族负 delta 各归各的桶；撤销对两侧都不进任何桶 */
 const RECORD_SUM_STAGES: PipelineStage[] = [
   {
     $group: {
       _id: null,
-      earnedGross: { $sum: { $cond: [{ $gt: ['$delta', 0] }, '$delta', 0] } },
+      earnedGross: {
+        $sum: {
+          $cond: [
+            { $and: [{ $gt: ['$delta', 0] }, { $ne: ['$type', EXCHANGE_REFUND_TYPE] }] },
+            '$delta',
+            0,
+          ],
+        },
+      },
       rolledBack: {
         $sum: {
           $cond: [
@@ -123,7 +137,8 @@ export async function pointsOverview(now = Date.now()): Promise<PointsOverview> 
     PointSigninModel.distinct('userId', { dateKey: { $gte: weekStart, $lte: today } }),
     PointSigninModel.distinct('userId'),
     PointCardModel.distinct('userId', { status: 'unused', expiresAt: { $gt: now } }),
-    PointRecordModel.distinct('userId', { delta: { $gt: 0 } }),
+    // 撤销补偿行（正 delta）不算「被发放过」：它只是把一次失败的消耗退回来
+    PointRecordModel.distinct('userId', { delta: { $gt: 0 }, type: { $ne: EXCHANGE_REFUND_TYPE } }),
   ]);
 
   const earnedGross = sums?.earnedGross ?? 0;
@@ -255,7 +270,16 @@ export async function pointsTrend(days: number, now = Date.now()): Promise<{ day
       {
         $group: {
           _id: '$bizDate',
-          earned: { $sum: { $cond: [{ $gt: ['$delta', 0] }, '$delta', 0] } },
+          // 撤销补偿行不进发放桶；被撤销的 exchange 行已降级成 exchange_reversed，也不进兑换桶
+          earned: {
+            $sum: {
+              $cond: [
+                { $and: [{ $gt: ['$delta', 0] }, { $ne: ['$type', EXCHANGE_REFUND_TYPE] }] },
+                '$delta',
+                0,
+              ],
+            },
+          },
           exchanged: { $sum: { $cond: [{ $eq: ['$type', 'exchange'] }, { $multiply: ['$delta', -1] }, 0] } },
           expired: { $sum: { $cond: [{ $eq: ['$type', 'expire'] }, { $multiply: ['$delta', -1] }, 0] } },
         },
