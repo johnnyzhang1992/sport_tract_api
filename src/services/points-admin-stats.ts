@@ -4,7 +4,8 @@
  * 口径（§6.5，一条都不能改）：
  * - 一律从 `PointRecord` 按 `type` 聚合，**不读 `PointAccount.totalSpent`**：`debitPoints`
  *   把兑换、过期回收、撤回都记进同一个 totalSpent（points-ledger.ts:264），拿它当「消耗」
- *   会把撤回算成花钱。totalSpent 仍然下发，但只作为「不能当消耗用」的可执行证据（AS-1 后半）；
+ *   会把撤回算成花钱。所以概况 DTO 不下发 totalSpent（避免前端误用），「不能当消耗用」
+ *   的证据由 AS-1 直接读 PointAccount 断言；
  * - 不变式：`balance == earnedGross - rolledBack - spentExchange - spentExpire`。
  *   等式右边只列了三族负 delta，所以负 delta 的类型集合也被 AS-2 钉住；
  * - 趋势桶键直接比对库里的东八区 `YYYY-MM-DD`（`dateKey` / `bizDate`），不走 `$dateToString`，
@@ -49,11 +50,6 @@ export interface PointsOverview {
   spentExpire: number;
   /** 流通余额：Σ PointAccount.balance */
   balance: number;
-  /**
-   * Σ PointAccount.totalSpent —— 只用于证明「不能当消耗用」：它混了撤回，
-   * 与 spentExchange + spentExpire 的差值恰为 rolledBack。
-   */
-  totalSpent: number;
   /** 今天（东八区）签到人数，含补签 */
   todaySigninUsers: number;
   /** 近 7 天（含今天）签到人数 */
@@ -115,8 +111,8 @@ export async function pointsOverview(now = Date.now()): Promise<PointsOverview> 
 
   const [[sums], [accounts], todayUsers, weekUsers, totalUsers, cardUsers] = await Promise.all([
     PointRecordModel.aggregate<RecordSums>(RECORD_SUM_STAGES),
-    PointAccountModel.aggregate<{ balance: number; totalSpent: number }>([
-      { $group: { _id: null, balance: { $sum: '$balance' }, totalSpent: { $sum: '$totalSpent' } } },
+    PointAccountModel.aggregate<{ balance: number }>([
+      { $group: { _id: null, balance: { $sum: '$balance' } } },
     ]),
     PointSigninModel.distinct('userId', { dateKey: today }),
     PointSigninModel.distinct('userId', { dateKey: { $gte: weekStart, $lte: today } }),
@@ -133,7 +129,6 @@ export async function pointsOverview(now = Date.now()): Promise<PointsOverview> 
     spentExchange: sums?.spentExchange ?? 0,
     spentExpire: sums?.spentExpire ?? 0,
     balance: accounts?.balance ?? 0,
-    totalSpent: accounts?.totalSpent ?? 0,
     todaySigninUsers: todayUsers.length,
     weekSigninUsers: weekUsers.length,
     totalSigninUsers: totalUsers.length,

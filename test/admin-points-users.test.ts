@@ -186,6 +186,24 @@ test('AU-5 keyword 按昵称/UID 字面量搜，元字符不当通配', async (t
   const row = (await pointsAdminUsers({ keyword: '张三(测试)' })).items.find((i) => i.id === u)!;
   const byUid = await pointsAdminUsers({ keyword: String(row.uid) });
   assert.equal(byUid.items.some((i) => i.id === u), true, 'UID 搜索要能命中本人');
+
+  // 存量库里 uid 有 string 形态（dev 实测 int/string 混存）：数字关键词必须两种 BSON 表示都命中。
+  // 绕过 schema 直写，否则 mongoose 会把 '51000' 强转成 51000，造不出字符串形态
+  const stringUidOid = new Types.ObjectId();
+  const stringUid = String(uidSeq + 50000);
+  await UserModel.collection.insertOne({
+    _id: stringUidOid,
+    openid: `t-t7-struid-${stringUidOid}`,
+    nickname: 'T7AU5-字符串UID',
+    uid: stringUid,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  t.after(() => UserModel.deleteOne({ _id: stringUidOid }));
+  const byStringUid = await pointsAdminUsers({ keyword: stringUid });
+  const stringRow = byStringUid.items.find((i) => i.id === String(stringUidOid));
+  assert.ok(stringRow, 'uid 存成字符串时，纯数字关键词也要命中（$in 里的字符串会被 mongoose 强转成数字）');
+  assert.equal(stringRow.uid, Number(stringUid));
 });
 
 test('AU-6 详情：概况与列表行同口径，且带 adFreeUntil 与当前连续', async (t) => {
@@ -271,4 +289,24 @@ test('AU-9 路由接线：四条都挂 adminAuth，详情/明细/卡片字段齐
   const ghost = await adminGet(`/sport-track/api/admin/points/users/${new Types.ObjectId()}/cards`);
   assert.equal(ghost.statusCode, 404, ghost.body);
   assert.equal(ghost.json().message, '用户不存在');
+});
+
+test('AU-10 大写 hex 用户 id：详情必须与列表同口径，不许全零', async (t) => {
+  // 大写 hex 也过 isObjectIdLike（/i）；详情按 String(ObjectId) 小写建 map，不归一就会查不到
+  let oid = new Types.ObjectId();
+  while (String(oid).toUpperCase() === String(oid)) oid = new Types.ObjectId();
+  const id = String(oid);
+  const upper = id.toUpperCase();
+  uidSeq += 1;
+  await UserModel.create({ _id: oid, openid: `t-t7-upper-${id}`, nickname: 'T7AU10-大写', uid: uidSeq });
+  t.after(() => wipe(oid));
+  await seedPoints(id, 40);
+
+  const row = (await pointsAdminUsers({ keyword: 'T7AU10-大写', pageSize: 10 })).items.find((i) => i.id === id)!;
+  assert.equal(row.balance, 40);
+  const d = await pointsAdminUserDetail(upper);
+  assert.equal(d.id, id);
+  assert.equal(d.balance, row.balance, '大写 hex 归一后必须读到同一个人的指标（否则详情全是 0）');
+  assert.equal(d.totalEarned, row.totalEarned);
+  assert.equal(d.lastEarnedAt, row.lastEarnedAt);
 });

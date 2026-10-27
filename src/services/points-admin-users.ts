@@ -122,13 +122,16 @@ function toPositiveInt(value: unknown, fallback: number): number {
  * 用户 id 闸门：形态非法 → 400（AU-8 第一段），查无此人 → 404「用户不存在」。
  * 这里刻意不用 assertObjectIdLike（它把畸形串也归成 404）：管理端详情/明细/卡片三条接口
  * 的路径参数是同一个，调用方传错 id 和「人已被删」是两类错误，文案要分得开。
+ *
+ * 校验通过后**归一成 String(ObjectId)**（小写）：isObjectIdLike 接受大写 hex，
+ * 而下游 metricsOf 的 Map 键是 String(ObjectId)（小写）——不归一就会「人找到了、指标全零」。
  */
 function userIdOf(value: unknown): string {
   const raw = String(value ?? '').trim();
   if (!isObjectIdLike(raw)) {
     throw new AppError(400, `用户 ID 不合法（收到「${shown(raw)}」，应为 24 位 ObjectId）`);
   }
-  return raw;
+  return String(new Types.ObjectId(raw));
 }
 
 async function loadUser(userId: string) {

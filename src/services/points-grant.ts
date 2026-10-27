@@ -49,10 +49,15 @@ export interface GrantInput {
   note?: string;
 }
 
-/** 发放结果：granted 是实际落卡张数，failed 逐个点名原因 */
+/** 发放结果：granted 是实际落卡张数，failed 逐个点名原因；refundFailed 是回补失败、仍多扣着的库存张数 */
 export interface GrantResult {
   granted: number;
   failed: { userId: string; reason: string }[];
+  /**
+   * 回补失败的库存张数。>0 表示预占多扣的库存没能原路退回（例如写库失败），
+   * 卡已经发出去了，不能靠抛错让调用方误以为整单失败——操作台必须提示「库存回补失败，请人工核对」。
+   */
+  refundFailed: number;
 }
 
 /** 发放记录查询：itemKey / source / userId / keyword 都可选，page 与 pageSize 走缺省 */
@@ -79,7 +84,8 @@ export interface IssuanceRow {
   nickname: string;
   itemKey: string;
   itemName: string;
-  source: string;
+  /** 三来源之一（老行物理缺 source，聚合里按 exchange 补齐） */
+  source: IssuanceSource;
   sourceText: string;
   createdAt: number;
   expiresAt: number;
@@ -114,12 +120,15 @@ const MAX_GRANT_USERS = 200;
 function assertGrantInput(input: GrantInput): { userIds: string[]; count: number; source: GrantSource; note: string } {
   const raw = Array.isArray(input.userIds) ? input.userIds : null;
   if (!raw) throw new AppError(400, `发放名单必须是用户 ID 数组（收到「${shown(input.userIds)}」）`);
-  const userIds = raw.map((id) => String(id ?? '').trim());
-  if (userIds.length === 0) throw new AppError(400, '至少选一个用户');
-  if (userIds.length > MAX_GRANT_USERS) throw new AppError(400, `最多 ${MAX_GRANT_USERS} 人（当前 ${userIds.length}）`);
-  for (const id of userIds) {
+  const rawIds = raw.map((id) => String(id ?? '').trim());
+  if (rawIds.length === 0) throw new AppError(400, '至少选一个用户');
+  if (rawIds.length > MAX_GRANT_USERS) throw new AppError(400, `最多 ${MAX_GRANT_USERS} 人（当前 ${rawIds.length}）`);
+  for (const id of rawIds) {
     if (!isObjectIdLike(id)) throw new AppError(400, `用户 ID 不合法：${id}`);
   }
+  // 形态闸门通过后归一成小写 String(ObjectId)：下面 known 集合按 String(user._id) 建、failed 也按它比对，
+  // isObjectIdLike 接受大写 hex（/i），不归一就会把真用户记成「用户不存在」并把库存退回去
+  const userIds = rawIds.map((id) => String(new Types.ObjectId(id)));
 
   const count = input.count === undefined || input.count === null ? 1 : Number(input.count);
   if (!Number.isInteger(count) || count < 1) {
@@ -153,6 +162,13 @@ export async function grantItem(
   assertObjectIdLike(itemId, '道具不存在');
   const item = await PointItemModel.findOne({ _id: itemId }).lean() as ItemDoc | null;
   if (!item) throw new AppError(404, '道具不存在');
+
+  // 有效期先归一：存量目录行可能没有 validDays，`undefined * DAY_MS` 会发出 expiresAt=NaN 的卡。
+  // 校验必须在库存预占之前——不然坏目录行会先扣库存再报错。
+  const validDays = Number(item.validDays);
+  if (!Number.isFinite(validDays) || validDays <= 0) {
+    throw new AppError(400, `「${item.name}」的卡有效期不合法（validDays=${shown(item.validDays)}，应为正数）`);
+  }
 
   const need = userIds.length * count;
   if (!item.unlimited) {
@@ -190,7 +206,7 @@ export async function grantItem(
           note,
           // 发卡时固化权益天数：后台把 7 天改成 10 天不该影响已经发出去的卡
           benefitDays: item.effect?.kind === 'ad_free' ? item.effect.days : 0,
-          expiresAt: now + item.validDays * DAY_MS,
+          expiresAt: now + validDays * DAY_MS,
           createdAt: now,
         })),
       );
@@ -204,13 +220,21 @@ export async function grantItem(
     }
   }
 
-  // 回补多占的库存：预占按名单长度算，跳过的人数 × count 那张数要原路退回（不补就是白扣库存）
+  // 回补多占的库存：预占按名单长度算，跳过的人数 × count 那张数要原路退回（不补就是白扣库存）。
+  // 此时卡已经落库，不能为了回补失败把整单抛成失败——把缺口放进 refundFailed 让操作台人工核对。
+  let refundFailed = 0;
   if (!item.unlimited && need > granted) {
-    await PointItemModel.updateOne({ _id: item._id }, { $inc: { stock: need - granted } })
-      .catch((e) => console.error('[points] 发放回补库存失败', item.key, e));
+    const refund = need - granted;
+    try {
+      const res = await PointItemModel.updateOne({ _id: item._id }, { $inc: { stock: refund } });
+      if ((res?.matchedCount ?? 0) === 0) refundFailed = refund;
+    } catch (e) {
+      refundFailed = refund;
+      console.error('[points] 发放回补库存失败', item.key, refund, e);
+    }
   }
 
-  return { granted, failed };
+  return { granted, failed, refundFailed };
 }
 
 /** 分页归一：page ≥ 1，pageSize 1–100（管理端列表口径，缺省 20） */
@@ -240,8 +264,13 @@ export async function listIssuances(q: IssuanceQuery): Promise<{
   if (source && !(ISSUANCE_SOURCES as readonly string[]).includes(source)) {
     throw new AppError(400, `筛选来源只能是 ${ISSUANCE_SOURCES.join(' / ')}（收到「${shown(q.source)}」）`);
   }
-  // 形态不对的 userId 一律 404（仓内统一闸门），不拦就是 CastError → 500 带内部文案
-  const userId = q.userId ? String(assertObjectIdLike(q.userId, '用户不存在')) : '';
+  // 查询参数里的 userId 是「筛选条件」不是路径资源：形态非法一律 400（路径 id 才沿用仓内 404 口径）。
+  // 通过后同样归一成小写 hex，与库里 userId 的 ObjectId 字节比较口径一致。
+  const rawUserId = q.userId ? String(q.userId).trim() : '';
+  if (rawUserId && !isObjectIdLike(rawUserId)) {
+    throw new AppError(400, `用户 ID 不合法（收到「${shown(q.userId)}」，应为 24 位 ObjectId）`);
+  }
+  const userId = rawUserId ? String(new Types.ObjectId(rawUserId)) : '';
 
   // keyword 走「先查人、再按 userId 预筛」而不是 $lookup 之后 $match：
   // - 持卡人字段在 users 里，$lookup 之后的 $match 只能落在 $facet 的 rows 内（已 skip/limit），

@@ -140,7 +140,9 @@ test('GR-2 整单库存闸门：不足则一张都不发', async (t) => {
 test('GR-3 部分用户不存在：跳过并记失败，末尾回补多扣的库存', async (t) => {
   const item = await PointItemModel.findOne({ key: 'ad_free_30d' }).lean();
   await PointItemModel.updateOne({ _id: item!._id }, { $set: { unlimited: false, stock: 5 } });
-  const real = new Types.ObjectId();
+  // 大写 hex 也是合法 id：这个用户 id 必须带字母，否则 toUpperCase 与原文相同、测不出归一化
+  let real = new Types.ObjectId();
+  while (String(real).toUpperCase() === String(real)) real = new Types.ObjectId();
   await UserModel.create({ _id: real, openid: `t-grant-${real}`, nickname: '发放测试用户' });
   // 缺一个用户：闸门放行时按 2 人 ×1 张预占 2，实发 1 张 → 末尾必须回补 1
   const ghost = new Types.ObjectId();
@@ -152,11 +154,20 @@ test('GR-3 部分用户不存在：跳过并记失败，末尾回补多扣的库
   const r = await grantItem(String(item!._id), { userIds: [String(real), '64b64b64b64b64b64b64b64b'] }, 'admin-1');
   assert.equal(r.granted, 1);
   assert.equal(r.failed.length, 1);
+  assert.equal(r.refundFailed, 0, '正常回补没有缺口');
   assert.equal((await PointItemModel.findOne({ key: 'ad_free_30d' }).lean())!.stock, 4, '只扣实际发出那张');
   assert.equal(r.failed[0]!.userId, '64b64b64b64b64b64b64b64b');
   assert.match(r.failed[0]!.reason, /用户不存在/);
   assert.equal(await PointCardModel.countDocuments({ userId: ghost }), 0, '不存在的用户不许落卡');
   assert.equal(await PointCardModel.countDocuments({ userId: real }), 1, '存在的用户正常拿到卡');
+
+  // 大写 hex：known 集合按 String(ObjectId)（小写）建，原始串不归一就会把真用户记成「用户不存在」
+  const upper = await grantItem(String(item!._id), { userIds: [String(real).toUpperCase()] }, 'admin-1');
+  assert.equal(upper.granted, 1, '大写 hex 必须认成同一个用户');
+  assert.equal(upper.failed.length, 0, '大写 hex 不许记成「用户不存在」');
+  assert.equal(upper.refundFailed, 0);
+  assert.equal((await PointItemModel.findOne({ key: 'ad_free_30d' }).lean())!.stock, 3,
+    '大写 id 不许被当成幽灵用户把库存退回去');
 });
 
 test('GR-4 入参闸门：空名单 / 超 200 人 / 非法 id / 未知 source', async (t) => {
@@ -293,7 +304,7 @@ test('GR-7 路由接线：鉴权闸门、grantedBy 取 token 里的管理员 id�
     userIds: [String(u), String(ghost)], count: 2, note: '客服补发',
   });
   assert.equal(granted.statusCode, 200, granted.body);
-  assert.deepEqual(granted.json().data, { granted: 2, failed: [{ userId: String(ghost), reason: '用户不存在' }] });
+  assert.deepEqual(granted.json().data, { granted: 2, failed: [{ userId: String(ghost), reason: '用户不存在' }], refundFailed: 0 });
   // 预占 2 人 ×2 张 = 4，实发 2 → 库存 5-2
   assert.equal(await readStock(TEST_KEY), 3, '回补多占的库存');
   const body = (await listIssuances({ page: 1, pageSize: 50, userId: String(u), itemKey: TEST_KEY }));
@@ -326,7 +337,7 @@ test('GR-7 路由接线：鉴权闸门、grantedBy 取 token 里的管理员 id�
   assert.equal(badSource.statusCode, 400, `未知来源要 400 而不是静默空列表：${badSource.body}`);
   assert.match(badSource.json().message, /筛选来源只能是 exchange \/ admin \/ system（收到「gift」）/);
   const badUser = await req('GET', '/sport-track/api/admin/points/issuances?userId=not-an-id');
-  assert.equal(badUser.statusCode, 404, `非法 userId 应 404：${badUser.body}`);
+  assert.equal(badUser.statusCode, 400, `查询参数里的非法 userId 是 400（路径 id 才 404）：${badUser.body}`);
   const badGrant = await req('POST', `/sport-track/api/admin/points/items/not-an-id/grant`, { userIds: [String(u)] });
   assert.equal(badGrant.statusCode, 404, `非法 :id 应 404：${badGrant.body}`);
   assert.equal(badGrant.json().message, '道具不存在');
@@ -371,39 +382,99 @@ test('GR-8 发卡中途抛错：已落库的张数算出货，只退真没发出
 });
 
 test('GR-9 keyword 按持卡人昵称/UID 字面量筛发放记录，元字符不当通配', async (t) => {
-  const a = new Types.ObjectId(); const b = new Types.ObjectId();
+  const a = new Types.ObjectId(); const b = new Types.ObjectId(); const near = new Types.ObjectId();
   // uid 是 sparse unique：取数值档最大值 +1（dev 库混着 int/string 两档，只筛数值档）
   const [uidAgg] = await UserModel.aggregate<{ maxUid: number | null }>([
     { $match: { uid: { $type: 'number' } } },
     { $group: { _id: null, maxUid: { $max: '$uid' } } },
   ]);
   const testUid = Number(uidAgg?.maxUid ?? 0) + 1;
+  // 共享库上别的行也可能命中同样的关键词：先取基线，之后只断言「本用例新增的命中数」
+  const countKeyword = async (keyword: string) => (await listIssuances({ keyword, pageSize: 1 })).total;
+  const beforeHit = await countKeyword('(测试)');
+  const beforeLiteral = await countKeyword('张三.*');
+  const beforeUid = await countKeyword(String(testUid));
   // 昵称里带正则元字符 ( 与 .：不转义时 '(测试)' 会当分组、'张三.*' 会当通配
   await UserModel.create({ _id: a, openid: `t-grant9-${a}`, nickname: '张三(测试)' });
   await UserModel.create({ _id: b, openid: `t-grant9-${b}`, nickname: '李四', uid: testUid });
-  t.after(() => Promise.all([a, b].map(cleanupUser)));
+  // 近义昵称：不转义时 '(测试)' 会把捕获组「测试」也匹配到这里，正例因此能失败
+  await UserModel.create({ _id: near, openid: `t-grant9-${near}`, nickname: '张三测试' });
+  t.after(() => Promise.all([a, b, near].map(cleanupUser)));
   const now = Date.now();
   await PointCardModel.create([
     { userId: a, itemKey: 'makeup_card', status: 'unused', expiresAt: now + 1e9, createdAt: now },
     { userId: b, itemKey: 'makeup_card', status: 'unused', expiresAt: now + 1e9, createdAt: now + 1 },
+    { userId: near, itemKey: 'makeup_card', status: 'unused', expiresAt: now + 1e9, createdAt: now + 2 },
   ]);
 
   const hit = await listIssuances({ keyword: '(测试)', pageSize: 50 });
-  assert.equal(hit.total, 1, '元字符按字面量匹配，只有张三 (测试) 那张');
-  assert.equal(hit.items[0].userId, String(a));
-  assert.equal(hit.items[0].nickname, '张三(测试)');
+  assert.equal(hit.total, beforeHit + 1,
+    `元字符按字面量匹配，本用例只新增张三 (测试) 一张（基线 ${beforeHit}）`);
+  assert.ok(hit.items.some((r) => r.userId === String(a) && r.nickname === '张三(测试)'));
 
-  // 不转义时 '张三.*' 会命中「张三(测试)」（total=1）；转义后按字面量搜不到任何人
+  // 不转义时 '张三.*' 会命中「张三(测试)」与「张三测试」（+2）；转义后按字面量搜不到任何人
   const literal = await listIssuances({ keyword: '张三.*', pageSize: 50 });
-  assert.equal(literal.total, 0, '转义后按字面量匹配，不能当通配');
+  assert.equal(literal.total, beforeLiteral, '转义后按字面量匹配，不能当通配');
 
   const byUid = await listIssuances({ keyword: String(testUid), pageSize: 50 });
-  assert.equal(byUid.total, 1, '纯数字关键词按 UID 命中');
-  assert.equal(byUid.items[0].userId, String(b));
+  assert.equal(byUid.total, beforeUid + 1, '纯数字关键词按 UID 命中');
+  assert.ok(byUid.items.some((r) => r.userId === String(b)));
 
   // 路由层把 keyword 透传下去（HTTP 入口同样按字面量）
   const http = await req('GET', `/sport-track/api/admin/points/issuances?keyword=${encodeURIComponent('(测试)')}`);
   assert.equal(http.statusCode, 200, http.body);
-  assert.equal(http.json().data.total, 1);
-  assert.equal(http.json().data.items[0].nickname, '张三(测试)');
+  assert.equal(http.json().data.total, beforeHit + 1);
+  assert.ok((http.json().data.items as Array<{ nickname: string }>).some((r) => r.nickname === '张三(测试)'));
+});
+
+test('GR-10 目录行缺 validDays：400 点名道具，不落 NaN 有效期、不动库存', async (t) => {
+  const id = new Types.ObjectId();
+  const key = 't_grant_bad_valid_days';
+  // 绕过 schema 写入一条历史脏目录行：validDays 物理缺失（required/min 是写入时校验，拦不住存量行）
+  await PointItemModel.collection.insertOne({
+    _id: id, key, name: '档期缺失卡', price: 100, effect: { kind: 'makeup', days: 0 },
+    stock: 5, unlimited: false, active: true, sortOrder: 999,
+  });
+  t.after(async () => {
+    await PointItemModel.deleteMany({ key });
+    await restoreSeededStock();
+  });
+  const u = new Types.ObjectId();
+  t.after(() => cleanupUser(u));
+
+  await assert.rejects(
+    () => grantItem(String(id), { userIds: [String(u)] }, 'admin-1'),
+    (e) => (e as AppError).statusCode === 400
+      && /档期缺失卡/.test((e as Error).message) && /validDays/.test((e as Error).message),
+    '缺 validDays 的目录行必须 400 点名道具，而不是发一张 NaN 过期的卡',
+  );
+  assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 5, '校验在库存预占之前，库存一分不能动');
+  assert.equal(await PointCardModel.countDocuments({ userId: u }), 0, '一张卡都不许落');
+});
+
+test('GR-11 回补库存失败不吞错：refundFailed 报出没退回去的张数', async (t) => {
+  const item = await PointItemModel.findOne({ key: 'ad_free_15d' }).lean();
+  await PointItemModel.updateOne({ _id: item!._id }, { $set: { unlimited: false, stock: 5 } });
+  const real = new Types.ObjectId();
+  const ghost = new Types.ObjectId();
+  await UserModel.create({ _id: real, openid: `t-grant11-${real}`, nickname: '回补失败用户' });
+
+  const model = PointItemModel as unknown as { updateOne: (...args: unknown[]) => Promise<unknown> };
+  const realUpdateOne = model.updateOne.bind(PointItemModel);
+  const originalError = console.error;
+  t.after(async () => {
+    model.updateOne = realUpdateOne;
+    console.error = originalError;
+    await Promise.all([real, ghost].map(cleanupUser));
+    await restoreSeededStock();
+  });
+  // 只让「回补库存」那一笔 updateOne 失败（预占走 findOneAndUpdate，不受影响）；控制台输出在用例里静音
+  model.updateOne = async () => { throw new Error('stock refund boom'); };
+  console.error = () => {};
+
+  const r = await grantItem(String(item!._id), { userIds: [String(real), String(ghost)] }, 'admin-1');
+  assert.equal(r.granted, 1);
+  assert.equal(r.failed.length, 1);
+  assert.equal(r.refundFailed, 1, '回补失败的那 1 张必须报出来，不许假装回补成功');
+  assert.equal(await readStock('ad_free_15d'), 3, '库存确实停在「多扣了 1」的状态（正常回补后应是 4）');
 });

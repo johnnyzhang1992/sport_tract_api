@@ -9,8 +9,8 @@ import {
 } from '../src/models/point.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
-import { creditPoints, debitPoints } from '../src/services/points-ledger.js';
-import { pointsOverview, pointsTrend } from '../src/services/points-admin-stats.js';
+import { creditPoints, debitPoints, settleExpired } from '../src/services/points-ledger.js';
+import { DEBIT_FAMILIES, pointsOverview, pointsTrend } from '../src/services/points-admin-stats.js';
 import { AppError } from '../src/utils/app-error.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { shiftDateKey } from '../src/utils/points-domain.js';
@@ -66,27 +66,81 @@ test('AS-1 概况不变式：balance == 毛发放 − 撤回 − 兑换 − 过�
   const u = new Types.ObjectId();
   t.after(() => wipe(u));
   const now = Date.parse('2026-10-27T10:00:00+08:00');
+  // 概况是全表聚合：本用例用「基线 → 造数 → 增量」断言五个词各自的精确值，
+  // 这样共享 dev 库上别人的流水（以及并发写入）不会把断言变成「差不多就行」
+  const before = await pointsOverview(now);
+  const [beforeAcc] = await PointAccountModel.aggregate<{ totalSpent: number }>([
+    { $group: { _id: null, totalSpent: { $sum: '$totalSpent' } } },
+  ]);
+
   await creditPoints(String(u), { type: 'signin', title: '签到', points: 60, bizDate: '2026-10-27', idemKey: `${u}:a` }, now);
   await creditPoints(String(u), { type: 'makeup_reward', title: '补签', points: 30, bizDate: '2026-10-26', idemKey: `${u}:b` }, now);
-  await debitPoints(String(u), { type: 'exchange', title: '兑换补签卡', points: 200, bizDate: '2026-10-27', idemKey: `${u}:c` }, now)
-    .catch(() => {}); // 余额不足也要造出「撤回」行，下面手动补
+  // 先攒够 200：原 fixture 只有 90 分，兑换被 catch 吞掉，spentExchange 从来没被任何用例读过
+  await creditPoints(String(u), { type: 'signin', title: '攒够兑换', points: 100, bizDate: '2026-10-25', idemKey: `${u}:c0` }, now);
+  await creditPoints(String(u), { type: 'signin', title: '攒够兑换', points: 100, bizDate: '2026-10-24', idemKey: `${u}:c1` }, now);
+  await creditPoints(String(u), { type: 'signin', title: '攒够兑换', points: 20, bizDate: '2026-10-23', idemKey: `${u}:c2` }, now);
+  await debitPoints(String(u), { type: 'exchange', title: '兑换补签卡', points: 200, bizDate: '2026-10-27', idemKey: `${u}:c` }, now);
   await debitPoints(String(u), { type: 'makeup_reward_rollback', title: '撤回补签', points: 30, bizDate: '2026-10-27', idemKey: `${u}:d` }, now);
+  // 过期也走真账本：再入 40，把它那一批的 expireAt 改到过去，settleExpired 会写一条真的 expire 流水
+  await creditPoints(String(u), { type: 'signin', title: '即将过期', points: 40, bizDate: '2026-10-22', idemKey: `${u}:e` }, now);
+  const expiringLot = await PointLotModel.findOne({ userId: u, earned: 40, remaining: 40 }).lean();
+  await PointLotModel.updateOne({ _id: expiringLot!._id }, { $set: { expireAt: now - 1 } });
+  await settleExpired(String(u), now);
+
   const o = await pointsOverview(now);
+  const [afterAcc] = await PointAccountModel.aggregate<{ totalSpent: number }>([
+    { $group: { _id: null, totalSpent: { $sum: '$totalSpent' } } },
+  ]);
+  const delta = {
+    earnedGross: o.earnedGross - before.earnedGross,
+    rolledBack: o.rolledBack - before.rolledBack,
+    spentExchange: o.spentExchange - before.spentExchange,
+    spentExpire: o.spentExpire - before.spentExpire,
+    balance: o.balance - before.balance,
+  };
+  assert.equal(delta.earnedGross, 350, '毛发放增量 = 60 + 30 + 100 + 100 + 20 + 40');
+  assert.equal(delta.rolledBack, 30, '撤回增量 = 那条 makeup_reward_rollback');
+  assert.equal(delta.spentExchange, 200, '真 exchange 行必须计进兑换消耗');
+  assert.equal(delta.spentExpire, 40, '真 expire 行必须计进过期消耗');
+  assert.equal(delta.balance, 80, '余额增量 = 350 − 30 − 200 − 40');
   assert.equal(o.earnedGross - o.rolledBack - o.spentExchange - o.spentExpire, o.balance,
-    'spec §6.5 不变式');
-  assert.ok(o.rolledBack >= 30);
-  assert.notEqual(o.spentExchange + o.spentExpire, o.totalSpent,
-    'totalSpent 混了撤回，不能当消耗用（这条断言就是证据）');
+    `spec §6.5 不变式：earnedGross ${o.earnedGross} − rolledBack ${o.rolledBack} − `
+    + `spentExchange ${o.spentExchange} − spentExpire ${o.spentExpire} 应等于 balance ${o.balance}`);
+  // totalSpent 只留在 PointAccount 里（概况 DTO 不再下发这个 foot-gun）。
+  // 本用例的兑换 200 + 撤回 30 都进了它，所以增量 230 ≠ 真消耗增量 240
+  const deltaTotalSpent = (afterAcc?.totalSpent ?? 0) - (beforeAcc?.totalSpent ?? 0);
+  assert.equal(deltaTotalSpent, 230, 'PointAccount.totalSpent 把撤回也记成消耗');
+  assert.equal(delta.spentExchange + delta.spentExpire, 240, '真正的消耗只有兑换 200 + 过期 40');
+  assert.notEqual(delta.spentExchange + delta.spentExpire, deltaTotalSpent,
+    'totalSpent 混了撤回，不能当消耗用（概况 DTO 不下发它，AS-1 直接读 PointAccount）');
 });
 
-test('AS-2 负 delta 的 type 必须全在三族内，否则不变式会静默失真', async () => {
-  const known = ['exchange', 'expire', 'makeup_reward_rollback'];
-  const odd = await PointRecordModel.distinct('type', { delta: { $lt: 0 } });
-  assert.deepEqual(
-    odd.filter((t) => !known.includes(t) && !t.endsWith('_rollback')),
-    [],
-    `出现未登记的扣分类型：${odd.join(', ')}。必须同步进 pointsOverview 的口径式与本文档`,
-  );
+test('AS-2 负 delta 的 type 必须全在三族内，否则不变式会静默失真', async (t) => {
+  // 单源：族判定只认 service 导出的 DEBIT_FAMILIES，测试不再自带第二份清单
+  const known = (type: string) => Object.values(DEBIT_FAMILIES).some((is) => is(type));
+  const oddUser = new Types.ObjectId();
+  const probeKey = `${oddUser}:probe`;
+  const oddTypes = async () => (await PointRecordModel.distinct('type', { delta: { $lt: 0 } }))
+    .filter((type) => !known(type));
+  t.after(async () => {
+    await PointRecordModel.deleteMany({ userId: oddUser });
+    await PointRecordModel.deleteOne({ idemKey: probeKey });
+  });
+
+  // 投一条未登记类型的扣分流水：判定必须把它揪出来，否则「全在三族内」永远是空转
+  await PointRecordModel.create({
+    userId: oddUser, type: 'task_reward_revoke', title: '未登记扣分', delta: -1,
+    balanceAfter: 0, bizDate: '2026-10-27', idemKey: probeKey, createdAt: Date.now(),
+  });
+  const flagged = await oddTypes();
+  assert.ok(flagged.includes('task_reward_revoke'),
+    `未登记的扣分类型 task_reward_revoke 必须被 AS-2 揪出，实际：${flagged.join(', ')}`);
+
+  // 探针行删掉后，库里的负 delta 类型必须全部落在三族内
+  await PointRecordModel.deleteMany({ userId: oddUser });
+  const rest = await oddTypes();
+  assert.deepEqual(rest, [],
+    `出现未登记的扣分类型：${rest.join(', ')}。必须同步进 pointsOverview 的口径式、DEBIT_FAMILIES 与本文档`);
 });
 
 test('AS-3 趋势缺日补 0 且桶数等于窗口', async (t) => {
