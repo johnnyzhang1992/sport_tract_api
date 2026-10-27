@@ -50,7 +50,8 @@ import {
   listIssuances,
   type GrantInput,
 } from '../services/points-grant.js';
-import { pointsOverview, pointsTrend } from '../services/points-admin-stats.js';
+import { pointsOverview, pointsTrend, itemsOverview } from '../services/points-admin-stats.js';
+import { adFreeRoster } from '../services/points-roster.js';
 import {
   pointsAdminUsers,
   pointsAdminUserDetail,
@@ -1661,6 +1662,18 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     return success(await pointsAdminUserCards(id));
   });
+
+  // ==================== 积分管理 · 道具概况与免广告名单 ====================
+  // 口径见 spec §4/§7.2：概况按卡与账本聚合；名单是**全后台唯一**允许出现 openid 的出口（RS-3 钉住）。
+  // 路由注册顺序不影响匹配：/items/overview 是静态段，不会被其它 /items/... 规则吞掉。
+
+  // 道具概况：发放总数 / 三来源分档 / 按道具分档 / 累计消耗积分 / 生效中免广告人数
+  fastify.get('/points/items/overview', { onRequest: [adminAuth] }, async () =>
+    success(await itemsOverview()));
+
+  // 免广告名单：当天有效的全量名单（给 We分析 人群包整包替换上传用，次日生效），按到期日倒序
+  fastify.get('/points/ad-free/roster', { onRequest: [adminAuth] }, async () =>
+    success(await adFreeRoster()));
 }
 
 /** 均匀采样（保留首尾点） */
