@@ -50,6 +50,13 @@ import {
   listIssuances,
   type GrantInput,
 } from '../services/points-grant.js';
+import { pointsOverview, pointsTrend } from '../services/points-admin-stats.js';
+import {
+  pointsAdminUsers,
+  pointsAdminUserDetail,
+  pointsAdminUserRecords,
+  pointsAdminUserCards,
+} from '../services/points-admin-users.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { backfillVehicle } from '../services/vehicle-backfill.js';
 import { backfillDriftScore } from '../services/drift-score-backfill.js';
@@ -1592,14 +1599,67 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 发放记录：以卡为主体，可按道具/来源/用户筛，老行物理缺 source 的按 exchange 归类。
   // query 全是字符串，page/pageSize 在这层就转成数字交给 service（别让 service 猜入参形态）
   fastify.get('/points/issuances', { onRequest: [adminAuth] }, async (request) => {
-    const q = request.query as { itemKey?: string; source?: string; userId?: string; page?: string; pageSize?: string };
+    const q = request.query as {
+      itemKey?: string; source?: string; userId?: string; keyword?: string; page?: string; pageSize?: string;
+    };
     return success(await listIssuances({
       itemKey: q.itemKey,
       source: q.source,
       userId: q.userId,
+      keyword: q.keyword,
       page: Math.max(1, Number(q.page) || 1),
       pageSize: Number(q.pageSize) || 20,
     }));
+  });
+
+  // ==================== 积分管理 · 概况与双趋势 ====================
+  // 口径见 spec §6.5/§6.6：概况一律按 PointRecord.type 聚合，不读 totalSpent（它混了撤回）。
+
+  // 概况：六组数 + 今日/近7天/累计签到人数 + 持卡未使用人数
+  fastify.get('/points/overview', { onRequest: [adminAuth] }, async () => success(await pointsOverview()));
+
+  // 双趋势：days 只认 7/30/90（默认 30），非白名单由 service 抛 400 并列出允许值
+  fastify.get('/points/trend', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as { days?: string };
+    // 空串 = 没传走默认；乱填（abc/15）原样交给 service 回 400，不能静默当 30
+    const days = q.days === undefined || q.days === '' ? 30 : Number(q.days);
+    return success(await pointsTrend(days));
+  });
+
+  // ==================== 积分管理 · 用户积分 ====================
+  // 列表行与详情概况共用 points-admin-users 的同一份聚合（AU-6），这里只做 query 形态转换。
+
+  // 用户积分列表：keyword 搜昵称/UID（字面量），sortBy 只认四项白名单，排序后切片
+  fastify.get('/points/users', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as {
+      keyword?: string; sortBy?: string; order?: string; page?: string; pageSize?: string;
+    };
+    return success(await pointsAdminUsers({
+      keyword: q.keyword,
+      sortBy: q.sortBy,
+      order: q.order,
+      page: q.page,
+      pageSize: q.pageSize,
+    }));
+  });
+
+  // 详情概况：余额/累计获得/累计消耗/签到天数/当前连续/兑换次数/持卡/最后发放/adFreeUntil
+  fastify.get('/points/users/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await pointsAdminUserDetail(id));
+  });
+
+  // 积分明细：复用 listPointRecords，管理端单页上限 100（用户端仍是 50）
+  fastify.get('/points/users/:id/records', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const q = request.query as { page?: string; pageSize?: string; type?: string };
+    return success(await pointsAdminUserRecords(id, q.page, q.pageSize, q.type));
+  });
+
+  // 道具记录：该用户全部卡（含后台手动/系统赠送），状态实时推导
+  fastify.get('/points/users/:id/cards', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await pointsAdminUserCards(id));
   });
 }
 

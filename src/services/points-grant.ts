@@ -23,6 +23,7 @@ import { PointCardModel, PointItemModel } from '../models/point.model.js';
 import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
+import { userKeywordFilter } from '../utils/user-keyword.js';
 import { STATUS_TEXT, cardStatus } from './points-items.js';
 // CardStatus 是 points-items 那份唯一口径（含 cardStatus 的实时推导），这里只引类型不再另立
 import type { CardStatus } from './points-items.js';
@@ -54,11 +55,13 @@ export interface GrantResult {
   failed: { userId: string; reason: string }[];
 }
 
-/** 发放记录查询：itemKey / source / userId 都可选，page 与 pageSize 走缺省 */
+/** 发放记录查询：itemKey / source / userId / keyword 都可选，page 与 pageSize 走缺省 */
 export interface IssuanceQuery {
   itemKey?: string;
   source?: string;
   userId?: string;
+  /** 持卡人昵称或 UID，字面量、不区分大小写（spec §7.2） */
+  keyword?: string;
   page?: number;
   pageSize?: number;
 }
@@ -217,7 +220,8 @@ function toPaging(q: IssuanceQuery): { p: number; ps: number } {
   return { p, ps };
 }
 
-const SOURCE_TEXT: Record<string, string> = {
+/** 三来源的中文文案：发放记录与用户详情里的「道具记录」共用这一份（spec §7.1/§8.3） */
+export const SOURCE_TEXT: Record<string, string> = {
   exchange: '兑换',
   admin: '后台手动',
   system: '系统赠送',
@@ -239,6 +243,17 @@ export async function listIssuances(q: IssuanceQuery): Promise<{
   // 形态不对的 userId 一律 404（仓内统一闸门），不拦就是 CastError → 500 带内部文案
   const userId = q.userId ? String(assertObjectIdLike(q.userId, '用户不存在')) : '';
 
+  // keyword 走「先查人、再按 userId 预筛」而不是 $lookup 之后 $match：
+  // - 持卡人字段在 users 里，$lookup 之后的 $match 只能落在 $facet 的 rows 内（已 skip/limit），
+  //   筛掉的空页没法用下一页补，total 也得再算一遍；
+  // - 预筛在 $facet 之前，total 与分页都按同一条件走；
+  // - 代价（有意为之）：用户文档缺失的卡行在「带 keyword」时查不到——它本来也没有昵称/UID 可匹配；
+  //   不带 keyword 时这些行仍靠 preserveNullAndEmptyArrays 留在列表里（GR-6 同口径）。
+  const keywordFilter = userKeywordFilter(q.keyword);
+  const keywordUserIds = keywordFilter
+    ? (await UserModel.find(keywordFilter).select({ _id: 1 }).lean()).map((u) => u._id)
+    : null;
+
   const pipeline: PipelineStage[] = [
     // 10-27 之前写入的卡没有 source 字段，先补成 exchange 再筛，否则按来源筛选会漏掉全部老行
     { $addFields: { source: { $ifNull: ['$source', 'exchange'] } } },
@@ -246,6 +261,8 @@ export async function listIssuances(q: IssuanceQuery): Promise<{
   if (itemKey) pipeline.push({ $match: { itemKey } });
   if (source) pipeline.push({ $match: { source } });
   if (userId) pipeline.push({ $match: { userId: new Types.ObjectId(userId) } });
+  // 空数组 = 关键词一个人都没命中 → $in: [] 让结果为空（不能把这条 $match 省掉）
+  if (keywordUserIds) pipeline.push({ $match: { userId: { $in: keywordUserIds } } });
   pipeline.push(
     { $sort: { createdAt: -1, _id: -1 } },
     {

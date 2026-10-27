@@ -369,3 +369,41 @@ test('GR-8 发卡中途抛错：已落库的张数算出货，只退真没发出
   assert.equal(await readStock('ad_free_15d'), 4, '回补只退真没发出去那张');
   assert.equal(await PointCardModel.countDocuments({ userId: u }), 1);
 });
+
+test('GR-9 keyword 按持卡人昵称/UID 字面量筛发放记录，元字符不当通配', async (t) => {
+  const a = new Types.ObjectId(); const b = new Types.ObjectId();
+  // uid 是 sparse unique：取数值档最大值 +1（dev 库混着 int/string 两档，只筛数值档）
+  const [uidAgg] = await UserModel.aggregate<{ maxUid: number | null }>([
+    { $match: { uid: { $type: 'number' } } },
+    { $group: { _id: null, maxUid: { $max: '$uid' } } },
+  ]);
+  const testUid = Number(uidAgg?.maxUid ?? 0) + 1;
+  // 昵称里带正则元字符 ( 与 .：不转义时 '(测试)' 会当分组、'张三.*' 会当通配
+  await UserModel.create({ _id: a, openid: `t-grant9-${a}`, nickname: '张三(测试)' });
+  await UserModel.create({ _id: b, openid: `t-grant9-${b}`, nickname: '李四', uid: testUid });
+  t.after(() => Promise.all([a, b].map(cleanupUser)));
+  const now = Date.now();
+  await PointCardModel.create([
+    { userId: a, itemKey: 'makeup_card', status: 'unused', expiresAt: now + 1e9, createdAt: now },
+    { userId: b, itemKey: 'makeup_card', status: 'unused', expiresAt: now + 1e9, createdAt: now + 1 },
+  ]);
+
+  const hit = await listIssuances({ keyword: '(测试)', pageSize: 50 });
+  assert.equal(hit.total, 1, '元字符按字面量匹配，只有张三 (测试) 那张');
+  assert.equal(hit.items[0].userId, String(a));
+  assert.equal(hit.items[0].nickname, '张三(测试)');
+
+  // 不转义时 '张三.*' 会命中「张三(测试)」（total=1）；转义后按字面量搜不到任何人
+  const literal = await listIssuances({ keyword: '张三.*', pageSize: 50 });
+  assert.equal(literal.total, 0, '转义后按字面量匹配，不能当通配');
+
+  const byUid = await listIssuances({ keyword: String(testUid), pageSize: 50 });
+  assert.equal(byUid.total, 1, '纯数字关键词按 UID 命中');
+  assert.equal(byUid.items[0].userId, String(b));
+
+  // 路由层把 keyword 透传下去（HTTP 入口同样按字面量）
+  const http = await req('GET', `/sport-track/api/admin/points/issuances?keyword=${encodeURIComponent('(测试)')}`);
+  assert.equal(http.statusCode, 200, http.body);
+  assert.equal(http.json().data.total, 1);
+  assert.equal(http.json().data.items[0].nickname, '张三(测试)');
+});

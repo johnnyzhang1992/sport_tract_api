@@ -334,11 +334,16 @@ export async function listPointRecords(
   now = Date.now(),
   /** 明细类型筛选（如 'exchange' = 兑换记录）；不传 = 全部 */
   type?: string,
-): Promise<{ items: PointRecordDto[]; total: number; balance: number }> {
+  /**
+   * 单页上限。用户端不传 → 50，行为与之前一致；管理端传 100（spec §7.1）。
+   * 上限由调用方显式放开，不靠 route 先 Math.min 一遍——route 忘了夹就等于没有闸门。
+   */
+  pageSizeCap = 50,
+): Promise<{ items: PointRecordDto[]; total: number; balance: number; pageSize: number }> {
   await settleExpired(userId, now);
 
   const safePage = Math.max(1, Math.trunc(page) || 1);
-  const safeSize = Math.min(50, Math.max(1, Math.trunc(pageSize) || 20));
+  const safeSize = Math.min(pageSizeCap, Math.max(1, Math.trunc(pageSize) || 20));
   // 类型筛选（2026-10-26）：积分明细页「兑换记录」入口按 type=exchange 过滤
   const filter: Record<string, unknown> = { userId };
   if (type) filter.type = type;
@@ -364,5 +369,5 @@ export async function listPointRecords(
     createdAt: r.createdAt,
   }));
 
-  return { items, total, balance: account?.balance ?? 0 };
+  return { items, total, balance: account?.balance ?? 0, pageSize: safeSize };
 }
