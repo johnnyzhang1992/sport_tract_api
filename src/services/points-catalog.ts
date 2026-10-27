@@ -3,7 +3,7 @@
  * 种子只用 $setOnInsert —— 后台改过价格/库存/文案后重跑启动钩子不得冲掉（PI-2 钉这条）。
  */
 import { Types } from 'mongoose';
-import { PointItemModel } from '../models/point.model.js';
+import { PointItemModel, type ItemKind } from '../models/point.model.js';
 
 export const POINT_ITEM_KEYS = {
   makeupCard: 'makeup_card',
@@ -21,12 +21,16 @@ export interface ItemDoc {
   notes: string[];
   price: number;
   validDays: number;
+  kind: ItemKind;
   effect: { kind: 'makeup' | 'ad_free'; days: number };
   stock: number;
   unlimited: boolean;
   active: boolean;
   sortOrder: number;
   image: string;
+  detailImages: string[];
+  /** 0 = 不限购；实物新建未传时落 1 */
+  perUserLimit: number;
 }
 
 const MAKEUP_NOTES = [
@@ -50,6 +54,8 @@ export const POINT_ITEMS_SEED: Omit<ItemDoc, '_id'>[] = [
     key: POINT_ITEM_KEYS.makeupCard, name: '补签卡', subtitle: '恢复连续打卡记录',
     description: '每张仅可使用一次；可补签近 7 天窗口内的漏签日，补一天用一张；兑换后 30 天内有效',
     notes: MAKEUP_NOTES, price: 200, validDays: 30,
+    // 四条种子一律虚拟道具：实物由后台显式新建（默认每人限购 1），种子不限购
+    kind: 'virtual', detailImages: [], perUserLimit: 0,
     effect: { kind: 'makeup', days: 0 },
     stock: 9999, unlimited: true, active: true, sortOrder: 10, image: '',
   },
@@ -57,6 +63,7 @@ export const POINT_ITEMS_SEED: Omit<ItemDoc, '_id'>[] = [
     key: `ad_free_${days}d`, name: `免广告卡·${days} 天`, subtitle: `激活后 ${days} 天内免广告`,
     description: `兑换后 30 天内需激活，激活起 ${days} 天免广告；封面广告次日生效`,
     notes: adFreeNotes(days), price: AD_FREE_PRICE[days], validDays: 30,
+    kind: 'virtual' as const, detailImages: [], perUserLimit: 0,
     effect: { kind: 'ad_free' as const, days },
     // active:false 起步：老端首页商品区是 wx:for，后台一上架就会多出点不动的卡，等 Task 14 发版后再开
     stock: 9999, unlimited: true, active: false, sortOrder: 20 + i * 10, image: '',

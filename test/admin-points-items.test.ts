@@ -41,6 +41,7 @@ const RENAMED_KEY = 'another_key';
 const validInput: ItemInput = {
   key: TEST_KEY, name: '测试道具', subtitle: '', description: '', notes: [],
   price: 100, validDays: 30, effect: { kind: 'ad_free' as const, days: 5 },
+  kind: 'virtual', detailImages: [], perUserLimit: 0,
   stock: 10, unlimited: false, active: true, sortOrder: 900, image: '',
 };
 
@@ -402,8 +403,10 @@ test('AI-9 PUT 只拥有内容字段：绝不写 stock/unlimited，缺内容字�
   assert.equal(db!.stock, 0, 'PUT 带了 stock 也要忽略');
   assert.equal(db!.unlimited, false, 'PUT 带了 unlimited 也要忽略');
 
-  // 十个内容字段全必传：缺哪个就 400 点名哪个，没有默认值兜底
-  for (const field of ['name', 'subtitle', 'description', 'notes', 'price', 'validDays', 'effect', 'active', 'sortOrder', 'image']) {
+  // 十三个内容字段全必传：缺哪个就 400 点名哪个，没有默认值兜底。
+  // kind / detailImages / perUserLimit 是本批次新加的三项——后台表单（Task 5）必须一起提交，
+  // 缺了就是 400，不会「顺手」按默认值落库（实物默认限购 1 只属于新建，不属于改档）。
+  for (const field of ['name', 'subtitle', 'description', 'notes', 'price', 'validDays', 'effect', 'active', 'sortOrder', 'image', 'kind', 'detailImages', 'perUserLimit']) {
     await assert.rejects(() => updateItem(id, omitFields(content, field)), (e) => {
       const err = e as AppError;
       return err.statusCode === 400 && err.message.includes(field);
@@ -488,4 +491,83 @@ test('AI-10 effect.days 非数字与 notes 非数组：400 点名对象+实际�
   assert.equal(db!.effect.kind, 'ad_free', '被拒的 PUT 不许改写 effect');
   assert.equal(db!.effect.days, 5);
   assert.deepEqual(db!.notes, []);
+});
+
+test('AI-11 实物道具：kind 枚举 / 详情图 ≤6 / 限购默认与范围；PUT 必带新增三字段', async (t) => {
+  t.after(cleanupItems);
+
+  // ① 实物不给 perUserLimit → 新建时落 1（每人限购一件）；显式 0 是「不限」，不许被默认值盖掉
+  const phys = await createItem(omitFields({ ...validInput, key: 't_physical_item', kind: 'physical' }, 'perUserLimit'));
+  const physDb = await readItem(String(phys._id));
+  assert.equal(physDb!.kind, 'physical');
+  assert.equal(physDb!.perUserLimit, 1, '实物未传 perUserLimit 时落库为 1');
+  assert.deepEqual(physDb!.detailImages, [], '没传详情图落库为空数组，不是 undefined');
+  const noLimit = await createItem({ ...validInput, key: 't_physical_no_limit', kind: 'physical', perUserLimit: 0 });
+  assert.equal((await readItem(String(noLimit._id)))!.perUserLimit, 0,
+    '显式 0 = 不限购，实物默认值 1 不许覆盖后台的明确选择');
+
+  // ② 虚拟道具不给新字段 → virtual + 限购 0 + 无详情图（与四条种子同口径）
+  const virt = await createItem(omitFields({ ...validInput, key: 't_virtual_item' }, 'kind', 'detailImages', 'perUserLimit'));
+  const virtDb = await readItem(String(virt._id));
+  assert.equal(virtDb!.kind, 'virtual');
+  assert.equal(virtDb!.perUserLimit, 0);
+  assert.deepEqual(virtDb!.detailImages, []);
+
+  // ③ 管理端列表行要带全三个字段（Task 5 表单回填就靠它，缺了表单只能空着回写）
+  const adminRow = (await listItemsForAdmin()).find((r) => r.key === 't_physical_item')!;
+  assert.equal(adminRow.kind, 'physical');
+  assert.equal(adminRow.perUserLimit, 1);
+  assert.deepEqual(adminRow.detailImages, []);
+
+  // ④ 详情图 6 张入库裸链；7 张 400 点名「最多 6 张（当前 7 张）」
+  const six = Array.from({ length: 6 }, (_, i) => `sport-track/items/d${i}.png`);
+  const withSix = await createItem({ ...validInput, key: 't_physical_six', kind: 'physical', detailImages: six });
+  assert.deepEqual((await readItem(String(withSix._id)))!.detailImages, six, '详情图按裸链存，不存签名参数');
+  const seven = [...six, 'sport-track/items/d6.png'];
+  assert.throws(() => assertItemInput({ ...validInput, detailImages: seven }), (e) =>
+    e instanceof AppError && e.statusCode === 400 && /商品详情图最多 6 张（当前 7 张）/.test(e.message),
+    '7 张详情图必须被 400 拦下并点名「最多 6 张（当前 7 张）」');
+  // 非数组：normalize 的 .map 会 TypeError（500），闸门要拦住并点名收到的值
+  assert.throws(() => assertItemInput({ ...validInput, detailImages: 'a.png' as never }), (e) =>
+    e instanceof AppError && e.statusCode === 400 && /商品详情图必须是字符串数组，最多 6 张（收到「a\.png」）/.test(e.message),
+    '非数组详情图必须在 service 闸门 400，不许冒成 500');
+
+  // ⑤ kind / perUserLimit 越界：一律在 service 闸门 400，漏了就是 Mongoose ValidationError → 500
+  const cases: Array<{ patch: Partial<ItemInput>; copy: RegExp }> = [
+    { patch: { kind: 'hardware' as never }, copy: /道具类型只能是 virtual 或 physical（收到「hardware」）/ },
+    { patch: { kind: 'Virtual' as never }, copy: /道具类型只能是 virtual 或 physical（收到「Virtual」）/ },
+    { patch: { perUserLimit: 100 }, copy: /每人限购只能是 0（不限）或 1–99 的整数（收到「100」）/ },
+    { patch: { perUserLimit: -1 }, copy: /每人限购只能是 0（不限）或 1–99 的整数（收到「-1」）/ },
+    { patch: { perUserLimit: 1.5 }, copy: /每人限购只能是 0（不限）或 1–99 的整数（收到「1\.5」）/ },
+    // 后台数字输入框清空后常交 ''：Number('')===0 会被当成「不限」，等于静默放开限购——必须 400 点名
+    { patch: { perUserLimit: '' as never }, copy: /每人限购只能是 0（不限）或 1–99 的整数（收到「空」）/ },
+  ];
+  for (const { patch, copy } of cases) {
+    assert.throws(() => assertItemInput({ ...validInput, ...patch }), (e) =>
+      e instanceof AppError && e.statusCode === 400 && copy.test(e.message), `应报「${copy}」：${JSON.stringify(patch)}`);
+  }
+
+  // ⑥ 经路由：kind 越界 400 且点名收到的值，不许留行
+  const badKind = await req('POST', '/sport-track/api/admin/points/items', { ...validInput, key: 't_bad_item_kind', kind: 'hardware' });
+  assert.equal(badKind.statusCode, 400, `kind 越界应 400 而非 500：${badKind.body}`);
+  assert.match(badKind.json().message, /道具类型只能是 virtual 或 physical（收到「hardware」）/);
+  assert.equal(await PointItemModel.countDocuments({ key: 't_bad_item_kind' }), 0, '被拒的入参不许留下道具行');
+
+  // ⑦ PUT 不猜默认值：新增三字段缺一个就 400 点名（实物默认限购 1 只属于新建）
+  for (const field of ['kind', 'detailImages', 'perUserLimit']) {
+    await assert.rejects(
+      () => updateItem(String(phys._id), omitFields({ ...validInput, key: 't_physical_item', kind: 'physical' }, field)),
+      (e) => {
+        const err = e as AppError;
+        return err.statusCode === 400 && err.message.includes(`缺少字段「${field}」`);
+      },
+      `PUT 缺「${field}」必须 400 点名`,
+    );
+  }
+  // 路由层同码：缺 kind 的 PUT 400，且库里 kind 没被半截改写
+  const putMissingKind = await req('PUT', `/sport-track/api/admin/points/items/${phys._id}`,
+    omitFields({ ...validInput, key: 't_physical_item', kind: 'physical' }, 'kind'));
+  assert.equal(putMissingKind.statusCode, 400, putMissingKind.body);
+  assert.match(putMissingKind.json().message, /kind/);
+  assert.equal((await readItem(String(phys._id)))!.kind, 'physical', '被拒的 PUT 不许改写 kind');
 });

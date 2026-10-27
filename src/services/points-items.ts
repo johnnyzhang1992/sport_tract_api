@@ -16,7 +16,7 @@
  */
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
-import { PointCardModel, PointExchangeModel, PointItemModel } from '../models/point.model.js';
+import { PointCardModel, PointExchangeModel, PointItemModel, type ItemKind } from '../models/point.model.js';
 import { debitPoints, getBalance } from './points-ledger.js';
 import { getThumbUrl } from './oss.js';
 import type { ItemDoc } from './points-catalog.js';
@@ -30,6 +30,11 @@ export interface ItemDto {
   description: string;
   notes: string[];
   effect: { kind: 'makeup' | 'ad_free'; days: number };
+  kind: ItemKind;
+  /** 实物详情图：逐张签发缩略档链（与 imageUrl 同口径），虚拟道具恒为空数组 */
+  detailImages: string[];
+  /** 0 = 不限购；实物默认 1 */
+  perUserLimit: number;
   imageUrl: string;
 }
 
@@ -116,6 +121,11 @@ export async function listActiveItems(): Promise<ItemDto[]> {
     key: r.key, name: r.name, subtitle: r.subtitle, price: r.price,
     validDays: r.validDays, description: r.description, notes: r.notes ?? [],
     effect: { kind: r.effect?.kind ?? 'makeup', days: r.effect?.days ?? 0 },
+    // 本批次之前入库的目录行物理上没有 kind/detailImages/perUserLimit：按虚拟/无图/不限的
+    // 默认口径兜底，别把 undefined 漏给端上（端上会当成实物或者限购 0 张）
+    kind: (r.kind ?? 'virtual') as ItemKind,
+    detailImages: (r.detailImages ?? []).map((u: string) => (u ? getThumbUrl(u) : '')),
+    perUserLimit: Number(r.perUserLimit ?? 0),
     // 私有桶裸链进 <img> 会 403；一期端上还不画图，先只给缩略档签名链
     imageUrl: r.image ? getThumbUrl(r.image) : '',
   }));

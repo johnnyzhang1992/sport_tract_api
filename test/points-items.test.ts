@@ -91,6 +91,10 @@ test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t)
       '兑换后不退积分',
     ],
     effect: { kind: 'makeup', days: 0 },
+    // 实物批次新增的三字段：补签卡是虚拟道具、不限购、无详情图，端上 DTO 必须照样带上
+    kind: 'virtual',
+    detailImages: [],
+    perUserLimit: 0,
     imageUrl: '',
   });
 

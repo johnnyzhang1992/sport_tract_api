@@ -1557,7 +1557,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.post('/points/items', { onRequest: [adminAuth] }, async (request) =>
     success(await createItem(request.body as ItemInput)));
 
-  // 内容整行更新：十个内容字段必传（缺一个 400 点名缺哪个），key 不可改，stock/unlimited 绝不写
+  // 内容整行更新：十三个内容字段必传（缺一个 400 点名缺哪个），key 不可改，stock/unlimited 绝不写
   fastify.put('/points/items/:id', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
     assertObjectIdLike(id, '道具不存在');

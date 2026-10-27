@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
-import { config } from '../src/config/index.js';
+import { config, isOssConfigured } from '../src/config/index.js';
 import { POINTS } from '../src/config/points.js';
 import {
   PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointItemModel,
@@ -9,7 +9,7 @@ import {
 } from '../src/models/point.model.js';
 import { creditPoints, getBalance } from '../src/services/points-ledger.js';
 import { seedPointItems } from '../src/services/points-catalog.js';
-import { exchangeItem } from '../src/services/points-items.js';
+import { exchangeItem, listActiveItems } from '../src/services/points-items.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { shiftDateKey } from '../src/utils/points-domain.js';
 import { AppError } from '../src/utils/app-error.js';
@@ -273,4 +273,54 @@ test('PC-9b 正常兑换结果带 refundFailed: 0（成功路径也要有缺口�
   const r = await exchangeItem(String(u), 'makeup_card', `${u}-ok`);
   assert.equal(r.refundFailed, 0, '没有回滚就没有缺口，字段仍要在（前端只是展示，不做缺失判断）');
   assert.equal(r.balance, 0);
+});
+
+test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走缩略档签名）', async (t) => {
+  const key = 't_physical_catalog';
+  const legacyKey = 't_legacy_no_kind';
+  t.after(() => PointItemModel.deleteMany({ key: { $in: [key, legacyKey] } }));
+  await seedPointItems();
+
+  // 详情图存的是 OSS 裸链（与 image 同形：endpoint + key），getThumbUrl 靠 endpoint 前缀取 key 再签名
+  const ossBase = config.oss.endpoint.replace(/\/$/, '');
+  const detailImages = [`${ossBase}/items/detail-a.png`, `${ossBase}/items/detail-b.png`];
+  await PointItemModel.create({
+    key, name: '实物目录道具', subtitle: '', description: '', notes: [],
+    price: 28900, validDays: 30, effect: { kind: 'makeup', days: 0 },
+    kind: 'physical', detailImages, perUserLimit: 2,
+    stock: 5, unlimited: false, active: true, sortOrder: 999, image: '',
+  });
+  // 本批次之前入库的老目录行物理上没有这三个字段：raw insert 绕过 schema 默认值来模拟它
+  await PointItemModel.collection.insertOne({
+    key: legacyKey, name: '老目录道具', subtitle: '', description: '', notes: [],
+    price: 100, validDays: 30, effect: { kind: 'makeup', days: 0 },
+    stock: 5, unlimited: false, active: true, sortOrder: 998, image: '',
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+
+  const items = await listActiveItems();
+  const row = items.find((i) => i.key === key)!;
+  assert.equal(row.kind, 'physical');
+  assert.equal(row.perUserLimit, 2);
+  assert.equal(row.detailImages.length, 2, '详情图要逐张下发');
+  if (isOssConfigured()) {
+    for (const url of row.detailImages) {
+      assert.match(url, /[?&]Signature=/, `详情图必须签名下发（私有桶裸链进 <img> 会 403），实际 ${url}`);
+      assert.match(decodeURIComponent(url), /x-oss-process=image\/resize,w_240/, '下发必须走缩略档位（原图灌列表会卡）');
+    }
+  } else {
+    assert.deepEqual(row.detailImages, detailImages, '未配 OSS 时 getThumbUrl 原样返回裸链');
+  }
+
+  // 虚拟种子同口径：virtual / 不限购 / 无详情图
+  const makeup = items.find((i) => i.key === 'makeup_card')!;
+  assert.equal(makeup.kind, 'virtual');
+  assert.equal(makeup.perUserLimit, 0);
+  assert.deepEqual(makeup.detailImages, []);
+
+  // 老行缺新字段：运行时按「虚拟 / 不限 / 无图」默认口径下发，不能把 undefined 漏给端上
+  const legacy = items.find((i) => i.key === legacyKey)!;
+  assert.equal(legacy.kind, 'virtual');
+  assert.equal(legacy.perUserLimit, 0);
+  assert.deepEqual(legacy.detailImages, []);
 });

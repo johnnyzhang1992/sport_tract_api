@@ -39,6 +39,9 @@ test('PI-0 启动钩子真的会播种', async () => {
 });
 
 test('PI-1 四条种子', async () => {
+  // kind / detailImages / perUserLimit 是实物批次后加的字段：老库里的四行物理上没有它们，
+  // 而幂等种子只 $setOnInsert 补不上（PI-2 钉这条「不覆盖」）。先删后种，断言针对的是种子定义本身。
+  await PointItemModel.deleteMany({ key: { $in: Object.values(POINT_ITEM_KEYS) } });
   await seedPointItems();
   const rows = await PointItemModel.find({ key: { $in: Object.values(POINT_ITEM_KEYS) } }).lean();
   assert.equal(rows.length, 4, '四条道具种子必须都在');
@@ -51,6 +54,10 @@ test('PI-1 四条种子', async () => {
     assert.equal(r.validDays, 30, '卡本身有效期统一 30 天');
     assert.equal(r.unlimited, true, '四条默认都不限量');
     assert.equal(r.stock, 9999);
+    // 四条种子全是虚拟道具：实物由后台显式新建（默认限购 1），种子一个都不许变成实物
+    assert.equal(r.kind, 'virtual', `${r.key} 种子必须是 virtual`);
+    assert.equal(r.perUserLimit, 0, `${r.key} 种子不限购（0 = 不限）`);
+    assert.deepEqual(r.detailImages, [], `${r.key} 种子没有详情图`);
   }
   assert.equal(byKey.get('ad_free_15d')!.effect.days, 15);
   assert.equal(byKey.get('makeup_card')!.effect.kind, 'makeup');

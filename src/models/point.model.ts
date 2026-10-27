@@ -100,6 +100,14 @@ dailySchema.index({ userId: 1, bizDate: 1 }, { unique: true });
 export const ITEM_EFFECT_KINDS = ['makeup', 'ad_free'] as const;
 export type ItemEffectKind = typeof ITEM_EFFECT_KINDS[number];
 
+/**
+ * 道具类型：virtual = 权益/卡（兑换即发 PointCard），physical = 实物（兑换落订单 + 收货地址）。
+ * 同样只写这一份：schema 的 enum 与管理端 assertItemInput 都读它，越界才能回 400 而不是 500。
+ * default 'virtual' 只对「新建且没表态」生效；存量行物理上没有这个字段，读取侧一律按 virtual 兜底。
+ */
+export const ITEM_KINDS = ['virtual', 'physical'] as const;
+export type ItemKind = typeof ITEM_KINDS[number];
+
 const itemSchema = new Schema({
   key: { type: String, required: true, unique: true },
   name: { type: String, required: true },
@@ -108,6 +116,7 @@ const itemSchema = new Schema({
   notes: { type: [String], default: [] },
   price: { type: Number, required: true, min: 1 },
   validDays: { type: Number, required: true, min: 1 },
+  kind: { type: String, enum: ITEM_KINDS, default: 'virtual' },
   effect: {
     kind: { type: String, enum: ITEM_EFFECT_KINDS, required: true },
     days: { type: Number, default: 0, min: 0 },
@@ -117,6 +126,10 @@ const itemSchema = new Schema({
   active: { type: Boolean, default: true },
   sortOrder: { type: Number, default: 0 },
   image: { type: String, default: '' },
+  // 实物详情图：存裸链（签名在读取时现签），条数上限 schema 表达不了，由 assertItemInput 拦
+  detailImages: { type: [String], default: [] },
+  // 每人限购：0 = 不限。实物「未表态」时由 createItem 落 1；这里只兜住负数（范围/整数在 service 校验）
+  perUserLimit: { type: Number, default: 0, min: 0 },
 }, { timestamps: true, versionKey: false });
 
 export const PointAccountModel = models.PointAccount ?? model('PointAccount', accountSchema);
