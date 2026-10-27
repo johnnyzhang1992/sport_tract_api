@@ -6,7 +6,7 @@ import { buildApp } from '../src/app.js';
 import { isOssConfigured } from '../src/config/index.js';
 import { PointCardModel, PointExchangeModel, PointItemModel } from '../src/models/point.model.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
-import { seedPointItems } from '../src/services/points-catalog.js';
+import { POINT_ITEMS_SEED, seedPointItems } from '../src/services/points-catalog.js';
 import { listActiveItems } from '../src/services/points-items.js';
 import {
   ITEM_KEY_RE,
@@ -20,10 +20,12 @@ import {
 import { AppError } from '../src/utils/app-error.js';
 
 /**
- * 管理端道具目录：CRUD + 库存改写 + 道具图上传（spec §5.1/§7.2，Task 4 用例 AI-1…AI-8）。
+ * 管理端道具目录：CRUD + 库存改写 + 道具图上传（spec §5.1/§7.2，Task 4 用例 AI-1…AI-9）。
  *
  * 共享 dev 库（sport-track-dev）口径：
- * - 测试道具一律 t_ 前缀 key，t.after()/after() 里按 key 删干净，绝不留档；
+ * - 测试道具一律 t_ 前缀 key，before()/t.after()/after() 都走 cleanupItems()
+ *   （^t_ 全集 + 闸门退化时写得进去的 another_key），绝不留档；
+ * - 行数类断言不写死种子条数，一律现读库（countDocuments）比对，残行/别的任务加行都翻不动它；
  * - ad_free_* / makeup_card 是被用例临时改过 active/sortOrder 的种子行，
  *   各自 t.after() 复原 + 文件级 after() 兜底刷回种子形态（三条免广告 active:false、
  *   makeup_card sortOrder:10 顶第一），别把 dev 库留在实验态；
@@ -33,12 +35,25 @@ import { AppError } from '../src/utils/app-error.js';
 const ADMIN_USER = 'admin_items_t4';
 const ADMIN_PASS = 'test123456';
 const TEST_KEY = 't_admin_item_case';
+/** 改名尝试的目标 key：key 不可改闸门一旦退化，'another_key' 就是它写进共享库的行，必须进清理集合 */
+const RENAMED_KEY = 'another_key';
 
 const validInput: ItemInput = {
   key: TEST_KEY, name: '测试道具', subtitle: '', description: '', notes: [],
   price: 100, validDays: 30, effect: { kind: 'ad_free' as const, days: 5 },
   stock: 10, unlimited: false, active: true, sortOrder: 900, image: '',
 };
+
+/**
+ * 本文件会在共享库里碰到的所有 key：^t_ 前缀（含 t_bad_kind）+ 闸门退化时写得进去的 another_key。
+ * 清理只删 TEST_KEY 是不够的——AI-3/AI-8 试图写入的 'another_key' 既不带 t_ 前缀也没有别的地方复原它，
+ * key 不可改闸门一旦回归，这行就永久留在共享 dev 目录里，下一次跑 AI-1 会因为多出一行而假红
+ * （Task 4 首轮变异验证的 mutation-7 就是这么不得不手删残留的）。
+ */
+const TEST_ITEM_FILTER = { $or: [{ key: /^t_/ }, { key: RENAMED_KEY }] };
+
+/** 统一的清库出口：before()/after()/t.after() 都走它，别各自挑一个 key */
+const cleanupItems = () => PointItemModel.deleteMany(TEST_ITEM_FILTER);
 
 let app: FastifyInstance;
 let adminToken = '';
@@ -52,6 +67,16 @@ async function req(method: string, url: string, payload?: unknown, withToken = t
   });
 }
 
+/** 从合法整行里删掉指定字段：验 PUT 的「内容字段必传」与「不许带库存」 */
+function omitFields(body: ItemInput, ...fields: string[]): ItemInput {
+  const out: Record<string, unknown> = { ...body };
+  for (const f of fields) delete out[f];
+  // 故意交出一个「字段缺席」的 body：绕开 TS 的必传声明，让运行期闸门自己去点名
+  return out as unknown as ItemInput;
+}
+
+const readItem = async (id: string) => PointItemModel.findOne({ _id: id }).lean();
+
 before(async () => {
   // buildApp 的 onReady 会跑 seedPointItems（$setOnInsert），目录种子在这里就位
   app = await buildApp({ logger: false });
@@ -63,12 +88,12 @@ before(async () => {
   adminToken = login.json().data.token;
   assert.ok(adminToken, '管理员登录应成功');
 
-  // 上一次崩溃残留会污染 AI-1 的行数断言，开跑前先清一遍本文件的 key
-  await PointItemModel.deleteMany({ key: TEST_KEY });
+  // 上一次崩溃/闸门退化残留的行会污染 AI-1 的行数与 409 断言，开跑前先清一遍本文件的 key 全集
+  await cleanupItems();
 });
 
 after(async () => {
-  await PointItemModel.deleteMany({ key: TEST_KEY });
+  await cleanupItems();
   await PointItemModel.updateMany({ key: /^ad_free_/ }, { $set: { active: false } });
   await PointItemModel.updateOne({ key: 'ad_free_7d' }, { $set: { sortOrder: 20, 'effect.days': 7 } });
   await PointItemModel.updateOne({ key: 'makeup_card' }, { $set: { sortOrder: 10, active: true } });
@@ -87,7 +112,12 @@ test('AI-1 列表含下架项，带兑换数/发放数', async (t) => {
   });
 
   const before = await listItemsForAdmin();
-  assert.equal(before.length, 4, '管理端必须看得到下架项（当前库里应只有四条种子）');
+  // 条数不写死 4，取库里的真实行数：共享 dev 目录被别的任务加行、或上一轮闸门退化留下残行，
+  // 都不该把「管理端看得到下架项」这条变成假红（首轮变异验证就为这多手删过一次 another_key）。
+  // 列表必须等于全表，才是这条断言的本意；四条种子的可见性由下面的按 key 断言负责。
+  const dbRows = await PointItemModel.countDocuments({});
+  assert.equal(before.length, dbRows, `管理端列表要覆盖全表（含下架项）：列表 ${before.length} 行 / 库里 ${dbRows} 行`);
+  assert.ok(dbRows >= POINT_ITEMS_SEED.length, `种子行要在库里（期望 ≥${POINT_ITEMS_SEED.length}，实际 ${dbRows}）`);
   assert.ok(before.find((r) => r.key === 'ad_free_7d' && r.active === false));
   const seeded = before.find((r) => r.key === 'makeup_card')!;
   assert.equal(seeded.active, true, '补签卡必须默认可见');
@@ -119,13 +149,14 @@ test('AI-1 列表含下架项，带兑换数/发放数', async (t) => {
 });
 
 test('AI-2 新增：key 非法/重复、ad_free 缺 days 各自报清楚', async (t) => {
-  t.after(() => PointItemModel.deleteMany({ key: TEST_KEY }));
+  t.after(cleanupItems);
   await assert.rejects(() => createItem({ ...validInput, key: 'Bad Key' }), (e) =>
     (e as AppError).statusCode === 400 && /道具 key/.test((e as Error).message));
   await createItem(validInput);
   await assert.rejects(() => createItem(validInput), (e) => (e as AppError).statusCode === 409
     && /道具 key 已存在：t_admin_item_case/.test((e as Error).message));
-  await assert.rejects(() => createItem({ ...validInput, key: 'x2', effect: { kind: 'ad_free', days: 0 } }),
+  // 这条也走 t_ 前缀：ad_free 天数闸门万一退化，落库的残行必须在清理集合里
+  await assert.rejects(() => createItem({ ...validInput, key: 't_ad_free_no_days', effect: { kind: 'ad_free', days: 0 } }),
     /免广告道具必须填天数/);
 
   // 其余 schema 表达不了的校验（assertItemInput 直调，不落库）：文案必须带对象+实际值+上限
@@ -135,6 +166,11 @@ test('AI-2 新增：key 非法/重复、ad_free 缺 days 各自报清楚', async
     { patch: { price: 0 }, copy: /兑换价至少 1 分（收到 0）/ },
     { patch: { validDays: 0 }, copy: /卡有效期至少 1 天（收到 0）/ },
     { patch: { notes: Array.from({ length: 9 }, (_, i) => `说明${i}`) }, copy: /兑换说明最多 8 条（当前 9 条）/ },
+    // effect.kind 越界：enum 只写在 schema 里，不在 service 闸门就会冒到 error-handler 变 500 带内部文案
+    { patch: { effect: { kind: 'xxx' as never, days: 1 } }, copy: /道具效果类型只能是 makeup 或 ad_free（收到「xxx」）/ },
+    { patch: { effect: { kind: 'MAKEUP' as never, days: 1 } }, copy: /道具效果类型只能是 makeup 或 ad_free（收到「MAKEUP」）/ },
+    { patch: { effect: undefined }, copy: /道具效果必须提供 effect 对象/ },
+    { patch: { effect: null as never }, copy: /道具效果必须提供 effect 对象/ },
   ];
   for (const { patch, copy } of cases) {
     assert.throws(() => assertItemInput({ ...validInput, ...patch }), (e) =>
@@ -146,7 +182,7 @@ test('AI-2 新增：key 非法/重复、ad_free 缺 days 各自报清楚', async
 });
 
 test('AI-3 编辑不许改 key（台账靠它关联）', async (t) => {
-  t.after(() => PointItemModel.deleteMany({ key: TEST_KEY }));
+  t.after(cleanupItems);
   const row = await createItem(validInput);
   await assert.rejects(() => updateItem(String(row._id), { ...validInput, key: 'another_key' }), (e) => {
     const err = e as AppError;
@@ -160,17 +196,28 @@ test('AI-3 编辑不许改 key（台账靠它关联）', async (t) => {
   assert.equal((await PointItemModel.findOne({ _id: row._id }).lean())!.price, 321, '改完库里要读得到');
 });
 
-test('AI-4 库存改写传目标值，返回改前改后；负数 400', async (t) => {
-  t.after(() => PointItemModel.deleteMany({ key: TEST_KEY }));
+test('AI-4 库存改写传目标值，返回改前改后；负数 400；unlimited 由这条独占', async (t) => {
+  t.after(cleanupItems);
   const row = await createItem(validInput);
-  const r = await setItemStock(String(row._id), 7);
+  const r = await setItemStock(String(row._id), { stock: 7 });
   // before 取的是创建时传的 10（不是 schema 默认 9999）：createItem 丢字段也能被这条抓住
-  assert.deepEqual(r, { before: 10, after: 7 });
+  assert.deepEqual(r, { before: { stock: 10, unlimited: false }, after: { stock: 7, unlimited: false } });
   // 目标值语义：连改两次不累加，第二次 before 就是上一次结果（写成 $inc 这里必红）
-  assert.deepEqual(await setItemStock(String(row._id), 3), { before: 7, after: 3 });
-  assert.equal((await PointItemModel.findOne({ _id: row._id }).lean())!.stock, 3);
-  await assert.rejects(() => setItemStock(String(row._id), -1), (e) =>
+  assert.deepEqual(await setItemStock(String(row._id), { stock: 3 }),
+    { before: { stock: 7, unlimited: false }, after: { stock: 3, unlimited: false } });
+  assert.equal((await readItem(String(row._id)))!.stock, 3);
+  await assert.rejects(() => setItemStock(String(row._id), { stock: -1 }), (e) =>
     (e as AppError).statusCode === 400 && /库存不能为负（收到 -1）/.test((e as Error).message));
+
+  // unlimited 单独改：不必带 stock，改完两个字段都要报出来（库存数字不能被顺手抹掉）
+  assert.deepEqual(await setItemStock(String(row._id), { unlimited: true }),
+    { before: { stock: 3, unlimited: false }, after: { stock: 3, unlimited: true } });
+  assert.equal((await readItem(String(row._id)))!.stock, 3, '只改 unlimited 不许动库存');
+  // 两个都不传：至少传一个，否则等于没说要改什么
+  await assert.rejects(() => setItemStock(String(row._id), {}), (e) =>
+    (e as AppError).statusCode === 400 && /stock/.test((e as Error).message) && /unlimited/.test((e as Error).message));
+  await assert.rejects(() => setItemStock(String(row._id), { unlimited: 'yes' as never }), (e) =>
+    (e as AppError).statusCode === 400 && /unlimited 只能是 true 或 false（收到「yes」）/.test((e as Error).message));
 });
 
 test('AI-5 active 过滤真的生效（不是靠种子默认值蒙过）', async () => {
@@ -186,7 +233,7 @@ test('AI-5 active 过滤真的生效（不是靠种子默认值蒙过）', async
 });
 
 test('AI-6 道具图上传：入库裸链、后台展示签名链、端上下发走缩略档', async (t) => {
-  t.after(() => PointItemModel.deleteMany({ key: TEST_KEY }));
+  t.after(cleanupItems);
   // 1x1 PNG（最小合法图，AI-6 走完整 multipart→OSS 链路）
   const png = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -261,7 +308,7 @@ test('AI-7 sortOrder 升序是真保障：两行同时上架互证', async (t) =
 });
 
 test('AI-8 路由接线：鉴权闸门 + CRUD/库存全走 HTTP，非法 id 404 不泄露 500', async (t) => {
-  t.after(() => PointItemModel.deleteMany({ key: TEST_KEY }));
+  t.after(cleanupItems);
   await seedPointItems();
   const GHOST = 'ffffffffffffffffffffffff';
   // 每条路由都必须挂 adminAuth：没 token 一律 401，不能因新节漏挂变公开接口
@@ -289,6 +336,16 @@ test('AI-8 路由接线：鉴权闸门 + CRUD/库存全走 HTTP，非法 id 404 
   assert.equal(badKey.statusCode, 400, badKey.body);
   assert.match(badKey.json().message, /key 创建后不可修改/);
 
+  // effect.kind 越界必须落 400 并点名收到的值：漏了这道闸门就是 Mongoose ValidationError
+  // → error-handler 通用分支 500，非生产环境还会把内部原文回显给后台
+  const badKindPost = await req('POST', '/sport-track/api/admin/points/items', { ...validInput, key: 't_bad_kind', effect: { kind: 'xxx', days: 1 } });
+  assert.equal(badKindPost.statusCode, 400, `effect.kind 越界应 400 而非 500：${badKindPost.body}`);
+  assert.match(badKindPost.json().message, /道具效果类型只能是 makeup 或 ad_free（收到「xxx」）/);
+  const badKindPut = await req('PUT', `/sport-track/api/admin/points/items/${id}`, { ...validInput, effect: { kind: 'xxx', days: 1 } });
+  assert.equal(badKindPut.statusCode, 400, `PUT 的 effect.kind 越界同样要 400：${badKindPut.body}`);
+  assert.match(badKindPut.json().message, /道具效果类型只能是 makeup 或 ad_free（收到「xxx」）/);
+  assert.equal(await PointItemModel.countDocuments({ key: 't_bad_kind' }), 0, '被拒的入参不许留下道具行');
+
   // 形态非法的 :id 走 assertObjectIdLike → 资源级 404，不许 CastError 落 500
   const ghostPut = await req('PUT', '/sport-track/api/admin/points/items/not-an-id', validInput);
   assert.equal(ghostPut.statusCode, 404, `PUT 非法 id 应 404：${ghostPut.body}`);
@@ -297,12 +354,18 @@ test('AI-8 路由接线：鉴权闸门 + CRUD/库存全走 HTTP，非法 id 404 
   assert.equal(ghostPatch.statusCode, 404, `PATCH 非法 id 应 404：${ghostPatch.body}`);
   assert.equal(ghostPatch.json().message, '道具不存在');
 
+  // PUT 不带 stock：库存必须原样（这条排在改价前，验证的是「缺字段不复活默认值」）
+  const putNoStock = await req('PUT', `/sport-track/api/admin/points/items/${id}`, omitFields(validInput, 'stock', 'unlimited'));
+  assert.equal(putNoStock.statusCode, 200, `PUT 不带库存也要合法（库存归 PATCH）：${putNoStock.body}`);
+  assert.equal((await readItem(id))!.stock, 10, 'PUT 缺 stock 不许把库存刷成默认 9999');
+
   const upd = await req('PUT', `/sport-track/api/admin/points/items/${id}`, { ...validInput, price: 150 });
   assert.equal(upd.statusCode, 200, upd.body);
   assert.equal(upd.json().data.price, 150);
 
   const stock = await req('PATCH', `/sport-track/api/admin/points/items/${id}/stock`, { stock: 4 });
-  assert.deepEqual(stock.json().data, { before: 10, after: 4 }, '库存改写回 {before, after}');
+  assert.deepEqual(stock.json().data,
+    { before: { stock: 10, unlimited: false }, after: { stock: 4, unlimited: false } }, '库存改写回 {before, after}');
   const badStock = await req('PATCH', `/sport-track/api/admin/points/items/${id}/stock`, {});
   assert.equal(badStock.statusCode, 400, `缺 stock 要 400 报实际值：${badStock.body}`);
   assert.match(badStock.json().message, /库存/);
@@ -314,4 +377,58 @@ test('AI-8 路由接线：鉴权闸门 + CRUD/库存全走 HTTP，非法 id 404 
   assert.ok(row, 'HTTP 列表能读回刚建的道具');
   assert.equal(row!.price, 150);
   assert.equal(row!.stock, 4);
+});
+
+test('AI-9 PUT 只拥有内容字段：绝不写 stock/unlimited，缺内容字段 400 点名', async (t) => {
+  t.after(cleanupItems);
+  const row = await createItem(validInput);
+  const id = String(row._id);
+  // 先把行改成「售罄 + 非不限量 + 有图」，PUT 之后这三个状态必须原样还在
+  await PointItemModel.updateOne({ _id: row._id }, { $set: { stock: 0, unlimited: false, image: 't_items/old.png' } });
+  // 整行内容（含当前图）——PUT 的正确姿势，只是不带库存与不限量
+  const content = { ...validInput, image: 't_items/old.png' };
+
+  // 内容齐全但不带库存：PUT 200，库存/不限量一个都不许被默认值复活
+  const ok = await updateItem(id, omitFields(content, 'stock', 'unlimited'));
+  assert.equal(ok.price, validInput.price);
+  let db = await readItem(id);
+  assert.equal(db!.stock, 0, 'PUT 不许把售罄改回 9999（目标值语义只属于 PATCH /stock）');
+  assert.equal(db!.unlimited, false, 'PUT 不许写 unlimited');
+  assert.equal(db!.image, 't_items/old.png', 'PUT 带的 image 与库里一致，不该被抹掉');
+
+  // 后台表单会把整行（含库存）原样提交回来：带着也不许写
+  await updateItem(id, { ...content, stock: 9999, unlimited: true });
+  db = await readItem(id);
+  assert.equal(db!.stock, 0, 'PUT 带了 stock 也要忽略');
+  assert.equal(db!.unlimited, false, 'PUT 带了 unlimited 也要忽略');
+
+  // 十个内容字段全必传：缺哪个就 400 点名哪个，没有默认值兜底
+  for (const field of ['name', 'subtitle', 'description', 'notes', 'price', 'validDays', 'effect', 'active', 'sortOrder', 'image']) {
+    await assert.rejects(() => updateItem(id, omitFields(content, field)), (e) => {
+      const err = e as AppError;
+      return err.statusCode === 400 && err.message.includes(field);
+    }, `缺「${field}」的 PUT 必须 400 并点名该字段`);
+  }
+  // null 也算没传（String(null) 会把 'null' 写进库）
+  await assert.rejects(() => updateItem(id, { ...content, image: null as never }), (e) =>
+    (e as AppError).statusCode === 400 && /image/.test((e as Error).message));
+  db = await readItem(id);
+  assert.equal(db!.image, 't_items/old.png', '被拒的 PUT 一个字都不该改（校验先于写）');
+  assert.equal(db!.price, validInput.price, '被拒的 PUT 不许留下半行改写');
+
+  // 路由层同样落码：缺 image 的 PUT 是 400（点名 image），不是 200 后悄悄清图
+  const missingImage = await req('PUT', `/sport-track/api/admin/points/items/${id}`, omitFields(content, 'image'));
+  assert.equal(missingImage.statusCode, 400, `PUT 缺 image 要 400：${missingImage.body}`);
+  assert.match(missingImage.json().message, /image/);
+  assert.equal((await readItem(id))!.image, 't_items/old.png', '400 之后图还在库里（不清图、不孤立已上传对象）');
+
+  // PATCH 是库存与不限量的唯一出口：HTTP 只改 unlimited 也要生效，且两个字段都报改前改后
+  const onlyUnlimited = await req('PATCH', `/sport-track/api/admin/points/items/${id}/stock`, { unlimited: true });
+  assert.equal(onlyUnlimited.statusCode, 200, onlyUnlimited.body);
+  assert.deepEqual(onlyUnlimited.json().data,
+    { before: { stock: 0, unlimited: false }, after: { stock: 0, unlimited: true } });
+  assert.equal((await readItem(id))!.unlimited, true);
+  const emptyPatch = await req('PATCH', `/sport-track/api/admin/points/items/${id}/stock`, {});
+  assert.equal(emptyPatch.statusCode, 400, `PATCH 空 body 要 400：${emptyPatch.body}`);
+  assert.match(emptyPatch.json().message, /stock/);
 });

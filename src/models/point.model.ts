@@ -92,6 +92,14 @@ dailySchema.index({ userId: 1, bizDate: 1 }, { unique: true });
  * 道具目录：一条 = 一种可兑换/可发放的道具。
  * 价格与有效期以前写死在 points-items.ts + config/points.ts，落库后那两个常量退化为种子值。
  */
+/**
+ * effect.kind 的唯一口径：schema 的 enum 和管理端 assertItemInput 都从这一份读，
+ * 免得两处各写各的——入参越界的 kind 若在 service 放行，落到 schema 就是 Mongoose
+ * ValidationError（非 AppError、非 11000），error-handler 只会回 500 + 内部原文。
+ */
+export const ITEM_EFFECT_KINDS = ['makeup', 'ad_free'] as const;
+export type ItemEffectKind = typeof ITEM_EFFECT_KINDS[number];
+
 const itemSchema = new Schema({
   key: { type: String, required: true, unique: true },
   name: { type: String, required: true },
@@ -101,7 +109,7 @@ const itemSchema = new Schema({
   price: { type: Number, required: true, min: 1 },
   validDays: { type: Number, required: true, min: 1 },
   effect: {
-    kind: { type: String, enum: ['makeup', 'ad_free'], required: true },
+    kind: { type: String, enum: ITEM_EFFECT_KINDS, required: true },
     days: { type: Number, default: 0, min: 0 },
   },
   stock: { type: Number, default: 9999, min: 0 },

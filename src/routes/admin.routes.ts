@@ -1525,19 +1525,19 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.post('/points/items', { onRequest: [adminAuth] }, async (request) =>
     success(await createItem(request.body as ItemInput)));
 
-  // 整行更新：key 创建后不可改（台账靠它关联），撞见改 key 回 400 并点名原值/新值
+  // 内容整行更新：十个内容字段必传（缺一个 400 点名缺哪个），key 不可改，stock/unlimited 绝不写
   fastify.put('/points/items/:id', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
     assertObjectIdLike(id, '道具不存在');
     return success(await updateItem(id, request.body as ItemInput));
   });
 
-  // 库存改写：传目标值不是增量，返回 {before, after}；负数 400
+  // 库存/不限量改写（这两个字段的唯一出口）：传目标值不是增量，返回两字段的 {before, after}；负数 400
   fastify.patch('/points/items/:id/stock', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    const { stock } = (request.body ?? {}) as { stock?: number };
+    const { stock, unlimited } = (request.body ?? {}) as { stock?: number; unlimited?: boolean };
     assertObjectIdLike(id, '道具不存在');
-    return success(await setItemStock(id, Number(stock)));
+    return success(await setItemStock(id, { stock, unlimited }));
   });
 
   // 道具图上传：入库裸链，展示与端上取签名链（私有桶裸链 403）——同专题图上传一套闸门
