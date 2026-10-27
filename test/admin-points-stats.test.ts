@@ -107,7 +107,8 @@ test('AS-1 概况不变式：balance == 毛发放 − 撤回 − 兑换 − 过�
     `spec §6.5 不变式：earnedGross ${o.earnedGross} − rolledBack ${o.rolledBack} − `
     + `spentExchange ${o.spentExchange} − spentExpire ${o.spentExpire} 应等于 balance ${o.balance}`);
   // totalSpent 只留在 PointAccount 里（概况 DTO 不再下发这个 foot-gun）。
-  // 本用例的兑换 200 + 撤回 30 都进了它，所以增量 230 ≠ 真消耗增量 240
+  // spec §6.5 的等式是 Σ totalSpent == spentExchange + rolledBack：本用例兑换 200 + 撤回 30 都进它 → 增量 230，
+  // 而过期回收走 settleExpired 只减余额、不动 totalSpent，所以真消耗是 240（200+40），两者差 10
   const deltaTotalSpent = (afterAcc?.totalSpent ?? 0) - (beforeAcc?.totalSpent ?? 0);
   assert.equal(deltaTotalSpent, 230, 'PointAccount.totalSpent 把撤回也记成消耗');
   assert.equal(delta.spentExchange + delta.spentExpire, 240, '真正的消耗只有兑换 200 + 过期 40');

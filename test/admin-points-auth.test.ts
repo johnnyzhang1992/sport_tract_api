@@ -8,8 +8,9 @@ import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 /**
  * 管理端积分域鉴权闸门（spec §9 PT-15，Task 9 用例）。
  *
- * 为什么逐条列路由而不是抽查：这一域的 15 条路由分散在四个「积分管理 · …」段落里，
- * 任何一条漏挂 `onRequest: [adminAuth]` 都会变成公开接口。
+ * 为什么逐条列路由而不是抽查：这一域的路由分散在五个「积分管理 · …」段落里，
+ * 任何一条漏挂 `onRequest: [adminAuth]` 都会变成公开接口；清单本身由 PT-15a 拿
+ * Fastify 运行期路由表对数，加了路由忘了进清单会直接红。
  *
  * 断言三件事（缺一不可）：
  * 1. 无凭证 → 401/403；
@@ -26,9 +27,10 @@ const BASE = '/sport-track/api/admin';
 
 /**
  * 本域的全部管理端路由（Task 4 目录 5 条 + Task 5 发放/记录 2 条 + Task 6/7 概况/用户 6 条
- * + Task 8 道具概况/名单 2 条 = 15 条）。
+ * + Task 8 道具概况/名单 2 条 + 实物批次订单 3 条 = 18 条）。
  * 路径里的 id 用固定 24 位 hex：鉴权闸门在参数校验之前，但用合法形态能保证
  * 「没有 401 时也不会因为 400 而误判」。
+ * 清单全不全由下面 PT-15a 拿运行期路由表对数，不靠人记得住。
  */
 const POINTS_ADMIN_ROUTES: Array<[string, string]> = [
   // Task 4：道具目录
@@ -51,7 +53,43 @@ const POINTS_ADMIN_ROUTES: Array<[string, string]> = [
   // Task 8：道具概况与免广告名单
   ['GET', `${BASE}/points/items/overview`],
   ['GET', `${BASE}/points/ad-free/roster`],
+  // 实物批次：订单列表 / 发货 / 代确认
+  ['GET', `${BASE}/points/orders`],
+  ['PATCH', `${BASE}/points/orders/${UID}/ship`],
+  ['PATCH', `${BASE}/points/orders/${UID}/complete`],
 ];
+
+/** printRoutes 的一行 → { 缩进层数, 路径段, 方法（去 HEAD） }；不匹配的行（空行、根 `/`）跳过 */
+function routeLine(line: string): { depth: number; seg: string; methods: string[] } | null {
+  const m = /^((?:[│ ]{4})*)(?:[├└]── )(.*?) \(([^)]+)\)$/.exec(line);
+  if (!m) return null;
+  return {
+    depth: m[1].length / 4,
+    seg: m[2],
+    methods: m[3].split(',').map((s) => s.trim()).filter((s) => s !== 'HEAD' && s !== 'OPTIONS'),
+  };
+}
+
+/**
+ * 数出运行期真实注册的「管理端积分域」路由（method + 完整路径）。
+ * 树形输出里顶层给全路径、子节点只给增量段（`/image`，或 `-regions` 这种不带斜杠的后缀），
+ * 按缩进层拼回父路径即可。
+ */
+function registeredAdminPointsRoutes(tree: string): string[] {
+  const prefix = `${BASE}/points`;
+  const stack: string[] = [];
+  const found: string[] = [];
+  for (const raw of tree.split('\n')) {
+    const node = routeLine(raw);
+    if (!node) continue;
+    stack[node.depth] = node.seg;
+    const full = stack.slice(0, node.depth + 1).join('');
+    for (const method of node.methods) {
+      if (full.startsWith(prefix)) found.push(`${method} ${full}`);
+    }
+  }
+  return found;
+}
 
 let app: FastifyInstance;
 let adminToken = '';
@@ -79,11 +117,25 @@ after(async () => {
   await app.close();
 });
 
-test('PT-15 路由清单覆盖 15 条（漏一条等于漏一道闸门）', () => {
-  assert.equal(POINTS_ADMIN_ROUTES.length, 15, 'Task 4–8 的管理端点路由必须全部列进来');
+test('PT-15 路由清单覆盖本域全部管理端路由（漏一条等于漏一道闸门）', () => {
   // 同一个 method+path 重复列会让计数虚高、实际漏测
   assert.equal(new Set(POINTS_ADMIN_ROUTES.map(([m, u]) => `${m} ${u}`)).size, POINTS_ADMIN_ROUTES.length,
     '清单里不许有重复路由');
+});
+
+test('PT-15a 清单与运行期路由表逐条对得上（新增路由忘了进清单，这里要红）', () => {
+  // 只断言 `length === 18` 拦不住「加了路由忘了加用例」——改测试的人会连数字一起改掉。
+  // 拿 Fastify 实际注册的路由表当基准，两边做集合差，缺哪条就点名哪条。
+  const registered = new Set(registeredAdminPointsRoutes(app.printRoutes({ commonPrefix: false })));
+  // 清单里的路径参数用固定 24 位 hex 实值（要走得到鉴权闸门后面的参数校验），
+  // 路由表里是 `:id` —— 对数前把 hex 段还原成占位符
+  const listed = new Set(POINTS_ADMIN_ROUTES.map(([m, u]) =>
+    `${m} ${u.split('?')[0].replace(/\/[a-f\d]{24}(?=\/|$)/gi, '/:id')}`));
+  const missing = [...registered].filter((r) => !listed.has(r));
+  const ghost = [...listed].filter((r) => !registered.has(r));
+  assert.deepEqual(missing, [], `这些已注册的路由没有鉴权用例：${missing.join('、')}`);
+  assert.deepEqual(ghost, [], `清单里有这些不存在的路由（改名或删掉了没同步）：${ghost.join('、')}`);
+  assert.equal(registered.size, POINTS_ADMIN_ROUTES.length, '对数：清单条数必须等于注册条数');
 });
 
 for (const [method, url] of POINTS_ADMIN_ROUTES) {
@@ -119,6 +171,7 @@ test('PT-15b 管理员凭证能过同一条闸门（反证上面的 401 不是�
     [`${BASE}/points/users`, 200],
     [`${BASE}/points/items/overview`, 200],
     [`${BASE}/points/ad-free/roster`, 200],
+    [`${BASE}/points/orders`, 200],
     // 幽灵 id：服务层 404「用户不存在」，证明路由已注册且鉴权已通过
     [`${BASE}/points/users/${UID}`, 404],
     [`${BASE}/points/users/${UID}/records`, 404],

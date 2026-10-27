@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { buildApp } from '../src/app.js';
-import { isOssConfigured } from '../src/config/index.js';
+import { config, isOssConfigured } from '../src/config/index.js';
 import { PointCardModel, PointExchangeModel, PointItemModel } from '../src/models/point.model.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { POINT_ITEMS_SEED, seedPointItems } from '../src/services/points-catalog.js';
@@ -520,7 +520,9 @@ test('AI-11 实物道具：kind 枚举 / 详情图 ≤6 / 限购默认与范围�
   assert.deepEqual(adminRow.detailImages, []);
 
   // ④ 详情图 6 张入库裸链；7 张 400 点名「最多 6 张（当前 7 张）」
-  const six = Array.from({ length: 6 }, (_, i) => `sport-track/items/d${i}.png`);
+  // 地址必须带本桶 endpoint：签名只对 `endpoint/key` 形态生效，写成裸 key 会让「已签名」断言前后同值恒过
+  const OSS = `${config.oss.endpoint.replace(/\/$/, '')}/${config.oss.baseDir}/detail-test`;
+  const six = Array.from({ length: 6 }, (_, i) => `${OSS}/d${i}.png`);
   const withSix = await createItem({ ...validInput, key: 't_physical_six', kind: 'physical', detailImages: six });
   assert.deepEqual((await readItem(String(withSix._id)))!.detailImages, six, '详情图按裸链存，不存签名参数');
   const seven = [...six, 'sport-track/items/d6.png'];
@@ -531,6 +533,18 @@ test('AI-11 实物道具：kind 枚举 / 详情图 ≤6 / 限购默认与范围�
   assert.throws(() => assertItemInput({ ...validInput, detailImages: 'a.png' as never }), (e) =>
     e instanceof AppError && e.statusCode === 400 && /商品详情图必须是字符串数组，最多 6 张（收到「a\.png」）/.test(e.message),
     '非数组详情图必须在 service 闸门 400，不许冒成 500');
+
+  // ④b 预览链：表单重开时把裸链塞进 <img> 会 403（私有桶），管理端必须逐张签名下发
+  const sixRow = (await listItemsForAdmin()).find((r) => r.key === 't_physical_six')!;
+  assert.equal(sixRow.detailPreviewUrls.length, 6, '预览链要与裸链一一对应，少一张表单就少一格');
+  if (isOssConfigured()) {
+    sixRow.detailPreviewUrls.forEach((u, i) => {
+      assert.ok(u.startsWith(`${six[i]}?`), `第 ${i} 张应是本桶地址的签名链，实际 ${u}`);
+      assert.match(decodeURIComponent(u), /x-oss-process=image\/resize,w_240/, '详情图预览走缩略档，别把原图灌进表单');
+    });
+  } else {
+    assert.deepEqual(sixRow.detailPreviewUrls, six, 'OSS 未配置时原样返回裸链');
+  }
 
   // ⑤ kind / perUserLimit 越界：一律在 service 闸门 400，漏了就是 Mongoose ValidationError → 500
   const cases: Array<{ patch: Partial<ItemInput>; copy: RegExp }> = [
@@ -570,4 +584,100 @@ test('AI-11 实物道具：kind 枚举 / 详情图 ≤6 / 限购默认与范围�
   assert.equal(putMissingKind.statusCode, 400, putMissingKind.body);
   assert.match(putMissingKind.json().message, /kind/);
   assert.equal((await readItem(String(phys._id)))!.kind, 'physical', '被拒的 PUT 不许改写 kind');
+});
+
+/**
+ * 带 content-type 的原始 body：`payload: {...}` 会被 inject 序列化成合法 JSON，
+ * 想真送一个 null / [] / "abc" 进路由只能自己交字符串。
+ */
+async function rawReq(method: string, url: string, body: string) {
+  return app.inject({
+    method: method as 'GET',
+    url,
+    headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+    payload: body,
+  });
+}
+
+test('AI-12 非对象 body（null/数组/字符串/数字）：POST 与 PUT 都要 400 点名请求体，不是 500', async (t) => {
+  t.after(cleanupItems);
+  const ITEMS = '/sport-track/api/admin/points/items';
+  // null 是最现实的一种：前端漏写 body 就是它。落到 createItem 的 input.key 上是 TypeError → 500，
+  // 非生产环境 error-handler 还会把内部原文回显出去
+  for (const body of ['null', '[]', '"abc"', '123']) {
+    const res = await rawReq('POST', ITEMS, body);
+    assert.equal(res.statusCode, 400, `POST body=${body} 应 400，实际 ${res.statusCode}：${res.body}`);
+    assert.match(res.json().message, /请求体/, `POST body=${body} 的文案要点名请求体：${res.body}`);
+    assert.doesNotMatch(res.json().message, /Cannot read|not a function|TypeError/, `不许回显内部原文：${res.body}`);
+  }
+  assert.equal(await PointItemModel.countDocuments(TEST_ITEM_FILTER), 0, '非对象 body 一条都不许落库');
+
+  // PUT 走同一条闸门：先建一行，四种坏 body 打它，库里那行必须原样（半截改写比报错更糟）
+  const created = await req('POST', ITEMS, validInput);
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data._id as string;
+  for (const body of ['null', '[]', '"abc"', '123']) {
+    const res = await rawReq('PUT', `${ITEMS}/${id}`, body);
+    assert.equal(res.statusCode, 400, `PUT body=${body} 应 400，实际 ${res.statusCode}：${res.body}`);
+    assert.match(res.json().message, /请求体/, `PUT body=${body} 的文案要点名请求体：${res.body}`);
+  }
+  const db = await readItem(id);
+  assert.equal(db!.name, '测试道具', '被拒的 PUT 不许改写库里的行');
+  assert.equal(db!.price, 100);
+});
+
+test('AI-13 stock/sortOrder/unlimited/active 类型闸门：NaN 不冒成 500，字符串不被 Boolean() 当成 true', async (t) => {
+  t.after(cleanupItems);
+  const ITEMS = '/sport-track/api/admin/points/items';
+
+  // 闸门本身（service 直调）：四类入参都要 400 并点名对象 + 实际值
+  const cases: Array<{ patch: Partial<ItemInput>; copy: RegExp }> = [
+    // stock：Number('abc')=NaN → schema min:0 失败 → ValidationError → 500
+    { patch: { stock: 'abc' as never }, copy: /库存 stock 必须是 ≥0 的整数（收到「abc」）/ },
+    { patch: { stock: -1 }, copy: /库存 stock 必须是 ≥0 的整数（收到「-1」）/ },
+    { patch: { stock: 1.5 }, copy: /库存 stock 必须是 ≥0 的整数（收到「1\.5」）/ },
+    // '' 单独判掉：Number('')===0，后台把输入框清空就等于静默售罄
+    { patch: { stock: '' as never }, copy: /库存 stock 必须是 ≥0 的整数（收到「空」）/ },
+    // sortOrder：schema 没有 min，NaN 会被原样存成脏值，比 500 更难查
+    { patch: { sortOrder: 'abc' as never }, copy: /排序 sortOrder 必须是整数（收到「abc」）/ },
+    { patch: { sortOrder: 1.5 }, copy: /排序 sortOrder 必须是整数（收到「1\.5」）/ },
+    { patch: { sortOrder: '' as never }, copy: /排序 sortOrder 必须是整数（收到「空」）/ },
+    // unlimited/active：Boolean('false')===true、Boolean(0)===false，字符串和数字都会静默改档位
+    { patch: { unlimited: 'false' as never }, copy: /不限量 unlimited 只能是 true 或 false（收到「false」）/ },
+    { patch: { unlimited: 'true' as never }, copy: /不限量 unlimited 只能是 true 或 false（收到「true」）/ },
+    { patch: { unlimited: 0 as never }, copy: /不限量 unlimited 只能是 true 或 false（收到「0」）/ },
+    { patch: { active: 'true' as never }, copy: /上架状态 active 只能是 true 或 false（收到「true」）/ },
+    { patch: { active: 1 as never }, copy: /上架状态 active 只能是 true 或 false（收到「1」）/ },
+  ];
+  for (const { patch, copy } of cases) {
+    assert.throws(() => assertItemInput({ ...validInput, ...patch }), (e) =>
+      e instanceof AppError && e.statusCode === 400 && copy.test(e.message),
+    `应报「${copy}」：${JSON.stringify(patch)}`);
+  }
+  // 合法形态照旧放行：0 与 false 都是「真的是零/真的是下架」，不许被当成没传
+  assert.doesNotThrow(() => assertItemInput({ ...validInput, stock: 0, sortOrder: 0, unlimited: false, active: false }));
+  // 负 sortOrder 允许（只是排在最前），不是脏值
+  assert.doesNotThrow(() => assertItemInput({ ...validInput, sortOrder: -5 }));
+
+  // 经路由：坏 stock 现在会 500（NaN → min:0），修完要 400 且不留行
+  const badStock = await req('POST', ITEMS, { ...validInput, key: 't_bad_stock', stock: 'abc' });
+  assert.equal(badStock.statusCode, 400, `非数字 stock 应 400 而非 500：${badStock.body}`);
+  assert.match(badStock.json().message, /stock/);
+  assert.equal(await PointItemModel.countDocuments({ key: 't_bad_stock' }), 0, '被拒的入参不许留下道具行');
+
+  // 最坏的一条：unlimited:'false' 会被 Boolean() 变成 true —— 限量道具被静默改成不限量
+  const badUnlimited = await req('POST', ITEMS, { ...validInput, key: 't_bad_unlimited', unlimited: 'false' });
+  assert.equal(badUnlimited.statusCode, 400, `字符串 unlimited 应 400：${badUnlimited.body}`);
+  assert.equal(await PointItemModel.countDocuments({ key: 't_bad_unlimited' }), 0);
+
+  // PUT 同闸门，库里原值一个字都不动
+  const created = await req('POST', ITEMS, { ...validInput, key: 't_put_gate_item', sortOrder: 900 });
+  assert.equal(created.statusCode, 200, created.body);
+  const id = created.json().data._id as string;
+  const putBad = await req('PUT', `${ITEMS}/${id}`, { ...validInput, key: 't_put_gate_item', sortOrder: 'abc' });
+  assert.equal(putBad.statusCode, 400, `PUT 非数字 sortOrder 应 400：${putBad.body}`);
+  assert.match(putBad.json().message, /sortOrder/);
+  const db = await readItem(id);
+  assert.equal(db!.sortOrder, 900, '被拒的 PUT 不许改写 sortOrder');
+  assert.equal(db!.active, true);
 });

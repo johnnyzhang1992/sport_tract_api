@@ -5,6 +5,7 @@ import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { buildApp } from '../src/app.js';
 import { POINTS } from '../src/config/points.js';
+import { config, isOssConfigured } from '../src/config/index.js';
 import {
   PointAccountModel, PointCardModel, PointDailyModel, PointLotModel,
   PointRecordModel, PointSigninModel,
@@ -309,4 +310,35 @@ test('AU-10 大写 hex 用户 id：详情必须与列表同口径，不许全零
   assert.equal(d.balance, row.balance, '大写 hex 归一后必须读到同一个人的指标（否则详情全是 0）');
   assert.equal(d.totalEarned, row.totalEarned);
   assert.equal(d.lastEarnedAt, row.lastEarnedAt);
+});
+
+test('AU-11 详情头像签名下发：私有桶裸链进 <img> 会 403，档位与 /admin/users/:id 同为方图 160', async (t) => {
+  const OSS = `${config.oss.endpoint.replace(/\/$/, '')}/${config.oss.baseDir}/t7-avatar`;
+  const bare = `${OSS}/a.png`;
+  const u = await makeUser(t);
+  await UserModel.updateOne({ _id: u.oid }, { $set: { avatarUrl: bare } });
+
+  const got = (await pointsAdminUserDetail(u.id)).avatarUrl;
+  if (isOssConfigured()) {
+    assert.ok(got.startsWith(`${bare}?`), `应是本桶地址的签名链，实际 ${got}`);
+    assert.match(got, /[?&]Signature=/, '签名链要带 Signature（裸链直连 403）');
+    // 与用户管理详情同一个头像档（m_fill 方图 160）：漏档位就是把 998px 原图灌进弹窗
+    assert.match(
+      decodeURIComponent(got),
+      /x-oss-process=image\/resize,m_fill,w_160,h_160/,
+      '积分详情头像也要走头像档位',
+    );
+  } else {
+    assert.equal(got, bare, 'OSS 未配置时原样返回裸链');
+  }
+
+  // 无头像 → 空串（不能是 undefined，也不能把空地址送去签名）
+  const noAvatar = await makeUser(t);
+  assert.equal((await pointsAdminUserDetail(noAvatar.id)).avatarUrl, '');
+
+  // 第三方域名（微信头像）签名逻辑不接管，原样下发
+  const ext = 'https://wx.qlogo.cn/mmopen/t7/132';
+  const eu = await makeUser(t);
+  await UserModel.updateOne({ _id: eu.oid }, { $set: { avatarUrl: ext } });
+  assert.equal((await pointsAdminUserDetail(eu.id)).avatarUrl, ext);
 });

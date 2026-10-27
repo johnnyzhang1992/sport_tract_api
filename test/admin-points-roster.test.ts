@@ -271,3 +271,39 @@ test('RS-4 道具概况：来源分档相加等于总数，道具分档与消耗
   assert.equal(o.totalSpentPoints - before.totalSpentPoints, 200, '累计消耗积分取账本 exchange 的 |delta|');
   assert.equal(o.adFreeUsers - before.adFreeUsers, 1, '生效中免广告人数与名单同一份推导');
 });
+
+test('RS-5 脏卡行（userId 不是 24 位 hex）：名单与道具概况都不许 500，也不许算进免广告人数', async (t) => {
+  const NOW = Date.parse('2026-10-26T10:00:00+08:00');
+  const DIRTY = 'not-a-valid-objectid';
+  const good = new Types.ObjectId();
+  // 清理要绕开 Mongoose 的 cast：脏行的 userId 是字符串，用 Model.deleteMany 会被强转成 ObjectId 而删不掉
+  t.after(async () => {
+    await PointCardModel.collection.deleteMany({ userId: DIRTY });
+    await PointCardModel.deleteMany({ userId: good });
+    await UserModel.deleteOne({ _id: good });
+  });
+
+  await UserModel.create({ _id: good, openid: `t-roster-rs5-${good}`, nickname: 'RS5 正常用户' });
+  await usedAdFreeCard(good, Date.parse('2026-10-26T00:00:00+08:00'), 1);
+  // raw insert 绕过 schema：库里真躺着一张 userId 不是 ObjectId 的已激活免广告卡（迁移/历史脏数据）
+  await PointCardModel.collection.insertOne({
+    userId: DIRTY,
+    itemKey: 'ad_free_7d',
+    status: 'used',
+    source: 'exchange',
+    benefitDays: 7,
+    activatedAt: Date.parse('2026-10-25T00:00:00+08:00'),
+    expiresAt: Date.parse('2026-12-31T00:00:00+08:00'),
+    createdAt: NOW,
+  });
+  assert.equal(await PointCardModel.collection.countDocuments({ userId: DIRTY }), 1, '脏行要真的在库里，否则用例是空跑');
+
+  // 两个接口共用 activeAdFree：以前 new Types.ObjectId(脏串) 抛错 → 一起 500
+  const rows = await adFreeRoster(NOW);
+  const mine = rows.filter((r) => r.openid === `t-roster-rs5-${good}`);
+  assert.equal(mine.length, 1, '脏行不许牵连正常用户：该进名单的还是要进');
+  assert.equal(rows.filter((r) => !r.openid).length, 0, '也不许冒出一条空 openid 的假行');
+
+  const o = await itemsOverview(NOW);
+  assert.equal(o.adFreeUsers, rows.length, '概况的免广告人数与名单同一条推导、同一个结果（脏行两边都不算）');
+});

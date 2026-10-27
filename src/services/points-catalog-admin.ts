@@ -11,8 +11,9 @@
  *   全按它关联，改一下等于把历史兑换挂错道具——PUT 撞见改 key 直接 400 并点名原值/新值；
  * - 库存改写传目标值而不是增量：后台看到的是「现在剩多少」，语义含糊一次点两下就翻倍；
  *   返回 {before, after}（两个字段各自的改前改后）让操作方当场核对；
- * - schema 表达不了的校验（key 形状、名称长度、effect.kind 越界、ad_free 必带 days、notes 条数）集中在
- *   assertItemInput，更新入口再叠一层字段必传闸门 assertItemContent；错误文案一律「对象 + 实际值 + 限制」，
+ * - schema 表达不了的校验（请求体形态、key 形状、名称长度、effect.kind 越界、ad_free 必带 days、notes 条数、
+ *   stock/sortOrder/perUserLimit 的整数性与范围、unlimited/active 的真布尔）集中在 assertItemInput，
+ *   更新入口再叠一层字段必传闸门 assertItemContent；错误文案一律「对象 + 实际值 + 限制」，
  *   不给通用失败；
  * - 唯一索引冲突（E11000）转 409 并点名 key，和仓内其它管理端写接口同码同形。
  */
@@ -27,7 +28,7 @@ import {
   type ItemEffectKind,
   type ItemKind,
 } from '../models/point.model.js';
-import { getSignedUrl } from './oss.js';
+import { getSignedUrl, getThumbUrl } from './oss.js';
 import type { ItemDoc } from './points-catalog.js';
 
 export const ITEM_KEY_RE = /^[a-z][a-z0-9_]{1,39}$/;
@@ -100,6 +101,8 @@ export interface AdminItemRow {
   kind: ItemKind;
   /** 入库裸链（回填写回它）；端上下发的是逐张签名后的缩略链 */
   detailImages: string[];
+  /** 与 detailImages 一一对应的签名缩略链：后台表单只认这个，裸链进 `<img>` 会 403 */
+  detailPreviewUrls: string[];
   /** 0 = 不限购 */
   perUserLimit: number;
   stock: number;
@@ -124,11 +127,38 @@ function shown(value: unknown): string {
 }
 
 /**
+ * 请求体形态闸门：`payload: null` 是前端漏写 body 的真实形态，数组/标量同理。
+ * 不拦的话后面每个 `input.xxx` 都可能抛 TypeError → 500，非生产环境还把内部原文（reading 'key'）回显出去。
+ */
+function assertItemObject(input: ItemInput | null | undefined): void {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new AppError(400, `道具请求体必须是一个 JSON 对象（收到「${shown(input)}」）`);
+  }
+}
+
+/** 布尔字段只收真布尔：Boolean('false') 是 true，字符串入参会把「限量」静默改成「不限量」 */
+function assertFlag(label: string, value: unknown): void {
+  if (value !== undefined && value !== null && typeof value !== 'boolean') {
+    throw new AppError(400, `${label} 只能是 true 或 false（收到「${shown(value)}」）`);
+  }
+}
+
+/** 整数字段：'' 单独判掉（Number('')===0，后台清空输入框不等于「0 库存/排第一」），NaN 与小数都拦下。
+ *  rule 是文案的前半句（含字段名与限制），收到的值由这里统一补上 */
+function assertIntField(rule: string, value: unknown, min: number | null): void {
+  const n = value === '' ? Number.NaN : Number(value);
+  if (!Number.isInteger(n) || (min !== null && n < min)) {
+    throw new AppError(400, `${rule}（收到「${shown(value)}」）`);
+  }
+}
+
+/**
  * 目录行入参校验：schema 表达不了的几条（key 形状、名称长度、effect.kind 越界、ad_free 必带 days、notes 条数）都在这里。
  * effect.kind 必须在这道闸门拦下：enum 只写在 schema 里，放行到落库就是 Mongoose ValidationError
  * ——它既不是 AppError 也不是 11000，error-handler 只能回 500，非生产环境还把内部原文回显出去。
  */
 export function assertItemInput(input: ItemInput): void {
+  assertItemObject(input);
   if (!ITEM_KEY_RE.test(String(input.key ?? ''))) {
     throw new AppError(400, `道具 key 只能是小写字母开头的 a-z0-9_，长度 2–40（收到「${input.key || '空'}」）`);
   }
@@ -188,6 +218,20 @@ export function assertItemInput(input: ItemInput): void {
         `每人限购只能是 0（不限）或 1–${PER_USER_LIMIT_MAX} 的整数（收到「${shown(rawLimit)}」）`);
     }
   }
+  // stock / sortOrder / unlimited / active：normalize 会 Number()/Boolean() 硬转，坏形态要么撞 schema
+  // min:0 变成 500（stock:'abc' → NaN），要么把脏值直接存进去（sortOrder:'abc' → NaN），
+  // 要么反向（unlimited:'false' → true，限量道具被静默改成不限量）。省略/null 仍允许，走目录默认口径。
+  const rawStock = (input as { stock?: unknown }).stock;
+  if (rawStock !== undefined && rawStock !== null) {
+    assertIntField('库存 stock 必须是 ≥0 的整数', rawStock, 0);
+  }
+  const rawSort = (input as { sortOrder?: unknown }).sortOrder;
+  if (rawSort !== undefined && rawSort !== null) {
+    // 负数放行：sortOrder 只决定先后，排在最前不是脏数据（stock 的 ≥0 才是硬约束）
+    assertIntField('排序 sortOrder 必须是整数', rawSort, null);
+  }
+  assertFlag('不限量 unlimited', (input as { unlimited?: unknown }).unlimited);
+  assertFlag('上架状态 active', (input as { active?: unknown }).active);
 }
 
 /**
@@ -197,6 +241,7 @@ export function assertItemInput(input: ItemInput): void {
  * 实物限购被默认成 1），而且这些改写还会绕过 PATCH /stock 的目标值语义。缺字段就该 400 点名缺哪个。
  */
 export function assertItemContent(input: ItemInput): void {
+  assertItemObject(input);
   const received = input as unknown as Record<string, unknown>;
   for (const field of ITEM_CONTENT_FIELDS) {
     const value = received[field];
@@ -221,10 +266,13 @@ function normalize(input: ItemInput): Omit<ItemDoc, '_id' | 'createdAt' | 'updat
     validDays: Number(input.validDays),
     kind,
     effect: { kind: effect.kind, days: Number(effect.days ?? 0) },
-    stock: input.stock == null ? 9999 : Number(input.stock),
-    unlimited: Boolean(input.unlimited),
-    active: input.active === undefined ? true : Boolean(input.active),
-    sortOrder: Number(input.sortOrder ?? 0),
+    // 四个字段 assertItemInput 已收成「有限整数 / 真布尔」，这里只做缺省回填：
+    // null 与 undefined 同义（都是没表态，走目录默认），不能再 Boolean()/Number() 硬转 ——
+    // 原来的 `input.active === undefined ? true : Boolean(input.active)` 会把 active:null 判成下架。
+    stock: input.stock ?? 9999,
+    unlimited: input.unlimited ?? false,
+    active: input.active ?? true,
+    sortOrder: input.sortOrder ?? 0,
     image: String(input.image ?? '').trim(),
     detailImages: (input.detailImages ?? []).map((u) => String(u)),
     // 实物「没表态」→ 每人限购 1；虚拟默认 0（不限）。显式 0 是后台明确选的「不限」，不许被覆盖
@@ -257,14 +305,19 @@ function normalizeContent(input: ItemInput): ItemContentPatch {
   };
 }
 
+/** 详情图逐张签发缩略链（顺序与裸链数组一一对应，表单按下标取预览） */
+const detailPreviewsOf = (urls: string[]): string[] => urls.map((u) => getThumbUrl(String(u)))
+
 function toSavedRow(r: ItemDoc): SavedItemRow {
   const { _id, createdAt: _c, updatedAt: _u, ...rest } = r as ItemDoc & Record<string, unknown>;
   const image = String(rest.image ?? '');
+  const detailImages = (rest.detailImages ?? []) as string[];
   return {
     ...rest,
     // 老行物理上没有这三个字段：回执按默认口径补齐，调用方不必再判 undefined
     kind: (rest.kind ?? 'virtual') as ItemKind,
-    detailImages: (rest.detailImages ?? []) as string[],
+    detailImages,
+    detailPreviewUrls: detailPreviewsOf(detailImages),
     perUserLimit: Number(rest.perUserLimit ?? 0),
     image,
     previewUrl: image ? getSignedUrl(image) : '',
@@ -305,6 +358,7 @@ export async function listItemsForAdmin(): Promise<AdminItemRow[]> {
     // 本批次前入库的老行没有这三个字段：按虚拟/无图/不限的默认口径回给表单，别让编辑表单拿到 undefined
     kind: (r.kind ?? 'virtual') as ItemKind,
     detailImages: r.detailImages ?? [],
+    detailPreviewUrls: detailPreviewsOf(r.detailImages ?? []),
     perUserLimit: Number(r.perUserLimit ?? 0),
     stock: r.stock,
     unlimited: r.unlimited,

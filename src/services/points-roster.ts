@@ -1,6 +1,8 @@
 /**
  * 免广告名单：微信没有「按用户写广告屏蔽名单」的 API，只能管理员在 We分析 上传人群包，且次日生效。
- * 所以这个接口必须下发 openid —— 它是全后台唯一允许出现 openid 的出口（RS-3 钉住），
+ * 所以这个接口必须下发 openid —— 它是**积分管理这一域**里唯一允许出现 openid 的出口（RS-3 钉这一条）；
+ * 全后台另有更早的一处：GET /admin/users/:id 的用户详情也下发 openid（`admin.routes.ts` 的 user 段，
+ * 本轮之前就有，不在积分域内），别把这里读成「整个后台只有这一处」。
  * 每次返回的是「当天有效」的全量名单，替换上传而不是追加（卡过期的人不会自动掉出名单）。
  *
  * 推导口径与 `adFreeUntilOf` 共用 `points-cards.replayAdFree`（spec §5.4）：
@@ -14,6 +16,7 @@ import { Types } from 'mongoose';
 import { PointCardModel } from '../models/point.model.js';
 import { UserModel } from '../models/user.model.js';
 import { bjDateStr } from '../utils/bj-time.js';
+import { isObjectIdLike } from '../utils/object-id.js';
 import { replayAdFree } from './points-cards.js';
 
 /** 名单行（spec §7.2）：导出人群包需要 openid + 到期日，后台展示需要 uid/昵称 */
@@ -40,6 +43,10 @@ async function activeAdFree(now: number): Promise<Map<string, number>> {
 
   const grouped = new Map<string, Array<{ activatedAt: number; benefitDays: number }>>();
   for (const c of cards) {
+    // 脏行守卫：库里可能躺着 userId 不是 ObjectId 的卡（迁移事故/历史数据）。
+    // 不拦的话下面 `new Types.ObjectId(脏串)` 直接抛，名单和道具概况（共用这条推导）一起 500；
+    // 这种行不属于任何用户，跳过就是正确口径（它本来也不该出现在人群包里）。
+    if (!isObjectIdLike(c.userId)) continue;
     const userId = String(c.userId);
     const list = grouped.get(userId);
     const one = { activatedAt: Number(c.activatedAt ?? 0), benefitDays: Number(c.benefitDays ?? 0) };

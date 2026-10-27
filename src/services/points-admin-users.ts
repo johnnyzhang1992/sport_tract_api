@@ -22,6 +22,7 @@ import { userKeywordFilter } from '../utils/user-keyword.js';
 import { STATUS_TEXT, cardStatus, type CardStatus } from './points-items.js';
 import { SOURCE_TEXT } from './points-grant.js';
 import { adFreeUntilOf } from './points-cards.js';
+import { getAvatarUrl } from './oss.js';
 import { EXCHANGE_REFUND_TYPE, listPointRecords } from './points-ledger.js';
 import { getSigninState } from './points-signin.js';
 import { ROLLBACK_RE } from './points-admin-stats.js';
@@ -265,7 +266,9 @@ export async function pointsAdminUserDetail(id: unknown): Promise<PointsUserDeta
   ]);
   return {
     ...toRow(user, metrics),
-    avatarUrl: String(user.avatarUrl ?? ''),
+    // 桶是私有的：裸链进 <img> 直接 403，且详情弹窗的头像位只有 56px，
+    // 与 /admin/users/:id 同档签发（m_fill 方图 160），别把 998px 原图拉进后台
+    avatarUrl: user.avatarUrl ? getAvatarUrl(String(user.avatarUrl)) : '',
     rolledBack: metrics.rolledBack,
     spentExchange: metrics.spentExchange,
     spentExpire: metrics.spentExpire,
