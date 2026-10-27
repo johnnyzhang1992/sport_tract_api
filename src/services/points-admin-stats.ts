@@ -45,6 +45,8 @@ export interface PointsOverview {
   rolledBack: number;
   /** 净发放：earnedGross - rolledBack */
   earnedNet: number;
+  /** 发放人数：有 delta > 0 流水的 distinct userId */
+  earnedUsers: number;
   /** 兑换消耗：Σ |delta| (type = exchange) */
   spentExchange: number;
   /** 过期回收：Σ |delta| (type = expire) */
@@ -103,14 +105,16 @@ const RECORD_SUM_STAGES: PipelineStage[] = [
 ];
 
 /**
- * 概况六组数一次并发取回。
+ * 概况七组数一次并发取回。
  * 签到人数用 `distinct userId`：口径是「人」不是「次数」（补签也计入今日/近7天/累计）。
+ * 发放人数同理取 `distinct userId`，但只认 `delta > 0` 的行 —— **不能拿 PointAccount 推**：
+ * 花过/过期过的人也会有账户行（且账户是懒建的），与「被发放过」不是同一群。
  */
 export async function pointsOverview(now = Date.now()): Promise<PointsOverview> {
   const today = bjDateStr(now);
   const weekStart = shiftDateKey(today, -6);
 
-  const [[sums], [accounts], todayUsers, weekUsers, totalUsers, cardUsers] = await Promise.all([
+  const [[sums], [accounts], todayUsers, weekUsers, totalUsers, cardUsers, earnUsers] = await Promise.all([
     PointRecordModel.aggregate<RecordSums>(RECORD_SUM_STAGES),
     PointAccountModel.aggregate<{ balance: number }>([
       { $group: { _id: null, balance: { $sum: '$balance' } } },
@@ -119,6 +123,7 @@ export async function pointsOverview(now = Date.now()): Promise<PointsOverview> 
     PointSigninModel.distinct('userId', { dateKey: { $gte: weekStart, $lte: today } }),
     PointSigninModel.distinct('userId'),
     PointCardModel.distinct('userId', { status: 'unused', expiresAt: { $gt: now } }),
+    PointRecordModel.distinct('userId', { delta: { $gt: 0 } }),
   ]);
 
   const earnedGross = sums?.earnedGross ?? 0;
@@ -127,6 +132,7 @@ export async function pointsOverview(now = Date.now()): Promise<PointsOverview> 
     earnedGross,
     rolledBack,
     earnedNet: earnedGross - rolledBack,
+    earnedUsers: earnUsers.length,
     spentExchange: sums?.spentExchange ?? 0,
     spentExpire: sums?.spentExpire ?? 0,
     balance: accounts?.balance ?? 0,

@@ -248,3 +248,27 @@ test('AS-7 路由接线：鉴权 + 概况/趋势 200、非法 days 400', async (
   assert.equal(bad.statusCode, 400, bad.body);
   assert.match(bad.json().message, /仅支持 7 \/ 30 \/ 90/);
 });
+
+test('AS-8 发放人数 = delta > 0 的 distinct userId（只出不进的人不算，赚完再花仍算一人）', async (t) => {
+  const now = Date.parse('2027-05-10T10:00:00+08:00');
+  const earner = new Types.ObjectId(); const spender = new Types.ObjectId();
+  t.after(() => wipe(earner));
+  t.after(() => wipe(spender));
+  // 概况是全表聚合：用差分断言，dev 库别人的正向流水不影响
+  const before = await pointsOverview(now);
+  // 赚过分、之后又花掉：仍是同一个「发放对象」，不能因为花光就不算
+  await creditPoints(String(earner), { type: 'signin', title: '签到', points: 100, bizDate: '2027-05-10', idemKey: `${earner}:e` }, now);
+  await debitPoints(String(earner), { type: 'exchange', title: '兑换', points: 30, bizDate: '2027-05-10', idemKey: `${earner}:x` }, now);
+  // 只有负向流水（过期回收）：没被发放过，不能进发放人数
+  await PointRecordModel.create({
+    userId: spender, type: 'expire', title: '积分过期', delta: -5, balanceAfter: 0,
+    bizDate: '2027-05-10', idemKey: `${spender}:exp`, createdAt: now,
+  });
+  const after = await pointsOverview(now);
+  assert.equal(after.earnedUsers, before.earnedUsers + 1,
+    '两个用户各有一条流水，但发放人数只多 1：只有 delta > 0 的那个人算');
+  // 直接读库对齐口径：earner 在 distinct 里且只出现一次，spender 不在
+  const earners = (await PointRecordModel.distinct('userId', { delta: { $gt: 0 } })).map(String);
+  assert.equal(earners.filter((id) => id === String(earner)).length, 1, '赚过又花掉的用户只算一次');
+  assert.ok(!earners.includes(String(spender)), '只有负向流水的用户不算发放人数');
+});
