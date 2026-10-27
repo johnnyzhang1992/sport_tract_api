@@ -38,6 +38,13 @@ import {
   deleteNotification,
   type NotificationInput,
 } from '../services/notification.js';
+import {
+  listItemsForAdmin,
+  createItem,
+  updateItem,
+  setItemStock,
+  type ItemInput,
+} from '../services/points-catalog-admin.js';
 import { backfillUsers, backfillEmptyNicknames } from '../services/uid.js';
 import { backfillVehicle } from '../services/vehicle-backfill.js';
 import { backfillDriftScore } from '../services/drift-score-backfill.js';
@@ -1507,6 +1514,42 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     await deleteNotification(id);
     return success(null, '已删除');
+  });
+
+  // ==================== 积分管理 · 道具目录 ====================
+
+  // 目录列表：含下架项，带 stock/unlimited/active/兑换数/发放数（spec §7.2）
+  fastify.get('/points/items', { onRequest: [adminAuth] }, async () => success(await listItemsForAdmin()));
+
+  // 新增道具：key 冲突 409、ad_free 缺 days 400，文案由 service 点名实际收到的值
+  fastify.post('/points/items', { onRequest: [adminAuth] }, async (request) =>
+    success(await createItem(request.body as ItemInput)));
+
+  // 整行更新：key 创建后不可改（台账靠它关联），撞见改 key 回 400 并点名原值/新值
+  fastify.put('/points/items/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    assertObjectIdLike(id, '道具不存在');
+    return success(await updateItem(id, request.body as ItemInput));
+  });
+
+  // 库存改写：传目标值不是增量，返回 {before, after}；负数 400
+  fastify.patch('/points/items/:id/stock', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const { stock } = (request.body ?? {}) as { stock?: number };
+    assertObjectIdLike(id, '道具不存在');
+    return success(await setItemStock(id, Number(stock)));
+  });
+
+  // 道具图上传：入库裸链，展示与端上取签名链（私有桶裸链 403）——同专题图上传一套闸门
+  fastify.post('/points/items/image', { onRequest: [adminAuth] }, async (request) => {
+    const file = await request.file();
+    if (!file) throw new AppError(400, '请选择图片文件');
+    const buf = await file.toBuffer();
+    if (buf.length > 2 * 1024 * 1024) throw new AppError(400, '图片不能超过 2MB', { code: 'IMAGE_TOO_LARGE' });
+    const ext = (file.mimetype || 'image/png').split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+    const key = `${config.oss.baseDir}/items/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const url = await uploadBuffer(buf, key, file.mimetype || 'image/png');
+    return success({ url, previewUrl: getSignedUrl(url) });
   });
 }
 
