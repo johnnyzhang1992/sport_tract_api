@@ -378,7 +378,7 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(again.credited, 0);
   assert.equal(again.balance, 7);
 
-  // 10) 领取每日任务（看广告视频，每天三次机会 × 5 分）：前三次各发一次，第四次幂等
+  // 10) 领取每日任务（看广告视频，每天三次机会 × POINTS.VIDEO_REWARD 分）：前三次各发一次，第四次幂等
   for (let i = 1; i <= 3; i += 1) {
     const claim = await post('/points/tasks/daily_video/claim');
     assert.equal(claim.statusCode, 200, claim.body);
@@ -390,9 +390,11 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(claimAgain.alreadyClaimed, true, '当天三次用完后走幂等返回');
   assert.equal(claimAgain.credited, 0);
 
-  // 11) 收尾 summary：余额 22（兑换把刚 seed 的目录价扣光，之后 +3 +4 +15，视频三次各 5）、卡已用掉、任务状态已领取
+  // 11) 收尾 summary：余额按账本逐笔算（兑换把刚 seed 的目录价扣光，之后补签 +3、签到 +4、
+  //     视频三次各发 POINTS.VIDEO_REWARD，分值改了这里不用动字面量）、卡已用掉、任务状态已领取
+  const expectedBalance = 3 + 4 + 3 * POINTS.VIDEO_REWARD;
   const s3 = data<Summary>(await get('/points/summary'));
-  assert.equal(s3.balance, 22);
+  assert.equal(s3.balance, expectedBalance);
   assert.equal(s3.signin.todaySigned, true);
   assert.equal(s3.signin.streakDay, 4);
   assert.equal(s3.signin.todayReward, 4);
@@ -414,10 +416,10 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   const p1 = data<RecordPage>(await get('/points/records?page=1&pageSize=2'));
   assert.equal(p1.total, totalRecords);
   assert.equal(p1.items.length, 2);
-  assert.equal(p1.balance, 22);
+  assert.equal(p1.balance, expectedBalance);
   assert.deepEqual(p1.items.map((i) => i.type), ['task_daily_video', 'task_daily_video'], '按时间倒序');
-  assert.equal(p1.items[0].delta, 5);
-  assert.equal(p1.items[0].balanceAfter, 22);
+  assert.equal(p1.items[0].delta, POINTS.VIDEO_REWARD, '视频发放流水记的是 VIDEO_REWARD，不锁字面量');
+  assert.equal(p1.items[0].balanceAfter, expectedBalance);
 
   const p3 = data<RecordPage>(await get(`/points/records?page=${Math.ceil(totalRecords / 2)}&pageSize=2`));
   assert.ok(p3.items.length >= 1, '末页必须有行（分页总数与实收条数要自洽）');

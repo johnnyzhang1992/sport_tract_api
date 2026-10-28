@@ -10,7 +10,11 @@ export const POINTS = {
    * （补签日 7 分 + 后面 6 天爬坡差额 21 分），200 分等于没人补得起，49 分留 21 分净回收。
    */
   MAKEUP_CARD_PRICE: 49,
-  VIDEO_REWARD: 5,
+  /**
+   * 激励视频单次分值：2026-10-28 用户拍板 5 → 10，配合榜单发分抬累计速度；
+   * 见 specs/2026-10-28-points-board-rewards-design.md
+   */
+  VIDEO_REWARD: 10,
   /** 补签段长上限（天）：窗口内未签段超过该值不可补。7 = 窗口本身的大小，等于"窗口内全部可补"
    *  （2026-10-25 用户拍板放宽；产品要收紧只改这个数字）。窗口内没有任何已签行时仍然不可补——
    *  补签只能接在已有记录上，新用户不能凭卡从零买连签 */
@@ -21,9 +25,10 @@ export const POINT_TASKS = {
   newbie_profile: { title: '完善头像和昵称', points: 5, period: 'once', claim: 'manual' },
   newbie_first_activity: { title: '首次完成运动', points: 10, period: 'once', claim: 'manual' },
   newbie_first_import: { title: '首次导入轨迹', points: 5, period: 'once', claim: 'manual' },
-  daily_activity: { title: '运动记录', points: 1, period: 'daily', claim: 'manual' },
+  // 2026-10-28 用户拍板，配合榜单发分抬累计速度（1 → 5）；见 specs/2026-10-28-points-board-rewards-design.md
+  daily_activity: { title: '运动记录', points: 5, period: 'daily', claim: 'manual' },
   // claim='manual'：发分走显式 claim 接口。流量主激励视频没有服务端验签接口可接，
-  // "看完才发分"只能信任客户端 onClose(isEnded)——刷分风险（现在 5 分 × 3 次/天/号）是接受的资损上限
+  // "看完才发分"只能信任客户端 onClose(isEnded)——刷分风险（现在 10 分 × 3 次/天/号）是接受的资损上限
   daily_video: {
     title: '观看广告视频',
     points: POINTS.VIDEO_REWARD,

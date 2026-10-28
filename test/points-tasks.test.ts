@@ -2,6 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
+import { POINTS, POINT_TASKS } from '../src/config/points.js';
 import {
   PointAccountModel, PointDailyModel, PointLotModel, PointRecordModel, PointTaskModel,
 } from '../src/models/point.model.js';
@@ -69,6 +70,13 @@ after(async () => {
   await mongoose.disconnect().catch(() => {});
 });
 
+test('PT-NEW-1 分值已上调：运动记录 5 分、激励视频 10 分 × 3 次/天', () => {
+  assert.equal(POINT_TASKS.daily_activity.points, 5);
+  assert.equal(POINTS.VIDEO_REWARD, 10);
+  assert.equal(POINT_TASKS.daily_video.points, POINTS.VIDEO_REWARD, '视频分值只有一个来源，别两处各写');
+  assert.equal(POINT_TASKS.daily_video.dailyTimes, 3);
+});
+
 test('PT1 完善资料：昵称+头像都齐才可领，领取幂等', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
@@ -128,7 +136,7 @@ test('PT2 首次运动 +10、首次导入 +5 只在有对应活动时可领', as
   assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 15);
 });
 
-test('PT3 每日运动 +1：当天 finished 轨迹才可领，次日不可领', async (t) => {
+test('PT3 每日运动按 daily_activity 分值发分：当天 finished 轨迹才可领，次日不可领', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
   await makeUser(uid);
@@ -139,10 +147,10 @@ test('PT3 每日运动 +1：当天 finished 轨迹才可领，次日不可领', 
 
   let rows = await getTaskRows(String(uid), NOW);
   assert.equal(row(rows, 'daily_activity').status, 'claimable');
-  assert.equal(row(rows, 'daily_activity').points, 1);
+  assert.equal(row(rows, 'daily_activity').points, POINT_TASKS.daily_activity.points);
 
   const claimed = await claimTask(String(uid), 'daily_activity', NOW);
-  assert.deepEqual(claimed, { alreadyClaimed: false, credited: 1 });
+  assert.deepEqual(claimed, { alreadyClaimed: false, credited: POINT_TASKS.daily_activity.points });
 
   rows = await getTaskRows(String(uid), NOW);
   assert.equal(row(rows, 'daily_activity').status, 'claimed');
@@ -158,14 +166,14 @@ test('PT3 每日运动 +1：当天 finished 轨迹才可领，次日不可领', 
   assert.equal(await PointTaskModel.countDocuments({ userId: uid, taskKey: 'daily_activity' }), 1);
 });
 
-test('PT4 视频任务每日三次：前三次各发 5 分、第四次幂等、次日重置', async (t) => {
+test('PT4 视频任务每日三次：前三次各发 VIDEO_REWARD 分、第四次幂等、次日重置', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
   await makeUser(uid);
 
-  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
-  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
-  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: POINTS.VIDEO_REWARD });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: POINTS.VIDEO_REWARD });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: POINTS.VIDEO_REWARD });
   // 第四次：当天机会用完，和「重复领取」同样走幂等返回，不再发分
   assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: true, credited: 0 });
 
@@ -174,7 +182,7 @@ test('PT4 视频任务每日三次：前三次各发 5 分、第四次幂等、�
     .map((r) => r.periodKey).sort();
   assert.deepEqual(slots, [1, 2, 3].map((n) => `${bjDateStr(NOW)}#${n}`));
   assert.equal(await PointTaskModel.countDocuments({ userId: uid, taskKey: 'daily_video' }), 3);
-  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 15);
+  assert.equal((await PointAccountModel.findOne({ userId: uid }).lean())?.balance, 3 * POINTS.VIDEO_REWARD);
 
   const video = row(await getTaskRows(String(uid), NOW), 'daily_video');
   assert.equal(video.status, 'claimed');
@@ -198,19 +206,19 @@ test('PT4b 视频任务中间次数可见；老口径的行（periodKey 无 #n�
   // 改版前留下的今天行（periodKey = 纯日期）：当作第 1 次已用，不能让人当天多出一次
   await PointTaskModel.create({
     userId: uid, taskKey: 'daily_video', periodKey: bjDateStr(NOW),
-    status: 'claimed', points: 5, claimedAt: NOW,
+    status: 'claimed', points: POINTS.VIDEO_REWARD, claimedAt: NOW,
   });
   const legacy = row(await getTaskRows(String(uid), NOW), 'daily_video');
   assert.equal(legacy.status, 'claimable');
   assert.equal(legacy.timesLeft, 2);
 
-  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: POINTS.VIDEO_REWARD });
   const mid = row(await getTaskRows(String(uid), NOW), 'daily_video');
   assert.equal(mid.status, 'claimable', '还剩一次，不能提前显示已领取');
   assert.equal(mid.timesLeft, 1);
   assert.equal(mid.actionText, '去观看');
 
-  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: 5 });
+  assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: false, credited: POINTS.VIDEO_REWARD });
   assert.equal(row(await getTaskRows(String(uid), NOW), 'daily_video').status, 'claimed');
   assert.deepEqual(await claimTask(String(uid), 'daily_video', NOW), { alreadyClaimed: true, credited: 0 });
 });
