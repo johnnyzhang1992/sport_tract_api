@@ -7,6 +7,7 @@
  * - service/路由只验「取数对不对」——共享 dev 库里全用户分布随时变，断言具体百分位数值会假红，
  *   所以这里只比对它读到的 totalUsers / mine / 活跃链集合。
  */
+process.env.TZ = 'UTC'; // 线上容器口径；必须在任何断言之前生效（同 east8-boundaries 的做法）
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
@@ -21,8 +22,12 @@ import { bjDateStr } from '../src/utils/bj-time.js';
 
 const API = '/sport-track/api';
 const DAY = 86400000;
-const NOW = Date.UTC(2026, 9, 28, 2, 0, 0); // 东八区 2026-10-28 10:00
-const TODAY = bjDateStr(NOW);
+// 参考时刻取真实时钟：所有日期档都从它派生，与被测代码同一时钟
+// （streakPopulation 显式传 NOW；路由内部用 Date.now()，NOW+Ns 的相对档位对它同样成立），
+// 不再写死日历日——写死的那天一过，「今天/昨天」的 fixture 就整体错位。
+const NOW = Date.now();
+const TODAY = bjDateStr(NOW);            // 东八区「今天」，随真实日期滚动
+const YESTERDAY = previousDateKey(TODAY); // 东八区「昨天」
 
 let app: FastifyInstance;
 let token = '';
@@ -38,6 +43,7 @@ const lot = (remaining: number, expireAt: number) => PointLotModel.create({
 });
 
 before(async () => {
+  assert.equal(new Date().getTimezoneOffset(), 0, '本文件必须跑在 TZ=UTC 下，否则这些用例失去意义');
   await mongoose.connect(config.mongodbUri, { serverSelectionTimeoutMS: 5000 });
   await PointSigninModel.init();
   app = await buildApp({ logger: false });
@@ -139,9 +145,9 @@ test('SUM-1 summary 下发 expiring：无批次 null、近端批次出话、远�
 
 test('SUM-2 streakPopulation 读到的口径：mine = 当前连签、活跃链含本人', async () => {
   await PointSigninModel.deleteMany({ userId: uid });
-  // 今天没签、昨天签过 → 链还活着，mine 取昨天的 6（2026-10-28 用户拍板的口径）
+  // 今天有行 → mine 取今天的值，本人也进活跃链
   await PointSigninModel.create({ userId: uid, dateKey: TODAY, streakDay: 1, points: 1, source: 'sign', createdAt: NOW });
-  const mine = await streakPopulation(userId, Date.now());
+  const mine = await streakPopulation(userId, NOW);
   assert.equal(mine.totalUsers, await UserModel.countDocuments({}), '分母 = 全部注册用户');
   assert.ok(mine.activeStreaks.length >= 1 && mine.activeStreaks.every((s) => s >= 1), '活跃链只收 ≥1 天的人');
   assert.ok(mine.activeStreaks.includes(1), '今天有行 → 本人以今天的库存值进活跃链');
@@ -149,19 +155,19 @@ test('SUM-2 streakPopulation 读到的口径：mine = 当前连签、活跃链�
   await PointSigninModel.deleteMany({ userId: uid, dateKey: TODAY });
   // 今天没签、昨天签过 → 链还活着，mine 取昨天的值（2026-10-28 用户拍板：今天还没过去，仍有可能）
   await PointSigninModel.create({
-    userId: uid, dateKey: previousDateKey(TODAY), streakDay: 6, points: 6, source: 'sign', createdAt: NOW,
+    userId: uid, dateKey: YESTERDAY, streakDay: 6, points: 6, source: 'sign', createdAt: NOW,
   });
-  const y = await streakPopulation(userId, Date.now());
+  const y = await streakPopulation(userId, NOW);
   assert.equal(y.mine, 6, '只有昨天的行时按昨天那条算，不能归 0');
   // 共享库里别人也可能连签 6 天，includes(6) 会被代打（变异验证实测逃过一次）：
   // 差分要成立必须先真的删掉本人行取基线，光换个 userId 没用——活跃链本来就不按 userId 过滤
   await PointSigninModel.deleteMany({ userId: uid });
-  const baseline = (await streakPopulation(userId, Date.now())).activeStreaks;
-  assert.equal((await streakPopulation(userId, Date.now())).mine, 0, '删干净后本人归 0');
+  const baseline = (await streakPopulation(userId, NOW)).activeStreaks;
+  assert.equal((await streakPopulation(userId, NOW)).mine, 0, '删干净后本人归 0');
   await PointSigninModel.create({
-    userId: uid, dateKey: previousDateKey(TODAY), streakDay: 6, points: 6, source: 'sign', createdAt: NOW,
+    userId: uid, dateKey: YESTERDAY, streakDay: 6, points: 6, source: 'sign', createdAt: NOW,
   });
-  const withMe = (await streakPopulation(userId, Date.now())).activeStreaks;
+  const withMe = (await streakPopulation(userId, NOW)).activeStreaks;
   const added = [...withMe];
   for (const s of baseline) {
     const i = added.indexOf(s);
@@ -170,7 +176,8 @@ test('SUM-2 streakPopulation 读到的口径：mine = 当前连签、活跃链�
   assert.deepEqual(added, [6], '本人以昨天的值进活跃链，且只进一个');
 
   await PointSigninModel.deleteMany({ userId: uid });
+  // 远古日期是故意的：本用例要的正是「落在今/昨天窗口外」，它不随日历滚动，安全
   await PointSigninModel.create({ userId: uid, dateKey: '2020-01-01', streakDay: 30, points: 3, source: 'sign', createdAt: NOW });
-  const stale = await streakPopulation(userId, Date.now());
+  const stale = await streakPopulation(userId, NOW);
   assert.equal(stale.mine, 0, '最近一次签到在窗口外 → 当前连签归 0，历史值不算');
 });
