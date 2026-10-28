@@ -296,6 +296,8 @@ test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走
     key, name: '实物目录道具', subtitle: '', description: '', notes: [],
     price: 28900, validDays: 30, effect: { kind: 'makeup', days: 0 },
     kind: 'physical', detailImages, perUserLimit: 2,
+    // 每日投放两字段（Task 2）：配置值要原样下发，todayLeft = 投放数 − 当日台账已兑数
+    dailyQuota: 3, perUserDaily: 1,
     // 主图也配一张：档位与详情图分开钉（详情图整宽走 medium，主图缩略走 thumb）
     stock: 5, unlimited: false, active: true, sortOrder: 999, image: `${ossBase}/items/art.png`,
   });
@@ -318,6 +320,10 @@ test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走
   }
   assert.equal(row.perUserLimit, 2);
   assert.equal(row.stockLeft, 5, '限量道具下发剩余库存（spec §7.3）');
+  // 每日投放三字段（Task 2）：本行当日没人兑换，剩余＝投放数
+  assert.equal(row.dailyQuota, 3);
+  assert.equal(row.perUserDaily, 1);
+  assert.equal(row.todayLeft, 3, '当日已兑 0 张：剩余＝投放数');
   assert.equal(row.detailImages.length, 2, '详情图要逐张下发');
   if (isOssConfigured()) {
     for (const url of row.detailImages) {
@@ -340,4 +346,8 @@ test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走
   assert.equal(legacy.kind, 'virtual');
   assert.equal(legacy.perUserLimit, 0);
   assert.deepEqual(legacy.detailImages, []);
+  // 每日投放两字段物理缺失的同款兜底：0＝不限、todayLeft=null，整表读取不报错
+  assert.equal(legacy.dailyQuota, 0, '老行物理缺 dailyQuota → 兜底 0（不限）');
+  assert.equal(legacy.perUserDaily, 0, '老行物理缺 perUserDaily → 兜底 0（不限）');
+  assert.equal(legacy.todayLeft, null, '不限投放下发 null，端上不显示「今日剩余」');
 });

@@ -1596,12 +1596,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
     return success(await updateItem(id, request.body as ItemInput));
   });
 
-  // 库存/不限量改写（这两个字段的唯一出口）：传目标值不是增量，返回两字段的 {before, after}；负数 400
+  // 库存/不限量/每日投放改写（这四个字段的唯一出口）：传目标值不是增量，回 before/after 两态；负数 400
   fastify.patch('/points/items/:id/stock', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    const { stock, unlimited } = (request.body ?? {}) as { stock?: number; unlimited?: boolean };
+    const { stock, unlimited, dailyQuota, perUserDaily } = (request.body ?? {}) as
+      { stock?: number; unlimited?: boolean; dailyQuota?: number; perUserDaily?: number };
     assertObjectIdLike(id, '道具不存在');
-    return success(await setItemStock(id, { stock, unlimited }));
+    return success(await setItemStock(id, { stock, unlimited, dailyQuota, perUserDaily }));
   });
 
   // 道具图上传：入库裸链，展示与端上取签名链（私有桶裸链 403）——同专题图上传一套闸门

@@ -4,7 +4,8 @@
  * 口径：
  * - 字段所有权按写接口切开，谁负责谁必传：
  *   PUT /points/items/:id 只拥有内容字段（ITEM_CONTENT_FIELDS 那十三个，一个都不许缺，缺就 400 点名），
- *   永远不写 stock / unlimited；PATCH /points/items/:id/stock 是 stock 与 unlimited 的唯一出口。
+ *   永远不写 stock / unlimited / dailyQuota / perUserDaily；
+ *   PATCH /points/items/:id/stock 是 stock、unlimited 与每日投放两字段（dailyQuota/perUserDaily）的唯一出口。
  *   合在一条 PUT 里就等于「可选字段 + 默认值」——后台少传一个键，售罄的道具会被悄悄复活成 9999、
  *   道具图被清空（已上传对象成孤儿）、ad_free 的效果被换成补签，这些都是静默改写不是失败；
  * - key 创建后不可改：台账（PointRecord.refId / PointCard.itemKey / PointExchange.itemKey）
@@ -75,10 +76,18 @@ export interface ItemInput {
   image?: string;
 }
 
-/** PATCH /points/items/:id/stock 入参：stock 与 unlimited 至少要传一个（null 视同没传） */
+/**
+ * PATCH /points/items/:id/stock 入参：stock/unlimited/dailyQuota/perUserDaily 至少要传一个（null 视同没传）。
+ * 每日投放两字段（dailyQuota/perUserDaily，0＝不限）与 stock/unlimited 同侧归这条独占：
+ * PUT 继续只改内容、新建只落 schema 默认 0（裁定 2，2026-10-28 榜单发积分同批）。
+ */
 export interface StockPatch {
   stock?: number | null;
   unlimited?: boolean | null;
+  /** 每日投放：0 = 不限；非负整数 */
+  dailyQuota?: number | null;
+  /** 每人每日上限：0 = 不限；非负整数 */
+  perUserDaily?: number | null;
 }
 
 /** 库存与不限量的一对状态：改前改后都报，操作方看得见另一个字段没被顺手改掉 */
@@ -105,6 +114,10 @@ export interface AdminItemRow {
   detailPreviewUrls: string[];
   /** 0 = 不限购 */
   perUserLimit: number;
+  /** 每日投放：0 = 不限（Task 11 后台表单的投放档位） */
+  dailyQuota: number;
+  /** 每人每日上限：0 = 不限 */
+  perUserDaily: number;
   stock: number;
   unlimited: boolean;
   active: boolean;
@@ -141,6 +154,19 @@ function assertFlag(label: string, value: unknown): void {
   if (value !== undefined && value !== null && typeof value !== 'boolean') {
     throw new AppError(400, `${label} 只能是 true 或 false（收到「${shown(value)}」）`);
   }
+}
+
+/**
+ * 每日投放两字段（dailyQuota/perUserDaily）的非负整数闸门：'abc' → NaN、1.5、-1 一律 400。
+ * '' 单独判掉：Number('')===0 会被当成「不限」，后台把输入框清空就等于静默放开当日投放。
+ * 文案按 brief 口径「对象 + 实际值 + 上限」：`${label} 必须是非负整数（收到 ${shown(value)}）`。
+ */
+function assertDailyField(label: 'dailyQuota' | 'perUserDaily', value: unknown): number {
+  const n = value === '' ? Number.NaN : Number(value);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new AppError(400, `${label} 必须是非负整数（收到 ${shown(value)}）`);
+  }
+  return n;
 }
 
 /** 整数字段：'' 单独判掉（Number('')===0，后台清空输入框不等于「0 库存/排第一」），NaN 与小数都拦下。
@@ -279,6 +305,10 @@ function normalize(input: ItemInput): Omit<ItemDoc, '_id' | 'createdAt' | 'updat
     perUserLimit: input.perUserLimit == null
       ? (kind === 'physical' ? 1 : 0)
       : Number(input.perUserLimit),
+    // 每日投放两字段：新建一律 0＝不限——它们是 PATCH /stock 的独占字段（裁定 2），
+    // ItemInput 根本不收这两个键，这里只是把落库文档补全（schema 默认同为 0）
+    dailyQuota: 0,
+    perUserDaily: 0,
   };
 }
 
@@ -319,6 +349,9 @@ function toSavedRow(r: ItemDoc): SavedItemRow {
     detailImages,
     detailPreviewUrls: detailPreviewsOf(detailImages),
     perUserLimit: Number(rest.perUserLimit ?? 0),
+    // 每日投放两字段同款兜底：PATCH /stock 改完的回执/读回不能是 undefined
+    dailyQuota: Number(rest.dailyQuota ?? 0),
+    perUserDaily: Number(rest.perUserDaily ?? 0),
     image,
     previewUrl: image ? getSignedUrl(image) : '',
     _id: String(_id),
@@ -360,6 +393,9 @@ export async function listItemsForAdmin(): Promise<AdminItemRow[]> {
     detailImages: r.detailImages ?? [],
     detailPreviewUrls: detailPreviewsOf(r.detailImages ?? []),
     perUserLimit: Number(r.perUserLimit ?? 0),
+    // 每日投放两字段（Task 2）：上线前入库的老行物理上没有它们，同 perUserLimit 的兜底惯用法
+    dailyQuota: Number(r.dailyQuota ?? 0),
+    perUserDaily: Number(r.perUserDaily ?? 0),
     stock: r.stock,
     unlimited: r.unlimited,
     active: r.active,
@@ -410,20 +446,24 @@ export async function updateItem(id: string, input: ItemInput): Promise<SavedIte
 }
 
 /**
- * 库存/不限量改写（PATCH 的唯一出口）：传目标值（不是增量），stock 与 unlimited 至少给一个，
- * 返回两个字段的 {before, after}；负数 400 并点名收到的值。
+ * 库存/不限量/每日投放改写（PATCH 的唯一出口）：传目标值（不是增量），四个字段至少给一个，
+ * 返回 stock/unlimited 两字段的 {before, after}（既有契约不变，dailyQuota/perUserDaily 改完
+ * 从管理列表/库里读回——回执扩形会破坏 Task 4 钉下的 deepEqual，裁定 2 只要求写入出口在这条）；
+ * 负数 400 并点名收到的值。
  * unlimited 道具的库存只是展示位——照改不拦，兑换链路本来就不读它扣减。
  */
 export async function setItemStock(id: string, patch: StockPatch): Promise<{ before: StockState; after: StockState }> {
   assertObjectIdLike(id, '道具不存在');
-  const received = patch as { stock?: unknown; unlimited?: unknown };
+  const received = patch as { stock?: unknown; unlimited?: unknown; dailyQuota?: unknown; perUserDaily?: unknown };
   // null 视同没传：PUT 那侧的「可选即默认值」教训不能在这侧重演
   const hasStock = received.stock !== undefined && received.stock !== null;
   const hasUnlimited = received.unlimited !== undefined && received.unlimited !== null;
-  if (!hasStock && !hasUnlimited) {
-    throw new AppError(400, '库存改写至少要传 stock 或 unlimited 之一（收到 空）');
+  const hasQuota = received.dailyQuota !== undefined && received.dailyQuota !== null;
+  const hasPerUserDaily = received.perUserDaily !== undefined && received.perUserDaily !== null;
+  if (!hasStock && !hasUnlimited && !hasQuota && !hasPerUserDaily) {
+    throw new AppError(400, '库存改写至少要传 stock / unlimited / dailyQuota / perUserDaily 之一（收到 空）');
   }
-  const set: { stock?: number; unlimited?: boolean } = {};
+  const set: { stock?: number; unlimited?: boolean; dailyQuota?: number; perUserDaily?: number } = {};
   if (hasStock) {
     const stock = Number(received.stock);
     if (!Number.isInteger(stock)) throw new AppError(400, `库存必须是整数（收到「${shown(received.stock)}」）`);
@@ -436,6 +476,9 @@ export async function setItemStock(id: string, patch: StockPatch): Promise<{ bef
     }
     set.unlimited = received.unlimited;
   }
+  // 每日投放两字段与 stock/unlimited 同侧（裁定 2）：闸门先跑完再 $set，一笔都不许半截写入
+  if (hasQuota) set.dailyQuota = assertDailyField('dailyQuota', received.dailyQuota);
+  if (hasPerUserDaily) set.perUserDaily = assertDailyField('perUserDaily', received.perUserDaily);
   const before = await PointItemModel.findOne({ _id: id }).lean() as ItemDoc | null;
   if (!before) throw new AppError(404, '道具不存在');
   const after = await PointItemModel

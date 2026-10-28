@@ -32,6 +32,10 @@ export interface ItemDoc {
   detailImages: string[];
   /** 0 = 不限购；实物新建未传时落 1 */
   perUserLimit: number;
+  /** 每日投放：0 = 不限；>0 = 每个东八区自然日全平台最多兑 N 张（闸门在 Task 3，这里先落字段） */
+  dailyQuota: number;
+  /** 每人每日上限：0 = 不限 */
+  perUserDaily: number;
 }
 
 const MAKEUP_NOTES = [
@@ -56,7 +60,8 @@ export const POINT_ITEMS_SEED: Omit<ItemDoc, '_id'>[] = [
     description: '每张仅可使用一次；可补签近 7 天窗口内的漏签日，补一天用一张；兑换后 30 天内有效',
     notes: MAKEUP_NOTES, price: POINTS.MAKEUP_CARD_PRICE, validDays: 30,
     // 四条种子一律虚拟道具：实物由后台显式新建（默认每人限购 1），种子不限购
-    kind: 'virtual', detailImages: [], perUserLimit: 0,
+    // 每日投放两字段同口径：种子 0＝不限，投放数只由后台 PATCH /stock 改写（Task 2）
+    kind: 'virtual', detailImages: [], perUserLimit: 0, dailyQuota: 0, perUserDaily: 0,
     effect: { kind: 'makeup', days: 0 },
     stock: 9999, unlimited: true, active: true, sortOrder: 10, image: '',
   },
@@ -64,7 +69,7 @@ export const POINT_ITEMS_SEED: Omit<ItemDoc, '_id'>[] = [
     key: `ad_free_${days}d`, name: `免广告卡·${days} 天`, subtitle: `激活后 ${days} 天内免广告`,
     description: `兑换后 30 天内需激活，激活起 ${days} 天免广告；封面广告次日生效`,
     notes: adFreeNotes(days), price: AD_FREE_PRICE[days], validDays: 30,
-    kind: 'virtual' as const, detailImages: [], perUserLimit: 0,
+    kind: 'virtual' as const, detailImages: [], perUserLimit: 0, dailyQuota: 0, perUserDaily: 0,
     effect: { kind: 'ad_free' as const, days },
     // active:false 起步：老端首页商品区是 wx:for，后台一上架就会多出点不动的卡，等 Task 14 发版后再开
     stock: 9999, unlimited: true, active: false, sortOrder: 20 + i * 10, image: '',

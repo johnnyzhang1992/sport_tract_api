@@ -165,6 +165,10 @@ const itemSchema = new Schema({
   detailImages: { type: [String], default: [] },
   // 每人限购：0 = 不限。实物「未表态」时由 createItem 落 1；这里只兜住负数（范围/整数在 service 校验）
   perUserLimit: { type: Number, default: 0, min: 0 },
+  // 每日投放（2026-10-28 榜单发积分同批）：0＝不限；>0＝每个东八区自然日最多兑 N 张，先到先得
+  dailyQuota: { type: Number, default: 0, min: 0 },
+  // 每人每日上限：0＝不限。没有这条，一个人能把当日额度扫光
+  perUserDaily: { type: Number, default: 0, min: 0 },
 }, { timestamps: true, versionKey: false });
 
 export const PointAccountModel = models.PointAccount ?? model('PointAccount', accountSchema);

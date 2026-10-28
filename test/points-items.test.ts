@@ -130,6 +130,10 @@ test('PI1 按目录实时价兑换一张卡，30 天有效，兑换记录可查'
     kind: 'virtual',
     detailImages: [],
     perUserLimit: 0,
+    // 2026-10-28 每日投放批次新增的三字段：未配置时 0＝不限，不限时 todayLeft 必须下发 null
+    dailyQuota: 0,
+    perUserDaily: 0,
+    todayLeft: null,
     // spec §7.3：unlimited 下发 null（端上显示「不限量」），限量道具下发剩余数
     stockLeft: null,
   });
@@ -565,4 +569,64 @@ test('X7 删卡失败不阻断库存回补与扣分撤销（S4）', async (t) =>
   const acc = await PointAccountModel.findOne({ userId: uid }).lean();
   assert.equal(acc?.balance, 200, '扣分撤销不依赖删卡成功');
   assert.equal(acc?.totalSpent, 0);
+});
+
+/**
+ * 每日投放字段（2026-10-28 榜单发积分同批，Task 2）：
+ * todayLeft 的数据源＝兑换台账（type:'exchange' + refType:'item' + refId=itemKey + bizDate=当日东八区），
+ * 不新建计数器表；当日计数是「全平台」口径——每人每日上限是 Task 3 兑换链的闸门，不混进展示字段。
+ * 共享 dev 库纪律：只用自己的 t_ 前缀临时行断言差值，绝不对平台总量做绝对值断言。
+ */
+test('PI-DQ-1 目录下发每日投放字段，缺省＝不限', async () => {
+  const row = (await listActiveItems()).find((i) => i.key === 'makeup_card')!;
+  assert.ok(row, '补签卡必须在架');
+  assert.equal(row.dailyQuota, 0, '未配置时 0＝不限');
+  assert.equal(row.perUserDaily, 0);
+  assert.equal(row.todayLeft, null, '不限时下发 null，端上不显示「今日剩余」');
+});
+
+test('PI-DQ-2 每日投放数按当日已兑数扣减（全平台台账口径，扣到 0 封底）', async (t) => {
+  const uid = newUser();
+  // 第二个用户的台账行同样扣 todayLeft：证明这是平台口径，不是用户口径
+  const other = newUser();
+  const key = await tempItem({ dailyQuota: 2, unlimited: true });
+  t.after(async () => { await wipe(uid); await wipe(other); await PointItemModel.deleteMany({ key }); });
+
+  const findRow = async () => (await listActiveItems()).find((i) => i.key === key)!;
+  const row0 = await findRow();
+  assert.equal(row0.dailyQuota, 2, '配置要原样下发');
+  assert.equal(row0.perUserDaily, 0, '没配每人上限就是 0＝不限');
+  assert.equal(row0.todayLeft, 2, '当日没人兑：剩余＝投放数');
+
+  await seedPoints(uid, 200);
+  // 台账 bizDate 必须落在真实「今日」：listActiveItems 按当日东八区计数，固定 NOW 的历史时刻对不上
+  const now = Date.now();
+  await exchangeItem(String(uid), key, 'req-dq-2', now);
+  assert.equal((await findRow()).todayLeft, 1, '今日已兑 1 张，剩 1');
+
+  // 直接补写台账的第二、三行（别的用户兑的）：扣减按平台全量，且不能扣成负数
+  const synth = (i: number) => PointRecordModel.create({
+    userId: other, type: 'exchange', title: '兑换测试道具', delta: -200, balanceAfter: 0,
+    bizDate: bjDateStr(now), refType: 'item', refId: key, idemKey: `${other}:dq-synth:${i}`, createdAt: now,
+  });
+  await synth(1);
+  assert.equal((await findRow()).todayLeft, 0, '当日已兑满投放数：剩 0');
+  await synth(2);
+  assert.equal((await findRow()).todayLeft, 0, '已兑数超出投放数也只能封底 0，不许出负数');
+});
+
+test('PI-DQ-3 老目录行物理缺 dailyQuota：兜底 0/不限、todayLeft=null，不报错', async (t) => {
+  const key = `t_items_legacy_${Date.now()}`;
+  t.after(() => PointItemModel.deleteMany({ key }));
+  // raw insert 绕过 schema 默认值：字段上线前入库的 dev 目录行就是这个物理形态（同 PC-10 的老行口径）
+  await PointItemModel.collection.insertOne({
+    key, name: '老目录道具', subtitle: '', description: '', notes: [],
+    price: 100, validDays: 30, effect: { kind: 'makeup', days: 0 },
+    stock: 5, unlimited: false, active: true, sortOrder: 998, image: '',
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+  const row = (await listActiveItems()).find((i) => i.key === key)!;
+  assert.equal(row.dailyQuota, 0, '物理缺字段按 0＝不限兜底（同 perUserLimit 的惯用法）');
+  assert.equal(row.perUserDaily, 0);
+  assert.equal(row.todayLeft, null, '不限投放不能下发 0（端上会显示「今日剩余 0 张」）');
 });

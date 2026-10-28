@@ -21,7 +21,7 @@
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import {
-  PointCardModel, PointExchangeModel, PointItemModel, PointOrderModel, type ItemKind,
+  PointCardModel, PointExchangeModel, PointItemModel, PointOrderModel, PointRecordModel, type ItemKind,
 } from '../models/point.model.js';
 import { debitPoints, getBalance, reverseDebit, type DebitResult } from './points-ledger.js';
 import { limitError, limitReached, validateAddress } from './points-orders.js';
@@ -42,6 +42,18 @@ export interface ItemDto {
   detailImages: string[];
   /** 0 = 不限购；实物默认 1 */
   perUserLimit: number;
+  /** 每日投放：0 = 不限；>0 = 每个东八区自然日全平台最多兑 N 张，先到先得（闸门在 Task 3，这里只下发配置与展示数） */
+  dailyQuota: number;
+  /** 每人每日上限：0 = 不限；兑换链的闸门字段（Task 3），展示层不参与扣减 */
+  perUserDaily: number;
+  /**
+   * 今日剩余：dailyQuota = 0（不限）时必须是 null（端上不显示「今日剩余」，0 会被读成「兑完」）；
+   * >0 时 = max(0, dailyQuota − 当日已兑条数)。
+   * 数据源＝兑换台账（PointRecord 的 type:'exchange' + refType:'item' + refId=itemKey + bizDate=当日东八区），
+   * 不新建计数器表；失败兑换的扣分行会被 reverseDebit 降级成 exchange_reversed，天然不占额度。
+   * 按 item 聚合的是当日全平台已兑数——每人维度是 Task 3 的闸门，不混进这个展示字段。
+   */
+  todayLeft: number | null;
   /** 剩余库存（spec §7.3）：unlimited 为 null（端上显示「不限量」），限量道具给实际剩余数 */
   stockLeft: number | null;
   imageUrl: string;
@@ -129,21 +141,37 @@ async function findInFlightExchange(userId: string, rid: string) {
 /** 用户端商品列表：只下发在架道具，按 sortOrder 升序（老客户端读 items[0]，故 makeup_card 必须排第一） */
 export async function listActiveItems(): Promise<ItemDto[]> {
   const rows = await PointItemModel.find({ active: true }).sort({ sortOrder: 1, _id: 1 }).lean();
-  return rows.map((r) => ({
-    key: r.key, name: r.name, subtitle: r.subtitle, price: r.price,
-    validDays: r.validDays, description: r.description, notes: r.notes ?? [],
-    effect: { kind: r.effect?.kind ?? 'makeup', days: r.effect?.days ?? 0 },
-    // 本批次之前入库的目录行物理上没有 kind/detailImages/perUserLimit：按虚拟/无图/不限的
-    // 默认口径兜底，别把 undefined 漏给端上（端上会当成实物或者限购 0 张）
-    kind: (r.kind ?? 'virtual') as ItemKind,
-    // 详情图在商品页整宽渲染（widthFix），w_240 会被拉糊 → 走 medium 档；后台表单的小预览仍是 thumb
-    detailImages: (r.detailImages ?? []).map((u: string) => (u ? getMediumUrl(u) : '')),
-    perUserLimit: Number(r.perUserLimit ?? 0),
-    // spec §7.3：unlimited 下发 null（端上显示「不限量」）；限量道具给实际剩余，别把 undefined 漏给端上
-    stockLeft: r.unlimited ? null : Number(r.stock ?? 0),
-    // 私有桶裸链进 <img> 会 403；hero 与积分页道具卡都是白底，缩略档（jpg）够用
-    imageUrl: r.image ? getThumbUrl(r.image) : '',
-  }));
+  // 今日剩余的数据源＝兑换台账（见 ItemDto.todayLeft 注释）：一次分组计数拿全部道具的当日已兑数，
+  // 不给每行单独发查询；bizDate 是东八区自然日字符串，与扣分行的写入同一口径（bjDateStr）。
+  const today = bjDateStr(Date.now());
+  const exchangedAgg = await PointRecordModel.aggregate<{ _id: string; count: number }>([
+    { $match: { type: 'exchange', refType: 'item', refId: { $in: rows.map((r) => r.key) }, bizDate: today } },
+    { $group: { _id: '$refId', count: { $sum: 1 } } },
+  ]);
+  const exchangedBy = new Map(exchangedAgg.map((g) => [g._id, Number(g.count)]));
+  return rows.map((r) => {
+    const dailyQuota = Number(r.dailyQuota ?? 0);
+    return {
+      key: r.key, name: r.name, subtitle: r.subtitle, price: r.price,
+      validDays: r.validDays, description: r.description, notes: r.notes ?? [],
+      effect: { kind: r.effect?.kind ?? 'makeup', days: r.effect?.days ?? 0 },
+      // 本批次之前入库的目录行物理上没有 kind/detailImages/perUserLimit：按虚拟/无图/不限的
+      // 默认口径兜底，别把 undefined 漏给端上（端上会当成实物或者限购 0 张）
+      kind: (r.kind ?? 'virtual') as ItemKind,
+      // 详情图在商品页整宽渲染（widthFix），w_240 会被拉糊 → 走 medium 档；后台表单的小预览仍是 thumb
+      detailImages: (r.detailImages ?? []).map((u: string) => (u ? getMediumUrl(u) : '')),
+      perUserLimit: Number(r.perUserLimit ?? 0),
+      // 每日投放两字段同 perUserLimit 的惯用法：老行物理缺字段按 0＝不限兜底
+      dailyQuota,
+      perUserDaily: Number(r.perUserDaily ?? 0),
+      // 不限投放下发 null；限量投放扣当日全平台已兑数、封底 0（台账超投也只是脏数据，不出负数）
+      todayLeft: dailyQuota > 0 ? Math.max(0, dailyQuota - (exchangedBy.get(r.key) ?? 0)) : null,
+      // spec §7.3：unlimited 下发 null（端上显示「不限量」）；限量道具给实际剩余，别把 undefined 漏给端上
+      stockLeft: r.unlimited ? null : Number(r.stock ?? 0),
+      // 私有桶裸链进 <img> 会 403；hero 与积分页道具卡都是白底，缩略档（jpg）够用
+      imageUrl: r.image ? getThumbUrl(r.image) : '',
+    };
+  });
 }
 
 /**

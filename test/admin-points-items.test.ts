@@ -681,3 +681,97 @@ test('AI-13 stock/sortOrder/unlimited/active 类型闸门：NaN 不冒成 500，
   assert.equal(db!.sortOrder, 900, '被拒的 PUT 不许改写 sortOrder');
   assert.equal(db!.active, true);
 });
+
+/**
+ * AI-14/AI-15 每日投放两字段（dailyQuota/perUserDaily，2026-10-28 Task 2）：
+ * 后台写入出口＝现有 PATCH /points/items/:id/stock（与 stock/unlimited 同侧，裁定 2）；
+ * PUT 继续只改内容，新建/PUT 带这两个字段一律不写。
+ */
+test('AI-14 PATCH 独占每日投放字段：写入生效、非负整数校验点名对象+实际值', async (t) => {
+  t.after(cleanupItems);
+  const row = await createItem(validInput);
+  const id = String(row._id);
+
+  // 服务层直调：两字段一起写，库存/不限量一个都不许被顺手改掉
+  const r = await setItemStock(id, { dailyQuota: 5, perUserDaily: 2 });
+  let db = await readItem(id);
+  assert.equal(db!.dailyQuota, 5, 'dailyQuota 要落库');
+  assert.equal(db!.perUserDaily, 2, 'perUserDaily 要落库');
+  assert.equal(db!.stock, 10, '改每日投放不许动库存');
+  assert.equal(db!.unlimited, false, '改每日投放不许动 unlimited');
+  // 回执保持既有 {stock, unlimited} 形状（API 契约不破坏；新字段改完从库里/列表读回核对）
+  assert.deepEqual(r, { before: { stock: 10, unlimited: false }, after: { stock: 10, unlimited: false } });
+
+  // 0 合法（＝不限）：不能把「明确填 0」当成没传
+  await setItemStock(id, { dailyQuota: 0 });
+  assert.equal((await readItem(id))!.dailyQuota, 0, '显式 0＝不限，要写进去');
+
+  // 非负整数闸门：负数/小数/非数字/空串一律 400，文案「对象 + 实际值 + 上限」
+  const cases: Array<{ patch: { dailyQuota?: unknown; perUserDaily?: unknown }; copy: RegExp }> = [
+    { patch: { dailyQuota: -1 }, copy: /dailyQuota 必须是非负整数（收到 -1）/ },
+    { patch: { dailyQuota: 1.5 }, copy: /dailyQuota 必须是非负整数（收到 1\.5）/ },
+    { patch: { dailyQuota: 'abc' }, copy: /dailyQuota 必须是非负整数（收到 abc）/ },
+    // '' 单独判掉：Number('')===0，后台清空输入框等于静默放开投放
+    { patch: { dailyQuota: '' }, copy: /dailyQuota 必须是非负整数（收到 空）/ },
+    { patch: { perUserDaily: -1 }, copy: /perUserDaily 必须是非负整数（收到 -1）/ },
+    { patch: { perUserDaily: 2.5 }, copy: /perUserDaily 必须是非负整数（收到 2\.5）/ },
+    { patch: { perUserDaily: '' }, copy: /perUserDaily 必须是非负整数（收到 空）/ },
+  ];
+  for (const { patch, copy } of cases) {
+    await assert.rejects(() => setItemStock(id, patch as never), (e) => {
+      const err = e as AppError;
+      return err.statusCode === 400 && copy.test(err.message);
+    }, `应报「${copy}」：${JSON.stringify(patch)}`);
+  }
+  db = await readItem(id);
+  assert.equal(db!.dailyQuota, 0, '被拒的 PATCH 一个字都不许写进库');
+  assert.equal(db!.perUserDaily, 2, 'perUserDaily 停在上一笔成功值（校验先于 $set）');
+
+  // 至少要传一个：四个字段都没传才 400，文案点名全部出口
+  await assert.rejects(() => setItemStock(id, {}), (e) => {
+    const err = e as AppError;
+    return err.statusCode === 400 && /stock/.test(err.message) && /unlimited/.test(err.message)
+      && /dailyQuota/.test(err.message) && /perUserDaily/.test(err.message);
+  });
+
+  // 经路由：合法写入 + 非法 400（不许冒成 500），非法入参不留痕
+  const ok = await req('PATCH', `/sport-track/api/admin/points/items/${id}/stock`, { dailyQuota: 8, perUserDaily: 1 });
+  assert.equal(ok.statusCode, 200, ok.body);
+  db = await readItem(id);
+  assert.equal(db!.dailyQuota, 8);
+  assert.equal(db!.perUserDaily, 1);
+  const bad = await req('PATCH', `/sport-track/api/admin/points/items/${id}/stock`, { dailyQuota: -3 });
+  assert.equal(bad.statusCode, 400, `负 dailyQuota 应 400 而非 500：${bad.body}`);
+  assert.match(bad.json().message, /dailyQuota 必须是非负整数（收到 -3）/);
+  assert.equal((await readItem(id))!.dailyQuota, 8, '被拒的路由 PATCH 不许改写库里值');
+
+  // 管理端列表要带这两个字段（Task 11 表单回填靠它），老行物理缺字段兜底 0 不报错
+  const adminRow = (await listItemsForAdmin()).find((r2) => r2.key === TEST_KEY)!;
+  assert.equal(adminRow.dailyQuota, 8);
+  assert.equal(adminRow.perUserDaily, 1);
+  const seedRow = (await listItemsForAdmin()).find((r2) => r2.key === 'makeup_card')!;
+  assert.equal(seedRow.dailyQuota, 0, '老种子行物理缺 dailyQuota：管理列表兜底 0，不是 undefined');
+  assert.equal(seedRow.perUserDaily, 0);
+});
+
+test('AI-15 PUT 只改内容：带 dailyQuota/perUserDaily 也不写；新建只落默认 0', async (t) => {
+  t.after(cleanupItems);
+  // 新建带这两个字段：不属于 ItemInput，normalize 一个都不读，落库只走 schema 默认 0
+  const row = await createItem({ ...validInput, dailyQuota: 7, perUserDaily: 3 } as unknown as ItemInput);
+  let db = await readItem(String(row._id));
+  assert.equal(db!.dailyQuota, 0, '新建不写每日投放：PATCH /stock 是唯一出口');
+  assert.equal(db!.perUserDaily, 0);
+
+  // 先经 PATCH 写 5，再 PUT 整行带着 99：PUT 必须原样忽略
+  await setItemStock(String(row._id), { dailyQuota: 5, perUserDaily: 4 });
+  await updateItem(String(row._id), { ...validInput, dailyQuota: 99, perUserDaily: 99 } as unknown as ItemInput);
+  db = await readItem(String(row._id));
+  assert.equal(db!.dailyQuota, 5, 'PUT 带了 dailyQuota 也要忽略（同 stock/unlimited 的字段所有权分工）');
+  assert.equal(db!.perUserDaily, 4, 'PUT 带了 perUserDaily 也要忽略');
+
+  // 路由层同口径：PUT body 带新字段仍是 200 且不写
+  const res = await req('PUT', `/sport-track/api/admin/points/items/${String(row._id)}`,
+    { ...validInput, dailyQuota: 66 });
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal((await readItem(String(row._id)))!.dailyQuota, 5, 'HTTP PUT 也不许写每日投放');
+});
