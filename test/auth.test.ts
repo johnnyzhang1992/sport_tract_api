@@ -5,6 +5,7 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { WeightLogModel } from '../src/models/weight-log.model.js';
 import { LoginLogModel } from '../src/models/login-log.model.js';
+import { PointCardModel } from '../src/models/point.model.js';
 import { nextUserUid } from '../src/services/uid.js';
 import FormData from 'form-data';
 
@@ -64,6 +65,25 @@ test('登录：code 换 token，返回 accessToken/refreshToken/user', async () 
   assert.ok(Number.isInteger(body.data.user.uid) && body.data.user.uid > 0);
   // openid 不出接口（敏感字段）
   assert.equal(body.data.user.openid, undefined);
+});
+
+test('登录返回 adFreeUntil：没卡为 0，激活的免广告卡按 benefitDays 推到期', async () => {
+  const r1 = await post('/sport-track/api/auth/login', { code: 'test-code-adfree' });
+  const u1 = r1.json().data.user;
+  assert.equal(u1.adFreeUntil, 0, '新用户没有免广告权益');
+
+  const now = Date.now();
+  await PointCardModel.create({
+    userId: u1.id, itemKey: 'ad_free_7d', status: 'used', benefitDays: 7,
+    activatedAt: now, expiresAt: now + 30 * 86400000, createdAt: now,
+  });
+  try {
+    const r2 = await post('/sport-track/api/auth/login', { code: 'test-code-adfree' });
+    const until = r2.json().data.user.adFreeUntil;
+    assert.ok(until >= now + 7 * 86400000 - 5000, `应推到期时刻（激活时刻 + 7 天），实际 ${until}`);
+  } finally {
+    await PointCardModel.deleteMany({ userId: u1.id });
+  }
 });
 
 test('登录幂等：同一 code 返回同一用户', async () => {

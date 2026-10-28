@@ -17,6 +17,7 @@ import { geoRoutes } from './routes/geo.routes.js';
 import { overviewRoutes } from './routes/overview.routes.js';
 import { topicRoutes } from './routes/topic.routes.js';
 import { notificationRoutes } from './routes/notification.routes.js';
+import { adsRoutes } from './routes/ads.routes.js';
 import { pointsRoutes } from './routes/points.routes.js';
 import { footprintRecordRoutes } from './routes/footprint-record.routes.js';
 import { adminRoutes } from './routes/admin.routes.js';
@@ -89,6 +90,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(overviewRoutes, { prefix: `${config.apiPrefix}/overview` });
   await fastify.register(topicRoutes, { prefix: `${config.apiPrefix}/topics` });
   await fastify.register(notificationRoutes, { prefix: `${config.apiPrefix}/notifications` });
+  await fastify.register(adsRoutes, { prefix: `${config.apiPrefix}/ads` });
   await fastify.register(pointsRoutes, { prefix: `${config.apiPrefix}/points` });
   await fastify.register(footprintRecordRoutes, { prefix: `${config.apiPrefix}/footprint-records` });
   await fastify.register(adminRoutes, { prefix: `${config.apiPrefix}/admin` });

@@ -38,6 +38,7 @@ import {
   deleteNotification,
   type NotificationInput,
 } from '../services/notification.js';
+import { type AdSlotInput, createAdSlot, deleteAdSlot, listAdSlotsForAdmin, updateAdSlot } from '../services/ads.js';
 import {
   listItemsForAdmin,
   createItem,
@@ -1556,6 +1557,26 @@ export async function adminRoutes(fastify: FastifyInstance) {
   fastify.delete('/notifications/:id', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
     await deleteNotification(id);
+    return success(null, '已删除');
+  });
+
+  // ==================== 广告管理（目前只支持模板广告） ====================
+  fastify.get('/ads', { onRequest: [adminAuth] }, async () => success(await listAdSlotsForAdmin()));
+
+  fastify.post('/ads', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    return success(await createAdSlot(body as AdSlotInput), '已创建');
+  });
+
+  fastify.put('/ads/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    return success(await updateAdSlot(id, body as AdSlotInput), '已保存');
+  });
+
+  fastify.delete('/ads/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    await deleteAdSlot(id);
     return success(null, '已删除');
   });
 
