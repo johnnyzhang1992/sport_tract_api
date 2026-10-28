@@ -9,7 +9,7 @@
  * 纯函数：不查库。
  */
 import { POINTS } from '../config/points.js';
-import { rewardForStreakDay, shiftDateKey } from './points-domain.js';
+import { daysBetween, rewardForStreakDay, shiftDateKey } from './points-domain.js';
 
 export { shiftDateKey } from './points-domain.js';
 
@@ -138,9 +138,3 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
   return cells;
 }
 
-/** 两个 dateKey 相差的自然天数（b - a，可为负） */
-function daysBetween(a: string, b: string): number {
-  const [ay, am, ad] = a.split('-').map(Number);
-  const [by, bm, bd] = b.split('-').map(Number);
-  return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000);
-}

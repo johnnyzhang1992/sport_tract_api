@@ -254,6 +254,40 @@ test('PS5b 补今天/补窗口外日期/补非法串/补已签日 → 各自文�
   assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 0, '四次拒绝都不发分');
 });
 
+test('PS5c 拒绝文案要说清对象与实际值（旧文案把段长上限写死成 2 天，早已放宽到 7）', async () => {
+  await wipe(uid);
+  await giveCard();
+  const grab = async (dateKey: string) => {
+    try {
+      await useMakeupCard(userId, dateKey, NOW);
+      return '';
+    } catch (e) {
+      return (e as Error).message;
+    }
+  };
+
+  // 窗口里一行签到记录都没有：新用户不能凭卡从零买连签
+  const noRecord = await grab('2026-10-24');
+  assert.match(noRecord, /窗口内还没有签到记录/, noRecord);
+  assert.ok(!/断签超过 2 天/.test(noRecord), '不得再出现写死「2 天」的旧口径');
+
+  await seed('2026-10-23', 1);
+  // 出窗：报窗口起点与收到的日期
+  const outOfWindow = await grab('2026-10-18');
+  assert.match(outOfWindow, /2026-10-19/, `窗口起点要出现在文案里：${outOfWindow}`);
+  assert.match(outOfWindow, /2026-10-18/, `收到的日期要出现在文案里：${outOfWindow}`);
+  // 是今天：报今天与收到的同一天，用户才知道为什么不行
+  const isToday = await grab('2026-10-25');
+  assert.match(isToday, /今天 2026-10-25/, isToday);
+  // 格式非法：回显收到的串
+  const malformed = await grab('2026-10-1x');
+  assert.match(malformed, /2026-10-1x/, malformed);
+  // 三条新文案都保留旧契约的尾巴，老客户端按「该日期不能补签」匹配不受影响
+  for (const m of [noRecord, outOfWindow, isToday, malformed]) {
+    assert.match(m, /不能补签/, m);
+  }
+});
+
 test('PS6 今天已签也能补昨天，补完把今天那份差额补上', async () => {
   await wipe(uid);
   await seed('2026-10-22', 1); await seed('2026-10-23', 2); // 造一段自洽的连签

@@ -34,6 +34,23 @@ const wipe = (u: Types.ObjectId) => Promise.all([
   PointDailyModel.deleteMany({ userId: u }),
 ]);
 
+/**
+ * 补签卡目录行的实时配置。价格与配图都是后台可改的运营项（2026-10-28 价格 200→49），
+ * 用例按实时值算账：把 200 写死在断言里，运营改一次价就挂一片测试。
+ */
+const makeupCatalog = () => PointItemModel.findOne({ key: 'makeup_card' })
+  .select({ price: 1, image: 1 }).lean();
+
+/** 目录行配了图就必须下发签名缩略链，没配图才是空串（私有桶裸链会 403） */
+function assertItemImageDto(imageUrl: string, image: string): void {
+  if (!image) {
+    assert.equal(imageUrl, '', '未配图的道具下发空串');
+    return;
+  }
+  assert.match(imageUrl, /^https:\/\/.+Signature=/, '配了图必须签名下发');
+  assert.match(decodeURIComponent(imageUrl), /x-oss-process=image\/resize,w_240/, '下发走缩略档位');
+}
+
 /** 造余额：每日上限 100，按业务日拆分发放，凑够 total */
 async function seedPoints(u: Types.ObjectId, total: number): Promise<void> {
   let left = total;
@@ -82,21 +99,25 @@ after(async () => {
   await mongoose.disconnect().catch(() => {});
 });
 
-test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t) => {
+test('PI1 按目录实时价兑换一张卡，30 天有效，兑换记录可查', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
-  await seedPoints(uid, POINTS.MAKEUP_CARD_PRICE);
-  assert.equal(await getBalance(String(uid), NOW), 200);
+  const catalog = await makeupCatalog();
+  const price = catalog?.price ?? 0;
+  assert.ok(price > 0, '目录行必须带价格');
+  await seedPoints(uid, price);
+  assert.equal(await getBalance(String(uid), NOW), price);
 
   // 商品列表：道具目录驱动，只下发在架项（ad_free_* 种子 active:false，这里只有补签卡）
   const items = await listActiveItems();
   const makeup = items.find((i) => i.key === 'makeup_card');
   assert.ok(makeup, '在架列表里应能查到补签卡');
-  assert.deepEqual(makeup, {
+  // price/imageUrl 是运营实时值，先从 DTO 里摘出来单独断，其余字段锁形状
+  const { price: dtoPrice, imageUrl: dtoImage, ...dtoRest } = makeup;
+  assert.deepEqual(dtoRest, {
     key: 'makeup_card',
     name: '补签卡',
     subtitle: '恢复连续打卡记录',
-    price: 200,
     validDays: 30,
     description: '每张仅可使用一次；可补签近 7 天窗口内的漏签日，补一天用一张；兑换后 30 天内有效',
     notes: [
@@ -111,8 +132,9 @@ test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t)
     perUserLimit: 0,
     // spec §7.3：unlimited 下发 null（端上显示「不限量」），限量道具下发剩余数
     stockLeft: null,
-    imageUrl: '',
   });
+  assert.equal(dtoPrice, price, 'DTO 价格 = 目录实时价');
+  assertItemImageDto(dtoImage, catalog?.image ?? '');
 
   const r = await exchangeItem(String(uid), 'makeup_card', 'req-1', NOW);
   assert.equal(r.balance, 0);
@@ -126,10 +148,10 @@ test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t)
   assert.equal(card.createdAt, NOW);
   assert.equal(card.usedForDate, '');
 
-  // 扣分明细：兑换一条 -200，业务日按东八区
+  // 扣分明细：兑换一条 −价格，业务日按东八区
   const record = await PointRecordModel.findOne({ userId: uid, type: 'exchange' }).lean();
   assert.ok(record);
-  assert.equal(record.delta, -200);
+  assert.equal(record.delta, -price);
   assert.equal(record.refType, 'item');
   assert.equal(record.refId, 'makeup_card');
   assert.equal(record.bizDate, bjDateStr(NOW));
@@ -139,7 +161,7 @@ test('PI1 200 分兑换一张卡，30 天有效，兑换记录可查', async (t)
   assert.ok(ex);
   assert.equal(String(ex.cardId), r.cardId);
   assert.equal(ex.itemKey, 'makeup_card');
-  assert.equal(ex.cost, 200);
+  assert.equal(ex.cost, price);
   assert.equal(ex.createdAt, NOW);
 
   const list = await listExchanges(String(uid), NOW);
@@ -171,24 +193,29 @@ test('PI2 同 requestId 重复兑换幂等，不重复扣分/发卡', async (t) 
 test('PI3 余额不足 400，文案包含当前值与所需值', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
-  await seedPoints(uid, 50);
+  const price = (await makeupCatalog())?.price ?? 0;
+  const short = price - 1; // 差 1 分：按实时价造，改价不会让这条用例悄悄变成恒过
+  await seedPoints(uid, short);
 
   await assert.rejects(exchangeItem(String(uid), 'makeup_card', 'req-low', NOW), (e: Error) => {
     assert.ok(e instanceof AppError, '应为 AppError');
     assert.equal((e as AppError).statusCode, 400);
-    assert.match(e.message, /积分不足（当前 50，需要 200）/);
+    assert.ok(
+      e.message.includes(`当前 ${short}`) && e.message.includes(`需要 ${price}`),
+      `文案要带实时价，实际「${e.message}」`,
+    );
     return true;
   });
 
   // 失败不留痕：不扣分、不发卡、不落兑换记录
-  assert.equal(await getBalance(String(uid), NOW), 50);
+  assert.equal(await getBalance(String(uid), NOW), short);
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0);
   assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 0);
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 0);
 
   // 缺少 requestId：直接 400，不触碰账本
   await assert.rejects(exchangeItem(String(uid), 'makeup_card', '  ', NOW), /缺少兑换请求 ID/);
-  assert.equal(await getBalance(String(uid), NOW), 50);
+  assert.equal(await getBalance(String(uid), NOW), short);
 });
 
 test('PI4 兑换记录按兑换时间倒序，状态与使用日期正确', async (t) => {
@@ -231,7 +258,8 @@ test('PI5 并发同 requestId 只扣一次分、只发一张卡', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
   // 余额留出两张卡的空间：并发两笔都先过余额闸门，靠账本 idemKey 去重只认一笔
-  await seedPoints(uid, 2 * POINTS.MAKEUP_CARD_PRICE);
+  const price = (await makeupCatalog())?.price ?? 0;
+  await seedPoints(uid, 2 * price);
 
   const [a, b] = await Promise.all([
     exchangeItem(String(uid), 'makeup_card', 'req-race', NOW),
@@ -239,12 +267,12 @@ test('PI5 并发同 requestId 只扣一次分、只发一张卡', async (t) => {
   ]);
 
   assert.equal(a.cardId, b.cardId);
-  assert.equal(a.balance, 200);
-  assert.equal(b.balance, 200);
+  assert.equal(a.balance, price);
+  assert.equal(b.balance, price);
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1); // 失败方不会留下孤儿卡
   assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 1);
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 1);
-  assert.equal(await getBalance(String(uid), NOW), 200);
+  assert.equal(await getBalance(String(uid), NOW), price);
 });
 
 test('PI6 余额恰好用尽的双击：后到请求命中在途兑换记录，返回同一张卡', async (t) => {

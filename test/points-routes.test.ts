@@ -41,6 +41,19 @@ const activeCatalogKeys = async (): Promise<string[]> => (
     .map((i) => String(i.key)).sort()
 );
 
+/**
+ * 补签卡目录行的实时配置（价格与配图都是后台可改的运营项，2026-10-28 价格 200→49）：
+ * 全链路用例按实时值算账，别把 200 写死在断言里。
+ */
+const makeupCatalog = () => PointItemModel.findOne({ key: 'makeup_card' })
+  .select({ price: 1, image: 1 }).lean();
+
+/** 配了图必须签名缩略链下发，没配图才是空串（私有桶裸链会 403） */
+const assertItemImageDto = (imageUrl: string, image: string): void => {
+  if (!image) assert.equal(imageUrl, '', '未配图的道具下发空串');
+  else assert.match(imageUrl, /^https:\/\/.+Signature=/, '配了图必须签名下发');
+};
+
 interface SigninCell {
   dateKey: string;
   state: string;
@@ -136,7 +149,7 @@ const wipe = (u: Types.ObjectId) => Promise.all([
   PointAccountModel.deleteMany({ userId: u }),
 ]);
 
-/** 每日上限 100：按业务日拆分发放，凑够兑换一张卡（200 分） */
+/** 每日上限 100：按业务日拆分发放，凑够兑换一张卡（按目录实时价） */
 async function seedPoints(u: string, total: number): Promise<void> {
   let left = total;
   for (let i = 0; left > 0; i++) {
@@ -255,29 +268,32 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
     'summary 下发整张在架目录，积分页按它渲染商品卡',
   );
   assert.equal(s0.items[0].key, 'makeup_card', 'sortOrder 排第一的补签卡必须在首位（老端读 items[0]）');
-  assert.equal(s0.items[0].price, POINTS.MAKEUP_CARD_PRICE);
+  const catalog = await makeupCatalog();
+  const price = catalog?.price ?? 0;
+  assert.ok(price > 0, '目录行必须带价格');
+  assert.equal(s0.items[0].price, price, '下发价 = 目录实时价');
   // 新 DTO 字段（spec §7.3）：notes/effect/imageUrl 必须随列表下发
   assert.deepEqual(s0.items[0].effect, { kind: 'makeup', days: 0 }, '补签卡 effect 快照');
   assert.ok(
     Array.isArray(s0.items[0].notes) && s0.items[0].notes.includes('兑换后不退积分'),
     'notes 由服务端下发（商品详情提示文案）',
   );
-  assert.equal(s0.items[0].imageUrl, '', '种子未配图 → 空串（私有桶裸链会 403，不如有图时给缩略档签名链）');
+  assertItemImageDto(s0.items[0].imageUrl, catalog?.image ?? '');
 
-  // 2) 授 200 分后 summary 余额同步
-  await seedPoints(userId, POINTS.MAKEUP_CARD_PRICE);
+  // 2) 按实时价凑够余额后 summary 同步
+  await seedPoints(userId, price);
   const s1 = data<Summary>(await get('/points/summary'));
-  assert.equal(s1.balance, 200);
+  assert.equal(s1.balance, price);
 
   // 3) 商品列表（/items 与 summary.items 同一路口径：目录在架项 + notes/effect/imageUrl）
   const items = data<ItemRow[]>(await get('/points/items'));
   assert.deepEqual(items.map((i) => i.key).sort(), await activeCatalogKeys(), '/points/items 与 summary.items 同一在架口径');
   assert.equal(items[0].key, 'makeup_card');
-  assert.equal(items[0].price, 200);
+  assert.equal(items[0].price, price);
   assert.equal(items[0].validDays, POINTS.MAKEUP_CARD_VALID_DAYS);
   assert.deepEqual(items[0].effect, { kind: 'makeup', days: 0 });
   assert.ok(Array.isArray(items[0].notes) && items[0].notes.length >= 3, 'notes 至少含三条使用提示');
-  assert.equal(items[0].imageUrl, '');
+  assertItemImageDto(items[0].imageUrl, catalog?.image ?? '');
 
   // 4) 兑换补签卡：同一 requestId 连点只扣一次、只发一张卡
   const requestId = `routes-${Date.now()}`;
@@ -341,7 +357,7 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   const exchanges = data<ExchangeRow[]>(await get('/points/exchanges'));
   assert.equal(exchanges.length, 1);
   assert.equal(exchanges[0].cardId, cardId);
-  assert.equal(exchanges[0].cost, 200);
+  assert.equal(exchanges[0].cost, price, '兑换记录记的是成交时的目录实时价');
   assert.equal(exchanges[0].status, 'used');
   assert.equal(exchanges[0].statusText, '已使用');
   assert.equal(exchanges[0].usedForDate, YESTERDAY);
@@ -374,7 +390,7 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(claimAgain.alreadyClaimed, true, '当天三次用完后走幂等返回');
   assert.equal(claimAgain.credited, 0);
 
-  // 11) 收尾 summary：余额 22（-200 +3 +4 +15，视频三次各 5）、卡已用掉、任务状态已领取
+  // 11) 收尾 summary：余额 22（兑换把刚 seed 的目录价扣光，之后 +3 +4 +15，视频三次各 5）、卡已用掉、任务状态已领取
   const s3 = data<Summary>(await get('/points/summary'));
   assert.equal(s3.balance, 22);
   assert.equal(s3.signin.todaySigned, true);
@@ -392,23 +408,28 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
   assert.equal(video?.status, 'claimed');
   assert.equal(video?.actionText, '已领取');
 
-  // 12) 明细分页：8 条（2 条种子发放、兑换、补签、签到、视频任务三次），余额与 summary 一致
+  // 12) 明细分页：种子发放按日上限拆成 ceil(价/100) 条，加兑换/补签/签到/视频三次共 6 条；余额与 summary 一致
+  const seedRows = Math.ceil(price / POINTS.DAILY_CAP);
+  const totalRecords = seedRows + 6;
   const p1 = data<RecordPage>(await get('/points/records?page=1&pageSize=2'));
-  assert.equal(p1.total, 8);
+  assert.equal(p1.total, totalRecords);
   assert.equal(p1.items.length, 2);
   assert.equal(p1.balance, 22);
   assert.deepEqual(p1.items.map((i) => i.type), ['task_daily_video', 'task_daily_video'], '按时间倒序');
   assert.equal(p1.items[0].delta, 5);
   assert.equal(p1.items[0].balanceAfter, 22);
 
-  const p3 = data<RecordPage>(await get('/points/records?page=4&pageSize=2'));
-  assert.equal(p3.items.length, 2);
-  assert.deepEqual(p3.items.map((i) => i.type), ['seed', 'seed']);
+  const p3 = data<RecordPage>(await get(`/points/records?page=${Math.ceil(totalRecords / 2)}&pageSize=2`));
+  assert.ok(p3.items.length >= 1, '末页必须有行（分页总数与实收条数要自洽）');
+  assert.deepEqual(
+    [...new Set(p3.items.map((i) => i.type))], ['seed'],
+    '时间倒序走到末页只剩造余额的种子发放行',
+  );
 
-  // 非法分页参数回落默认值，pageSize 上限 50
+  // 非法分页参数回落默认值，pageSize 上限 50：一页装下全部实收条数
   const clamped = data<RecordPage>(await get('/points/records?page=0&pageSize=999'));
-  assert.equal(clamped.items.length, 8);
-  assert.equal(clamped.total, 8);
+  assert.equal(clamped.items.length, totalRecords);
+  assert.equal(clamped.total, totalRecords);
 });
 
 /** 账本不变式：Σ record.delta === account.balance === Σ 未过期 lot.remaining */
@@ -487,7 +508,7 @@ test('PR5 差额被今天 DAILY_CAP 截断：响应报实发值，账本不变�
   const r = data<{ credited: number; toppedUp: number; balance: number } & SigninState>(m);
   assert.equal(r.credited, 4, '当天分记在昨天那格自己的 bizDate，不受今天上限影响 → 全额');
   assert.equal(r.toppedUp, 2, '差额按今天入账，被 DAILY_CAP 截到只剩的 2 分——响应报实发而不是名义 4');
-  assert.equal(r.balance, 200 + 1 + 97 + 4 + 2, '卡是直接发的、没走兑换扣分');
+  assert.equal(r.balance, POINTS.MAKEUP_CARD_PRICE + 1 + 97 + 4 + 2, '卡是直接发的、没走兑换扣分');
 
   const page = data<RecordPage>(await get('/points/records?page=1&pageSize=10'));
   assert.equal(page.items.find((x) => x.type === 'makeup_reward')?.delta, 4);

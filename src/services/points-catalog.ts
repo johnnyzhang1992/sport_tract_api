@@ -3,6 +3,7 @@
  * 种子只用 $setOnInsert —— 后台改过价格/库存/文案后重跑启动钩子不得冲掉（PI-2 钉这条）。
  */
 import { Types } from 'mongoose';
+import { POINTS } from '../config/points.js';
 import { PointItemModel, type ItemKind } from '../models/point.model.js';
 
 export const POINT_ITEM_KEYS = {
@@ -53,7 +54,7 @@ export const POINT_ITEMS_SEED: Omit<ItemDoc, '_id'>[] = [
   {
     key: POINT_ITEM_KEYS.makeupCard, name: '补签卡', subtitle: '恢复连续打卡记录',
     description: '每张仅可使用一次；可补签近 7 天窗口内的漏签日，补一天用一张；兑换后 30 天内有效',
-    notes: MAKEUP_NOTES, price: 200, validDays: 30,
+    notes: MAKEUP_NOTES, price: POINTS.MAKEUP_CARD_PRICE, validDays: 30,
     // 四条种子一律虚拟道具：实物由后台显式新建（默认每人限购 1），种子不限购
     kind: 'virtual', detailImages: [], perUserLimit: 0,
     effect: { kind: 'makeup', days: 0 },

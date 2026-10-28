@@ -274,7 +274,9 @@ test('PC-9b 正常兑换结果带 refundFailed: 0（成功路径也要有缺口�
   await PointItemModel.updateOne({ key: 'makeup_card' }, { $set: { unlimited: true, stock: 9999 } });
   const u = new Types.ObjectId();
   t.after(() => wipe(u));
-  await seedBalance(u, 200);
+  // 按目录实时价造余额：价格是后台可改的运营项（2026-10-28 补签卡 200→49），
+  // 写死 200 会把「扣光」测成「还剩 151」
+  await seedBalance(u, (await PointItemModel.findOne({ key: 'makeup_card' }).lean())!.price);
 
   const r = await exchangeItem(String(u), 'makeup_card', `${u}-ok`);
   assert.equal(r.refundFailed, 0, '没有回滚就没有缺口，字段仍要在（前端只是展示，不做缺失判断）');
@@ -294,7 +296,8 @@ test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走
     key, name: '实物目录道具', subtitle: '', description: '', notes: [],
     price: 28900, validDays: 30, effect: { kind: 'makeup', days: 0 },
     kind: 'physical', detailImages, perUserLimit: 2,
-    stock: 5, unlimited: false, active: true, sortOrder: 999, image: '',
+    // 主图也配一张：档位与详情图分开钉（详情图整宽走 medium，主图缩略走 thumb）
+    stock: 5, unlimited: false, active: true, sortOrder: 999, image: `${ossBase}/items/art.png`,
   });
   // 本批次之前入库的老目录行物理上没有这三个字段：raw insert 绕过 schema 默认值来模拟它
   await PointItemModel.collection.insertOne({
@@ -307,6 +310,12 @@ test('PC-10 listActiveItems 下发 kind/detailImages/perUserLimit（详情图走
   const items = await listActiveItems();
   const row = items.find((i) => i.key === key)!;
   assert.equal(row.kind, 'physical');
+  if (isOssConfigured()) {
+    // 主图走缩略档：AI-6 只在「运营真配了图」时才验得出档位，库里配图被清空那条断言就空跑，
+    // 这条按 fixture 自带的配图钉住「主图也签名 + 走 thumb 档」
+    assert.match(decodeURIComponent(row.imageUrl), /[?&]Signature=/, '道具主图必须签名下发');
+    assert.match(decodeURIComponent(row.imageUrl), /x-oss-process=image\/resize,w_240/, '道具主图要走缩略档');
+  }
   assert.equal(row.perUserLimit, 2);
   assert.equal(row.stockLeft, 5, '限量道具下发剩余库存（spec §7.3）');
   assert.equal(row.detailImages.length, 2, '详情图要逐张下发');

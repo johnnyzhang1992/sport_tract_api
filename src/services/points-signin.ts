@@ -15,9 +15,10 @@
  * 签到会被误判成重放（credited 0）。
  */
 import { AppError } from '../utils/app-error.js';
+import { POINTS } from '../config/points.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import { previousDateKey, rewardForStreakDay } from '../utils/points-domain.js';
-import { planSigninCells, windowStartKey, type SigninCell } from '../utils/points-window.js';
+import { planSigninCells, windowStartKey, WINDOW_DAYS, type SigninCell } from '../utils/points-window.js';
 import { PointCardModel, PointSigninModel } from '../models/point.model.js';
 import { creditPoints, debitPoints, getBalance } from './points-ledger.js';
 import { creditStreakTopUp } from './points-streak.js';
@@ -188,8 +189,17 @@ export async function useMakeupCard(
 ): Promise<MakeupResult> {
   const todayKey = bjDateStr(now);
   const key = String(dateKey ?? '').trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(key) || key >= todayKey) throw new AppError(400, '该日期不能补签');
-  if (key < windowStartKey(todayKey)) throw new AppError(400, '该日期不能补签');
+  // 三条拒绝文案各自说清「对象 + 实际值 + 限制」，尾巴统一留「该日期不能补签」保住老客户端的匹配
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) {
+    throw new AppError(400, `日期格式必须是 YYYY-MM-DD（收到「${key}」）：该日期不能补签`);
+  }
+  if (key >= todayKey) {
+    throw new AppError(400, `只能补今天之前的日期（今天 ${todayKey}，收到 ${key}）：该日期不能补签`);
+  }
+  if (key < windowStartKey(todayKey)) {
+    throw new AppError(400,
+      `已超出近 ${WINDOW_DAYS} 天补签窗口（窗口起点 ${windowStartKey(todayKey)}，收到 ${key}）：该日期不能补签`);
+  }
 
   const state = await getSigninState(userId, now);
   const cell = state.cells.find((c) => c.dateKey === key);
@@ -199,7 +209,12 @@ export async function useMakeupCard(
     userId, dateKey: key, source: 'makeup', points: 0,
   }).lean();
   if (cell?.state === 'signed' && !stale) throw new AppError(400, '该日已签到，无需补签');
-  if (cell?.state !== 'makeup' && !stale) throw new AppError(400, '断签超过 2 天或超出窗口，该日不能补签');
+  if (cell?.state !== 'makeup' && !stale) {
+    // 段长上限读配置不写死：2026-10-25 放宽到 7（= 窗口大小）后，旧文案里的「2 天」就成了谎话
+    throw new AppError(400, state.cells.some((c) => c.state === 'signed')
+      ? `该日所在未签段超过上限 ${POINTS.MAX_MAKEUP_GAP_DAYS} 天（收到 ${key}）：该日不能补签`
+      : `窗口内还没有签到记录，补签只能接在已有记录上（收到 ${key}）：该日不能补签`);
+  }
   if (state.cards <= 0 && !stale) throw new AppError(400, '没有可用的补签卡，请先兑换');
 
   // 残留恢复：卡已扣（usedForDate=key）→ 从发分步续跑（卡不再扣；credit 同 idemKey 幂等，

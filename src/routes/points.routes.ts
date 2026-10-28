@@ -5,6 +5,8 @@ import { getTaskRows, claimTask } from '../services/points-tasks.js';
 import { listActiveItems, exchangeItem, listExchanges } from '../services/points-items.js';
 import { confirmReceipt, listMyOrders } from '../services/points-orders.js';
 import { activateCard, adFreeUntilOf, countUnusedCards } from '../services/points-cards.js';
+import { getSigninCalendar } from '../services/points-calendar.js';
+import { expiringOf, streakPercentileOf } from '../services/points-summary.js';
 import { success } from '../utils/response.js';
 
 /**
@@ -19,7 +21,7 @@ export async function pointsRoutes(fastify: FastifyInstance) {
     // 先结算过期批次，保证余额/卡数与后续各接口看到的口径一致
     await settleExpired(userId);
     const now = Date.now();
-    const [signin, tasks, items, balance, adFreeUntil, cardsByItem] = await Promise.all([
+    const [signin, tasks, items, balance, adFreeUntil, cardsByItem, expiring, streakPercentile] = await Promise.all([
       getSigninState(userId, now),
       getTaskRows(userId),
       listActiveItems(),
@@ -27,6 +29,8 @@ export async function pointsRoutes(fastify: FastifyInstance) {
       // 免广告到期时刻与持卡数都是现推不落字段（spec §5.4），与卡行永远同一口径
       adFreeUntilOf(userId),
       countUnusedCards(userId, now),
+      expiringOf(userId, now),
+      streakPercentileOf(userId, now),
     ]);
     return success({
       balance,
@@ -40,6 +44,10 @@ export async function pointsRoutes(fastify: FastifyInstance) {
       // 端上按 adFreeUntil > now 跳过自主代码位广告；cards 给卡包页/「我的补签卡 N 张」用（spec §7.3）
       adFreeUntil,
       cards: cardsByItem,
+      // 积分页两张新卡（2026-10-28）：过期提醒只在 ≤EXPIRE_NOTICE_DAYS 时非 null，
+      // 阈值判定在服务端，端上只按有值/无值渲染整行；百分位按全部注册用户算，本人 0 天时是 0
+      expiring,
+      streakPercentile,
     });
   });
 
@@ -94,6 +102,12 @@ export async function pointsRoutes(fastify: FastifyInstance) {
   fastify.post('/signin/makeup', { onRequest: [fastify.authenticate] }, async (request) => {
     const { dateKey } = (request.body ?? {}) as { dateKey?: string };
     return success(await useMakeupCard(request.user.userId, String(dateKey ?? '')));
+  });
+
+  // 签到月历（积分页半屏日历）：month 缺省为当月；「可补」判据与七格同源，端上不再自己推
+  fastify.get('/signin/calendar', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { month } = request.query as { month?: string };
+    return success(await getSigninCalendar(request.user.userId, String(month ?? '')));
   });
 
   // 激活免广告卡（补签卡不走这条路，见 POST /signin/makeup）

@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { config } from '../src/config/index.js';
+import { POINTS } from '../src/config/points.js';
 import { PointItemModel } from '../src/models/point.model.js';
 import { seedPointItems, POINT_ITEM_KEYS } from '../src/services/points-catalog.js';
 
@@ -13,9 +14,18 @@ import { seedPointItems, POINT_ITEM_KEYS } from '../src/services/points-catalog.
  * PI-2 种子幂等：改过价格再跑一次不被覆盖（自给自足：先播种再改价，且断言 updateOne 命中）
  * PI-3 effect 校验：ad_free 必须带 days>0，makeup_card 是 makeup 效果（schema 表达不了，留给 service，本条钉住现状）
  */
+/**
+ * 这四行在共享 dev 库里就是**运营配置**（价格、配图、上架状态都在后台改过，不在代码里）。
+ * 本文件为了验种子定义必须先删后种，所以收尾不能只种回默认值——那会把后台配的道具图冲成空串
+ * （2026-10-28 起每跑一次全量回归就冲一次，商品页 hero 跟着退化成首字占位）。
+ * 口径改成：开跑前快照、收尾按快照还原；库里本来没行（新库）才退回默认种子。
+ */
+let seedSnapshot: Record<string, unknown>[] = [];
 before(async () => {
   await mongoose.connect(config.mongodbUri);
   await PointItemModel.init();
+  const rows = await PointItemModel.find({ key: { $in: Object.values(POINT_ITEM_KEYS) } }).lean();
+  seedSnapshot = rows.map(({ _id, ...rest }) => rest as Record<string, unknown>);
 });
 // PI-2 中途断言失败会把 price=777 之类的脏值留在共享 dev 库里，且幂等种子永远冲不掉它；
 // after 统一「删了重种」兜底，保证本文件无论成败都以干净种子退出。
@@ -23,7 +33,13 @@ before(async () => {
 let bootApp: FastifyInstance | undefined;
 after(async () => {
   await PointItemModel.deleteMany({ key: { $in: Object.values(POINT_ITEM_KEYS) } });
-  await seedPointItems();
+  if (seedSnapshot.length === 0) {
+    await seedPointItems();
+  } else {
+    await Promise.all(seedSnapshot.map((r) => PointItemModel.updateOne(
+      { key: r.key }, { $set: r }, { upsert: true },
+    )));
+  }
   await bootApp?.close();
   await mongoose.disconnect();
 });
@@ -46,7 +62,9 @@ test('PI-1 四条种子', async () => {
   const rows = await PointItemModel.find({ key: { $in: Object.values(POINT_ITEM_KEYS) } }).lean();
   assert.equal(rows.length, 4, '四条道具种子必须都在');
   const byKey = new Map(rows.map((r) => [r.key, r]));
-  assert.equal(byKey.get('makeup_card')!.price, 200);
+  // 补签卡价引用 config 常量（2026-10-28 由 200 调到 49）：这条断言要的是「种子价 == 代码默认价」，
+  // 不是那个数字本身；免广告三档没抽常量，仍按种子字面值钉
+  assert.equal(byKey.get('makeup_card')!.price, POINTS.MAKEUP_CARD_PRICE);
   assert.equal(byKey.get('ad_free_7d')!.price, 200);
   assert.equal(byKey.get('ad_free_15d')!.price, 400);
   assert.equal(byKey.get('ad_free_30d')!.price, 600);

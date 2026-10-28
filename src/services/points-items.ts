@@ -141,7 +141,7 @@ export async function listActiveItems(): Promise<ItemDto[]> {
     perUserLimit: Number(r.perUserLimit ?? 0),
     // spec §7.3：unlimited 下发 null（端上显示「不限量」）；限量道具给实际剩余，别把 undefined 漏给端上
     stockLeft: r.unlimited ? null : Number(r.stock ?? 0),
-    // 私有桶裸链进 <img> 会 403；一期端上还不画图，先只给缩略档签名链
+    // 私有桶裸链进 <img> 会 403；hero 与积分页道具卡都是白底，缩略档（jpg）够用
     imageUrl: r.image ? getThumbUrl(r.image) : '',
   }));
 }
