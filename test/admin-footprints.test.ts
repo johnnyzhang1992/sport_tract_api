@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
+import { config, isOssConfigured } from '../src/config/index.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
@@ -82,7 +83,10 @@ before(async () => {
   await FootprintRecordModel.deleteMany({ title: new RegExp(`^${MZ}`) });
   await UserModel.deleteMany({ nickname: new RegExp(`^${MZ}`) });
   const a = await UserModel.create({ nickname: `${MZ}甲`, uid: 91001, openid: `fpadmin_${MZ}a` });
-  const b = await UserModel.create({ nickname: `${MZ}乙`, uid: 91002, openid: `fpadmin_${MZ}b` });
+  const b = await UserModel.create({
+    nickname: `${MZ}乙`, uid: 91002, openid: `fpadmin_${MZ}b`,
+    avatarUrl: `${config.oss.endpoint.replace(/\/$/, '')}/${config.oss.baseDir}/t-fp-avatar.png`,
+  });
   uidA = String(a._id);
   uidB = String(b._id);
 
@@ -144,6 +148,14 @@ test('F1 列表：按 createdAt 倒序分页，项内回填昵称/UID/省市/照
   assert.equal(first.userId, uidB);
   assert.equal(first.userNickname, `${MZ}乙`);
   assert.equal(first.userUid, '91002', 'UID 与用户列表同口径（字符串）');
+  if (isOssConfigured()) {
+    assert.match(first.userAvatarUrl, /[?&]Signature=/, '列表头像要走签名链');
+    assert.match(decodeURIComponent(first.userAvatarUrl), /x-oss-process=image\/resize,m_fill,w_160,h_160/,
+      '与用户管理同一个头像档位');
+  } else {
+    assert.ok(first.userAvatarUrl.endsWith('t-fp-avatar.png'), '未配 OSS 时原样返回裸链');
+  }
+  assert.equal(d.items[1].userAvatarUrl, '', '甲没传头像 → 空串，前端走首字占位');
   assert.equal(first.province, '测试省丙');
   assert.equal(first.city, '测试市丙');
   assert.equal(first.visitDate, '2026-09-21');

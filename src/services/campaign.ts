@@ -1287,7 +1287,7 @@ export async function adminGetCampaign(
   const from = (page - 1) * pageSize;
   const uids = members.map((m) => String(m.userId));
   const users = await UserModel.find({ _id: { $in: uids } })
-    .select('nickname uid')
+    .select('nickname uid avatarUrl')
     .lean();
   const uMap = new Map(users.map((u) => [String(u._id), u]));
   const segs = await loadSegments(String(c._id));
@@ -1333,14 +1333,19 @@ export async function adminGetCampaign(
       ),
     )
     .slice(0, 10)
-    .map(({ m, s }, i) => ({
-      rank: i + 1,
-      userId: String(m.userId),
-      name: uMap.get(String(m.userId))?.nickname || '微信用户',
-      distance: s.distance,
-      count: s.count,
-      duration: s.duration,
-    }));
+    .map(({ m, s }, i) => {
+      const u = uMap.get(String(m.userId));
+      return {
+        rank: i + 1,
+        userId: String(m.userId),
+        name: u?.nickname || '微信用户',
+        // 详情页两张用户表（榜单单 + 成员表）都要头像；榜单只有 10 行，逐行签名不成问题
+        avatarUrl: u?.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
+        distance: s.distance,
+        count: s.count,
+        duration: s.duration,
+      };
+    });
   return {
     id: String(c._id),
     title: c.title,
@@ -1370,12 +1375,15 @@ export async function adminGetCampaign(
     membersPageSize: pageSize,
     members: pageMembers.map((m) => {
       const s = stats.get(String(m.userId))!;
+      const u = uMap.get(String(m.userId));
       return {
         userId: String(m.userId),
         role: m.role,
         state: m.state,
-        name: uMap.get(String(m.userId))?.nickname || '微信用户',
-        uid: uMap.get(String(m.userId))?.uid ?? null,
+        name: u?.nickname || '微信用户',
+        // 成员表头像（管理端）：私有桶裸链进 <img> 会 403，逐行签名（一页 ≤ 20 行）
+        avatarUrl: u?.avatarUrl ? getAvatarUrl(String(u.avatarUrl)) : '',
+        uid: u?.uid ?? null,
         joinedAt: m.joinedAt,
         leftAt: m.leftAt,
         count: s.count,

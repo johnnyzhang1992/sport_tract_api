@@ -15,6 +15,7 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { UserModel } from '../src/models/user.model.js';
+import { config, isOssConfigured } from '../src/config/index.js';
 import { CampaignModel } from '../src/models/campaign.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
@@ -114,6 +115,9 @@ before(async () => {
   await ensureAdmin();
   creator = await loginMock('mock_openid_campaign_detail_creator');
   joiner = await loginMock('mock_openid_campaign_detail_joiner');
+  await UserModel.updateOne({ _id: joiner.id }, {
+    $set: { avatarUrl: `${config.oss.endpoint.replace(/\/$/, '')}/${config.oss.baseDir}/t-cad-avatar.png` },
+  });
   for (let i = 0; i < 9; i += 1) idle.push(await loginMock(`mock_openid_campaign_detail_idle_${i}`));
 
   // 活动窗口：昨天开赛、还剩 5 天（派生 active），不限类型
@@ -247,6 +251,13 @@ test('CAD3 排行榜：按距离降序、名次连续、只取前 10', async () 
   assert.equal(rows[0].distance, 30000);
   assert.equal(rows[0].count, 2);
   assert.equal(rows[0].duration, 6000);
+  // 榜单单上的昵称列也要头像（详情页两张用户表口径一致）
+  if (isOssConfigured()) {
+    assert.match(String(rows[0].avatarUrl), /[?&]Signature=/, '榜单头像要走签名链');
+  } else {
+    assert.ok(String(rows[0].avatarUrl).endsWith('t-cad-avatar.png'));
+  }
+  assert.equal(rows[1].avatarUrl, '', '没上传头像给空串，前端走首字占位');
   assert.equal(rows[1].userId, creator.id);
   assert.equal(rows[1].distance, 10000);
   assert.equal(typeof rows[0].name, 'string');

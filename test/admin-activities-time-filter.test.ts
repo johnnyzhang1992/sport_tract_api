@@ -9,6 +9,7 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
+import { config, isOssConfigured } from '../src/config/index.js';
 
 let app: FastifyInstance;
 let adminToken = '';
@@ -46,6 +47,9 @@ before(async () => {
   });
   const u = await UserModel.findOne({ openid: 'tf-user' }).select('_id').lean();
   userId = String(u!._id);
+  await UserModel.updateOne({ _id: u!._id }, {
+    $set: { avatarUrl: `${config.oss.endpoint.replace(/\/$/, '')}/${config.oss.baseDir}/t-tf-avatar.png` },
+  });
 
   // 两条轨迹：A 在 base 日，B 在 base+5 天
   for (const [k, offsetDays] of [['A', 0], ['B', 5]] as const) {
@@ -83,9 +87,16 @@ test('TF1 startTimeFrom：只返回区间起点之后的轨迹', async () => {
     headers: { authorization: `Bearer ${adminToken}` },
   });
   assert.equal(res.statusCode, 200, res.body);
-  const items = res.json().data.items as Array<{ id: string }>;
+  const items = res.json().data.items as Array<{ id: string; userAvatarUrl: string }>;
   assert.equal(items.length, 1, `应只有 B 一条，实际 ${items.length}`);
   assert.equal(items[0].id, ids.B, '返回的应是 B');
+  if (isOssConfigured()) {
+    assert.match(items[0].userAvatarUrl, /[?&]Signature=/, '轨迹列表的用户列要带签名头像');
+    assert.match(decodeURIComponent(items[0].userAvatarUrl), /x-oss-process=image\/resize,m_fill,w_160,h_160/,
+      '头像档位与用户管理一致');
+  } else {
+    assert.ok(String(items[0].userAvatarUrl).endsWith('t-tf-avatar.png'));
+  }
 });
 
 test('TF2 startTimeFrom+To：两端夹住的才返回', async () => {

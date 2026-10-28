@@ -1,5 +1,5 @@
 import { Types } from 'mongoose';
-import { cleanUrl, deleteOssObjects, getSignedUrl, getThumbUrl } from './oss.js';
+import { cleanUrl, deleteOssObjects, getSignedUrl, getThumbUrl, getAvatarUrl } from './oss.js';
 import { countPhotos, settlePhotoQuota } from './photo-quota.js';
 import { locateRegion } from './region.js';
 import { AppError } from '../utils/app-error.js';
@@ -460,9 +460,11 @@ export async function adminListFootprintRecords(query: AdminFootprintListQuery) 
 
   // 昵称/UID 只回填本页涉及的用户，不整表捞
   const ids = [...new Set(docs.map((d) => String(d.userId)))];
-  const users = await UserModel.find({ _id: { $in: ids } }).select('_id nickname uid').lean();
+  const users = await UserModel.find({ _id: { $in: ids } }).select('_id nickname uid avatarUrl').lean();
   const nickMap = new Map(users.map((u) => [String(u._id), u.nickname || '微信用户']));
   const uidMap = new Map(users.map((u) => [String(u._id), u.uid != null ? String(u.uid) : '']));
+  // 头像只给本页涉及的用户签名（私有桶裸链进 <img> 会 403），档位与用户管理一致
+  const avatarMap = new Map(users.map((u) => [String(u._id), u.avatarUrl ? getAvatarUrl(String(u.avatarUrl)) : '']));
 
   return {
     total,
@@ -473,6 +475,7 @@ export async function adminListFootprintRecords(query: AdminFootprintListQuery) 
       userId: String(d.userId),
       userNickname: nickMap.get(String(d.userId)) ?? '微信用户',
       userUid: uidMap.get(String(d.userId)) ?? '',
+      userAvatarUrl: avatarMap.get(String(d.userId)) ?? '',
       title: d.title,
       visitDate: d.visitDate,
       category: d.category ?? '',

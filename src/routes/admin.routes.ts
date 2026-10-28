@@ -945,7 +945,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         .skip((p - 1) * ps)
         .limit(ps)
         .lean(),
-      UserModel.find({}).select('_id nickname gender').lean(),
+      UserModel.find({}).select('_id nickname gender avatarUrl').lean(),
       // 顺带报一句"有多少作废行到了可以清的程度"——**只试运行，不在读接口里删数据**：
       // 这个接口会被后台每次刷新/翻页调用，也会被测试和脚本调用，把不可逆删除挂上来
       // 等于随手就能删库。真删要走显式的 POST /activities/purge-cancelled。
@@ -960,6 +960,15 @@ export async function adminRoutes(fastify: FastifyInstance) {
       : [];
     const photoMap = new Map(photoRows.map((r) => [String(r._id), photoSummary(r.markers)]));
     const nickMap = new Map(users.map((u) => [String(u._id), u.nickname || '微信用户']));
+    // 头像只给本页行为止：上面 users 是全量，逐个签名太贵；先取裸链，本页再签
+    const avatarMap = new Map(users.map((u) => [String(u._id), u.avatarUrl ? String(u.avatarUrl) : '']));
+    const signedAvatar = new Map<string, string>();
+    for (const a of items) {
+      const id = String(a.userId);
+      if (signedAvatar.has(id)) continue;
+      const bare = avatarMap.get(id) ?? '';
+      signedAvatar.set(id, bare ? getAvatarUrl(bare) : '');
+    }
     const genderMap = new Map(users.map((u) => [String(u._id), u.gender ?? 0]));
     return success({
       total,
@@ -977,6 +986,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
         userId: String(a.userId),
         userNickname: nickMap.get(String(a.userId)) ?? '微信用户',
         userGender: genderMap.get(String(a.userId)) ?? 0,
+        userAvatarUrl: signedAvatar.get(String(a.userId)) ?? '',
         type: a.type,
         status: a.status,
         corrected: a.corrected ?? true, // 与详情 DTO 同口径：旧轨迹缺字段视为已纠偏
