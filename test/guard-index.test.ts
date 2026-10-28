@@ -102,9 +102,18 @@ test('campaignmembers：partial 条件写错状态（不是 joined）不算防�
  * pointrecords 热路径索引（IMP-1，2026-10-29）：listActiveItems 的「今日剩余」聚合
  * `{type:'exchange', refType:'item', bizDate:当日, refId:{$in}}` 没有它就只能 COLLSCAN 全表扫积分台账，
  * 积分页每次加载都随账本增长变慢。索引声明被删/改名/换序时 autoIndex 同样只留 warning，
- * 这里显式 createIndexes 等建完再核对形状——防线不在就红，不许假设它在。
+ * 这里两侧都核对：声明侧（schema.indexes()）保证「代码里还写着」，真实库侧（createIndexes 等建完
+ * 再核对形状）保证「库里真在」——createIndexes 只增不删，删了声明但库里留着旧索引时库侧仍是绿的，
+ * 少了声明侧这条就会假绿（防线不在就红，不许假设它在）。
  */
-test('pointrecords 真实库里的防线：{type,refType,bizDate,refId} 热路径索引在', async () => {
+test('pointrecords 热路径索引：声明侧与真实库侧的防线都在（{type,refType,bizDate,refId}）', async () => {
+  // 声明侧：认字段组合与键序，不认索引名。删掉/改名 recordSchema.index(...) 时这一条先红，
+  // 不受库里残留索引影响。
+  const declared = PointRecordModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).join(',') === 'type,refType,bizDate,refId'),
+    `schema 里的索引声明没有 {type,refType,bizDate,refId} 这条！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
   await PointRecordModel.createIndexes(); // 与 plugins/mongodb.ts / campaignmembers 同款：显式等建完再核对形状
   const idx = await PointRecordModel.collection.indexes();
   assert.ok(

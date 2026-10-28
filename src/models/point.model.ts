@@ -23,7 +23,8 @@ const recordSchema = new Schema({
 }, { versionKey: false });
 recordSchema.index({ userId: 1, createdAt: -1 });
 // 积分页今日剩余（points-items.listActiveItems）：兑换台账聚合 {type,refType,bizDate,refId $in}。
-// 键序固定：三个等值字段（type/refType/bizDate）做前缀，$in 的 refId 收尾——反了前缀就断在 $in 处。
+// 键序是这里选定的规范形状（等值 type/refType/bizDate 做前缀，$in 的 refId 收尾），不是 Mongo 硬要求：
+// $in 也能按等值绑定，换序仍可能走 IXSCAN；guard-index 按这个 exact 键组合认，换序即判失效。
 // 没有这条索引，每次积分页加载都全表扫整个积分台账（COLLSCAN，随账本增长无限放大）。
 recordSchema.index({ type: 1, refType: 1, bizDate: 1, refId: 1 });
 
