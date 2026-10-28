@@ -6,11 +6,16 @@
  *   makeup_card 靠 sortOrder 排第一保持兼容；
  * - 兑换按目录 `kind` 分流：virtual 发 PointCard、physical 落 PointOrder + 收货地址快照，
  *   两条链互斥（虚拟绝不落订单，实物绝不发卡）；限购对两类都生效（见 points-orders.limitReached）；
- * - 兑换写序固定：读目录 → 扣库存 → 扣分 → 发卡/落订单 → 落兑换记录。**不变量 A（all-or-nothing）**：
- *   过了库存闸门之后的任何失败，余额、totalSpent、批次、库存、卡/订单、兑换记录都回到调用前——
- *   发卡/落记录/落订单失败时用 points-ledger.reverseDebit 真正撤销扣分（补偿行成对，不进发放/消耗口径）；
+ * - 兑换写序固定：读目录 → 限购 → 每日额度 → 库存 → 扣分 → 发卡/落订单 → 落兑换记录。**不变量 A（all-or-nothing）**：
+ *   过了每日额度闸门之后的任何失败，余额、totalSpent、批次、库存、额度计数、卡/订单、兑换记录都回到调用前——
+ *   发卡/落记录/落订单失败时用 points-ledger.reverseDebit 真正撤销扣分（补偿行成对，不进发放/消耗口径），
+ *   并连同 takeDailyQuota 抢到的当日额度一起回补（returnDailyQuota）；
  * - 库存闸门：unlimited 分支既不筛 stock 也不 $inc（写成 $or + 无条件 $inc 会把
  *   不限量道具的库存悄悄扣掉）；非 unlimited 用带 stock>0 条件的原子 findOneAndUpdate 抢库存；
+ * - 每日额度闸门（Task 3）：dailyQuota/perUserDaily 走 PointDailyQuota 计数器（行 {key,dateKey,userId}，
+ *   userId 空串＝当日总量行），先建基线行再走「不带 upsert 的条件 $inc」，与库存闸门同一原子口径；
+ *   dateKey 由调用方 now 派生（不许在闸门里现取 Date.now()）。展示字段 todayLeft 仍读兑换台账（Task 2 数据源）：
+ *   台账能数不能原子扣退，强制与展示各走各的源，回补路径两侧一致由 DQ-4/DQ-5 钉住；
  * - 兑换幂等键 `exchange:${userId}:${requestId}`：先查兑换记录短路重放；并发同一 requestId
  *   由账本 idemKey + 兑换记录唯一索引 (userId, requestId) 双重兜底，只扣一次分、只发一张卡、
  *   只扣一次库存——落败方删卡、回补库存，但绝不动那笔真实扣分（它的权益是胜出方的卡）；
@@ -21,7 +26,8 @@
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import {
-  PointCardModel, PointExchangeModel, PointItemModel, PointOrderModel, PointRecordModel, type ItemKind,
+  PointCardModel, PointDailyQuotaModel, PointExchangeModel, PointItemModel,
+  PointOrderModel, PointRecordModel, type ItemKind,
 } from '../models/point.model.js';
 import { debitPoints, getBalance, reverseDebit, type DebitResult } from './points-ledger.js';
 import { limitError, limitReached, validateAddress } from './points-orders.js';
@@ -42,16 +48,18 @@ export interface ItemDto {
   detailImages: string[];
   /** 0 = 不限购；实物默认 1 */
   perUserLimit: number;
-  /** 每日投放：0 = 不限；>0 = 每个东八区自然日全平台最多兑 N 张，先到先得（闸门在 Task 3，这里只下发配置与展示数） */
+  /** 每日投放：0 = 不限；>0 = 每个东八区自然日全平台最多兑 N 张，先到先得（闸门＝本文件 takeDailyQuota） */
   dailyQuota: number;
-  /** 每人每日上限：0 = 不限；兑换链的闸门字段（Task 3），展示层不参与扣减 */
+  /** 每人每日上限：0 = 不限；兑换链闸门与 dailyQuota 同走 takeDailyQuota 计数器，展示层不参与扣减 */
   perUserDaily: number;
   /**
    * 今日剩余：dailyQuota = 0（不限）时必须是 null（端上不显示「今日剩余」，0 会被读成「兑完」）；
    * >0 时 = max(0, dailyQuota − 当日已兑条数)。
    * 数据源＝兑换台账（PointRecord 的 type:'exchange' + refType:'item' + refId=itemKey + bizDate=当日东八区），
-   * 不新建计数器表；失败兑换的扣分行会被 reverseDebit 降级成 exchange_reversed，天然不占额度。
-   * 按 item 聚合的是当日全平台已兑数——每人维度是 Task 3 的闸门，不混进这个展示字段。
+   * 这是 Task 2 定死的展示口径，Task 3 没有把它改指向计数器（裁定 2）；失败兑换的扣分行会被 reverseDebit
+   * 降级成 exchange_reversed，天然不占额度。兑换闸门（takeDailyQuota）另走 PointDailyQuota 计数器——
+   * 台账能数不能原子扣退，强制与展示分源，回补后两侧一致由 DQ-4/DQ-5 钉住。
+   * 按 item 聚合的是当日全平台已兑数——每人维度是闸门口径，不混进这个展示字段。
    */
   todayLeft: number | null;
   /** 剩余库存（spec §7.3）：unlimited 为 null（端上显示「不限量」），限量道具给实际剩余数 */
@@ -262,7 +270,111 @@ async function takeStock(item: ItemDoc): Promise<StockHold | null> {
   };
 }
 
-/** 虚拟道具：校验卡有效期 → 限购 → 扣库存 → 扣分 → 发卡 → 落兑换记录（扣分后失败退分 + 回补库存） */
+// ==================== 每日投放闸门（Task 3）：dailyQuota / perUserDaily ====================
+
+/**
+ * 基线行：$setOnInsert 只建行、永不碰已有计数；并发首建撞 {key,dateKey,userId} 唯一索引时
+ * 败者拿 E11000——行已在了，直接吃掉（与 points-ledger.ensureAccount 同款）。
+ * 没有那条 unique 这步就不成立：两个并发首次会各插一行基线，条件闸门只守得住其中一份。
+ */
+async function ensureQuotaRow(key: string, dateKey: string, userId: string): Promise<void> {
+  try {
+    await PointDailyQuotaModel.updateOne(
+      { key, dateKey, userId },
+      { $setOnInsert: { count: 0 } },
+      { upsert: true },
+    );
+  } catch (e) {
+    if (!isDuplicateKey(e)) throw e;
+  }
+}
+
+/**
+ * 原子抢一格（brief Step 3 的两个可选实现里选了「先建基线行、再走不带 upsert 的条件更新」）：
+ * $lt 条件 + upsert 会在条件不命中时插一行而不是拒绝（Step 3 的注意项），所以这里绝不带 upsert——
+ * 条件 findOneAndUpdate 不命中返回 null 就是「兑完」，与 takeStock 的 { stock: { $gt: 0 } } 同一原子口径，
+ * 并发下服务端逐条排队执行条件 $inc，count 不可能越过 cap。
+ */
+async function bumpQuota(key: string, dateKey: string, userId: string, cap: number): Promise<boolean> {
+  const row = await PointDailyQuotaModel.findOneAndUpdate(
+    { key, dateKey, userId, count: { $lt: cap } },
+    { $inc: { count: 1 } },
+    { returnDocument: 'after' },
+  ).lean();
+  return row !== null;
+}
+
+/** 撤销一格：个人行挡下时回退刚抢的总量行、以及抢到手之后链条任何一步失败的补偿。吞自家异常——它不许盖住原始失败 */
+async function undoQuota(key: string, dateKey: string, userId: string): Promise<void> {
+  try {
+    // count>0 条件是脏双退的自保（误调两次不能把计数器凿成负数）
+    await PointDailyQuotaModel.updateOne(
+      { key, dateKey, userId, count: { $gt: 0 } },
+      { $inc: { count: -1 } },
+    );
+  } catch (e) {
+    console.error('[points] 每日额度回补失败', key, dateKey, userId, e);
+  }
+}
+
+/**
+ * 抢当日额度：总量行（userId=''）与个人行都要过，任一失败即回滚已抢的那一行（brief 接口）。
+ * 为什么强制口径走计数器而不复用台账（todayLeft 的数据源）：台账只能数、不能原子地「先扣再核、失败退回」，
+ * 裁定 2 定死两侧分工——闸门扣计数器，展示读台账，回补路径两侧一致由 DQ-4/DQ-5 钉住。
+ * dateKey 一律 bjDateStr(now) 从调用方传入的时刻派生，不在闸门里现取 Date.now()（裁定 3）：
+ * 展示路径读挂钟、写链带 now，闸门若也读挂钟就会在 UTC+8 零点前后与写入行错位。
+ * 两字段都是 0（未配置限量投放）时整个闸门直通且不落任何计数器行——上线前的目录行行为零变化。
+ */
+async function takeDailyQuota(item: ItemDoc, userId: string, now: number): Promise<boolean> {
+  const dailyQuota = Number(item.dailyQuota ?? 0);
+  const perUserDaily = Number(item.perUserDaily ?? 0);
+  if (dailyQuota <= 0 && perUserDaily <= 0) return true;
+  const dateKey = bjDateStr(now);
+  if (dailyQuota > 0) {
+    await ensureQuotaRow(item.key, dateKey, '');
+    if (!(await bumpQuota(item.key, dateKey, '', dailyQuota))) return false;
+  }
+  if (perUserDaily > 0) {
+    await ensureQuotaRow(item.key, dateKey, userId);
+    if (!(await bumpQuota(item.key, dateKey, userId, perUserDaily))) {
+      if (dailyQuota > 0) await undoQuota(item.key, dateKey, ''); // 个人满而总量未满：刚抢的总量格让给下一位（DQ-2）
+      return false;
+    }
+  }
+  return true;
+}
+
+/** 兑换链失败补偿的镜像：抢到手之后任何一步没成，把那一格原路退回（与 takeStock 的 hold.rollback 同一职责） */
+async function returnDailyQuota(item: ItemDoc, userId: string, now: number): Promise<void> {
+  const dateKey = bjDateStr(now);
+  if (Number(item.dailyQuota ?? 0) > 0) await undoQuota(item.key, dateKey, '');
+  if (Number(item.perUserDaily ?? 0) > 0) await undoQuota(item.key, dateKey, userId);
+}
+
+/**
+ * 超限 400 文案（对象 + 实际值 + 上限 + 刷新时间，全仓文案纪律）：
+ * - 总量投放兑完 → 逐字用批准过的「「${name}」今日 ${N} 张已兑完（每人每日限 ${M} 张），明日 00:00 刷新」；
+ *   M 只在配置了个人上限时带上——perUserDaily=0 是「不限」，写成「限 0 张」与目录口径互相矛盾（brief 未覆盖的组合，这里收口）；
+ * - 只撞个人上限（总量未兑完）时「今日 N 张已兑完」是谎话，换同三要素的个人口径文案。
+ * 判据直接读计数器（与闸门同一数据源），不回查台账——展示归展示、闸门报错归闸门。
+ */
+async function dailyQuotaError(item: ItemDoc, userId: string, now: number): Promise<AppError> {
+  const dateKey = bjDateStr(now);
+  const dailyQuota = Number(item.dailyQuota ?? 0);
+  const perUserDaily = Number(item.perUserDaily ?? 0);
+  const rows = await PointDailyQuotaModel.find(
+    { key: item.key, dateKey, userId: { $in: ['', userId] } },
+  ).select({ userId: 1, count: 1 }).lean();
+  const total = Number(rows.find((r) => (r.userId ?? '') === '')?.count ?? 0);
+  const mine = Number(rows.find((r) => r.userId === userId)?.count ?? 0);
+  if (dailyQuota > 0 && total >= dailyQuota) {
+    const perUserNote = perUserDaily > 0 ? `（每人每日限 ${perUserDaily} 张）` : '';
+    return new AppError(400, `「${item.name}」今日 ${dailyQuota} 张已兑完${perUserNote}，明日 00:00 刷新`);
+  }
+  return new AppError(400, `「${item.name}」今日已兑 ${mine} 张（每人每日限 ${perUserDaily} 张），明日 00:00 刷新`);
+}
+
+/** 虚拟道具：校验卡有效期 → 限购 → 每日额度 → 扣库存 → 扣分 → 发卡 → 落兑换记录（额度抢到手后任何失败回补额度 + 退分 + 回补库存） */
 async function exchangeVirtual(
   userId: string, item: ItemDoc, rid: string, now: number,
 ): Promise<ExchangeResult> {
@@ -282,8 +394,23 @@ async function exchangeVirtual(
   // 限购先于库存闸门：超限不能扣库存，也不能留下任何待回滚状态
   if (await limitReached(userId, item, now)) throw await limitError(userId, item);
 
+  // 闸门顺序固定（裁定 1）：限购 → 每日额度 → 库存 → 扣分（原「兑换满 180 天」已由产品去掉，不许加回）
+  if (!(await takeDailyQuota(item, userId, now))) throw await dailyQuotaError(item, userId, now);
+  // 额度抢在库存与扣分之前：此后任何一步失败——库存空、扣分失败、发卡/落记录失败，
+  // 乃至同 requestId 重放落败（权益属于胜者那一单）——都要把手里这格原路退回；
+  // releaseQuota 幂等，一个请求至多退一次。
+  let quotaHeld = true;
+  const releaseQuota = async (): Promise<void> => {
+    if (!quotaHeld) return;
+    quotaHeld = false;
+    await returnDailyQuota(item, userId, now);
+  };
+
   const hold = await takeStock(item);
-  if (!hold) throw new AppError(400, `「${item.name}」已兑完（当前库存 0）`);
+  if (!hold) {
+    await releaseQuota();
+    throw new AppError(400, `「${item.name}」已兑完（当前库存 0）`);
+  }
 
   let debit: DebitResult;
   try {
@@ -296,11 +423,13 @@ async function exchangeVirtual(
     }, now);
   } catch (e) {
     await hold.rollback();
+    await releaseQuota();
     if (!isInsufficientBalance(e)) hold.rethrowWithRefund(e);
     // 余额恰好够一次的连点：A 扣光余额后、兑换记录落库前，B 会先撞余额闸门。
     // 补查在途记录：命中说明是同一笔点击，返回 A 那张卡（不再扣分/发卡）；否则才是真的余额不足。
     const inFlight = await findInFlightExchange(userId, rid);
     if (!inFlight) hold.rethrowWithRefund(e);
+    // 短路重放成功也是「本次没产出新兑换」：胜者那一击自带额度格，本请求的这格必须退回
     return { cardId: String(inFlight.cardId), balance: await getBalance(userId, now), refundFailed: hold.refundFailed };
   }
 
@@ -327,6 +456,7 @@ async function exchangeVirtual(
   } catch (e) {
     // M1：扣分已经落账，发卡失败必须把这次扣分真正撤销，否则用户被扣分却没有卡。
     await hold.rollback();
+    await releaseQuota();
     await undoDebit();
     hold.rethrowWithRefund(e);
   }
@@ -346,6 +476,9 @@ async function exchangeVirtual(
       console.error('[points] 撤回兑换卡失败', item.key, String(card._id), delErr);
     }
     await hold.rollback();
+    // 本 catch 的三个出口（非重复键抛错 / 胜者重放返回 / 找不到胜者抛错）都不是「本次兑换成了」：
+    // 重放路径的权益属于胜者那一单，胜者自己占过格，这里占的一格必须退。
+    await releaseQuota();
     if (!isDuplicateKey(e)) {
       await undoDebit();
       hold.rethrowWithRefund(e);
@@ -362,9 +495,9 @@ async function exchangeVirtual(
 }
 
 /**
- * 实物道具：地址校验 → 限购 → 扣库存 → 扣分 → 落订单（不发卡）。
- * 地址/限购在库存闸门之前，非法输入不动余额与库存；扣分之后的失败用 reverseDebit 撤销并回补库存，
- * 与虚拟兑换复用同一套 all-or-nothing 逆序链。
+ * 实物道具：地址校验 → 限购 → 每日额度 → 扣库存 → 扣分 → 落订单（不发卡）。
+ * 地址/限购在库存闸门之前，非法输入不动余额与库存；额度抢到手后的失败连同扣分一起走同一条回滚链回补额度，
+ * 与虚拟兑换复用同一套 all-or-nothing 逆序链与同一份 takeDailyQuota/returnDailyQuota 实现。
  */
 async function exchangePhysical(
   userId: string, item: ItemDoc, rid: string, now: number, addressInput: unknown,
@@ -378,8 +511,20 @@ async function exchangePhysical(
   const address = validateAddress(addressInput);
   if (await limitReached(userId, item, now)) throw await limitError(userId, item);
 
+  // 与虚拟链同一套闸门与顺序（裁定 1）：限购 → 每日额度 → 库存 → 扣分
+  if (!(await takeDailyQuota(item, userId, now))) throw await dailyQuotaError(item, userId, now);
+  let quotaHeld = true;
+  const releaseQuota = async (): Promise<void> => {
+    if (!quotaHeld) return;
+    quotaHeld = false;
+    await returnDailyQuota(item, userId, now);
+  };
+
   const hold = await takeStock(item);
-  if (!hold) throw new AppError(400, `「${item.name}」已兑完（当前库存 0）`);
+  if (!hold) {
+    await releaseQuota();
+    throw new AppError(400, `「${item.name}」已兑完（当前库存 0）`);
+  }
 
   let debit: DebitResult;
   try {
@@ -390,10 +535,12 @@ async function exchangePhysical(
     }, now);
   } catch (e) {
     await hold.rollback();
+    await releaseQuota();
     if (!isInsufficientBalance(e)) hold.rethrowWithRefund(e);
     // 与虚拟路径同理：余额刚够一次的连点，胜者订单可能还没落库，补查在途订单
     const inFlight = await findInFlightOrder(userId, rid);
     if (!inFlight) hold.rethrowWithRefund(e);
+    // 短路重放：订单是胜者那一击落的，额度格也是胜者占的——本次这格退回去
     return { orderId: String(inFlight._id), balance: await getBalance(userId, now), refundFailed: hold.refundFailed };
   }
 
@@ -418,6 +565,8 @@ async function exchangePhysical(
     return { orderId: String(order._id), balance: debit.balance, refundFailed: hold.refundFailed };
   } catch (e) {
     await hold.rollback();
+    // 与虚拟链同口径：本 catch 的出口（抛错/胜者重放）都不是本次兑换成了，额度格一律退
+    await releaseQuota();
     if (!isDuplicateKey(e)) {
       await undoDebit();
       hold.rethrowWithRefund(e);

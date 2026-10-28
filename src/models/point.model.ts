@@ -129,6 +129,25 @@ const dailySchema = new Schema({
 dailySchema.index({ userId: 1, bizDate: 1 }, { unique: true });
 
 /**
+ * 每日投放计数器：dailyQuota（当日全平台投放）与 perUserDaily（每人每日上限）的原子闸门（Task 3）。
+ * 行按 { key, dateKey, userId } 定位，userId 为空串＝「当日总量」行，其余＝该用户当日个人行。
+ * 为什么不用兑换台账计数（展示字段 todayLeft 的数据源）：闸门要「先占额度、条件不中即拒绝、失败还能原子回退」，
+ * count 只能查不能扣——所以强制口径走这里的条件 $inc，展示口径留在台账（裁定 2），两侧一致性由测试钉住。
+ * dateKey 一律由调用链的 `now` 经 bjDateStr 派生，不在闸门里现取 Date.now()（裁定 3，防跨 UTC+8 零点错位）。
+ */
+const dailyQuotaSchema = new Schema({
+  key: { type: String, required: true },
+  dateKey: { type: String, required: true },
+  // 空串＝平台总量行。不写 required：String 的 required 会把 '' 判成「未填」（mongoose 的空值口径），
+  // 总量行恰恰要的是 ''；default '' 兜住「没表态就是总量行」的读法，闸门写入一律显式带上 userId。
+  userId: { type: String, default: '' },
+  count: { type: Number, required: true, default: 0, min: 0 },
+}, { versionKey: false });
+// unique 是正确性防线不是性能索引：ensureQuotaRow 用 upsert 建基线，两个并发首次都 miss 查询时
+// 靠这条唯一索引让败者撞 E11000 退化；没有它基线行会插成多份，条件 $inc 只守得住其中一份。
+dailyQuotaSchema.index({ key: 1, dateKey: 1, userId: 1 }, { unique: true });
+
+/**
  * 道具目录：一条 = 一种可兑换/可发放的道具。
  * 价格与有效期以前写死在 points-items.ts + config/points.ts，落库后那两个常量退化为种子值。
  */
@@ -185,4 +204,5 @@ export const PointCardModel = models.PointCard ?? model('PointCard', cardSchema)
 export const PointExchangeModel = models.PointExchange ?? model('PointExchange', exchangeSchema);
 export const PointOrderModel = models.PointOrder ?? model('PointOrder', orderSchema);
 export const PointDailyModel = models.PointDaily ?? model('PointDaily', dailySchema);
+export const PointDailyQuotaModel = models.PointDailyQuota ?? model('PointDailyQuota', dailyQuotaSchema);
 export const PointItemModel = models.PointItem ?? model('PointItem', itemSchema);

@@ -51,3 +51,17 @@ export function hasExchangeLedgerIndex(indexes: IndexShape[]): boolean {
     return fields === 'type,refType,bizDate,refId' && Object.values(i.key ?? {}).every((v) => v === 1);
   });
 }
+
+/**
+ * 每日投放计数器（pointdailyquotas）的唯一防线是否真在：{key,dateKey,userId} unique。
+ * 这是正确性防线不是性能索引：takeDailyQuota 先 upsert 建基线行、再走「不带 upsert 的条件 $inc」，
+ * 并发首次建行的两个请求靠这条唯一索引让败者撞 E11000 退化；删了它基线行会插成多份，
+ * 条件闸门只守得住其中一份——超发+额度回补错位，且不会有任何报错。
+ * 认字段组合（排序后比对）不认键序也不认名字：三字段在闸门里全是等值条件，唯一性约束与键序无关。
+ */
+export function hasUniqueDailyQuotaIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const fields = Object.keys(i.key ?? {}).sort().join(',');
+    return fields === 'dateKey,key,userId' && i.unique === true;
+  });
+}

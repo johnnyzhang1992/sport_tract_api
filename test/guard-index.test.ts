@@ -20,8 +20,10 @@ import mongoose from 'mongoose';
 import { config } from '../src/config/index.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
-import { PointRecordModel } from '../src/models/point.model.js';
-import { hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex } from '../src/utils/guard-index.js';
+import { PointDailyQuotaModel, PointRecordModel } from '../src/models/point.model.js';
+import {
+  hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
+} from '../src/utils/guard-index.js';
 
 before(async () => {
   await mongoose.connect(config.mongodbUri, { serverSelectionTimeoutMS: 5000 });
@@ -132,4 +134,33 @@ test('pointrecords：键序不对（$in 的 refId 不做收尾）不算防线：
 
 test('pointrecords：缺字段（没有 refType）不算防线', () => {
   assert.equal(hasExchangeLedgerIndex([{ name: 'x', key: { type: 1, bizDate: 1, refId: 1 } }]), false);
+});
+
+/**
+ * 每日投放计数器（Task 3）的 {key,dateKey,userId} unique 防线：正确性防线——
+ * ensureQuotaRow 的并发建行去重、takeDailyQuota 的条件 $inc 都钉在「一个 key+日+人只有一行」上，
+ * 声明被删时 autoIndex 只留 warning，基线行可能插成多份、闸门只守住其中一份（超发且无声）。
+ * 两侧都核对（同 pointrecords 热路径索引的 10-29 教训）：删声明但库里留着旧索引时库侧假绿，
+ * 声明侧这条先红。
+ */
+test('pointdailyquotas 防线：unique {key,dateKey,userId} 声明侧与真实库侧都在', async () => {
+  const declared = PointDailyQuotaModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).sort().join(',') === 'dateKey,key,userId'),
+    `schema 里的索引声明没有 {key,dateKey,userId} 这条！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
+  await PointDailyQuotaModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
+  const idx = await PointDailyQuotaModel.collection.indexes();
+  assert.ok(
+    hasUniqueDailyQuotaIndex(idx),
+    `防线不在！现有索引：${JSON.stringify(idx.map((i) => ({ name: i.name, unique: i.unique, key: i.key })))}`,
+  );
+});
+
+test('pointdailyquotas：普通索引（非 unique）不算防线：并发建基线行会插成多份', () => {
+  assert.equal(hasUniqueDailyQuotaIndex([{ name: 'x', key: { key: 1, dateKey: 1, userId: 1 } }]), false);
+});
+
+test('pointdailyquotas：字段不全（缺 dateKey）不算防线：跨日行会互相顶掉', () => {
+  assert.equal(hasUniqueDailyQuotaIndex([{ name: 'x', key: { key: 1, userId: 1 }, unique: true }]), false);
 });
