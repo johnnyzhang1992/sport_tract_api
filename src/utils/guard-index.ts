@@ -36,3 +36,17 @@ export function hasUniqueJoinedIndex(indexes: IndexShape[]): boolean {
     return fields === 'campaignId,userId' && i.unique === true && i.partialFilterExpression?.state === 'joined';
   });
 }
+
+/**
+ * 积分页热路径索引是否真在（pointrecords）：listActiveItems 的今日剩余聚合
+ * `{type:'exchange', refType:'item', bizDate:当日, refId:{$in:在架 keys}}` 靠它免全表扫。
+ * 与上面两条 unique 防线不同，这是性能索引：不看 unique/partial，但看键序——
+ * 三个等值字段（type/refType/bizDate）必须做前缀、$in 的 refId 收尾，顺序反了前缀断在 $in 处，
+ * 改名/换序都按「防线不在」处理（索引名是 Mongoose 自动生成的，按键组合认，不认名字）。
+ */
+export function hasExchangeLedgerIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const fields = Object.keys(i.key ?? {}).join(',');
+    return fields === 'type,refType,bizDate,refId' && Object.values(i.key ?? {}).every((v) => v === 1);
+  });
+}
