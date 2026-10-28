@@ -342,3 +342,25 @@ test('AU-11 详情头像签名下发：私有桶裸链进 <img> 会 403，档位
   await UserModel.updateOne({ _id: eu.oid }, { $set: { avatarUrl: ext } });
   assert.equal((await pointsAdminUserDetail(eu.id)).avatarUrl, ext);
 });
+
+test('AU-12 用户积分列表带头像：本桶走 160 方图签名，无头像给空串', async (t) => {
+  const OSS = `${config.oss.endpoint.replace(/\/$/, '')}/${config.oss.baseDir}/t7-avatar-list`;
+  const bare = `${OSS}/l.png`;
+  const withAvatar = await makeUser(t, 'T7AU9有头像');
+  await UserModel.updateOne({ _id: withAvatar.oid }, { $set: { avatarUrl: bare } });
+  const plain = await makeUser(t, 'T7AU9无头像');
+
+  const r = await pointsAdminUsers({ keyword: 'T7AU9', pageSize: 100 });
+  const rows = new Map(r.items.map((x) => [x.id, x.avatarUrl]));
+  assert.ok(rows.has(withAvatar.id) && rows.has(plain.id), '两个种子用户都要在列表里');
+
+  const got = rows.get(withAvatar.id) ?? '';
+  if (isOssConfigured()) {
+    assert.ok(got.startsWith(`${bare}?`), `列表头像应是本桶地址的签名链，实际 ${got}`);
+    assert.match(decodeURIComponent(got), /x-oss-process=image\/resize,m_fill,w_160,h_160/,
+      '与用户管理/积分详情同一个头像档位');
+  } else {
+    assert.equal(got, bare, 'OSS 未配置时原样返回裸链');
+  }
+  assert.equal(rows.get(plain.id), '', '没上传头像给空串，别让前端拿 undefined 拼 src');
+});

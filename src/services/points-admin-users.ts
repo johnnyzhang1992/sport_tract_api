@@ -38,6 +38,8 @@ export interface PointsUserRow {
   id: string;
   uid: number;
   nickname: string;
+  /** 头像签名链（私有桶裸链进 <img> 会 403）；没上传头像为空串 */
+  avatarUrl: string;
   balance: number;
   totalEarned: number;
   exchanges: number;
@@ -46,7 +48,6 @@ export interface PointsUserRow {
 }
 
 export interface PointsUserDetail extends PointsUserRow {
-  avatarUrl: string;
   /** 撤回（含补签撤回等所有 _rollback 族），与总览 rolledBack 同口径 */
   rolledBack: number;
   spentExchange: number;
@@ -219,6 +220,8 @@ function toRow(
     exchanges: m.exchanges,
     cardsUnused: m.cardsUnused,
     lastEarnedAt: m.lastEarnedAt,
+    // 列表是全量组装再切片：签名只给本页的行做（见下），这里先占位
+    avatarUrl: '',
   };
 }
 
@@ -234,7 +237,7 @@ export async function pointsAdminUsers(q: PointsUserQuery = {}): Promise<PointsU
   const ps = Math.min(ADMIN_PAGE_SIZE_CAP, toPositiveInt(q.pageSize, 20));
 
   const filter = userKeywordFilter(q.keyword);
-  const users = await UserModel.find(filter ?? {}).select({ _id: 1, uid: 1, nickname: 1 }).lean();
+  const users = await UserModel.find(filter ?? {}).select({ _id: 1, uid: 1, nickname: 1, avatarUrl: 1 }).lean();
   const now = Date.now();
   const metrics = await metricsOf(users.map((u) => u._id), now);
   const rows = users.map((u) => toRow(u, metrics.get(String(u._id)) ?? ZERO_METRICS));
@@ -250,6 +253,12 @@ export async function pointsAdminUsers(q: PointsUserQuery = {}): Promise<PointsU
   const total = rows.length;
   // 切片在排序之后：先切会把「本页内顺序」当成全局顺序，跨页既重又漏
   const items = rows.slice((p - 1) * ps, p * ps);
+  // 只有本页这几十行需要头像：按页内用户签名，别给全量用户签一遍（每签一条都要算 HMAC）
+  const avatarById = new Map(users.map((u) => [String(u._id), u.avatarUrl ? String(u.avatarUrl) : '']));
+  for (const it of items) {
+    const bare = avatarById.get(it.id) ?? '';
+    it.avatarUrl = bare ? getAvatarUrl(bare) : '';
+  }
   return { total, page: p, pageSize: ps, items };
 }
 
