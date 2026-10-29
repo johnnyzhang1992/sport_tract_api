@@ -17,6 +17,7 @@ import {
   settlePeriod,
   settleDueForUser,
   computeSettleUnits,
+  periodStartMsFromKey,
   boardLabel,
   boardPeriodTag,
   type BoardCandidate,
@@ -944,6 +945,13 @@ const WEEK_KEYS = [
   '2027-02-01', // U7：SP-12 失败路径（release/金额不符/重试）
   '2027-02-08', // U8：SP-13 通知失败不吞钱
   '2027-02-15', // U9：SP-14 崩在发分与翻牌之间（幂等补翻牌）
+  '2027-02-22', // U10：SP-15 已结算单元完成标记（聚合计数取证）
+  '2027-03-01', // U11：SP-16 占位过期重算同结论 → 刷新 TTL
+  '2027-03-08', // U12：SP-17 补翻牌前的流水金额核对
+  '2027-03-15', // U13：SP-18 场景一（榜上还有他人持有的新鲜锁 ⇒ 不落完成标记）
+  '2027-03-22', // U14：SP-18 场景二（翻牌竞态落空 ⇒ 同上）
+  '2027-03-29', // U15：SP-19 完成标记过期重评后同结论 → 续期归位
+  '2027-04-05', // U16：SP-17 场景二（补翻牌竞态落空 ⇒ 未落定，不落标记）
 ] as const;
 const U_START = (key: string) => bjMid(Number(key.slice(0, 4)), Number(key.slice(5, 7)), Number(key.slice(8, 10)));
 const U_END = (key: string) => U_START(key) + 7 * DAY_MS;
@@ -956,6 +964,13 @@ const U6 = WEEK_KEYS[5]; const U6_START = U_START(U6); const U6_END = U_END(U6);
 const U7 = WEEK_KEYS[6]; const U7_START = U_START(U7); const U7_END = U_END(U7); const NOW7 = U7_END;
 const U8 = WEEK_KEYS[7]; const U8_START = U_START(U8); const U8_END = U_END(U8); const NOW8 = U8_END;
 const U9 = WEEK_KEYS[8]; const U9_START = U_START(U9); const U9_END = U_END(U9); const NOW9 = U9_END;
+const U10 = WEEK_KEYS[9]; const U10_START = U_START(U10); const U10_END = U_END(U10); const NOW10 = U10_END;
+const U11 = WEEK_KEYS[10]; const U11_START = U_START(U11); const U11_END = U_END(U11); const NOW11 = U11_END;
+const U12 = WEEK_KEYS[11]; const U12_START = U_START(U12); const U12_END = U_END(U12); const NOW12 = U12_END;
+const U13 = WEEK_KEYS[12]; const U13_START = U_START(U13); const U13_END = U_END(U13); const NOW13 = U13_END;
+const U14 = WEEK_KEYS[13]; const U14_START = U_START(U14); const U14_END = U_END(U14); const NOW14 = U14_END;
+const U15 = WEEK_KEYS[14]; const U15_START = U_START(U15); const U15_END = U_END(U15); const NOW15 = U15_END;
+const U16 = WEEK_KEYS[15]; const U16_START = U_START(U16); const U16_END = U_END(U16); const NOW16 = U16_END;
 /** 月/年单元：SP-5 滞后闸门（2026-12 的结算界是 2027-01-01）与 SP-7 年榜 500 分。
  *  年榜夹具用 2027 年——2026/更早年份的窗口里有真实用户数据，绝不当结算对象。 */
 const M_DEC = '2026-12';
@@ -1294,6 +1309,11 @@ test('SP-12 发分失败/金额不符：不翻牌、释放锁、大声留痕；�
   assert.match(logsB, /不符|漂移/, '金额不符的留痕要能指认是钱账漂移');
   assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U7, type: 'cycling', status: 'credited' }), 0, '金额不符不许翻牌');
   assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U7, type: 'cycling', status: 'pending' }), 0, '金额不符也要释放锁');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U7, type: 'cycling', userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID }),
+    0,
+    '金额不符 ⇒ 该榜本轮未落定，完成标记同样不落（标记只承诺"全部落定"，修复轮 1 Important 1）',
+  );
   // (c) 真正可用的重试：前两轮都没把钱发出去，这一轮三条全补上，一条不多
   const ok = await settlePeriod('week', U7, U7_END, NOW7 + 2000);
   assert.equal(ok.credited, 3);
@@ -1365,4 +1385,239 @@ test('SP-7 年榜 500 一笔不被每日上限截断；流水标题与通知按�
   assert.deepEqual([...res.skippedTypes].sort(), ['mountaineering', 'running', 'skiing', 'swimming']);
   await assertUnitLedgerMatchesRecords('year', '2027');
   await assertPerUserBoardCap('year', '2027');
+});
+
+/* ====================================================================
+ * 修复轮 1（评审 Important 1/2 + Minor 5/6）
+ *
+ * Important 1 的取证需要"聚合次数"这个可观测量：trustedBoardRows 的唯一入口是
+ * ActivityModel.aggregate，测试内临时换计数包装（node --test-concurrency=1 + 文件内串行，
+ * finally 必还原——劫持口径同 captureErrors）。
+ * ================================================================== */
+
+/** 在 fn 执行期间统计 ActivityModel.aggregate 的调用次数（发分口径一榜一次 aggregate） */
+async function withAggSpy<T>(fn: () => Promise<T>): Promise<{ count: number; result: T }> {
+  const holder = ActivityModel as unknown as { aggregate: (...a: unknown[]) => unknown };
+  const orig = holder.aggregate;
+  let count = 0;
+  holder.aggregate = (...a: unknown[]) => {
+    count += 1;
+    return (orig as (...x: unknown[]) => unknown).apply(ActivityModel, a);
+  };
+  try {
+    const result = await fn();
+    return { count, result };
+  } finally {
+    holder.aggregate = orig;
+  }
+}
+
+test('SP-15 已结算单元有完成标记：二次进页零聚合；迟到赢家在 TTL 过期后重算补发（Important 1）', async () => {
+  const cyc = await seedBoard('cycling', U10_START, [3200, 3100, 3000, 2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300, 1200]);
+  // (1) 首轮：8 个榜各聚合一次（1 个过门槛 + 7 个空榜），TOP3 发满
+  const run1 = await withAggSpy(() => settlePeriod('week', U10, U10_END, NOW10));
+  assert.equal(run1.result.credited, 3);
+  assert.equal(run1.count, 8, '夹具自证：首次评估本来会跑 8 个聚合');
+  // Minor 6：发 3 人 ⇒ 恰 3 条定向通知、0 条广播（userId null）——广播会发给全平台
+  assert.equal(
+    await NotificationModel.countDocuments({ userId: { $in: cyc.slice(0, 3) }, title: '榜单积分奖励到账' }),
+    3,
+    '每个赢家一条定向通知',
+  );
+  assert.equal(
+    await NotificationModel.countDocuments({ userId: null, title: '榜单积分奖励到账' }),
+    0,
+    '榜单到账通知必须定向（spec §4.5/D14），一条都不许落广播',
+  );
+  // (2) 归一标记时刻：占位/完成标记落的是真实时钟，raw handle 推到假时钟（SP-2 同款）。
+  // 注意走 collection 原语＝不过 schema 类型转换，哨兵 userId 要手动成 ObjectId 才匹配得上库里那批行。
+  const marked = await BoardSettlementModel.collection.updateMany(
+    { period: 'week', periodKey: U10, userId: new Types.ObjectId(BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID) },
+    { $set: { updatedAt: new Date(NOW10) } },
+  );
+  assert.equal(marked.modifiedCount, 8, '8 个榜都要有完成/跳过标记（修复前过门槛的榜没有 ⇒ 本断言先红）');
+  // (3) 二次进入：短路在聚合之前——0 次
+  const run2 = await withAggSpy(() => settlePeriod('week', U10, U10_END, NOW10 + 3_600_000));
+  assert.equal(run2.count, 0, '已结算单元再进页面：一个聚合都不许跑（修复前这里 ≥1，且永不归零）');
+  assert.equal(run2.result.credited, 0);
+  // (4) 迟到赢家：TTL 内被短路挡住（机制 (i) 的代价，报告写明最坏等待 ≤ skippedFreshMs＝24h）
+  const [late] = await seedBoard('cycling', U10_START, [99_999]);
+  const runTtl = await withAggSpy(() => settlePeriod('week', U10, U10_END, NOW10 + 2 * 3_600_000));
+  assert.equal(runTtl.count, 0, '有效期内不重评：短路是标记的意义');
+  assert.equal(await PointRecordModel.countDocuments({ userId: late, type: 'board_reward' }), 0);
+  // (5) TTL 过期（>24h）：重评一轮，迟到 TOP1 补发——「标记是缓存不是判决」与裁定 2 同构
+  const run3 = await withAggSpy(() => settlePeriod('week', U10, U10_END, NOW10 + DAY_MS + 2 * 3_600_000));
+  assert.equal(run3.count, 8, '过期重算：每单元每天至多这一轮全扫');
+  assert.equal(run3.result.credited, 1, '迟到 TOP1 补发一条（原 TOP1 降第 2 撞 credited 终态行，安静跳过）');
+  assert.equal(await PointRecordModel.countDocuments({ userId: late, refId: `cycling:week:${U10}` }), 1);
+  assert.equal(await getBalance(String(late), NOW10 + DAY_MS), 50, '迟到赢家拿的是 TOP1 的 50 分');
+  // 钱账对账不变式照钉：短路/重算路径都没造出「流水与台账不成对」的行
+  await assertUnitLedgerMatchesRecords('week', U10);
+});
+
+test('SP-16 占位过期重算后同结论：刷新 updatedAt 续期 TTL（否则第二天起每次进页全扫）', async () => {
+  await seedBoard('running', U11_START, [1000, 900, 800, 700, 600]); // 5 人，稳不过门槛
+  const r1 = await settlePeriod('week', U11, U11_END, NOW11);
+  assert.ok(r1.skippedTypes.includes('running'));
+  const key = { type: 'running', period: 'week' as const, periodKey: U11, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID };
+  const row = await BoardSettlementModel.findOne(key).lean();
+  assert.ok(row, '夹具：门槛占位已落');
+  // 把占位推到 epoch 零：对任何假时钟都过期；重算同结论后若不续期，updatedAt 会停在 0（可观测）
+  await BoardSettlementModel.collection.updateOne({ _id: row?._id }, { $set: { updatedAt: new Date(0) } });
+  const reasonBefore = row?.reason;
+  await settlePeriod('week', U11, U11_END, NOW11 + 60_000);
+  const after = await BoardSettlementModel.findOne(key).lean();
+  assert.ok((after?.updatedAt as Date).getTime() > 0, '重算同结论也要续期占位 TTL——不续期则修复前自第二天起每次进页都重聚合该榜');
+  assert.equal(after?.reason, reasonBefore, '续期只动 TTL 不覆盖 reason（BS-4 的台账留痕纪律）');
+  assert.equal(await BoardSettlementModel.countDocuments({ type: 'running', period: 'week', periodKey: U11 }), 1, '续期走撞键败者路径，不造重复行');
+});
+
+test('SP-17 补翻牌前先核对既有流水分值：与台账应发分值不符 ⇒ 拒翻牌、释放锁、大声留痕（Minor 5）', async () => {
+  const cyc = await seedBoard('cycling', U12_START, [6100, 6000, 5900, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200]);
+  const u1 = String(cyc[0]);
+  // 埋一条「金额不符」的同 idemKey 流水（模拟上游漂移/人工改动后的现场）：只有 20 分，台账本轮要标 50
+  const pre = await creditPoints(u1, {
+    type: 'board_reward', title: '历史遗留流水', points: 20, bizDate: '2027-03-02',
+    refType: 'board', refId: `cycling:week:${U12}`,
+    idemKey: `${u1}:board:cycling:week:${U12}`, ignoreDailyCap: true,
+  }, NOW12);
+  assert.equal(pre.credited, 20, '夹具自证：先落了一条 20 分的流水');
+  const logs = await captureErrors(async () => {
+    const r = await settlePeriod('week', U12, U12_END, NOW12);
+    assert.equal(r.credited, 2, 'u1 必须被拒翻牌（第 2、3 名正常发）');
+  });
+  assert.match(logs, /补翻牌/, '补翻牌金额核对失败要指认得出来');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U12, userId: cyc[0] }),
+    0,
+    '金额不符 ⇒ 释放锁（不留 pending/credited 行），等人工对账后重跑',
+  );
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U12, status: 'credited' }),
+    2,
+  );
+  assert.equal(await PointRecordModel.countDocuments({ refId: `cycling:week:${U12}` }), 3, '20 分旧流水 + 两条新流水，没有第四笔');
+  assert.equal(await getBalance(u1, NOW12), 20, 'u1 余额仍是那笔 20——补翻牌核对不许把钱变出来');
+  // 场景二：金额核对通过、但补翻牌本身竞态落空（claim 与 flip 之间行被外部删除）⇒ 同样未落定：
+  // 留痕、不落 credited、不落完成标记
+  const cycB = await seedBoard('cycling', U16_START, [6300, 6200, 6150, 6000, 5900, 5800, 5700, 5600, 5500, 5400, 5300, 5200]);
+  const preB = await creditPoints(String(cycB[1]), {
+    type: 'board_reward', title: '先行流水', points: 30, bizDate: '2027-04-06',
+    refType: 'board', refId: `cycling:week:${U16}`,
+    idemKey: `${cycB[1]}:board:cycling:week:${U16}`, ignoreDailyCap: true,
+  }, NOW16);
+  assert.equal(preB.credited, 30, '夹具：TOP2 的 30 分流水已先行落账（金额与本轮 plan 一致）');
+  const logsB = await captureErrors(async () => {
+    const r = await settlePeriod('week', U16, U16_END, NOW16, {
+      credit: async (uid, input, n) => {
+        const paid = await creditPoints(uid, input, n ?? NOW16);
+        if (uid === String(cycB[1])) {
+          await BoardSettlementModel.deleteOne({ period: 'week', periodKey: U16, userId: uid, status: 'pending' });
+        }
+        return paid;
+      },
+    });
+    assert.equal(r.credited, 2, 'TOP1/TOP3 正常；TOP2 补翻牌竞态落空，不计入 credited');
+  });
+  assert.match(logsB, /未能补翻牌/, '补翻牌竞态落空必须留痕（原有纪律）');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ type: 'cycling', period: 'week', periodKey: U16, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID, status: 'skipped' }),
+    0,
+    '有未落定条目 ⇒ 完成标记不落（标记只承诺"全部落定"）',
+  );
+});
+
+test('PK-1 周 periodKey 必须是东八区周一：周二/周日的键直接炸（Important 2）', () => {
+  // 现状：任意 \d{4}-\d{2}-\d{2} 都被接受 → 周二是「平移一天的另一期」，idemKey 不同 ⇒ 同一批钱双发
+  assert.equal(periodStartMsFromKey('week', '2026-10-19'), Date.parse('2026-10-19T00:00:00+08:00'), '夹具：周一照旧通过');
+  assert.throws(() => periodStartMsFromKey('week', '2026-10-20'), /periodKey/, '周二的键必须拒：它和 2026-10-19 是重叠窗口、不同 idemKey');
+  assert.throws(() => periodStartMsFromKey('week', '2026-10-25'), /periodKey/);
+  // 经由 settlePeriod 也要炸（Task 10 的调用面）
+  return assert.rejects(() => settlePeriod('week', '2026-10-20', NOW1, NOW1), /periodKey/);
+});
+
+test('PK-2 周 periodKey 日期本身非法：NaN 时刻不许变成窗口', () => {
+  assert.throws(() => periodStartMsFromKey('week', '2026-02-30'), /periodKey/);
+  assert.throws(() => periodStartMsFromKey('week', '2026-13-05'), /periodKey/);
+});
+
+test('PK-3 月 periodKey 的月份必须落在 01–12：2026-13 不许滚进明年（Important 2）', () => {
+  assert.equal(periodStartMsFromKey('month', '2026-12'), Date.UTC(2026, 11, 1) - BJ_OFFSET_MS, '夹具：12 月照旧通过');
+  assert.throws(() => periodStartMsFromKey('month', '2026-13'), /periodKey/, 'Date.UTC 会把 13 月静默滚成次年 1 月——键与窗口错位＝双发隐患');
+  assert.throws(() => periodStartMsFromKey('month', '2026-00'), /periodKey/, '00 月会滚成上一年 12 月');
+});
+
+test('PK-4 年 periodKey 必须是 4 位年份（Important 2）', () => {
+  assert.equal(periodStartMsFromKey('year', '2026'), Date.UTC(2026, 0, 1) - BJ_OFFSET_MS, '夹具：4 位年照旧通过');
+  assert.throws(() => periodStartMsFromKey('year', '26'), /periodKey/, '"26" 会被 Date.UTC 当成公元 26 年');
+  assert.throws(() => periodStartMsFromKey('year', '20260'), /periodKey/);
+});
+
+test('SP-18 本轮未落定的榜不落完成标记：他人持锁/翻牌竞态都留给下轮重评（Important 1 的另一半）', async () => {
+  // 场景一：cyc0 的发放锁被"另一个进程"新鲜持有（pending < 10min），本轮对它只能败者跳过——
+  // 该榜算"未落定"。若照常落完成标记，那个进程死了也要等标记 TTL（24h）才重评，
+  // 比 pendingStaleMs（10min）的接管窗口还慢一个数量级。
+  const cyc = await seedBoard('cycling', U13_START, [7100, 7000, 6900, 6000, 5900, 5800, 5700, 5600, 5500, 5400, 5300, 5200]);
+  assert.equal((await claimBoardSettlement(
+    { type: 'cycling', period: 'week', periodKey: U13, userId: String(cyc[0]) },
+    { rank: 1, points: 50 },
+  )).won, true, '夹具：模拟并发对手刚抢到 TOP1 的锁');
+  // 把锁的 updatedAt 归一到"假时钟 9 分钟前"：仍在 10min 持有窗口内（SP-11 的反向操作，同款 raw handle）——
+  // 否则真实时钟的锁对未来的假 now 而言早已超时，会被接管，场景就演不成了
+  await BoardSettlementModel.collection.updateOne(
+    { type: 'cycling', period: 'week', periodKey: U13, status: 'pending' },
+    { $set: { updatedAt: new Date(NOW13 - 9 * 60_000) } },
+  );
+  const res1 = await settlePeriod('week', U13, U13_END, NOW13);
+  assert.equal(res1.credited, 2, 'TOP2/3 照发，一条重复键不许打断整批');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({
+      type: 'cycling', period: 'week', periodKey: U13,
+      userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID, status: 'skipped',
+    }),
+    0,
+    '榜上有未落定条目 ⇒ 完成标记不落（SP-15 的短路是"全部落定"的短路）',
+  );
+  // 场景二：钱落了、翻牌前 pending 行易主（flip 条件落空）⇒ 同样算未落定，大声留痕 + 不落标记
+  const cycB = await seedBoard('cycling', U14_START, [6600, 6500, 6400, 6000, 5900, 5800, 5700, 5600, 5500, 5400, 5300, 5200]);
+  const logsB = await captureErrors(async () => {
+    const r = await settlePeriod('week', U14, U14_END, NOW14, {
+      credit: async (uid, input, n) => {
+        const paid = await creditPoints(uid, input, n ?? NOW14);
+        if (uid === String(cycB[0])) {
+          // 模拟竞态：翻牌前我的 pending 行被后台清理删掉了——flip 条件落空，钱已到账
+          await BoardSettlementModel.deleteOne({ period: 'week', periodKey: U14, userId: uid, status: 'pending' });
+        }
+        return paid;
+      },
+    });
+    assert.equal(r.credited, 2, '翻牌落空的那条不计入 credited');
+  });
+  assert.match(logsB, /翻牌未命中/, '钱到账而翻牌落空必须留痕待人工对账（原有纪律不破）');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({
+      type: 'cycling', period: 'week', periodKey: U14,
+      userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID, status: 'skipped',
+    }),
+    0,
+    '翻牌竞态 ⇒ 该榜本轮未落定，不落完成标记',
+  );
+  assert.equal(await PointRecordModel.countDocuments({ userId: cycB[0], refId: `cycling:week:${U14}` }), 1, '夹具自证：那条钱真的落了账');
+});
+
+test('SP-19 完成标记过期重评后同结论：reason 归位完成留痕并续期 TTL（markBoardSettled 撞键分支）', async () => {
+  await seedBoard('cycling', U15_START, [6600, 6500, 6450, 6000, 5900, 5800, 5700, 5600, 5500, 5400, 5300, 5200]);
+  await settlePeriod('week', U15, U15_END, NOW15);
+  const key = { type: 'cycling', period: 'week' as const, periodKey: U15, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID };
+  const row = await BoardSettlementModel.findOne(key).lean();
+  assert.ok(row, '首轮：cycling 过门槛且全部落定 ⇒ 完成标记已落');
+  assert.match(row?.reason ?? '', /已完成结算/);
+  // 模拟"标记早已过期 + 上一世文案"：updatedAt 归零、reason 改写（raw handle 绕过 timestamps 插件）
+  await BoardSettlementModel.collection.updateOne({ _id: row?._id }, { $set: { updatedAt: new Date(0), reason: '占位旧文案（过期模拟）' } });
+  // 假时钟推过期后重评：榜仍过门槛、三条仍撞 credited 终态 ⇒ 全部落定，标记续期并归位
+  await settlePeriod('week', U15, U15_END, NOW15 + DAY_MS + 60_000);
+  const after = await BoardSettlementModel.findOne(key).lean();
+  assert.match(after?.reason ?? '', /已完成结算/, '重评同结论 ⇒ reason 归位完成留痕（Task 10 台账页看最新结论）');
+  assert.ok((after?.updatedAt as Date).getTime() > 0, '重评同结论 ⇒ 续期 TTL，否则从过期起每次进页重扫该榜');
+  assert.equal(await BoardSettlementModel.countDocuments(key), 1, '撞键分支只更新既有行，不新增行');
 });
