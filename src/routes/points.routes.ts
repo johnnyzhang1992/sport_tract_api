@@ -8,15 +8,21 @@ import { activateCard, adFreeUntilOf, countUnusedCards } from '../services/point
 import { getSigninCalendar } from '../services/points-calendar.js';
 import { expiringOf, streakPercentileOf } from '../services/points-summary.js';
 import { scheduleLazySettle } from '../services/board-lazy-settle.js';
+import { BOARD_REWARDS, boardRulesText } from '../config/points.js';
 import { success } from '../utils/response.js';
 
 /**
- * 积分中心接口（全部需登录）。
+ * 积分中心接口（除公开的 GET /rules 外全部需登录）。
  *
  * 汇总一次带回签到状态（含七格 cells 与未使用补签卡数）、任务行、商品与余额，前端首页/积分页只发一个请求。
  * 业务错误（AppError）由全局 error-handler 统一转成 400/404，路由层只做参数解包。
  */
 export async function pointsRoutes(fastify: FastifyInstance) {
+  // 规则页榜单文案（公开，先例 GET /ads）：规则是配置不是用户数据，游客也要能读；
+  // 文案唯一真值是 boardRulesText()，路由只透传、不改写（PR-RULES-2 钉住逐字相等）
+  fastify.get('/rules', async () =>
+    success({ boardRules: boardRulesText(BOARD_REWARDS.rewards, BOARD_REWARDS) }));
+
   fastify.get('/summary', { onRequest: [fastify.authenticate] }, async (request) => {
     const userId = request.user.userId;
     // 懒结算后台触发（Task 9 / spec §4.2）：放在读汇总之前，但**不等它、也不因它失败**——

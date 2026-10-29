@@ -9,7 +9,7 @@ import {
 } from '../src/models/point.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { LoginLogModel } from '../src/models/login-log.model.js';
-import { BOARD_REWARDS, POINTS } from '../src/config/points.js';
+import { BOARD_REWARDS, POINTS, boardRulesText } from '../src/config/points.js';
 import { creditPoints } from '../src/services/points-ledger.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { previousDateKey, shiftDateKey } from '../src/utils/points-domain.js';
@@ -217,8 +217,9 @@ after(async () => {
 });
 
 test('PR1 未登录访问 /points/* 全部 401', async () => {
-  // 清单 = points.routes.ts 里注册的全部用户侧路由（实物批次加了 orders 两条），
-  // 少一条就是那条没挂 authenticate —— 新增路由必须同步进这张表
+  // 清单 = points.routes.ts 里注册的全部**需登录**路由；公开的 GET /points/rules（同 /ads 的公开口径）
+  // 不在表内，由 PR-RULES-2 正向钉住「不带 token 也 200」。
+  // 少一条就是那条没挂 authenticate —— 新增需登录路由必须同步进这张表
   const cases = [
     ['GET', '/points/summary'],
     ['POST', '/points/sign-in'],
@@ -237,6 +238,43 @@ test('PR1 未登录访问 /points/* 全部 401', async () => {
     const res = await app.inject({ method, url: `${API}${url}` });
     assert.equal(res.statusCode, 401, `${method} ${url} 游客应 401`);
   }
+});
+
+/**
+ * 规则页榜单文案（spec §4.8 第 1 条，用户逐字定稿）：分值/门槛/3 榜上限全部从
+ * BOARD_REWARDS 插值，文案里不许出现第二份数字。六句逐字钉住，渲染结果必须与定稿一字不差。
+ */
+test('PR-RULES-1 boardRulesText 六句逐字定稿，数字全部来自配置插值', () => {
+  const rules = boardRulesText(BOARD_REWARDS.rewards, BOARD_REWARDS);
+  assert.equal(rules.length, 6);
+  assert.deepEqual(rules, [
+    '每周/每月/每年，各运动类型的全国榜按总距离排名，前三名获得积分：周榜第 1 名 50 分、第 2 名 30 分、第 3 名 20 分；月榜 100 / 80 / 50 分；年榜 500 / 400 / 300 分。',
+    '榜单奖励只发给"大家都来动"的榜：同一周期内，该运动类型的全国榜参与人数超过 10 人才发放，人数不足则本期不发。',
+    '同一期内，每人最多计成绩最好的 3 个榜单，其余名次不再叠加积分。',
+    '奖励在周期结束后顺延发放：上周（周一至周日）的周榜在下周一到账，上月的月榜在下月 1 日到账，上一年的年榜在次年 1 月 1 日到账。',
+    '只有可信的运动记录计入排名：疑似搭车、轨迹漂移异常、配速不合理的记录会被剔除。',
+    '积分奖励会同时发一条消息通知，并在「积分明细」里留一条记录。',
+  ]);
+  // 插值不是装饰：换一份配置，三句数字文案必须跟着变（否则就是文案里另写了一份数字）
+  const custom = boardRulesText(
+    { week: [7, 5, 3], month: [8, 6, 4], year: [9, 7, 5] },
+    { minParticipants: 11, perUserBoards: 2 },
+  );
+  assert.ok(custom[0].includes('周榜第 1 名 7 分、第 2 名 5 分、第 3 名 3 分'));
+  assert.ok(custom[0].includes('月榜 8 / 6 / 4 分'));
+  assert.ok(custom[0].includes('年榜 9 / 7 / 5 分'));
+  assert.ok(custom[1].includes('超过 11 人才发放'));
+  assert.ok(custom[2].includes('成绩最好的 2 个榜单'));
+});
+
+test('PR-RULES-2 GET /points/rules 公开可读（不带 token），下发与 boardRulesText 逐字相等', async () => {
+  // 规则是配置不是用户数据（先例：公开 GET /ads）：游客进规则页也要能看到榜单说明
+  const res = await app.inject({ method: 'GET', url: `${API}/points/rules` });
+  assert.equal(res.statusCode, 200, res.body);
+  const rules = (res.json().data as { boardRules: string[] }).boardRules;
+  assert.equal(rules.length, 6);
+  // 路由层不得改写文案：必须与函数本体逐字相等（防止「顺手」在路由里重排/加前缀）
+  assert.deepEqual(rules, boardRulesText(BOARD_REWARDS.rewards, BOARD_REWARDS));
 });
 
 test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', async () => {

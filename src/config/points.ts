@@ -76,3 +76,24 @@ export const BOARD_REWARDS = {
    */
   skippedFreshMs: 24 * 60 * 60_000,
 };
+
+/**
+ * 规则页「榜单奖励」六句定稿（spec §4.8 第 1 条，2026-10-28 用户逐字确认）。
+ *
+ * 分值/门槛/3 榜上限一律从配置插值——文案里不许再写第二份数字，否则后台调了分值
+ * 规则页还在说旧数（本轮刚修过「需 200 积分」那个坑）。第 4–6 句是纯文字，
+ * 与 spec 逐字一致（test/points-routes.test.ts PR-RULES-1 钉住）。
+ */
+export function boardRulesText(
+  rewards: Record<'week' | 'month' | 'year', [number, number, number]> = BOARD_REWARDS.rewards,
+  opts: { minParticipants: number; perUserBoards: number } = BOARD_REWARDS,
+): string[] {
+  return [
+    `每周/每月/每年，各运动类型的全国榜按总距离排名，前三名获得积分：周榜第 1 名 ${rewards.week[0]} 分、第 2 名 ${rewards.week[1]} 分、第 3 名 ${rewards.week[2]} 分；月榜 ${rewards.month.join(' / ')} 分；年榜 ${rewards.year.join(' / ')} 分。`,
+    `榜单奖励只发给"大家都来动"的榜：同一周期内，该运动类型的全国榜参与人数超过 ${opts.minParticipants} 人才发放，人数不足则本期不发。`,
+    `同一期内，每人最多计成绩最好的 ${opts.perUserBoards} 个榜单，其余名次不再叠加积分。`,
+    '奖励在周期结束后顺延发放：上周（周一至周日）的周榜在下周一到账，上月的月榜在下月 1 日到账，上一年的年榜在次年 1 月 1 日到账。',
+    '只有可信的运动记录计入排名：疑似搭车、轨迹漂移异常、配速不合理的记录会被剔除。',
+    '积分奖励会同时发一条消息通知，并在「积分明细」里留一条记录。',
+  ];
+}
