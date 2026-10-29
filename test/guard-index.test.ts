@@ -24,7 +24,7 @@ import { NotificationModel } from '../src/models/notification.model.js';
 import { PointDailyQuotaModel, PointRecordModel, BoardSettlementModel } from '../src/models/point.model.js';
 import {
   hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
-  hasNotificationRecipientIndex, hasUniqueBoardSettlementIndex,
+  hasNotificationRecipientIndex, hasUniqueBoardSettlementIndex, hasBoardSettlementAdminReadIndex,
 } from '../src/utils/guard-index.js';
 
 before(async () => {
@@ -247,4 +247,47 @@ test('boardsettlements：字段不全（缺 periodKey）不算防线：不同期
 
 test('boardsettlements：只按 userId 唯一不算防线：一个人同期只能上一次榜', () => {
   assert.equal(hasUniqueBoardSettlementIndex([{ name: 'x', key: { userId: 1 }, unique: true }]), false);
+});
+
+/**
+ * 榜单发放台账的管理端读路径索引（Task 10）：{period,periodKey,status,type,userId} 全等值。
+ * 唯一索引的前缀是 type，而后台台账页的主路径是「按周期单元看这一期」（period+periodKey，八张榜
+ * 一起对账）——type 缺席时唯一索引服务不了它（Task 6 评审点名的 {period,status} 无索引读路径）。
+ * 性能索引，同 pointrecords/notifications 的 10-29 教训两侧都核对：删声明但 dev 库留着旧索引时
+ * 库侧假绿，声明侧先红；exact 键组合与键序一起认（换成 status 打头就服务不了「先按周期收窄」）。
+ */
+test('boardsettlements 管理端读索引：声明侧与真实库侧的防线都在（{period,periodKey,status,type,userId}）', async () => {
+  const declared = BoardSettlementModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).join(',') === 'period,periodKey,status,type,userId'
+      && Object.values(keys).every((v) => v === 1)),
+    `schema 里的索引声明没有 {period,periodKey,status,type,userId} 这条！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
+  await BoardSettlementModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
+  const idx = await BoardSettlementModel.collection.indexes();
+  assert.ok(
+    hasBoardSettlementAdminReadIndex(idx),
+    `防线不在！现有索引：${JSON.stringify(idx.map((i) => ({ name: i.name, key: i.key })))}`,
+  );
+});
+
+test('boardsettlements：读索引键序不对（status 打头）不算防线：周期前缀断了', () => {
+  assert.equal(
+    hasBoardSettlementAdminReadIndex([{ name: 'x', key: { status: 1, period: 1, periodKey: 1, type: 1, userId: 1 } }]),
+    false,
+  );
+});
+
+test('boardsettlements：读索引缺字段（没有 status）不算防线：{period,periodKey} 之后还要按状态收窄', () => {
+  assert.equal(
+    hasBoardSettlementAdminReadIndex([{ name: 'x', key: { period: 1, periodKey: 1, type: 1, userId: 1 } }]),
+    false,
+  );
+});
+
+test('boardsettlements：唯一索引不算管理端读防线（前缀是 type，周期查询用不上）', () => {
+  assert.equal(
+    hasBoardSettlementAdminReadIndex([{ name: 'x', key: { type: 1, period: 1, periodKey: 1, userId: 1 }, unique: true }]),
+    false,
+  );
 });

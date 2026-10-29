@@ -52,6 +52,11 @@ import {
   type GrantInput,
 } from '../services/points-grant.js';
 import { listOrders, shipOrder, completeOrder } from '../services/points-orders.js';
+import {
+  listBoardSettlements,
+  revokeBoardSettlement,
+  type BoardSettlementListQuery,
+} from '../services/points-board.js';
 import { pointsOverview, pointsTrend, itemsOverview } from '../services/points-admin-stats.js';
 import { adFreeRoster } from '../services/points-roster.js';
 import {
@@ -1735,6 +1740,22 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 免广告名单：当天有效的全量名单（给 We分析 人群包整包替换上传用，次日生效），按到期日倒序
   fastify.get('/points/ad-free/roster', { onRequest: [adminAuth] }, async () =>
     success(await adFreeRoster()));
+
+  // ==================== 积分管理 · 榜单发放台账（spec §4.7） ====================
+  // 列表默认只出「发放行」（pending/credited/revoked）；status=skipped 才给整榜级占位行
+  // （人数门槛占位 / 完成标记，两类都不是某个人的奖励，也永不提供撤回）。
+  // query 全是字符串，校验与归一在 service 里做（非法值 400 点名收到的值）。
+  fastify.get('/points/board-settlements', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as BoardSettlementListQuery;
+    return success(await listBoardSettlements(q));
+  });
+
+  // 撤回一笔已发放的榜奖：备注必填（原文进用户通知）→ 反向流水 + 台账 revoked + 定向通知成对落库
+  fastify.post('/points/board-settlements/:id/revoke', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const { note } = (request.body ?? {}) as { note?: unknown };
+    return success(await revokeBoardSettlement(id, { note }, { adminId: adminIdOf(request) }));
+  });
 }
 
 /** 均匀采样（保留首尾点） */

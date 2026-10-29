@@ -207,8 +207,9 @@ const itemSchema = new Schema({
  * - pending：锁已持有、发放尚未确认。**默认值**——裸 create 忘了表态时落在这一态，
  *   宁可「没发出去」也不能默认「已发过」（方向相反的默认值会把没付款的行了结掉）。
  * - credited：已发放，recordId 指向 pointrecords 那笔流水。
- * - skipped：整榜级占位行（人数门槛没过）。占位是为了别再重算——发分口径一榜一个 aggregate、
- *   一期 8 个榜，每次页面浏览都重算一遍。reason 记为什么跳过。
+ * - skipped：**只用于整榜级占位行**（人数门槛没过 / 已完成结算的完成标记），一行都不代表某个人的奖励，
+ *   永远不发分、永远不可撤回；reason 用下面的常量前缀区分两类（占位是为了别再重算——发分口径
+ *   一榜一个 aggregate、一期 8 个榜，每次页面浏览都重算一遍）。
  * - revoked：运营撤回（Task 10）。**不删行**：唯一键继续占位，撤回才是终态，
  *   否则下一次懒结算会把这笔钱原路再发一遍（撤回等于没撤）。
  *
@@ -231,6 +232,45 @@ export type BoardSettlementPeriod = typeof BOARD_SETTLEMENT_PERIODS[number];
 /** 整榜级（skipped）行的哨兵 userId：不属于任何真人，见上面注释 */
 export const BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID = '000000000000000000000000';
 
+/**
+ * 整榜级占位行（status='skipped'）的两类 reason **前缀常量**（Task 10 评审强制项）。
+ *
+ * 为什么是「常量前缀 + 谓词」而不是「自由文本」：settlePeriod 会写两种 status='skipped' 的行
+ * ——人数门槛没过的占位、以及一个单元全部落定后的完成标记（都是**缓存**，见 points-board.ts）。
+ * 只靠中文描述区分，台账页与撤回面稍一改文案就把占位当发放行：占位行 points=0、没有流水凭据，
+ * 一旦被当成一笔奖励去撤回，轻则空转（0 分流水），重则把哨兵 userId 当收件人给用户发通知。
+ * 所以：写侧只能用这两个常量起头（points-board.ts 的 thresholdSkipReason / markBoardSettled），
+ * 读侧用下面的谓词判定，**不许**再出现 `reason.includes('人数')` 这种匹配。
+ *
+ * 前缀是人读得起眼的中文（后台台账页要直接展示 reason），机器判定靠 startsWith 而不是全文匹配。
+ */
+export const BOARD_SETTLEMENT_THRESHOLD_SKIP_REASON_PREFIX = '【门槛未过】';
+export const BOARD_SETTLEMENT_SETTLED_MARKER_REASON_PREFIX = '【已完成结算】';
+
+/** 谓词的入参形状：lean 读回来的台账行（字段可能是 ObjectId、字符串或缺失） */
+type LedgerRowLike = { userId?: unknown; status?: string; reason?: string } | null | undefined;
+
+/**
+ * 结构判定（优先级高于 reason 文本）：这一行是不是「整榜级占位行」。
+ * 判据＝哨兵 userId **且** status='skipped'——两个都来自 settlePeriod 的写路径，
+ * 真人发放行的 userId 永远是真 ObjectId（required 闸门 + 12 个 0 这个 id Mongo 不会生成）。
+ * reason 认不出常量的历史行/异类行也从这里被判成整榜级：宁可少给一张撤回按钮，不可把占位当钱。
+ */
+export function isBoardLevelRow(row: LedgerRowLike): boolean {
+  if (!row) return false;
+  return String(row.userId ?? '') === BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID && row.status === 'skipped';
+}
+
+/** 门槛占位行（参与人数没过大门槛，本期整榜不发） */
+export function isThresholdSkip(row: LedgerRowLike): boolean {
+  return isBoardLevelRow(row) && String(row!.reason ?? '').startsWith(BOARD_SETTLEMENT_THRESHOLD_SKIP_REASON_PREFIX);
+}
+
+/** 完成标记行（这一期已经全部落定，有效期内不重扫；不是判决，过期会重评补发迟到者） */
+export function isSettledMarker(row: LedgerRowLike): boolean {
+  return isBoardLevelRow(row) && String(row!.reason ?? '').startsWith(BOARD_SETTLEMENT_SETTLED_MARKER_REASON_PREFIX);
+}
+
 const boardSettlementSchema = new Schema({
   /** 榜单的运动类型（ACTIVITY_TYPES 里的值）。不在这里 enum：那份表在 config/constants.ts，
    * 抄第二份就会漂移（PB-10 同一条纪律）；测试夹具用 t_ 前缀的假类型也才写得进来。 */
@@ -250,10 +290,17 @@ const boardSettlementSchema = new Schema({
   /** 本笔发放的分值；0 只用于整榜级 skipped 行 */
   points: { type: Number, required: true, min: 0 },
   status: { type: String, enum: BOARD_SETTLEMENT_STATUSES, default: 'pending' },
-  /** 跳过/撤回的原因（后台台账页与对账要看） */
+  /**
+   * 原因（后台台账页与对账要看）：
+   * - status='skipped' → 上面两个常量前缀之一（门槛占位 / 完成标记），**不是发放记录**；
+   * - status='revoked' → 后台撤回时填的备注原文（会一并出现在用户收到的通知里）。
+   */
   reason: { type: String, default: '' },
-  /** 对应的 pointrecords 流水 _id：Task 10 撤回时按它反向冲销 */
+  /** 对应的 pointrecords 流水 _id：Task 10 撤回时按它反向冲销；撤回后**不清空**（审计链留全） */
   recordId: { type: Schema.Types.ObjectId, default: null },
+  /** 撤回留痕：操作人（admin 的 _id/username）与时刻。反向流水按 idemKey 反查得到，不另存字段 */
+  revokedBy: { type: String, default: '' },
+  revokedAt: { type: Number, default: 0 },
 }, { timestamps: true, versionKey: false });
 
 // unique 是**正确性防线**不是性能索引：一期 8 个榜的懒结算会被反复、并发地触发，
@@ -261,8 +308,23 @@ const boardSettlementSchema = new Schema({
 // 删了它的症状：同一笔榜单奖励发两遍（资损）且不报错，台账多出一行，
 // claimBoardSettlement 的败者分支同时变成死代码（与上面 PointDailyQuota 同一条教训）。
 // 键序 {type,period,periodKey,userId}＝brief 钉死的形状：唯一性约束与键序无关，但 Task 7 的
-// 读路径要按 {type,period,periodKey} 前缀把整榜已发行的行一次捞出来，前缀放前面才用得上索引。
+// 读路径按 {type,period,periodKey} 前缀捞的是**某一个具体榜单**（8 个类型之一）这一期的行——
+// 那里头只有真人发放行；整榜级占位行（门槛/完成标记）的键是哨兵 userId，由 isBoardLevelRow /
+// isBoardSettlementSkipped 单独认，不属于任何人的发放台账（Task 10 的列表与撤回都据它排除）。
 boardSettlementSchema.index({ type: 1, period: 1, periodKey: 1, userId: 1 }, { unique: true });
+
+/**
+ * 管理端台账列表的读索引（Task 10）：`{period, periodKey, status, type, userId}` 等值前缀。
+ * 为什么不是复用上面那条唯一索引：它的前缀是 **type**，后台的主路径是「按周期单元看这一期」
+ * （period + periodKey，八张榜一起列出来对账），type 缺席时唯一索引帮不上忙——Task 6 评审
+ * 点名的 `{period, status}` 读路径就是这个缺口。
+ * 键序（等值在前、按筛选频率递降）：period（周期档）→ periodKey（具体哪一期）→ status
+ * （默认视图 = 三个发放态 $in / 显式 skipped = 整榜级行）→ type → userId。
+ * 覆盖：period｜period+periodKey｜+status｜+type｜+userId（全部等值前缀组合）。
+ * 不覆盖（走 _id 索引 + 残差过滤，**不是**集合扫描）：只给 userId 或什么都不给的默认翻页。
+ * 排序另走 _id（落库顺序＝结算顺序），与本索引无关——列表默认按 _id 倒序翻页，稳定不跳行。
+ */
+boardSettlementSchema.index({ period: 1, periodKey: 1, status: 1, type: 1, userId: 1 });
 
 export type BoardSettlement = mongoose.InferSchemaType<typeof boardSettlementSchema>;
 

@@ -98,3 +98,20 @@ export function hasNotificationRecipientIndex(indexes: IndexShape[]): boolean {
       && key.userId === 1 && key.published === 1 && key.publishedAt === -1;
   });
 }
+
+/**
+ * 榜单发放台账（boardsettlements，Task 10）的**管理端读路径**索引是否真在：
+ * {period:1, periodKey:1, status:1, type:1, userId:1}（全等值前缀，无 unique）。
+ * 为什么单开一条：唯一索引 {type,period,periodKey,userId} 的前缀是 type，而后台台账页的主路径是
+ * 「按周期单元看这一期」（period + periodKey，八张榜一起对账）——type 缺席时唯一索引帮不上忙，
+ * 这就是 Task 6 评审点名的 `{period,status}` 无索引读路径。
+ * 性能防线，认 exact 键组合与键序（等值前缀换成 status 打头就服务不了「先按周期收窄」的形状），
+ * 不认名字（名字是 Mongoose 自动生成的）。
+ */
+export function hasBoardSettlementAdminReadIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    return Object.keys(key).join(',') === 'period,periodKey,status,type,userId'
+      && Object.values(key).every((v) => v === 1);
+  });
+}

@@ -27,7 +27,7 @@ const BASE = '/sport-track/api/admin';
 
 /**
  * 本域的全部管理端路由（Task 4 目录 5 条 + Task 5 发放/记录 2 条 + Task 6/7 概况/用户 6 条
- * + Task 8 道具概况/名单 2 条 + 实物批次订单 3 条 = 18 条）。
+ * + Task 8 道具概况/名单 2 条 + 实物批次订单 3 条 + Task 10 榜单发放台账 2 条 = 20 条）。
  * 路径里的 id 用固定 24 位 hex：鉴权闸门在参数校验之前，但用合法形态能保证
  * 「没有 401 时也不会因为 400 而误判」。
  * 清单全不全由下面 PT-15a 拿运行期路由表对数，不靠人记得住。
@@ -57,6 +57,9 @@ const POINTS_ADMIN_ROUTES: Array<[string, string]> = [
   ['GET', `${BASE}/points/orders`],
   ['PATCH', `${BASE}/points/orders/${UID}/ship`],
   ['PATCH', `${BASE}/points/orders/${UID}/complete`],
+  // Task 10：榜单发放台账（列表 + 撤回）
+  ['GET', `${BASE}/points/board-settlements`],
+  ['POST', `${BASE}/points/board-settlements/${UID}/revoke`],
 ];
 
 /** printRoutes 的一行 → { 缩进层数, 路径段, 方法（去 HEAD） }；不匹配的行（空行、根 `/`）跳过 */
@@ -172,6 +175,7 @@ test('PT-15b 管理员凭证能过同一条闸门（反证上面的 401 不是�
     [`${BASE}/points/items/overview`, 200],
     [`${BASE}/points/ad-free/roster`, 200],
     [`${BASE}/points/orders`, 200],
+    [`${BASE}/points/board-settlements`, 200],
     // 幽灵 id：服务层 404「用户不存在」，证明路由已注册且鉴权已通过
     [`${BASE}/points/users/${UID}`, 404],
     [`${BASE}/points/users/${UID}/records`, 404],
