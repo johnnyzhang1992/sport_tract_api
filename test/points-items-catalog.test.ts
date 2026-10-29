@@ -288,7 +288,7 @@ test('PC-9b 正常兑换结果带 refundFailed: 0（成功路径也要有缺口�
   await PointItemModel.updateOne({ key: 'makeup_card' }, { $set: { unlimited: true, stock: 9999 } });
   const u = new Types.ObjectId();
   t.after(() => wipe(u));
-  // 按目录实时价造余额：价格是后台可改的运营项（2026-10-28 补签卡 200→49），
+  // 按目录实时价造余额：价格是后台可改的运营项（2026-10-29 定稿 99），
   // 写死 200 会把「扣光」测成「还剩 151」
   await seedBalance(u, (await PointItemModel.findOne({ key: 'makeup_card' }).lean())!.price);
 

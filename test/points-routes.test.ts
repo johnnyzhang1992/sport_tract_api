@@ -46,7 +46,7 @@ const activeCatalogKeys = async (): Promise<string[]> => (
 );
 
 /**
- * 补签卡目录行的实时配置（价格与配图都是后台可改的运营项，2026-10-28 价格 200→49）：
+ * 补签卡目录行的实时配置（价格与配图都是后台可改的运营项，2026-10-29 定稿 99）：
  * 全链路用例按实时值算账，别把 200 写死在断言里。
  */
 const makeupCatalog = () => PointItemModel.findOne({ key: 'makeup_card' })

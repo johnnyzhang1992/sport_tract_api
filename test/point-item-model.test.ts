@@ -62,7 +62,7 @@ test('PI-1 四条种子', async () => {
   const rows = await PointItemModel.find({ key: { $in: Object.values(POINT_ITEM_KEYS) } }).lean();
   assert.equal(rows.length, 4, '四条道具种子必须都在');
   const byKey = new Map(rows.map((r) => [r.key, r]));
-  // 补签卡价引用 config 常量（2026-10-28 由 200 调到 49）：这条断言要的是「种子价 == 代码默认价」，
+  // 补签卡价引用 config 常量（2026-10-29 定稿 99）：这条断言要的是「种子价 == 代码默认价」，
   // 不是那个数字本身；免广告三档没抽常量，仍按种子字面值钉
   assert.equal(byKey.get('makeup_card')!.price, POINTS.MAKEUP_CARD_PRICE);
   assert.equal(byKey.get('ad_free_7d')!.price, 200);
