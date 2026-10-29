@@ -3,7 +3,7 @@
  * adFreeUntil 不落字段：激活是唯一写路径、卡行数极小，存一份只会多出一个能和卡脱钩的真相（spec §5.4）。
  */
 import { Types } from 'mongoose';
-import { PointCardModel, PointItemModel } from '../models/point.model.js';
+import { PointCardModel, PointExchangeModel, PointItemModel } from '../models/point.model.js';
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
@@ -95,6 +95,8 @@ export interface UserCardDto {
   /** 获取来源：exchange=兑换 / admin=后台发放 / system=系统赠送 */
   source: string;
   sourceText: string;
+  /** 获得时花的积分（兑换=目录实时价；发放/赠送=0，端上显示「免费」） */
+  cost: number;
   createdAt: number;
 }
 
@@ -117,6 +119,12 @@ export async function listCards(userId: string, now = Date.now()): Promise<UserC
     .select({ key: 1, name: 1, 'effect.kind': 1 })
     .lean();
   const itemByKey = new Map(items.map((it) => [it.key, it]));
+
+  // 获得时花的积分：兑换行才有钱，发放/赠送没有 exchange 行 → 兜 0（端上显示「免费」）
+  const exchanges = await PointExchangeModel.find({ cardId: { $in: rows.map((r) => r._id) } })
+    .select({ cardId: 1, cost: 1 })
+    .lean();
+  const costByCardId = new Map(exchanges.map((e) => [String(e.cardId), e.cost]));
 
   // 免广告已激活卡先按激活序重放窗口（同 adFreeUntilOf 的排序口径：activatedAt 升序、同刻按 _id）
   const windowById = new Map<string, { startAt: number; endAt: number }>();
@@ -159,6 +167,7 @@ export async function listCards(userId: string, now = Date.now()): Promise<UserC
       ...(r.usedForDate ? { usedForDate: r.usedForDate } : {}),
       source: r.source ?? 'exchange',
       sourceText: SOURCE_TEXT[r.source] ?? r.source ?? '兑换获得',
+      cost: costByCardId.get(String(r._id)) ?? 0,
       createdAt: r.createdAt,
     };
   });

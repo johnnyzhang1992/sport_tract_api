@@ -155,7 +155,7 @@ test('CD-5 countUnusedCards 按道具分组，只数未过期未使用的卡', a
 // ==================== TC-L 用户侧卡列表（「我的卡」，三来源可见） ====================
 
 import { listCards } from '../src/services/points-cards.js';
-import { PointItemModel } from '../src/models/point.model.js';
+import { PointCardModel, PointExchangeModel, PointItemModel } from '../src/models/point.model.js';
 
 test('TC-L1 三来源全可见：兑换/后台发放/系统赠送都在列表里，来源文案正确', async (t) => {
   const u = newUser();
@@ -169,6 +169,12 @@ test('TC-L1 三来源全可见：兑换/后台发放/系统赠送都在列表里
     mk({ source: 'admin', grantedBy: 'admin-id', note: '运营补偿', createdAt: t0 + 60_000 }),
     mk({ source: 'system', note: '新年礼', createdAt: t0 + 120_000 }),
   ]);
+  // 兑换那张卡要带出「当时花的积分」：exchange 行按 cardId 关联（统一卡结构的「积分」列）
+  const exchangeCard = await PointCardModel.findOne({ userId: u, source: 'exchange' }).lean();
+  await PointExchangeModel.create({
+    userId: u, itemKey: 'makeup_card', cost: 49, cardId: exchangeCard!._id,
+    requestId: `tcl1-${exchangeCard!._id}`, createdAt: t0,
+  });
   const rows = await listCards(String(u), t0);
   assert.equal(rows.length, 3);
   assert.deepEqual(rows.map((r) => r.source).sort(), ['admin', 'exchange', 'system']);
@@ -176,6 +182,9 @@ test('TC-L1 三来源全可见：兑换/后台发放/系统赠送都在列表里
     [...new Set(rows.map((r) => r.sourceText))].sort(),
     ['兑换获得', '后台发放', '系统赠送'],
   );
+  // 积分：兑换=实价；发放/赠送=0（端上显示「免费」）
+  assert.equal(rows.find((r) => r.source === 'exchange')!.cost, 49);
+  assert.ok(rows.filter((r) => r.source !== 'exchange').every((r) => r.cost === 0));
   // 都是补签卡：三态口径 unused、待使用文案
   assert.ok(rows.every((r) => r.kind === 'makeup' && r.status === 'unused' && r.statusText === '待使用'));
 });
