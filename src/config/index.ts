@@ -46,6 +46,9 @@ export const config = {
   // 榜单奖励灰度开关（spec §6）：默认 false——线上先小流量验一轮结算再放开。
   // 短路点在 settlePeriod/settleDueForUser 入口；回滚＝关掉它（已发的分不回收，台账保留）。
   boardRewardsEnabled: bool(process.env.BOARD_REWARDS_ENABLED, false),
+  // 配套的发分起点 BOARD_SETTLE_FROM（东八日期串 'YYYY-MM-DD' 或毫秒，缺省＝今天 00:00）：
+  // **窗口终点 >= 它的周期单元才结算**。开闸时务必显式设成上线日，别指望"从历史开头补发"；
+  // 解析与语义见 config/points.ts 的 parseSettleFrom。
 
   // 管理后台（admin 接口独立鉴权，与小程序用户隔离）
   adminUsername: process.env.ADMIN_USERNAME ?? 'admin',

@@ -25,6 +25,7 @@ import { PointDailyQuotaModel, PointRecordModel, BoardSettlementModel } from '..
 import {
   hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
   hasNotificationRecipientIndex, hasUniqueBoardSettlementIndex, hasBoardSettlementAdminReadIndex,
+  hasBoardTrustedAggregateIndex,
 } from '../src/utils/guard-index.js';
 
 before(async () => {
@@ -290,4 +291,39 @@ test('boardsettlements：唯一索引不算管理端读防线（前缀是 type�
     hasBoardSettlementAdminReadIndex([{ name: 'x', key: { type: 1, period: 1, periodKey: 1, userId: 1 }, unique: true }]),
     false,
   );
+});
+
+/**
+ * activities 上榜单发分聚合的读索引（2026-10-29 终审 must-fix #4）：
+ * trustedBoardRows 的 $match 是 `{type, status:'finished', startTime:{$gte,$lt}}`，四道可信判据
+ * 都是文档内过滤。没有它时实际计划退到 status_1 单键——一次结算 pass 的 8 个榜各扫一遍
+ * 全部 finished 轨迹（dev 库 1000 keys/1000 docs 每榜）。慢查询不是错数，但随账本增长会把
+ * 懒结算拖成页面超时，所以同 pointrecords 的 10-29 教训两侧都核对：删声明但库里留旧索引时
+ * 库侧假绿，声明侧这条先红；exact 键组合 + 键序 + 全 1 方向一起认。
+ */
+test('activities 发分聚合读索引：声明侧与真实库侧的防线都在（{type,status,startTime}）', async () => {
+  const declared = ActivityModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).join(',') === 'type,status,startTime'
+      && Object.values(keys).every((v) => v === 1)),
+    `schema 里的索引声明没有 {type:1,status:1,startTime:1} 这条！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
+  await ActivityModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
+  const idx = await ActivityModel.collection.indexes();
+  assert.ok(
+    hasBoardTrustedAggregateIndex(idx),
+    `防线不在！现有索引：${JSON.stringify(idx.map((i) => ({ name: i.name, key: i.key })))}`,
+  );
+});
+
+test('activities：键序不对（startTime 打头）不算发分防线：等值前缀断了', () => {
+  assert.equal(hasBoardTrustedAggregateIndex([{ name: 'x', key: { startTime: 1, type: 1, status: 1 } }]), false);
+});
+
+test('activities：缺 type（只剩 status+startTime）不算发分防线：一次 pass 会扫全部类型', () => {
+  assert.equal(hasBoardTrustedAggregateIndex([{ name: 'x', key: { status: 1, startTime: 1 } }]), false);
+});
+
+test('activities：startTime 方向写成倒序不算发分防线：区间是正序收尾', () => {
+  assert.equal(hasBoardTrustedAggregateIndex([{ name: 'x', key: { type: 1, status: 1, startTime: -1 } }]), false);
 });

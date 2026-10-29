@@ -115,3 +115,22 @@ export function hasBoardSettlementAdminReadIndex(indexes: IndexShape[]): boolean
       && Object.values(key).every((v) => v === 1);
   });
 }
+
+/**
+ * 榜单发分聚合（activities，2026-10-29 终审 must-fix #4）的读路径索引是否真在：
+ * {type:1, status:1, startTime:1}——trustedBoardRows 的 $match 是
+ * `{type, status:'finished', startTime:{$gte,$lt}}`，四道可信判据都进不了索引。
+ * 性能索引（非 unique），认 exact 键组合与键序（两个等值在前、区间收尾）与全 1 方向；
+ * 换序（status/startTime 打头）或方向写成 -1 都按「防线不在」处理（索引名是 Mongoose
+ * 自动生成的，按键组合+方向认，不认名字）。
+ * 它静默消失时：一次结算 pass 的 8 个榜各自扫「全部 finished 轨迹」（dev 库实测
+ * 1000 keys/1000 docs／榜），完成标记过期后每重评一次再付一遍——慢查询而不是错数，
+ * 但 8× 全表扫会随账本增长把懒结算拖成页面超时。
+ */
+export function hasBoardTrustedAggregateIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    return Object.keys(key).join(',') === 'type,status,startTime'
+      && Object.values(key).every((v) => v === 1);
+  });
+}

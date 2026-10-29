@@ -121,6 +121,18 @@ activitySchema.index(
 // 按省查询轨迹（点亮地图省下钻）：provinces 为多键索引
 activitySchema.index({ userId: 1, provinces: 1 });
 
+/**
+ * 榜单发分聚合的读路径（services/points-board.ts 的 trustedBoardRows，2026-10-29 终审 must-fix #4）：
+ * `$match {type, status:'finished', startTime:{$gte,$lt}}`——四道可信判据（vehicleMs/driftScore/
+ * corrected/avgPace）都是同一文档上的过滤，进不了索引，能服务等值+区间的只有这三个字段。
+ * 键序：type → status（两个等值）→ startTime（区间收尾），与查询形状一一对应。
+ * 不建它时的实际计划是 `status_1` 单键（`{userId,status,startTime}` 缺 type 等值前缀用不上）：
+ * 一次结算 pass 的 8 个榜各扫一遍**全部 finished 轨迹**（dev 库实测 1000 keys/1000 docs），
+ * 单元一多就是 8×全表，且完成标记过期后每重评一次再付一遍。IDX-1（test/points-board.test.ts）
+ * 用 EXPLAIN 钉住它真被选中；guard-index.ts 的两侧自检钉住声明与库里都还在。
+ */
+activitySchema.index({ type: 1, status: 1, startTime: 1 });
+
 export type Activity = mongoose.InferSchemaType<typeof activitySchema>;
 
 export const ActivityModel = models.Activity ?? model('Activity', activitySchema);

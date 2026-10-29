@@ -77,6 +77,15 @@ function trustedMatch(type: string) {
     : { ...BASE_TRUSTED_MATCH, avgPace: { $gte: MIN_PLAUSIBLE_PACE_SEC_PER_KM } };
 }
 
+/**
+ * 发分聚合的 $match（导出给 EXPLAIN 取证共用：测试不许另抄一份过滤器形状）。
+ * 能进索引的只有 type/status 两个等值 + startTime 区间；四道可信判据都是文档内过滤
+ * （对应 models/activity.model.ts 的 {type,status,startTime} 索引，IDX-1 用 EXPLAIN 钉住）。
+ */
+export function trustedBoardMatch(type: string, startMs: number, endMs: number): Record<string, unknown> {
+  return { ...trustedMatch(type), type, startTime: { $gte: startMs, $lt: endMs } };
+}
+
 /** 某类型某窗口 [startMs, endMs) 内「可信总距离」降序的用户榜（发分口径，比展示多四道判据） */
 export async function trustedBoardRows(
   type: string,
@@ -84,7 +93,7 @@ export async function trustedBoardRows(
   endMs: number,
 ): Promise<BoardCandidate[]> {
   const rows = await ActivityModel.aggregate<{ _id: Types.ObjectId; distance: number }>([
-    { $match: { ...trustedMatch(type), type, startTime: { $gte: startMs, $lt: endMs } } },
+    { $match: trustedBoardMatch(type, startMs, endMs) },
     { $group: { _id: '$userId', distance: { $sum: '$distance' } } },
     { $sort: { distance: -1 } },
   ]);
@@ -109,6 +118,18 @@ export interface BoardReward {
 
 export type BoardPeriod = 'week' | 'month' | 'year';
 
+/**
+ * 已经计入上限的榜（上一/几轮 pass 已落定在台账上的 credited/revoked 行）。
+ * 只占「每人 3 榜」的名额，不在本轮发分——revoked 也算占用：它的唯一键仍在，本轮重算也抢不到发放权。
+ * points 是台账上的既发分值，随种子一起带过来做审计/排查；选榜**不用它排序**：
+ * 已发的榜砍不掉，名额只按「几个榜」扣，不按分值重排。
+ */
+export interface SeededBoard {
+  userId: string;
+  type: string;
+  points: number;
+}
+
 export interface PlanOpts {
   /** 各周期 TOP1/2/3 分值（spec §3 D4：周 50/30/20、月 100/80/50、年 500/400/300） */
   rewards: Record<BoardPeriod, [number, number, number]>;
@@ -116,6 +137,13 @@ export interface PlanOpts {
   minParticipants: number;
   /** 同一期每人最多计 N 个榜（D5，取分值最高的 N 个） */
   perUserBoards: number;
+  /**
+   * 本轮之前已计入的榜（终审 must-fix #1）。本函数保持纯：台账由调用方（settlePeriod）读好传进来。
+   * 为什么必须有：结算 pass 只重算「没有新鲜完成标记」的榜，上一轮已 credited 的榜会被 24h 标记短路；
+   * 若上限只在本轮算出的结果里数，同一用户就能在下一轮再拿一个新榜（第 4 个），
+   * 而台账里那 3 个还在——上限被跨轮次绕过。
+   */
+  seeded?: readonly SeededBoard[];
 }
 
 /**
@@ -166,16 +194,30 @@ function planOneBoard(
  * - 保留标记用对象身份而不是 `type:userId` 拼键：上游 $group 保证一个用户在一个榜里只有一行，
  *   但真出现重复行时拼键会把重复的一起放过（上限该数"榜"还是数"条"就说不清了）。
  * - 输出顺序＝榜的入参顺序 → 榜内名次顺序，不随分值重排（Task 7 逐条发分时对账更好做）。
+ * - `seeded`（终审 must-fix #1）：台账上已 credited/revoked 的榜先占名额——它们是既成事实、砍不掉，
+ *   所以每人的**剩余名额 = N − 已计入数**，本轮新算出的榜只按分值降序（同分 type 码点升序）填剩余名额。
+ *   同一 (人,榜) 既在台账又在候选里时只按台账算一个榜（本轮那条必然抢不到发放权）。
  */
 export function flattenWithPerUserCap(
   perBoard: ReadonlyMap<string, BoardReward[]>,
   perUserBoards: number,
+  seeded: readonly SeededBoard[] = [],
 ): BoardReward[] {
   const all: BoardReward[] = [];
   for (const rows of perBoard.values()) for (const r of rows) all.push(r);
 
+  const seededPairs = new Set<string>();
+  const seededCount = new Map<string, number>();
+  for (const s of seeded) {
+    seededPairs.add(`${s.userId}\u0000${s.type}`);
+    seededCount.set(s.userId, (seededCount.get(s.userId) ?? 0) + 1);
+  }
+  // 已在台账上的 (人,榜) 不再参与本轮候选：同一行抢锁必然 won=false（credited/revoked 是终态），
+  // 留在候选里只会跟它自己争一个名额。
+  const fresh = all.filter((r) => !seededPairs.has(`${r.userId}\u0000${r.type}`));
+
   const byUser = new Map<string, BoardReward[]>();
-  for (const r of all) {
+  for (const r of fresh) {
     const list = byUser.get(r.userId);
     if (list) list.push(r);
     else byUser.set(r.userId, [r]);
@@ -183,10 +225,11 @@ export function flattenWithPerUserCap(
 
   const keep = new Set<BoardReward>();
   const limit = Math.max(0, perUserBoards);
-  for (const list of byUser.values()) {
-    for (const r of pickBestBoards(list).slice(0, limit)) keep.add(r);
+  for (const [userId, list] of byUser) {
+    const remaining = Math.max(0, limit - (seededCount.get(userId) ?? 0));
+    for (const r of pickBestBoards(list).slice(0, remaining)) keep.add(r);
   }
-  return all.filter((r) => keep.has(r));
+  return fresh.filter((r) => keep.has(r));
 }
 
 /** 分值降序 → type 码点升序（稳定：同分值同 type 的行保持原顺序） */
@@ -215,7 +258,7 @@ export function planPeriodRewards(
     // 互不相同的类型，真传重了属于上游 bug，这里不静默合并两份榜
     perBoard.set(b.type, planOneBoard(b.type, b.rows, reward, opts));
   }
-  return flattenWithPerUserCap(perBoard, opts.perUserBoards);
+  return flattenWithPerUserCap(perBoard, opts.perUserBoards, opts.seeded ?? []);
 }
 
 /* ==========================================================================
@@ -590,6 +633,9 @@ export async function computeSettleUnits(userId: string, now: number): Promise<S
       if (seen.has(mark)) continue;
       const dueMs = settleBoundaryMs(period, periodKey);
       if (dueMs > now) continue; // C1：滞后界未到（含正在进行中的当前周/月/年）
+      // 结算起点之前的单元连枚举都不进（终审 must-fix #4）：懒结算不会为历史期反复触发 8 个聚合，
+      // 也不会在旧单元上留下任何台账行。见 settlePeriod 同一条闸门的注释。
+      if (dueMs < BOARD_REWARDS.settleFrom) continue;
       seen.add(mark);
       units.push({ period, periodKey, startMs, endMs: dueMs, dueMs });
     }
@@ -644,7 +690,14 @@ export async function settlePeriod(
 ): Promise<{ credited: number; skippedTypes: string[] }> {
   if (!BOARD_REWARDS.enabled) return { credited: 0, skippedTypes: [] }; // C5 灰度开关：SP-4
   const startMs = periodStartMsFromKey(period, periodKey); // 脏 periodKey 在这里炸，不许算出错窗口
-  if (now < settleBoundaryMs(period, periodKey)) return { credited: 0, skippedTypes: [] }; // C1 滞后闸门：SP-5
+  const boundaryMs = settleBoundaryMs(period, periodKey);
+  if (now < boundaryMs) return { credited: 0, skippedTypes: [] }; // C1 滞后闸门：SP-5
+  // 结算起点闸门（终审 must-fix #4）：窗口终点（= 滞后界 = 该期结束那一瞬）早于 settleFrom 的单元
+  // **永不结算**——开关一拨不会把上线前的周/月/年榜整片补发。这里在**任何聚合/台账写入之前**返回：
+  // 不落门槛占位、不落完成标记、不落发放行，所以没有任何一条路径能让旧单元日后自己变成"可发"；
+  // 懒结算侧 computeSettleUnits 也不枚举它们（连尝试都不尝试）。唯一能改变结论的动作是运维
+  // 显式把 BOARD_SETTLE_FROM 往前调（那是人的决定，不是这里能拦的事故）。
+  if (boundaryMs < BOARD_REWARDS.settleFrom) return { credited: 0, skippedTypes: [] };
   const credit = deps.credit ?? creditPoints;
   const notify = deps.notify ?? createNotification;
   const opts: PlanOpts = {
@@ -668,7 +721,16 @@ export async function settlePeriod(
     }
     boards.push({ type, rows });
   }
-  const rewards = planPeriodRewards(period, boards, opts);
+  // 每人 3 榜上限要跨轮次生效（终审 must-fix #1）：本轮可能只重算「没有新鲜完成标记」的少数榜
+  // （上一轮已发的那 3 个榜被 24h 标记短路，根本不在 boards 里）。只在本轮结果里数名额，
+  // 同一用户就能在下一轮再拿一个新榜 = 第 4 个。把台账上已 credited/revoked 的行作为
+  // 「已占名额」喂给纯函数 planPeriodRewards；读过滤器命中 {period,periodKey,status} 读索引。
+  const seeded: SeededBoard[] = (await BoardSettlementModel
+    .find({ period, periodKey, status: { $in: ['credited', 'revoked'] } })
+    .select({ userId: 1, type: 1, points: 1 })
+    .lean())
+    .map((r) => ({ userId: String(r.userId), type: String(r.type), points: Number(r.points ?? 0) }));
+  const rewards = planPeriodRewards(period, boards, { ...opts, seeded });
   const bizDate = bjDateStr(now);
   let credited = 0;
   // 修复轮 1（Important 1）：本轮没落定的榜（发分失败被释放/发放锁被别的请求持有中/翻牌竞态落空）

@@ -1,4 +1,5 @@
 import { config } from './index.js';
+import { bjToday0 } from '../utils/bj-time.js';
 
 export const POINTS = {
   SIGNIN_MAX: 7,
@@ -44,6 +45,30 @@ export const POINT_TASKS = {
 export type TaskKey = keyof typeof POINT_TASKS;
 
 /**
+ * 结算起点（2026-10-29 终审 must-fix #4）的解析：`BOARD_SETTLE_FROM` 收
+ * **东八日期串 'YYYY-MM-DD'（按当日 00:00）或毫秒时间戳**；缺省/空＝进程启动当天的东八零点。
+ * 语义只有一条：**窗口终点 >= settleFrom 的周期单元才可结算**，早于它的单元永不发分。
+ * 为什么缺省是"今天"：这一版之前 BOARD_REWARDS 没有起点，开关一拨就会把上线前的
+ * 所有周/月/年榜一次性补发（全平台 8 个榜 × 全部历史周期，真金白银且没人预期）。
+ * 缺省今天 ⇒ 开闸后只有「上线当天尚未结束、之后才到期」的第一期会发。
+ * 环境变量写错（既不是日期也不是正数毫秒）时**退回缺省并留一条 error 日志**：
+ * 配错只许少发不许多发，绝不能因为一个笔误把开关当成"从历史开头算起"。
+ */
+export function parseSettleFrom(raw: string | undefined, now = Date.now()): number {
+  const s = String(raw ?? '').trim();
+  if (!s) return bjToday0(now);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const ms = Date.parse(`${s}T00:00:00+08:00`);
+    if (!Number.isNaN(ms)) return ms;
+  } else {
+    const n = Number(s);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  console.error(`[points] BOARD_SETTLE_FROM 不是东八日期串（YYYY-MM-DD）也不是毫秒时间戳，已退回缺省（今天 00:00）：${s}`);
+  return bjToday0(now);
+}
+
+/**
  * 榜单奖励结算配置（spec §4.1/§4.2/§6；2026-10-29 裁定后**没有**单榜总额上限项——
  * BOARD_PER_BOARD_CAP_FACTOR 已删，勿再加回：并列全发）。
  *
@@ -61,6 +86,13 @@ export const BOARD_REWARDS = {
   } as Record<'week' | 'month' | 'year', [number, number, number]>,
   /** 单榜参与人数**严格大于**该值才发（D2；恰好 10 人不发＝产品拍板） */
   minParticipants: 10,
+  /**
+   * 结算起点（ms，东八零点）：**窗口终点 >= 此值的单元才结算**（见 parseSettleFrom 的注释）。
+   * 运营含义：`BOARD_SETTLE_FROM`＝从哪一期开始发；缺省今天 ⇒ 上线不补发任何历史，
+   * 只有上线当天还没结束、之后才到期的那一期起发。早于它的单元懒结算不再枚举，
+   * 即便被直接调 settlePeriod 也只返回 0 且不落任何台账行（永远发不出分）。
+   */
+  settleFrom: parseSettleFrom(process.env.BOARD_SETTLE_FROM),
   /** 同一期每人最多计 N 个榜（D5，取分值最高的 N 个） */
   perUserBoards: 3,
   /**

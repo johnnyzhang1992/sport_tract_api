@@ -7,6 +7,7 @@ import { buildApp } from '../src/app.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import {
   trustedBoardRows,
+  trustedBoardMatch,
   planPeriodRewards,
   flattenWithPerUserCap,
   claimBoardSettlement,
@@ -38,10 +39,11 @@ import {
 } from '../src/models/point.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
 import { hasNoPace, NO_PACE_TYPES } from '../src/utils/pace.js';
+import { hasBoardTrustedAggregateIndex } from '../src/utils/guard-index.js';
 import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM, ACTIVITY_TYPES } from '../src/config/constants.js';
-import { BOARD_REWARDS } from '../src/config/points.js';
+import { BOARD_REWARDS, parseSettleFrom } from '../src/config/points.js';
 import { creditPoints, getBalance } from '../src/services/points-ledger.js';
-import { BJ_OFFSET_MS } from '../src/utils/bj-time.js';
+import { BJ_OFFSET_MS, bjToday0 } from '../src/utils/bj-time.js';
 
 /**
  * 榜单发分专用的可信轨迹聚合（spec §7：发分口径比展示多四道防刷判据）。
@@ -997,6 +999,10 @@ const WEEK_KEYS = [
   '2027-03-22', // U14：SP-18 场景二（翻牌竞态落空 ⇒ 同上）
   '2027-03-29', // U15：SP-19 完成标记过期重评后同结论 → 续期归位
   '2027-04-05', // U16：SP-17 场景二（补翻牌竞态落空 ⇒ 未落定，不落标记）
+  '2027-04-12', // U17：SP-20（终审 must-fix #1）3 榜上限跨结算轮次
+  '2027-04-19', // U18：SP-21 结算起点之前的单元永不发分（must-fix #4）
+  '2027-04-26', // U19：SP-21 窗口跨越结算起点 ⇒ 照常发
+  '2027-05-03', // U20：SP-21 窗口终点恰好等于结算起点 ⇒ 照常发（>= 语义）
 ] as const;
 const U_START = (key: string) => bjMid(Number(key.slice(0, 4)), Number(key.slice(5, 7)), Number(key.slice(8, 10)));
 const U_END = (key: string) => U_START(key) + 7 * DAY_MS;
@@ -1016,6 +1022,10 @@ const U13 = WEEK_KEYS[12]; const U13_START = U_START(U13); const U13_END = U_END
 const U14 = WEEK_KEYS[13]; const U14_START = U_START(U14); const U14_END = U_END(U14); const NOW14 = U14_END;
 const U15 = WEEK_KEYS[14]; const U15_START = U_START(U15); const U15_END = U_END(U15); const NOW15 = U15_END;
 const U16 = WEEK_KEYS[15]; const U16_START = U_START(U16); const U16_END = U_END(U16); const NOW16 = U16_END;
+const U17 = WEEK_KEYS[16]; const U17_START = U_START(U17); const U17_END = U_END(U17); const NOW17 = U17_END;
+const U18 = WEEK_KEYS[17]; const U18_START = U_START(U18); const U18_END = U_END(U18); const NOW18 = U18_END;
+const U19 = WEEK_KEYS[18]; const U19_START = U_START(U19); const U19_END = U_END(U19); const NOW19 = U19_END;
+const U20 = WEEK_KEYS[19]; const U20_START = U_START(U20); const U20_END = U_END(U20); const NOW20 = U20_END;
 /** 月/年单元：SP-5 滞后闸门（2026-12 的结算界是 2027-01-01）与 SP-7 年榜 500 分。
  *  年榜夹具用 2027 年——2026/更早年份的窗口里有真实用户数据，绝不当结算对象。 */
 const M_DEC = '2026-12';
@@ -1673,4 +1683,180 @@ test('SP-19 完成标记过期重评后同结论：reason 归位完成留痕并�
   assert.match(after?.reason ?? '', /已完成结算/, '重评同结论 ⇒ reason 归位完成留痕（Task 10 台账页看最新结论）');
   assert.ok((after?.updatedAt as Date).getTime() > 0, '重评同结论 ⇒ 续期 TTL，否则从过期起每次进页重扫该榜');
   assert.equal(await BoardSettlementModel.countDocuments(key), 1, '撞键分支只更新既有行，不新增行');
+});
+
+/* ====================================================================
+ * 终审修复（2026-10-29）：A（3 榜上限跨轮次）+ B（结算起点与聚合索引）
+ * ================================================================== */
+
+test('SP-20 3 榜上限跨结算轮次生效：重算一个未落定的榜，不会给已满 3 榜的人第 4 个榜（终审 must-fix #1）', async () => {
+  // 场景与 SP-18 同源：本轮有一个榜「未落定」（walking 的 TOP2 发分炸掉、锁被释放），
+  // 落不下完成标记 ⇒ 下一轮会重新结算 walking。上一轮已发的那 3 个榜被 24h 标记短路，不在本轮 boards 里。
+  // 上限若只在本轮结果里数（修复前），multi 就能在第二轮拿下 walking = 第 4 个榜。
+  const multi = mkUser();
+  const others: Record<string, Types.ObjectId[]> = {};
+  for (const type of ['cycling', 'hiking', 'rowing', 'walking']) {
+    others[type] = await seedBoard(type, U17_START, [8000, 7900, 7000, 6900, 6800, 6700, 6600, 6500, 6400, 6300, 6200]);
+    await mkActivity(multi, type, 9000, {
+      startTime: U17_START + DAY_MS,
+      avgPace: hasNoPace(type) ? null : MIN_PLAUSIBLE_PACE_SEC_PER_KM + 100,
+    });
+  }
+  const firstPass = await captureErrors(async () => {
+    const r = await settlePeriod('week', U17, U17_END, NOW17, {
+      credit: async (uid, input, n) => {
+        if (uid === String(others.walking[0]) && String(input.refId ?? '').startsWith('walking:')) {
+          throw new Error('夹具：第一轮 walking TOP2 发分失败');
+        }
+        return creditPoints(uid, input, n ?? NOW17);
+      },
+      notify: (async () => ({ id: 'n', title: 't', content: 'c' })) as never,
+    });
+    // cycling/hiking/rowing 各 3 条 + walking（multi 被上限砍掉）TOP2 失败、TOP3 照发 = 1 条
+    assert.equal(r.credited, 10, `第一轮：3 榜×3 + walking 1 条；实际 ${r.credited}`);
+  });
+  assert.match(firstPass, /发分失败/, '夹具自证：walking TOP2 的失败走了失败路径');
+  const multiCreditedAfter1 = await BoardSettlementModel.countDocuments({
+    period: 'week', periodKey: U17, userId: multi, status: 'credited',
+  });
+  assert.equal(multiCreditedAfter1, 3, '第一轮 multi 拿满 3 个榜（walking 的第 4 个被砍）');
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: multi, refId: `walking:week:${U17}` }),
+    0,
+    'multi 的 walking 第一轮没发',
+  );
+  // walking 本轮未落定 ⇒ 没有完成标记；其余 7 个榜有。把标记时刻归一到假时钟（SP-15 同款），
+  // 第二轮只会重算 walking——这正是「已发的 3 个榜被标记短路、不在本轮 boards 里」的现场。
+  assert.equal(
+    await BoardSettlementModel.countDocuments({
+      period: 'week', periodKey: U17, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID, type: 'walking',
+    }),
+    0,
+    '夹具自证：walking 未落定 ⇒ 无完成标记',
+  );
+  await BoardSettlementModel.collection.updateMany(
+    { period: 'week', periodKey: U17, userId: new Types.ObjectId(BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID) },
+    { $set: { updatedAt: new Date(NOW17) } },
+  );
+
+  const second = await settlePeriod('week', U17, U17_END, NOW17);
+  assert.equal(second.credited, 1, '第二轮只有 walking 的 TOP2 补发；multi 已满 3 榜，一条都不加');
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: multi, refId: `walking:week:${U17}` }),
+    0,
+    '台账上已有 3 个榜 ⇒ 本轮重算出来的 walking 不能再发给同一人（修复前这里＝1，第 4 个榜）',
+  );
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: others.walking[0], refId: `walking:week:${U17}` }),
+    1,
+    '新落定的 walking 照常付给不受上限影响的人（上限只砍满额用户）',
+  );
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U17, userId: multi, status: 'credited' }),
+    3,
+    '两轮之后 multi 在 U17 仍是 3 个榜',
+  );
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U17, userId: multi, type: 'walking' }),
+    0,
+    '第 4 个榜连台账行都不许有',
+  );
+  await assertPerUserBoardCap('week', U17);
+  await assertUnitLedgerMatchesRecords('week', U17);
+});
+
+test('SP-21 结算起点：窗口终点早于 settleFrom 的单元永不发分；跨越/等于起点的照常发（终审 must-fix #4）', async () => {
+  const saved = BOARD_REWARDS.settleFrom;
+  assert.equal(typeof saved, 'number', 'settleFrom 必须是毫秒数（默认＝进程启动当天的东八零点）');
+  // 解析口径：BJ 日期串 = 当日 00:00；毫秒串原样；空/脏值退回「今天 00:00」而不是历史开头
+  assert.equal(parseSettleFrom('2027-01-15'), bjMid(2027, 1, 15), '日期串按东八零点解析');
+  assert.equal(parseSettleFrom(String(bjMid(2027, 2, 1))), bjMid(2027, 2, 1), '毫秒串原样');
+  assert.equal(parseSettleFrom(undefined, NOW18), bjToday0(NOW18), '缺省＝当天东八零点');
+  const dirty = await captureErrors(async () => {
+    assert.equal(parseSettleFrom('not-a-date', NOW18), bjToday0(NOW18), '脏值退回缺省（少发不多发）');
+  });
+  assert.match(dirty, /BOARD_SETTLE_FROM/, '脏值要留痕，别静默当成"从头算"');
+
+  try {
+    // (i) 整个窗口早于起点：一分不发，且不落任何台账行（连占位/标记都没有）
+    const before = await seedBoard('cycling', U18_START, [5200, 5100, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200, 4100]);
+    BOARD_REWARDS.settleFrom = U18_END + 1;
+    const gated = await settlePeriod('week', U18, U18_END, NOW18);
+    assert.equal(gated.credited, 0, '早于 settleFrom 的单元必须零发放');
+    assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: { $regex: `:week:${U18}$` } }), 0);
+    assert.equal(await BoardSettlementModel.countDocuments({ periodKey: U18 }), 0, '旧单元不落任何台账行（不把"不发"写成门槛跳过）');
+    // 懒结算入口也不枚举它：这个人有可信行，但该单元早于起点
+    const units = await computeSettleUnits(String(before[0]), NOW18);
+    assert.equal(units.some((u) => u.period === 'week' && u.periodKey === U18), false, 'computeSettleUnits 不枚举起点之前的单元');
+
+    // (ii) 窗口跨越起点（起点落在窗口中间）：窗口终点 >= 起点 ⇒ 照常发
+    await seedBoard('cycling', U19_START, [5200, 5100, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200, 4100]);
+    BOARD_REWARDS.settleFrom = U19_START + 2 * DAY_MS;
+    const straddle = await settlePeriod('week', U19, U19_END, NOW19);
+    assert.equal(straddle.credited, 3, '跨越起点的那一期照发 TOP3');
+
+    // (iii) 窗口终点恰好等于起点：>= 语义 ⇒ 照发
+    await seedBoard('cycling', U20_START, [5200, 5100, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200, 4100]);
+    BOARD_REWARDS.settleFrom = U20_END;
+    const exact = await settlePeriod('week', U20, U20_END, NOW20);
+    assert.equal(exact.credited, 3, '终点 == 起点仍可结算（边界取 >=，不是 >）');
+  } finally {
+    BOARD_REWARDS.settleFrom = saved;
+  }
+});
+
+test('IDX-1 发分聚合的 $match 走 {type,status,startTime} 索引：声明侧/库侧/EXPLAIN 三处钉住（must-fix #4 索引）', async () => {
+  // 声明侧：删掉 activitySchema.index({type,status,startTime}) 时这条先红（库里可能还留着索引）。
+  const declared = ActivityModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).join(',') === 'type,status,startTime'
+      && Object.values(keys).every((v) => v === 1)),
+    `schema 里没有 {type:1,status:1,startTime:1} 这条声明！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
+  await ActivityModel.createIndexes();
+  const idx = await ActivityModel.collection.indexes();
+  const target = idx.find((i) => hasBoardTrustedAggregateIndex([i]));
+  assert.ok(target, `真实库里没有这条发分聚合索引！现有索引：${JSON.stringify(idx.map((i) => i.key))}`);
+
+  // 夹具：窗口内至少一条可信轨迹（保证 EXPLAIN 的 nReturned ≥ 1）
+  await mkActivity(mkUser(), 'running', 4321, { startTime: WIN_START + 1 });
+  // 与 trustedBoardRows 同一份 $match（trustedBoardMatch 由服务层导出，测试不另抄过滤器形状）
+  const explain: any = await ActivityModel.aggregate([
+    { $match: trustedBoardMatch('running', WIN_START, WIN_END) },
+    { $group: { _id: '$userId', distance: { $sum: '$distance' } } },
+    { $sort: { distance: -1 } },
+  ]).explain('executionStats');
+  const stages: string[] = [];
+  const indexNames: string[] = [];
+  // explain 的形态随 Mongo 版本/管道而定（有 $sort 时 explainVersion=2：{stages:[{$cursor:{queryPlanner,executionStats}}]}）；
+  // 整棵树遍历，只认 stage/indexName 与 executionStats 三个计数，不依赖具体嵌套层级。
+  let stats: { nReturned?: number; totalDocsExamined?: number; totalKeysExamined?: number } = {};
+  const walk = (node: any) => {
+    if (!node || typeof node !== 'object') return;
+    if (typeof node.stage === 'string') stages.push(node.stage);
+    if (node.indexName) indexNames.push(node.indexName);
+    if (typeof node.totalDocsExamined === 'number' && !stats.totalDocsExamined) {
+      stats = { nReturned: node.nReturned, totalDocsExamined: node.totalDocsExamined, totalKeysExamined: node.totalKeysExamined };
+    }
+    for (const v of Object.values(node)) {
+      if (v && typeof v === 'object') walk(v);
+    }
+  };
+  walk(explain);
+  assert.equal(stages.includes('COLLSCAN'), false, `发分聚合走了集合扫描：${JSON.stringify(stages)}`);
+  assert.ok(stages.includes('IXSCAN'), `没有 IXSCAN：${JSON.stringify(stages)}`);
+  assert.ok(indexNames.includes(String(target!.name)),
+    `没有落到 {type,status,startTime} 索引 ${target!.name} 上（修复前退到 status_1，一次 pass 的 8 个榜各扫一遍全部 finished 轨迹）：${JSON.stringify(indexNames)}`);
+  const statsFinal = stats as { nReturned?: number; totalDocsExamined?: number; totalKeysExamined?: number };
+  assert.ok(Number(statsFinal.nReturned ?? 0) >= 1, '夹具自证：窗口内至少有一个用户');
+  // 选择性取证：扫描的键/文档数与「全库 finished 轨迹」比必须是收窄的（修复前 1000/1000 每榜）
+  const finishedTotal = await ActivityModel.countDocuments({ status: 'finished' });
+  assert.ok(
+    Number(statsFinal.totalKeysExamined) <= Number(statsFinal.totalDocsExamined),
+    `索引键数不该多于回表数：keys=${statsFinal.totalKeysExamined} docs=${statsFinal.totalDocsExamined}`,
+  );
+  assert.ok(
+    Number(statsFinal.totalDocsExamined) < finishedTotal,
+    `一次榜聚合不该扫完全部 finished 轨迹：docs=${statsFinal.totalDocsExamined} / 全库=${finishedTotal}`,
+  );
 });
