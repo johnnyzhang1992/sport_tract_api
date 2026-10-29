@@ -4,8 +4,8 @@ import mongoose, { Types } from 'mongoose';
 import { config, isOssConfigured } from '../src/config/index.js';
 import { POINTS } from '../src/config/points.js';
 import {
-  PointAccountModel, PointCardModel, PointDailyModel, PointExchangeModel, PointItemModel,
-  PointLotModel, PointRecordModel,
+  PointAccountModel, PointCardModel, PointDailyModel, PointDailyQuotaModel, PointExchangeModel,
+  PointItemModel, PointLotModel, PointRecordModel,
 } from '../src/models/point.model.js';
 import { creditPoints, getBalance } from '../src/services/points-ledger.js';
 import { seedPointItems } from '../src/services/points-catalog.js';
@@ -27,6 +27,15 @@ const onShelf = async (key: string) => {
   await PointItemModel.updateOne({ key }, { $set: { active: true } });
 };
 
+/**
+ * 每日投放计数器的清场范围：2026-10-29 起运营给三条免广告卡配了真实 dailyQuota（30 天 5 / 15 天 10 / 7 天 20）。
+ * 这些用例把它们当普通商品反复兑换，计数器按 {key,dateKey,userId} 跨运行累计——不清掉的话
+ * 同一天第二次跑就会撞当日投放上限（PC-5 的 20 并发更是刚好吃满 7 天卡的 20 张）。
+ * 只删计数器行，绝不动目录行的 dailyQuota/perUserDaily（那是运营配置，不是测试数据）。
+ */
+const RESET_QUOTA_KEYS = ['makeup_card', 'ad_free_7d', 'ad_free_15d', 'ad_free_30d'];
+const resetQuota = () => PointDailyQuotaModel.deleteMany({ key: { $in: RESET_QUOTA_KEYS } });
+
 before(async () => {
   // 单文件直跑不经过 app 的 mongodb 插件，这里自行连接；唯一索引异步建，幂等/并发断言要先等 init
   await mongoose.connect(config.mongodbUri, { serverSelectionTimeoutMS: 5000 });
@@ -34,6 +43,7 @@ before(async () => {
     PointExchangeModel.init(), PointRecordModel.init(), PointAccountModel.init(),
     PointDailyModel.init(), PointItemModel.init(),
   ]);
+  await resetQuota();
 });
 
 after(async () => {
@@ -44,6 +54,7 @@ after(async () => {
     { key: { $in: ['makeup_card', 'ad_free_7d', 'ad_free_15d', 'ad_free_30d'] } },
     { $set: { unlimited: true, stock: 9999 } },
   );
+  await resetQuota();
   await mongoose.disconnect().catch(() => {});
 });
 
@@ -150,6 +161,9 @@ test('PC-5 幂等：同一 requestId 并发 20 次只扣一次分、发一张卡
   await seedPointItems();
   await PointItemModel.updateOne({ key: 'ad_free_7d' }, { $set: { unlimited: false, stock: 50 } });
   await onShelf('ad_free_7d');
+  // 20 发并发正好等于 7 天卡现行的当日投放 20 张：先清掉同文件前几条用例吃掉的计数器，
+  // 否则这一发会撞当日总量（这不是本用例要测的东西）
+  await resetQuota();
   const u = new Types.ObjectId();
   t.after(() => wipe(u));
   await seedBalance(u, 200);

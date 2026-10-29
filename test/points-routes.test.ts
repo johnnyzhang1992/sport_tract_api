@@ -502,7 +502,8 @@ test('PR4 补窗口最左日：一条 makeup_reward + 一条 makeup_topup，明�
       source: 'sign', createdAt: Date.now(),
     });
   }
-  await seedPoints(userId, POINTS.MAKEUP_CARD_PRICE);
+  // 按目录实时价凑余额（2026-10-29 起补签卡价 99）：写死常量会在运营改价的当天假红
+  await seedPoints(userId, (await makeupCatalog())?.price ?? 0);
   const ex = await post('/points/items/makeup_card/exchange', { requestId: `pr4-${Date.now()}` });
   assert.equal(ex.statusCode, 200, ex.body);
 

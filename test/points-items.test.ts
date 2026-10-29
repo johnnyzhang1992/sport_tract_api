@@ -205,7 +205,8 @@ test('PI1 按目录实时价兑换一张卡，30 天有效，兑换记录可查'
 test('PI2 同 requestId 重复兑换幂等，不重复扣分/发卡', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
-  await seedPoints(uid, POINTS.MAKEUP_CARD_PRICE);
+  // 按目录实时价凑余额：2026-10-29 起补签卡价 99，写死常量会让用例在改价当天假红
+  await seedPoints(uid, (await makeupCatalog())?.price ?? 0);
 
   const first = await exchangeItem(String(uid), 'makeup_card', 'req-1', NOW);
   const again = await exchangeItem(String(uid), 'makeup_card', 'req-1', NOW + 60000);
@@ -354,7 +355,8 @@ test('PI6 余额恰好用尽的双击：后到请求命中在途兑换记录，�
 test('PI7 兑换记录写失败不留孤儿卡，重试仍只对应一次扣分', async (t) => {
   const uid = newUser();
   t.after(() => wipe(uid));
-  await seedPoints(uid, POINTS.MAKEUP_CARD_PRICE);
+  const makeupPrice = (await makeupCatalog())?.price ?? 0; // 实时价（2026-10-29 起 99），别写死常量
+  await seedPoints(uid, makeupPrice);
 
   const model = PointExchangeModel as unknown as {
     create: (...args: unknown[]) => Promise<unknown>;
@@ -370,7 +372,7 @@ test('PI7 兑换记录写失败不留孤儿卡，重试仍只对应一次扣分'
   // M1/M2 不变量（A）：扣分必须真正撤销，卡与库存一起回滚——不能留下「扣了分没卡」
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 0);
   assert.equal(await PointExchangeModel.countDocuments({ userId: uid }), 0);
-  assert.equal(await getBalance(String(uid), NOW), POINTS.MAKEUP_CARD_PRICE, '失败后余额回到扣分前');
+  assert.equal(await getBalance(String(uid), NOW), makeupPrice, '失败后余额回到扣分前');
   const failedAcc = await PointAccountModel.findOne({ userId: uid }).lean();
   assert.equal(failedAcc?.totalSpent, 0, 'totalSpent 也必须回滚');
 
@@ -979,7 +981,7 @@ test('DQ-11 个人行那步抛异常：已抢到的总量格当场退回，不�
   assert.equal((await quotaRow(key, '', now))?.count, 1);
 });
 
-test('DQ-12 额度回补失败要像库存缺口一样报出来：400 保留主文案、尾注格数、data 带 quotaRefundFailed', async (t) => {
+test('DQ-12 额度回补失败只写服务端日志：用户只见兑换失败本身（message 无尾注），诊断仍在 data 与日志里', async (t) => {
   const uid = newUser();
   const key = await tempItem({ dailyQuota: 1, perUserDaily: 1 });
   t.after(() => dropTemp(key, uid));
@@ -994,21 +996,33 @@ test('DQ-12 额度回补失败要像库存缺口一样报出来：400 保留主�
     if (inc?.count === -1) throw new Error('quota refund boom');
     return (realUpd as unknown as (...a: unknown[]) => unknown)(...args);
   });
-  // undoQuota 仍会 console.error 留底（同库存 backStock 口径），测试里压掉噪音
+  // 收集 console.error 而不是压掉：缺口必须只走服务端日志（2026-10-29 主人定稿）
+  const logs: unknown[][] = [];
   const originalError = console.error;
-  console.error = () => {};
+  console.error = (...args: unknown[]) => { logs.push(args); };
   try {
     await assert.rejects(() => exchangeItem(String(uid), key, 'req-dq12', now), (e: unknown) => {
       const err = e as AppError;
       assert.equal(err.statusCode, 400, '主状态码保留（前端按「积分不足」引导赚分）');
-      assert.match(err.message, /^积分不足/, '主文案原样，缺口以尾注追加');
-      assert.match(err.message, /（另：每日额度回补失败 2 格，请人工核对）/, '总量行＋个人行都没退回去');
-      assert.equal(err.extra?.quotaRefundFailed, 2);
+      assert.equal(err.message, '积分不足（当前 100，需要 200）', '主文案逐字原样，运维尾注不再追加');
+      assert.doesNotMatch(err.message, /回补失败|人工核对/, '缺口提示不再对用户可见（客户端只渲染 e.message）');
+      assert.equal(err.extra?.quotaRefundFailed, 2, '非用户可见的运维字段仍要带上（data.quotaRefundFailed）');
       return true;
     });
   } finally {
     upd.restore();
     console.error = originalError;
   }
-  assert.equal((await quotaRow(key, '', now))?.count, 1, '退不回去的那格就是缺口——现在文案点名，不再无声少发');
+  // 服务端日志保留结构化诊断：itemKey / userId / dateKey / failedSlots
+  const gapLog = logs.find((args) => {
+    const meta = args[1] as { failedSlots?: number } | undefined;
+    return typeof meta === 'object' && meta !== null && meta.failedSlots === 2;
+  });
+  assert.ok(gapLog, '回补缺口必须写一条结构化服务端日志');
+  const meta = gapLog[1] as Record<string, unknown>;
+  assert.equal(meta.itemKey, key);
+  assert.equal(meta.userId, String(uid));
+  assert.equal(meta.dateKey, bjDateStr(now));
+  assert.equal(meta.failedSlots, 2, '总量行＋个人行都没退回去');
+  assert.equal((await quotaRow(key, '', now))?.count, 1, '退不回去的那格就是缺口——日志点名，不再无声少发');
 });
