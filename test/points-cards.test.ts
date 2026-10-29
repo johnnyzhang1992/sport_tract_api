@@ -151,3 +151,103 @@ test('CD-5 countUnusedCards 按道具分组，只数未过期未使用的卡', a
   const byKey = Object.fromEntries(rows.map((r) => [r.itemKey, r.unused]));
   assert.deepEqual(byKey, { ad_free_7d: 2, makeup_card: 1 });
 });
+
+// ==================== TC-L 用户侧卡列表（「我的卡」，三来源可见） ====================
+
+import { listCards } from '../src/services/points-cards.js';
+import { PointItemModel } from '../src/models/point.model.js';
+
+test('TC-L1 三来源全可见：兑换/后台发放/系统赠送都在列表里，来源文案正确', async (t) => {
+  const u = newUser();
+  t.after(() => wipe(u));
+  const t0 = Date.parse('2026-10-20T10:00:00+08:00');
+  const mk = (over: Record<string, unknown>) => ({
+    userId: u, itemKey: 'makeup_card', status: 'unused', expiresAt: t0 + 30 * DAY, createdAt: t0, ...over,
+  });
+  await PointCardModel.insertMany([
+    mk({ source: 'exchange', createdAt: t0 }),
+    mk({ source: 'admin', grantedBy: 'admin-id', note: '运营补偿', createdAt: t0 + 60_000 }),
+    mk({ source: 'system', note: '新年礼', createdAt: t0 + 120_000 }),
+  ]);
+  const rows = await listCards(String(u), t0);
+  assert.equal(rows.length, 3);
+  assert.deepEqual(rows.map((r) => r.source).sort(), ['admin', 'exchange', 'system']);
+  assert.deepEqual(
+    [...new Set(rows.map((r) => r.sourceText))].sort(),
+    ['兑换获得', '后台发放', '系统赠送'],
+  );
+  // 都是补签卡：三态口径 unused、待使用文案
+  assert.ok(rows.every((r) => r.kind === 'makeup' && r.status === 'unused' && r.statusText === '待使用'));
+});
+
+test('TC-L2 免广告卡激活后 active 窗口正确，endAt 与 adFreeUntilOf 一致', async (t) => {
+  const u = newUser();
+  t.after(() => wipe(u));
+  const t0 = Date.parse('2026-10-20T10:00:00+08:00');
+  // 目录行提供名称（目录按 key join）
+  await PointItemModel.updateOne(
+    { key: 'ad_free_7d' },
+    { $set: { name: '免广告卡·7 天', effect: { kind: 'ad_free', days: 7 } } },
+    { upsert: true },
+  );
+  const card = await PointCardModel.create({
+    userId: u, itemKey: 'ad_free_7d', status: 'unused', source: 'admin',
+    benefitDays: 7, expiresAt: t0 + 30 * DAY, createdAt: t0,
+  });
+  // 未激活：unused
+  assert.equal((await listCards(String(u), t0))[0].status, 'unused');
+  // 激活：active，窗口 [t0, t0+7d]
+  await activateCard(String(u), String(card._id), t0);
+  const rows = await listCards(String(u), t0 + DAY);
+  assert.equal(rows[0].status, 'active');
+  assert.equal(rows[0].statusText, '生效中');
+  assert.equal(rows[0].startAt, t0);
+  assert.equal(rows[0].endAt, t0 + 7 * DAY);
+  // 一致性钉：逐卡窗口的 endAt === adFreeUntilOf 的重放结果（不许出现第二份算术）
+  assert.equal(rows[0].endAt, await adFreeUntilOf(String(u)));
+  assert.equal(rows[0].name, '免广告卡·7 天');
+});
+
+test('TC-L3 顺延排队：第二张在第一张窗口内激活 → queued，startAt=前一张 endAt', async (t) => {
+  const u = newUser();
+  t.after(() => wipe(u));
+  const t0 = Date.parse('2026-10-20T10:00:00+08:00');
+  const mk = (activatedAt: number) => ({
+    userId: u, itemKey: 'ad_free_7d', status: 'used', source: 'exchange',
+    benefitDays: 7, activatedAt, expiresAt: activatedAt + 30 * DAY, createdAt: activatedAt,
+  });
+  await PointCardModel.insertMany([mk(t0), mk(t0 + 2 * DAY)]); // 第二张在第 2 天就激活了
+  const rows = await listCards(String(u), t0 + 3 * DAY);
+  const byStart = rows.sort((a, b) => (a.startAt ?? 0) - (b.startAt ?? 0));
+  assert.equal(byStart[0].status, 'active');
+  assert.equal(byStart[0].startAt, t0);
+  assert.equal(byStart[1].status, 'queued'); // 还没轮到它
+  assert.equal(byStart[1].statusText, '待生效');
+  assert.equal(byStart[1].startAt, t0 + 7 * DAY); // 第一张用完才开始
+  // 全部窗口走完后两张都 done
+  const later = await listCards(String(u), t0 + 15 * DAY);
+  assert.ok(later.every((r) => r.status === 'done' && r.statusText === '已结束'));
+});
+
+test('TC-L4 未激活但过了卡有效期 → expired；补签卡用过后带 usedForDate', async (t) => {
+  const u = newUser();
+  t.after(() => wipe(u));
+  const t0 = Date.parse('2026-10-01T10:00:00+08:00');
+  await PointCardModel.insertMany([
+    // 免广告卡：30 天卡有效期已过且从未激活
+    { userId: u, itemKey: 'ad_free_7d', status: 'unused', source: 'exchange',
+      benefitDays: 7, expiresAt: t0, createdAt: t0 - 40 * DAY },
+    // 补签卡：已使用
+    { userId: u, itemKey: 'makeup_card', status: 'used', source: 'exchange',
+      usedForDate: '2026-09-28', expiresAt: t0 + 30 * DAY, createdAt: t0 - DAY },
+  ]);
+  const rows = await listCards(String(u), t0);
+  const adFree = rows.find((r) => r.kind === 'ad_free')!;
+  const makeup = rows.find((r) => r.kind === 'makeup')!;
+  assert.equal(adFree.status, 'expired');
+  assert.equal(adFree.statusText, '已过期');
+  assert.equal(makeup.status, 'used');
+  assert.equal(makeup.usedForDate, '2026-09-28');
+  // 未使用（未过期）的排最前，过期的垫底
+  assert.equal(rows[0].kind, 'makeup');
+});

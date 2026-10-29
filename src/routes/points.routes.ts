@@ -4,7 +4,7 @@ import { getSigninState, signIn, useMakeupCard } from '../services/points-signin
 import { getTaskRows, claimTask } from '../services/points-tasks.js';
 import { listActiveItems, exchangeItem, listExchanges } from '../services/points-items.js';
 import { confirmReceipt, listMyOrders } from '../services/points-orders.js';
-import { activateCard, adFreeUntilOf, countUnusedCards } from '../services/points-cards.js';
+import { activateCard, adFreeUntilOf, countUnusedCards, listCards } from '../services/points-cards.js';
 import { getSigninCalendar } from '../services/points-calendar.js';
 import { expiringOf, streakPercentileOf } from '../services/points-summary.js';
 import { scheduleLazySettle } from '../services/board-lazy-settle.js';
@@ -121,6 +121,10 @@ export async function pointsRoutes(fastify: FastifyInstance) {
   });
 
   // 激活免广告卡（补签卡不走这条路，见 POST /signin/makeup）
+  // 我的卡：兑换/后台发放/系统赠送三来源全部可见（发放不落 exchange，这里是发放卡的唯一用户侧出口）
+  fastify.get('/cards', { onRequest: [fastify.authenticate] }, async (request) =>
+    success(await listCards(request.user.userId)));
+
   fastify.post('/cards/:cardId/activate', { onRequest: [fastify.authenticate] }, async (request) => {
     const { cardId } = request.params as { cardId: string };
     return success(await activateCard(request.user.userId, cardId));
