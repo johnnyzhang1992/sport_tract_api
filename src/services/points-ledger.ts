@@ -23,6 +23,13 @@ export interface CreditInput {
   refType?: string;
   refId?: string;
   idemKey: string;
+  /**
+   * 不占/不受每日上限（spec §4.2「不占每日上限 100」，榜单发放专用）：
+   * true ⇒ 跳过 DAILY_CAP 预占/截断，也不进 pointdaily 的当日投放计数。
+   * 默认 false＝现有行为逐字节不动。调用方（settlePeriod）必须核对 credited===期望值，
+   * 这个开关不豁免"发满"的责任。
+   */
+  ignoreDailyCap?: boolean;
 }
 
 export interface DebitInput {
@@ -40,6 +47,13 @@ export interface CreditResult {
   balance: number;
   duplicated: boolean;
   capped: boolean;
+  /**
+   * 本次落定（或先前已落定）的那笔 pointrecords._id（字符串）。
+   * 成功与两个重复分支都有值；「截断到 0 分」「零分」没有流水 ⇒ null。
+   * 榜单台账（BoardSettlement.recordId）靠它当场写回——结算**不许**再按 idemKey 反查，
+   * 那个反查本身就是 find-then-act 竞态（Task 7 评审裁定 3）。
+   */
+  recordId: string | null;
 }
 
 export interface DebitResult {
@@ -183,20 +197,24 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
   await settleExpired(userId, now);
 
   const dup = await PointRecordModel.findOne({ idemKey: input.idemKey }).lean();
-  if (dup) return { credited: 0, balance: await getBalance(userId, now), duplicated: true, capped: false };
+  if (dup) return { credited: 0, balance: await getBalance(userId, now), duplicated: true, capped: false, recordId: String(dup._id) };
 
   const requested = Math.trunc(input.points);
   if (!Number.isFinite(requested) || requested <= 0) throw new AppError(400, '积分数必须为正整数');
 
-  // 每日上限：先原子预占请求数，再按超限差额退回——并发窗口内合计仍 ≤ DAILY_CAP
-  const provisional = await bumpDailyEarned(userId, input.bizDate, requested);
-  const over = Math.max(0, provisional - POINTS.DAILY_CAP);
-  const credited = requested - over;
-  if (credited <= 0) {
-    await refundDailyEarned(userId, input.bizDate, requested);
-    return { credited: 0, balance: await getBalance(userId, now), duplicated: false, capped: true };
+  // 每日上限：先原子预占请求数，再按超限差额退回——并发窗口内合计仍 ≤ DAILY_CAP。
+  // ignoreDailyCap（榜单发放）整段跳过：既不预占，也不进当日计数器（spec §4.2「不占每日上限」）。
+  let credited = requested;
+  if (!input.ignoreDailyCap) {
+    const provisional = await bumpDailyEarned(userId, input.bizDate, requested);
+    const over = Math.max(0, provisional - POINTS.DAILY_CAP);
+    credited = requested - over;
+    if (credited <= 0) {
+      await refundDailyEarned(userId, input.bizDate, requested);
+      return { credited: 0, balance: await getBalance(userId, now), duplicated: false, capped: true, recordId: null };
+    }
+    if (over > 0) await refundDailyEarned(userId, input.bizDate, over);
   }
-  if (over > 0) await refundDailyEarned(userId, input.bizDate, over);
 
   // 先确保账户存在：否则新用户的首笔并发发放会在 upsert 阶段撞唯一键（E11000）冒到调用方
   await ensureAccount(userId);
@@ -226,9 +244,13 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
     });
   } catch (e) {
     await PointAccountModel.updateOne({ userId }, { $inc: { balance: -credited, totalEarned: -credited } });
-    await refundDailyEarned(userId, input.bizDate, credited);
-    // 并发同 idemKey：另一个请求已入账，本次按重复处理
-    if (isDuplicateKey(e)) return { credited: 0, balance: await getBalance(userId, now), duplicated: true, capped: false };
+    if (!input.ignoreDailyCap) await refundDailyEarned(userId, input.bizDate, credited);
+    // 并发同 idemKey：另一个请求已入账，本次按重复处理。回读那行的 _id 一并带回
+    // （这是账本自己的败者分支，不是结算侧的反查——调用方拿到 duplicated 时 recordId 就有值）
+    if (isDuplicateKey(e)) {
+      const again = await PointRecordModel.findOne({ idemKey: input.idemKey }).lean();
+      return { credited: 0, balance: await getBalance(userId, now), duplicated: true, capped: false, recordId: again ? String(again._id) : null };
+    }
     throw e;
   }
 
@@ -244,12 +266,12 @@ export async function creditPoints(userId: string, input: CreditInput, now = Dat
   } catch (e) {
     // 批次写失败：撤销本次发放，避免余额没有对应批次（永不过期/无法 FIFO 扣减）
     await PointAccountModel.updateOne({ userId }, { $inc: { balance: -credited, totalEarned: -credited } });
-    await refundDailyEarned(userId, input.bizDate, credited);
+    if (!input.ignoreDailyCap) await refundDailyEarned(userId, input.bizDate, credited);
     await PointRecordModel.deleteOne({ _id: record._id });
     throw e;
   }
 
-  return { credited, balance: balanceAfter, duplicated: false, capped: credited < requested };
+  return { credited, balance: balanceAfter, duplicated: false, capped: credited < requested, recordId: String(record._id) };
 }
 
 /** 扣减积分：余额闸门（原子条件更新，禁止负余额）+ 明细 + 批次 FIFO 扣减 */

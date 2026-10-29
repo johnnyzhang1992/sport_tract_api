@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import mongoose, { Types } from 'mongoose';
 import { config } from '../src/config/index.js';
-import { PointAccountModel, PointLotModel, PointRecordModel } from '../src/models/point.model.js';
+import { PointAccountModel, PointDailyModel, PointLotModel, PointRecordModel } from '../src/models/point.model.js';
 import { creditPoints, debitPoints, settleExpired, getBalance, listPointRecords, reverseDebit } from '../src/services/points-ledger.js';
 
 const userId = String(new Types.ObjectId());
@@ -282,4 +282,59 @@ test('PL11 reverseDebit：余额/totalSpent/批次复原，补偿行成对且幂
     '重放没有真实扣分，补偿必须跳过');
   assert.equal((await PointAccountModel.findOne({ userId: u }).lean())?.balance, d2.balance);
   assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'exchange_refund' }), 1);
+});
+
+/* ====================================================================
+ * Task 7 前置改造（榜单结算要用到的两件事）：
+ * - CR1：CreditResult.recordId —— 结算靠它把台账翻成 credited 并回指流水；
+ *   「重复分支回已有行 id、截断/零分回 null」是钉死的形状约定，
+ *   结算侧**不许**再按 idemKey 反查（find-then-insert 同款竞态）。
+ * - CR2：ignoreDailyCap —— spec §4.2「不占每日上限 100」：年榜 500 一笔不能被
+ *   DAILY_CAP 截断，也不得挤占 pointdaily 的当日投放计数。默认 false＝现有行为逐字节不动。
+ * ================================================================== */
+
+const crUser = String(new Types.ObjectId());
+ALL_USER_IDS.push(new Types.ObjectId(crUser));
+
+test('CR1 CreditResult.recordId：成功路径给新建流水 id，重复路径给已有行 id，截断/零分为 null', async () => {
+  const input = { type: 'board_reward', title: '骑行·周榜第 1 名·20261207周', points: 50, bizDate: '2026-11-01', idemKey: key('cr1') };
+  const ok = await creditPoints(crUser, input, NOW);
+  assert.equal(ok.credited, 50);
+  assert.ok(ok.recordId && /^[0-9a-f]{24}$/.test(ok.recordId), '成功发放必须回 recordId');
+  const rec = await PointRecordModel.findOne({ idemKey: key('cr1') }).lean();
+  assert.equal(ok.recordId, String(rec?._id), 'recordId 就是那条流水的 _id');
+  const dup = await creditPoints(crUser, input, NOW);
+  assert.equal(dup.duplicated, true);
+  assert.equal(dup.recordId, ok.recordId, '重复分支要带回已有流水的 id：结算据此补翻牌，而不是反查 idemKey');
+  // 当日额度（100）已被 cr1+bizDate 的 50 用掉一半以上后打满，拿「截到 0」的分支验 null
+  await creditPoints(crUser, { type: 'admin', title: '占满', points: 100, bizDate: '2026-11-02', idemKey: key('cr1:full') }, NOW);
+  const zero = await creditPoints(crUser, { type: 'admin', title: '超额', points: 10, bizDate: '2026-11-02', idemKey: key('cr1:over') }, NOW);
+  assert.equal(zero.credited, 0);
+  assert.equal(zero.capped, true);
+  assert.equal(zero.recordId, null, '零分/截断到 0 的路径没有流水，recordId 只能是 null');
+  // 部分截断（credited>0）的路径同样有真实流水，必须回它的 id（settle 守卫靠 credited!==points 拒翻牌，
+  // 而"这半笔钱落在哪条行上"要能从结果直接拿到）
+  await creditPoints(crUser, { type: 'admin', title: '再占满', points: 100, bizDate: '2026-11-03', idemKey: key('cr1:full3') }, NOW);
+  const part = await creditPoints(crUser, { type: 'admin', title: '截一半', points: 30, bizDate: '2026-11-03', idemKey: key('cr1:part') }, NOW);
+  assert.equal(part.credited, 0); // 100 满额：截到 0
+  assert.equal(part.recordId, null);
+});
+
+test('CR2 ignoreDailyCap：不截断、不进当日计数器，且常规通道的上限原样生效', async () => {
+  const d = '2026-11-04';
+  const fill = await creditPoints(crUser, { type: 'admin', title: '占满当日', points: 100, bizDate: d, idemKey: key('cr2:fill') }, NOW);
+  assert.equal(fill.credited, 100);
+  const board = await creditPoints(crUser, {
+    type: 'board_reward', title: '骑行·年榜第 1 名·2027年', points: 500, bizDate: d, idemKey: key('cr2:board'), ignoreDailyCap: true,
+  }, NOW);
+  assert.equal(board.credited, 500, '榜单发放不占每日上限：500 一笔全额入账');
+  assert.equal(board.capped, false);
+  assert.ok(board.recordId, '成功路径照常回 recordId');
+  assert.equal(await getBalance(crUser, NOW), 850, 'CR1 累计 50+100(11-02)+100(11-03) + CR2 的 100+500');
+  const daily = await PointDailyModel.findOne({ userId: new Types.ObjectId(crUser), bizDate: d }).lean();
+  assert.equal(daily?.earned, 100, 'ignoreDailyCap 的这笔不进当日投放计数器');
+  // 上限本身没有被"抬"：常规通道当天还是 0 余量
+  const after = await creditPoints(crUser, { type: 'admin', title: '常规', points: 1, bizDate: d, idemKey: key('cr2:after') }, NOW);
+  assert.equal(after.credited, 0);
+  assert.equal(after.capped, true);
 });
