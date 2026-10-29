@@ -20,9 +20,11 @@ import mongoose from 'mongoose';
 import { config } from '../src/config/index.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
+import { NotificationModel } from '../src/models/notification.model.js';
 import { PointDailyQuotaModel, PointRecordModel } from '../src/models/point.model.js';
 import {
   hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
+  hasNotificationRecipientIndex,
 } from '../src/utils/guard-index.js';
 
 before(async () => {
@@ -166,4 +168,44 @@ test('pointdailyquotas：普通索引（非 unique）不算防线：并发建基
 
 test('pointdailyquotas：字段不全（缺 dateKey）不算防线：跨日行会互相顶掉', () => {
   assert.equal(hasUniqueDailyQuotaIndex([{ name: 'x', key: { key: 1, userId: 1 }, unique: true }]), false);
+});
+
+/**
+ * 定向通知（notifications，Task 8）读路径索引 {userId:1, published:1, publishedAt:-1}：
+ * publishedRows 登录侧过滤是 `{published:true, $or:[{userId:null},{userId:me}]}`，$or 的 isosolution
+ * 按分支走本索引（userId、published 等值前缀 + publishedAt 倒序收尾，免内存排序）；游客/畸形 userId
+ * 收敛成 `{userId:null, published:true}`，同样落在等值前缀上。性能索引，同 pointrecords 的 10-29 教训
+ * 两侧都核对：删声明但库里留旧索引时库侧假绿，声明侧先红；既认键序也认方向（publishedAt 写成升序
+ * 就服务不了倒序排序，按「防线不在」处理）。既有的 {published:1, publishedAt:-1} 是方案保留项，
+ * 声明侧一并钉住，不许顺手删。
+ */
+test('notifications 定向读路径索引：声明侧与真实库侧的防线都在（{userId,published,publishedAt}）', async () => {
+  const declared = NotificationModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).join(',') === 'userId,published,publishedAt'
+      && keys.userId === 1 && keys.published === 1 && keys.publishedAt === -1),
+    `schema 里的索引声明没有 {userId:1,published:1,publishedAt:-1} 这条！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).join(',') === 'published,publishedAt' && keys.publishedAt === -1),
+    `既有的 {published:1,publishedAt:-1} 声明不能被删！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
+  await NotificationModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
+  const idx = await NotificationModel.collection.indexes();
+  assert.ok(
+    hasNotificationRecipientIndex(idx),
+    `防线不在！现有索引：${JSON.stringify(idx.map((i) => ({ name: i.name, key: i.key })))}`,
+  );
+});
+
+test('notifications：键序不对（published 在前）不算定向防线：$or 分支前缀是 userId', () => {
+  assert.equal(hasNotificationRecipientIndex([{ name: 'x', key: { published: 1, userId: 1, publishedAt: -1 } }]), false);
+});
+
+test('notifications：publishedAt 方向写成升序不算防线：列表口径是倒序', () => {
+  assert.equal(hasNotificationRecipientIndex([{ name: 'x', key: { userId: 1, published: 1, publishedAt: 1 } }]), false);
+});
+
+test('notifications：缺字段（没有 published）不算防线：草稿会混进结果集', () => {
+  assert.equal(hasNotificationRecipientIndex([{ name: 'x', key: { userId: 1, publishedAt: -1 } }]), false);
 });

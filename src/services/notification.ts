@@ -10,11 +10,23 @@ export interface NotificationSummaryItem {
   title: string;
 }
 
-/** 已发布通知，按发布时间倒序（首页/列表共用的唯一排序口径） */
-async function publishedRows() {
-  return NotificationModel.find({ published: true })
+/**
+ * 用户侧可见性过滤（Task 8，方案 A）：广播行（userId:null，含字段缺失的历史行）+ 发给我的定向行。
+ * 游客/畸形 userId 一律收敛成「只看广播」——比 plan 片段更严：畸形串若落到无过滤分支会泄他人定向行。
+ */
+function recipientFilter(userId?: string): Record<string, unknown> {
+  if (userId && isObjectIdLike(userId)) {
+    // 单条 $or 查询：一行最多命中一个分支，天然不会把广播重复计入
+    return { $or: [{ userId: null }, { userId: new Types.ObjectId(userId) }] };
+  }
+  return { userId: null };
+}
+
+/** 已发布通知（广播 + 定向给我的），按发布时间倒序（首页/列表共用的唯一排序口径） */
+async function publishedRows(userId?: string) {
+  return NotificationModel.find({ published: true, ...recipientFilter(userId) })
     .sort({ publishedAt: -1 })
-    .select({ title: 1, content: 1, publishedAt: 1 })
+    .select({ title: 1, content: 1, publishedAt: 1, userId: 1 })
     .lean();
 }
 
@@ -70,7 +82,7 @@ async function unreadState<T extends { _id: Types.ObjectId; publishedAt?: number
 
 /** 首页单行：登录用户取最新未读（没有则 null）；游客取最新已发布，未读数恒 0 */
 export async function notificationSummary(userId?: string) {
-  const rows = await publishedRows();
+  const rows = await publishedRows(userId);
   const { unreadRows } = await unreadState(userId, rows);
   const latest = unreadRows[0];
   return {
@@ -79,9 +91,9 @@ export async function notificationSummary(userId?: string) {
   };
 }
 
-/** 历史列表：已发布全量，倒序；游客 read 一律 false、unreadCount=0 */
+/** 历史列表：可见范围（广播+定向给我的）全量，倒序；游客 read 一律 false、unreadCount=0 */
 export async function listNotifications(userId?: string) {
-  const rows = await publishedRows();
+  const rows = await publishedRows(userId);
   const { unreadRows, isUnread } = await unreadState(userId, rows);
   return {
     items: rows.map((r) => ({
@@ -94,10 +106,11 @@ export async function listNotifications(userId?: string) {
   };
 }
 
-/** 详情：仅已发布可读；读接口不写已读 */
-export async function getNotificationDetail(id: string) {
+/** 详情：仅已发布且对我可见（广播或收件人是我）可读；读接口不写已读。
+ * 别人的定向行按 404 处理——与仓内「外来 id 藏进 404」口径一致，不外泄「存在但不可见」。 */
+export async function getNotificationDetail(id: string, userId?: string) {
   assertObjectIdLike(id, '通知不存在');
-  const row = await NotificationModel.findOne({ _id: id, published: true }).lean();
+  const row = await NotificationModel.findOne({ _id: id, published: true, ...recipientFilter(userId) }).lean();
   if (!row) throw new AppError(404, '通知不存在');
   return {
     id: String(row._id),
@@ -107,10 +120,10 @@ export async function getNotificationDetail(id: string) {
   };
 }
 
-/** 标已读：幂等（并发唯一键冲突视为成功），返回最新未读数 */
+/** 标已读：幂等（并发唯一键冲突视为成功），返回最新未读数；别人的定向行按 404（同详情口径） */
 export async function markNotificationRead(userId: string, id: string) {
   assertObjectIdLike(id, '通知不存在');
-  const exists = await NotificationModel.exists({ _id: id, published: true });
+  const exists = await NotificationModel.exists({ _id: id, published: true, ...recipientFilter(userId) });
   if (!exists) throw new AppError(404, '通知不存在');
 
   try {
@@ -123,7 +136,7 @@ export async function markNotificationRead(userId: string, id: string) {
     if ((e as { code?: number }).code !== 11000) throw e;
   }
 
-  const rows = await publishedRows();
+  const rows = await publishedRows(userId);
   const { unreadRows } = await unreadState(userId, rows);
   return { unreadCount: unreadRows.length };
 }
@@ -136,6 +149,8 @@ export interface AdminNotification {
   content: string;
   published: boolean;
   publishedAt: number | null;
+  /** 定向收件人；null＝广播。后台列表只回广播行，此字段恒 null（保留供单条 DTO 透明） */
+  userId: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -144,6 +159,8 @@ export type NotificationInput = {
   title?: unknown;
   content?: unknown;
   published?: unknown;
+  /** 定向收件人（24 位 hex）；null/缺省＝广播 */
+  userId?: unknown;
 };
 
 function toAdminNotification(r: Record<string, unknown> & { _id: unknown }): AdminNotification {
@@ -153,6 +170,7 @@ function toAdminNotification(r: Record<string, unknown> & { _id: unknown }): Adm
     content: String(r.content || ''),
     published: Boolean(r.published),
     publishedAt: (r.publishedAt as number | null) ?? null,
+    userId: r.userId ? String(r.userId) : null,
     createdAt: r.createdAt ? new Date(r.createdAt as string).getTime() : 0,
     updatedAt: r.updatedAt ? new Date(r.updatedAt as string).getTime() : 0,
   };
@@ -173,12 +191,22 @@ function validateInput(input: NotificationInput, { partial }: { partial: boolean
     out.content = content;
   }
   if (input.published !== undefined) out.published = Boolean(input.published);
+  if (input.userId !== undefined) {
+    if (input.userId === null) {
+      out.userId = null; // 显式 null＝广播
+    } else {
+      // 畸形收件人 id 必须 400：静默当广播发出去等于把定向流水公开全站
+      const raw = String(input.userId).trim();
+      if (!isObjectIdLike(raw)) throw new AppError(400, '收件人 userId 格式不合法（需 24 位 hex，或 null 表示广播）');
+      out.userId = new Types.ObjectId(raw);
+    }
+  }
   return out;
 }
 
-/** 管理端列表：含草稿，按创建时间倒序 */
+/** 管理端列表：只回广播行（含草稿）；定向通知是系统自动发的流水，不进公告台账，按创建时间倒序 */
 export async function adminListNotifications(): Promise<AdminNotification[]> {
-  const rows = await NotificationModel.find({}).sort({ createdAt: -1 }).lean();
+  const rows = await NotificationModel.find({ userId: null }).sort({ createdAt: -1 }).lean();
   return rows.map((r) => toAdminNotification(r as never));
 }
 

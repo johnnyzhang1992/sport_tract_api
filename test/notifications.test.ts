@@ -94,6 +94,10 @@ before(async () => {
 
 after(async () => {
   await NotificationReadModel.deleteMany({ userId: new Types.ObjectId(userId) });
+  for (const u of extraUsers) {
+    await NotificationReadModel.deleteMany({ userId: new Types.ObjectId(u.id) });
+    await UserModel.deleteOne({ _id: new Types.ObjectId(u.id) });
+  }
   await NotificationModel.deleteMany({ title: new RegExp(`^${PREFIX}`) });
   await NotificationModel.deleteMany({ _id: { $in: madeNotices.map((id) => new Types.ObjectId(id)) } });
   await NotificationReadModel.deleteMany({
@@ -304,4 +308,164 @@ test('NT9 未发布→发布 刷新 publishedAt；下架后公开接口不可见
 
   const pub2 = (await adminReq('PUT', `/notifications/${created.id}`, { published: true })).json().data;
   assert.ok(pub2.publishedAt > pub1.publishedAt, '重新发布要回到列表顶部');
+});
+
+// ==================== Task 8 定向通知（NT-DIR-1..5） ====================
+// Notification.userId 可选：null/缺省＝全站广播，非空＝定向（只有收件人可见）。
+// 游客与畸形 userId 一律只看广播；定向行不进后台列表（系统流水，不是公告）。
+
+const extraUsers: { id: string; token: string }[] = []; // NT-DIR 临时用户，after 统一清理
+
+/** 现造一个登录用户（openid 唯一即注册） */
+async function loginFresh(tag: string) {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/sport-track/api/auth/login',
+    payload: { code: `openid:${tag}-${Date.now()}-${Math.random().toString(36).slice(2)}` },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const d = res.json().data;
+  return { id: String(d.user?.id ?? d.user?._id), token: d.accessToken as string };
+}
+
+const getWith = (tok: string, url: string) =>
+  app.inject({ method: 'GET', url: `/sport-track/api${url}`, headers: { authorization: `Bearer ${tok}` } });
+const postWith = (tok: string, url: string) =>
+  app.inject({ method: 'POST', url: `/sport-track/api${url}`, headers: { authorization: `Bearer ${tok}` } });
+
+test('NT-DIR-1 定向通知只对收件人可见，别的用户与列表都查不到', async () => {
+  const other = await loginFresh('notif-other');
+  extraUsers.push(other);
+
+  const dir = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR1-TO-ME`,
+    content: '定向正文',
+    published: true,
+    userId,
+  })).json().data;
+  madeNotices.push(dir.id);
+
+  // 收件人：列表与详情都可见
+  const mine = (await get('/notifications')).json().data;
+  assert.ok(mine.items.some((i: { id: string }) => i.id === dir.id), '收件人列表要看到定向行');
+  assert.equal((await get(`/notifications/${dir.id}`)).statusCode, 200, '收件人详情可读');
+
+  // 非收件人：列表没有这一行；详情/标已读按仓内既有口径 404（不外泄「存在但不可见」）
+  const theirs = (await getWith(other.token, '/notifications')).json().data;
+  assert.ok(!theirs.items.some((i: { id: string }) => i.id === dir.id), '非收件人列表不能出现定向行');
+  assert.equal((await getWith(other.token, `/notifications/${dir.id}`)).statusCode, 404, '别人打开定向详情要 404');
+  assert.equal((await postWith(other.token, `/notifications/${dir.id}/read`)).statusCode, 404, '别人标已读定向行要 404');
+
+  assert.equal(dir.userId, userId, '创建定向通知要回显收件人');
+});
+
+test('NT-DIR-2 广播通知所有人可见（现有行为不回归）', async () => {
+  const other = await loginFresh('notif-bcast');
+  extraUsers.push(other);
+
+  const bcast = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR2-BROADCAST`,
+    content: '广播正文',
+    published: true,
+  })).json().data;
+  madeNotices.push(bcast.id);
+
+  for (const [who, list] of [
+    ['主用户', (await get('/notifications')).json().data],
+    ['其它用户', (await getWith(other.token, '/notifications')).json().data],
+    ['游客', (await getGuest('/notifications')).json().data],
+  ] as const) {
+    assert.ok(list.items.some((i: { id: string }) => i.id === bcast.id), `广播行 ${who} 的列表必须可见`);
+  }
+  assert.equal((await getWith(other.token, `/notifications/${bcast.id}`)).statusCode, 200, '广播详情人人可读');
+  assert.equal((await getGuest(`/notifications/${bcast.id}`)).statusCode, 200, '游客广播详情可读');
+  assert.equal(bcast.userId, null, '未传 userId 的广播行，收件人字段回显 null');
+});
+
+test('NT-DIR-3 未读数：一条广播 + 一条定向 = 2，不重复计', async () => {
+  const fresh = await loginFresh('notif-unread');
+  extraUsers.push(fresh);
+  // 共享 dev 库不写死绝对值：先取基线，再断增量
+  const base = (await getWith(fresh.token, '/notifications/summary')).json().data.unreadCount as number;
+
+  const b = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR3-BC`,
+    content: '广播一条',
+    published: true,
+  })).json().data;
+  const d = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR3-DIR`,
+    content: '定向一条',
+    published: true,
+    userId: fresh.id,
+  })).json().data;
+  madeNotices.push(b.id, d.id);
+
+  const after = (await getWith(fresh.token, '/notifications/summary')).json().data;
+  assert.equal(
+    after.unreadCount - base,
+    2,
+    '广播走 userId:null 分支、定向走 $or 收件人分支；广播若同时被两分支重复计入会得到 3',
+  );
+  assert.equal((await getWith(fresh.token, `/notifications/${d.id}`)).statusCode, 200, '收件人能打开自己的定向行');
+  assert.equal(d.userId, fresh.id, '定向行要回显收件人');
+});
+
+test('NT-DIR-4 定向通知不出现在后台通知管理列表（它是系统自动发的流水，不是公告）', async () => {
+  const dir = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR4-HIDDEN`,
+    content: '系统流水',
+    published: true,
+    userId,
+  })).json().data;
+  madeNotices.push(dir.id);
+  const bcast = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR4-SHOW`,
+    content: '广播公告（草稿）',
+    published: false,
+  })).json().data;
+  madeNotices.push(bcast.id);
+
+  const list = (await adminReq('GET', '/notifications')).json().data as { id: string }[];
+  assert.ok(!list.some((n) => n.id === dir.id), '后台列表不能混入定向流水');
+  assert.ok(list.some((n) => n.id === bcast.id), '广播草稿仍要出现在后台列表');
+
+  // validateInput：畸形 userId 必须 400，不能静默降级成广播发出去
+  const bad = await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR4-BAD`,
+    content: 'x',
+    published: true,
+    userId: 'not-an-object-id',
+  });
+  assert.equal(bad.statusCode, 400, bad.body);
+  assert.match(bad.json().message, /收件人|userId/);
+
+  // 显式 null＝广播，要正常接受
+  const nullUid = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR4-NULL`,
+    content: 'x',
+    published: true,
+    userId: null,
+  })).json().data;
+  madeNotices.push(nullUid.id);
+  assert.equal(nullUid.userId, null, '显式 null 是广播');
+});
+
+test('NT-DIR-5 游客看不到任何定向项', async () => {
+  const dir = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR5-GUEST`,
+    content: '定向正文',
+    published: true,
+    userId,
+  })).json().data;
+  madeNotices.push(dir.id);
+
+  const guestList = (await getGuest('/notifications')).json().data;
+  assert.ok(
+    !guestList.items.some((i: { id: string }) => i.id === dir.id),
+    '游客列表不能出现定向行',
+  );
+  assert.equal((await getGuest(`/notifications/${dir.id}`)).statusCode, 404, '游客打开定向详情要 404');
+  const guestSummary = (await getGuest('/notifications/summary')).json().data;
+  assert.notEqual(guestSummary.item?.id, dir.id, '游客首页条不能取到定向行');
 });

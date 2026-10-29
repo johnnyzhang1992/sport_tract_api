@@ -65,3 +65,20 @@ export function hasUniqueDailyQuotaIndex(indexes: IndexShape[]): boolean {
     return fields === 'dateKey,key,userId' && i.unique === true;
   });
 }
+
+/**
+ * 定向通知（notifications，Task 8）读路径索引是否真在：{userId:1, published:1, publishedAt:-1}。
+ * 性能索引（非 unique），但认键序与方向：登录侧过滤是
+ * `{published:true, $or:[{userId:null},{userId:me}]}`，$or 的 isosolution 下每个分支都按
+ * userId（等值）→ published（等值）→ publishedAt（倒序收尾，免内存排序）走本索引；
+ * 游客/畸形 userId 收敛成 `{userId:null, published:true}`，同样落在等值前缀上。
+ * 键序换成 published 在前、或 publishedAt 方向写成升序，都按「防线不在」处理（索引名是
+ * Mongoose 自动生成的，按键组合+方向认，不认名字）。
+ */
+export function hasNotificationRecipientIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    return Object.keys(key).join(',') === 'userId,published,publishedAt'
+      && key.userId === 1 && key.published === 1 && key.publishedAt === -1;
+  });
+}

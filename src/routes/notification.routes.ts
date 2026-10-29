@@ -19,10 +19,10 @@ export async function notificationRoutes(fastify: FastifyInstance) {
     return success(await listNotifications(request.user?.userId));
   });
 
-  // 通知详情
+  // 通知详情（广播人人可读；定向行只有收件人可读，别人 404）
   fastify.get('/:id', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     const { id } = request.params as { id: string };
-    return success(await getNotificationDetail(id));
+    return success(await getNotificationDetail(id, request.user?.userId));
   });
 
   // 打开详情后标已读（幂等）
