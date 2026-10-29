@@ -11,7 +11,7 @@
  *   若照旧套 $gte 就把这两类永久挡在发分之外（榜面永远空、§4.8「各运动类型的全国榜按
  *   总距离排名，前三名获得积分」变假话）。豁免表用 pace.ts 导出的 NO_PACE_TYPES/hasNoPace，
  *   不在本文件另抄一份，其余三道判据对所有类型一律照旧生效。
- * - 本文件建发分查询 + 结算数学（门槛/并列/每人 3 榜上限/单榜总额截断）；发分接线与台账是后续任务。
+ * - 本文件建发分查询 + 结算数学（门槛/并列全发/每人 3 榜上限）；发分接线与台账是后续任务。
  *   **不改 leaderboard() 的展示口径**（榜面与发分结果可能不一致，由规则页文案说明），
  *   也不做省份过滤（发分是全平台口径）。
  */
@@ -59,7 +59,7 @@ export async function trustedBoardRows(
 }
 
 /* ==========================================================================
- * 结算数学（Task 5）：门槛 → 名次/并列 → 单榜总额上限 → 每人 3 榜上限。
+ * 结算数学（Task 5）：门槛 → 名次/并列（全发）→ 每人 3 榜上限。
  * 纯函数，不碰库、不碰时钟：输入是 trustedBoardRows 出来的行，输出是「谁、哪个榜、
  * 第几名、发多少」。发分本身（幂等抢锁 + 流水 + 通知）是 Task 7 的 settlePeriod。
  * ========================================================================= */
@@ -83,21 +83,15 @@ export interface PlanOpts {
   minParticipants: number;
   /** 同一期每人最多计 N 个榜（D5，取分值最高的 N 个） */
   perUserBoards: number;
-  /** 单榜发放总额 ≤ 该榜 TOP3 之和 × 该系数（D10 保留意见；产品要调就调这个数字） */
-  perBoardCapFactor: number;
 }
 
 /**
- * 单榜结算：门槛 → 并列名次 → 总额上限截断。
+ * 单榜结算：门槛 → 并列名次 → 并列组整组照发。
  *
  * - 门槛：rows.length **>** minParticipants 才发（一个用户一行，rows.length 就是参与人数）。
  * - 并列：同距离＝同名次同分值（D10「并列都发」），名次按竞赛排名跳过（1,1,3）。
  * - 每人只在本榜拿一条，所以 out.length 就是"已发放的条数"；闸门 `out.length < 3` 让
  *   TOP3 之外只有并列组能把条数推过 3（并列不许砍人）。
- * - 总额上限：cap = TOP3 之和 × perBoardCapFactor；判据是 `>`（恰好顶格照发）。
- *   超限的并列组**整组**丢弃并就地停榜——不留组内先后的部分发放，否则同分的人
- *   一个拿钱一个不拿，直接违反「并列都发」；停榜而不是继续发后面的人，是因为
- *   差名次不该比被截掉的好名次先拿到钱。
  */
 function planOneBoard(
   type: string,
@@ -106,12 +100,11 @@ function planOneBoard(
   opts: PlanOpts,
 ): BoardReward[] {
   if (rows.length <= opts.minParticipants) return [];
-  const cap = (reward[0] + reward[1] + reward[2]) * opts.perBoardCapFactor;
+  // 并列全发，无单榜总额上限（2026-10-29 用户裁定）——勿再引入 cap/截断，周榜 5 人并列第 1 就发 5×50＝250
   // 只按距离降序做一次**稳定**排序：并列的定义是「距离相等」，同距离的行必须相邻才认得出。
   // 除距离外不加任何第二把尺（不比 createdAt、不比 userId 大小）——同分行原样保留调用方给的先后。
   const sorted = [...rows].sort((a, b) => b.distance - a.distance);
   const out: BoardReward[] = [];
-  let spent = 0;
   let i = 0;
   while (i < sorted.length && out.length < 3) {
     const rank = i + 1;
@@ -122,9 +115,7 @@ function planOneBoard(
     for (let j = i + 1; j < sorted.length && sorted[j].distance === tied[0].distance; j += 1) {
       tied.push(sorted[j]);
     }
-    if (spent + tied.length * points > cap) break;
     for (const t of tied) out.push({ userId: t.userId, type, rank, points });
-    spent += tied.length * points;
     i += tied.length;
   }
   return out;
@@ -135,7 +126,7 @@ function planOneBoard(
  * 第 N+1 个起一条不发。
  *
  * - 只数"真拿到分的榜"：在某个榜排到第 4 名（压根没进 perBoard）不占额度；
- *   被总额上限截断的榜发的是空数组，同样不占额度（PR-7 钉这条顺序）。
+ *   没过人数门槛的榜发的是空数组，同样不占额度（PR-7 钉这条顺序）。
  * - 选榜排序键：**分值降序 → type 名码点升序**。用码点而不是 localeCompare，是因为后者
  *   随运行环境的区域设置变；结算必须可重放（同一批输入两次跑逐字节相同，台账与撤回才对得上）。
  *   这个顺序是裁定里"分值相同必须可重放"的显式选择：按 type 名（码点）升序保留。

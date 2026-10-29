@@ -263,12 +263,11 @@ test('PB-10 配速豁免表单一事实源（源码级守卫）', () => {
  * 上面的 PB/BR 系列是聚合口径用例（要 dev 库），两者同文件只是共用夹具目录，
  * PR-* 自身没有任何 await，输入全是内存里的 BoardCandidate[]。
  *
- * 数字表（spec §3 D2/D4/D5 ＋ D10 保留意见，逐字取 plan Task 5）：
+ * 数字表（spec §3 D2/D4/D5 ＋ D10 2026-10-29 裁定「并列全发，不设单榜总额上限」，逐字取 plan Task 5）：
  *   rewards：周 50/30/20、月 100/80/50、年 500/400/300（TOP1/2/3）
  *   minParticipants＝10（判定 rows.length **>** 10，恰好 10 人不发）
  *   perUserBoards＝3（同一期一个用户最多计 3 个榜）
- *   perBoardCapFactor＝2 → 单榜总额上限：周 (50+30+20)×2＝200、
- *                        月 (100+80+50)×2＝460、年 (500+400+300)×2＝1200
+ *   无单榜总额上限：周榜 5 人并列第 1＝5×50＝250 照发（PR-5 钉死；cap 已于修复轮 1 移除）
  *
  * 夹具纪律（避免"门槛代打"和"巧合绿"这两类本仓踩过的坑）：
  *   - many(n) 给 n 个**互不相等**的距离 1000,999,…，永不产生并列；
@@ -286,7 +285,6 @@ const OPTS: PlanOpts = {
   rewards: { week: [50, 30, 20], month: [100, 80, 50], year: [500, 400, 300] },
   minParticipants: 10,
   perUserBoards: 3,
-  perBoardCapFactor: 2,
 };
 
 /** n 个互不相等的距离：1000、999、998……（无并列） */
@@ -349,8 +347,8 @@ test('PR-2 周榜 TOP1/2/3＝50/30/20；月榜＝100/80/50；年榜＝500/400/30
     planPeriodRewards('year', boards, OPTS).map((r) => `${r.rank}:${r.points}`),
     ['1:500', '2:400', '3:300'],
   );
-  // 三档发放总额分别＝该榜 TOP3 之和（周 100、月 230、年 1200），都远低于各自的
-  // 单榜上限（200/460/2400）——正常三人各得一条时 cap 根本不该出手
+  // 三档发放总额分别＝该榜 TOP3 之和（周 100、月 230、年 1200）——正常三人各得一条，
+  // 恰好发满 TOP3 之和；并列全发时可以到这个数以上（见 PR-5），没有单榜总额上限
   assert.deepEqual(
     (['week', 'month', 'year'] as const).map(
       (p) => planPeriodRewards(p, boards, OPTS).reduce((s, r) => s + r.points, 0),
@@ -511,7 +509,7 @@ test('PR-4 并列都发：4 人并列第 1 名全拿 TOP1 分，第 2 名顺延�
   assert.equal(
     got.reduce((s, r) => s + r.points, 0),
     200,
-    '4×50 恰好等于周榜上限 200：并列把榜发到顶格也不截（cap 是「>」）',
+    '4×50＝200 照发：无单榜总额上限（2026-10-29 裁定），并列不许砍人',
   );
   // 并列也可以发生在第 2 名：第 1 名 1 人 + 第 2 名 2 人并列都发，第 3 名顺延为空（名次 1,2,2）
   const rows2: BoardCandidate[] = [
@@ -528,20 +526,32 @@ test('PR-4 并列都发：4 人并列第 1 名全拿 TOP1 分，第 2 名顺延�
   ]);
 });
 
-test('PR-5 单榜总额超上限时按达成先后截断（并列人数打爆 cap 的极端）', () => {
-  // (a) 5 人并列第 1：5×50＝250 > 周榜上限 200 → 整组不发（并列不许拆，拆了就是同分不同钱）
+test('PR-5 并列人数打爆 TOP3 之和时整组照发——既不截断也不整组不发（2026-10-29 裁定）', () => {
+  // (a) 5 人并列第 1：5×50＝250 超过 TOP3 之和 100——无单榜总额上限，整组全发（每个都拿钱，谁也不掉）
   const five: BoardCandidate[] = ['a', 'b', 'c', 'd', 'e'].map((userId) => ({
     userId,
     distance: 1000,
   }));
   const tail = Array.from({ length: 6 }, (_, i) => ({ userId: `t${i}`, distance: 800 - i * 100 }));
-  assert.deepEqual(
-    planPeriodRewards('week', [{ type: 'running', rows: [...five, ...tail] }], OPTS),
-    [],
-    '并列组越过上限时整组不发，绝不只发组内前 4 个（同分必须同钱）',
+  const weekRows = [...five, ...tail];
+  assert.equal(weekRows.length, 11, '夹具过门槛：11 行 > 10');
+  const paidGroup = planPeriodRewards('week', [{ type: 'running', rows: weekRows }], OPTS);
+  assert.deepEqual(paidGroup.map(key), [
+    'running/a#r1/50',
+    'running/b#r1/50',
+    'running/c#r1/50',
+    'running/d#r1/50',
+    'running/e#r1/50',
+  ]);
+  assert.equal(
+    paidGroup.reduce((s, r) => s + r.points, 0),
+    250,
+    '周榜 5 人并列第 1 ⇒ 该榜发 5×50＝250（裁定原文的算例，不许砍成 200 也不许发 0）',
   );
+  assert.ok(paidGroup.every((r) => r.rank === 1), '并列组全员第 1 名，第 2/3 名顺延为空');
 
-  // (b) 先达成的保住了：第 1 名 1 人（50）＋ 第 2 名 6 人并列（180）＝230 > 200
+  // (b) 第 1 名 1 人（50）＋第 2 名 6 人并列（6×30＝180）＝230：旧 cap 下会「先到先得＋整组不发」，
+  // 现在两条规则都不存在——7 人全发，榜也不因“总额超了”提前停
   const winner: BoardCandidate = { userId: 'w', distance: 2000 };
   const six: BoardCandidate[] = ['a', 'b', 'c', 'd', 'e', 'f'].map((userId) => ({
     userId,
@@ -550,31 +560,25 @@ test('PR-5 单榜总额超上限时按达成先后截断（并列人数打爆 ca
   const rest = Array.from({ length: 4 }, (_, i) => ({ userId: `t${i}`, distance: 900 - i * 100 }));
   const boards = [{ type: 'running', rows: [winner, ...six, ...rest] }];
   assert.equal(boards[0].rows.length, 11, '夹具过门槛：11 行 > 10');
-  const truncated = planPeriodRewards('week', boards, OPTS);
-  assert.deepEqual(truncated.map(key), ['running/w#r1/50']);
-  assert.equal(
-    truncated.reduce((s, r) => s + r.points, 0),
-    50,
-    '截断保留先达成的第 1 名，并列的第 2 名整组不发',
-  );
-  // 截断后不"回头"发第 4 名以后的人：差名次不该比被截的好名次先拿到钱
-  assert.ok(truncated.every((r) => r.rank === 1), '一旦某组被截断，该榜就地停止发放');
+  const paidAll = planPeriodRewards('week', boards, OPTS);
+  assert.equal(paidAll.length, 7, '1 个第 1 名 + 6 人并列第 2 名全部照发');
+  assert.deepEqual(paidAll.map((r) => r.rank), [1, 2, 2, 2, 2, 2, 2]);
+  assert.equal(paidAll.reduce((s, r) => s + r.points, 0), 230);
 
-  // (c) 上限系数可配：perBoardCapFactor=3 → 上限 300，同一夹具 50+180 全发
-  const full = planPeriodRewards('week', boards, { ...OPTS, perBoardCapFactor: 3 });
-  assert.equal(full.length, 7, '系数提到 3 以后同榜 7 人全发（cap 真的读 opts，没写死 2）');
-  assert.equal(full.reduce((s, r) => s + r.points, 0), 230);
-  assert.deepEqual(full.map((r) => r.rank), [1, 2, 2, 2, 2, 2, 2]);
+  // (c) 同输入两次调用逐字节相同（去掉 cap 后结算仍必须可重放）
+  assert.deepEqual(planPeriodRewards('week', boards, OPTS), paidAll);
 });
 
-test('PR-6 名次按距离降序，距离相同视为并列（不比 createdAt）', () => {
-  // 乱序入参：函数自己按距离降序排（除此之外不加任何二级判据）
+test('PR-6 名次按距离降序，距离相同视为并列（不比 createdAt、不比 userId）', () => {
+  // 乱序入参：函数自己按距离降序排（除此之外不加任何二级判据）。
+  // 并列组刻意排成 B 在 A 前＝输入序 ≠ userId 码点序（'A' < 'B'）：
+  // 实现若偷加 (distance, userId) 第二把尺，下面两条深比较立刻红（修复轮 1 前该组是 A 在前，抓不住）。
   const rows: BoardCandidate[] = [
     { userId: 'C', distance: 900 },
     { userId: 'f1', distance: 700 },
-    { userId: 'A', distance: 1000 },
-    { userId: 'f2', distance: 300 },
     { userId: 'B', distance: 1000 },
+    { userId: 'f2', distance: 300 },
+    { userId: 'A', distance: 1000 },
     { userId: 'f3', distance: 800 },
     { userId: 'f4', distance: 600 },
     { userId: 'f5', distance: 500 },
@@ -582,23 +586,31 @@ test('PR-6 名次按距离降序，距离相同视为并列（不比 createdAt�
     { userId: 'f7', distance: 200 },
     { userId: 'f8', distance: 100 },
   ];
+  assert.ok(
+    rows.filter((r) => r.distance === 1000).map((r) => r.userId).join() === 'B,A'
+      && 'A' < 'B',
+    '夹具自证：并列组输入序（B,A）与 userId 码点序（A,B）相反',
+  );
   assert.equal(rows.length, 11, '夹具过门槛：11 行 > 10');
   const got = planPeriodRewards('week', [{ type: 'running', rows }], OPTS);
   // A、B 同分并列第 1 各拿 50；C 顺延到第 3 名（竞赛排名跳过第 2）拿 20
-  assert.deepEqual(got.map(key), ['running/A#r1/50', 'running/B#r1/50', 'running/C#r3/20']);
+  assert.deepEqual(got.map(key), ['running/B#r1/50', 'running/A#r1/50', 'running/C#r3/20']);
   const byUser = new Map(got.map((r) => [r.userId, r]));
   assert.equal(byUser.get('A')?.points, byUser.get('B')?.points, '同距离必须同分值');
   assert.equal(byUser.get('A')?.rank, byUser.get('B')?.rank, '同距离必须同名次');
   assert.equal(byUser.get('C')?.rank, 3, '并列使名次跳过：1,1,3 而不是 1,1,2');
   assert.deepEqual(
     got.map((r) => r.userId),
-    ['A', 'B', 'C'],
-    '并列组内保持调用方给的先后（稳定排序），绝不引入 createdAt/uid 之类的第二把尺',
+    ['B', 'A', 'C'],
+    '并列组内保持调用方给的先后（稳定排序）：B 在 A 前＝输入序，绝不引入 createdAt/userId 之类的第二把尺',
   );
-  // 全部同分＝一个 11 人大并列组：11×50＝550 > 周榜上限 200 → 整组不发（并列不许拆开）
+  // 全部同分＝一个 11 人大并列组：11×50＝550 整组全发（无单榜总额上限，2026-10-29 裁定）
   const allTied = Array.from({ length: 11 }, (_, i) => ({ userId: `x${i}`, distance: 500 }));
-  assert.equal(planPeriodRewards('week', [{ type: 'running', rows: allTied }], OPTS).length, 0);
-  // 距离完全相同且分值不撞 cap 时（月榜 TOP1 并列 4 人 ×100＝400 ≤ 上限 460）全发
+  const allPaid = planPeriodRewards('week', [{ type: 'running', rows: allTied }], OPTS);
+  assert.equal(allPaid.length, 11, '11 人大并列整组照发，一个都不砍');
+  assert.ok(allPaid.every((r) => r.rank === 1 && r.points === 50));
+  assert.equal(allPaid.reduce((s, r) => s + r.points, 0), 550);
+  // 月榜 4 人并列 TOP1 ×100＝400 同样全发（发放条数只受 out.length<3 闸门＋并列不许砍人约束）
   const fourTied = Array.from({ length: 4 }, (_, i) => ({ userId: `y${i}`, distance: 500 }));
   const monthTail = Array.from({ length: 7 }, (_, i) => ({ userId: `m${i}`, distance: 400 - i * 10 }));
   const monthRows = [...fourTied, ...monthTail];
@@ -607,35 +619,44 @@ test('PR-6 名次按距离降序，距离相同视为并列（不比 createdAt�
   assert.ok(monthGot.every((r) => r.points === 100 && r.rank === 1));
 });
 
-test('PR-7 截断与 3 榜上限互不代打：被总额上限截掉的榜不占用户额度', () => {
-  // running 榜：5 人并列第 1（含 me）→ 5×50＝250 > 周榜上限 200 → 整条榜不发
+test('PR-7 并列全发照样占用每人 3 榜额度；没过门槛的空榜不占额度', () => {
+  // running 榜：me/a/b/c/d 五人并列第 1 → 5×50＝250 整组照发（2026-10-29 裁定），me 在本榜有一条 50 分
   const tiedFive: BoardCandidate[] = ['me', 'a', 'b', 'c', 'd'].map((userId) => ({
     userId,
     distance: 1000,
   }));
   const runningTail = Array.from({ length: 6 }, (_, i) => ({ userId: `r${i}`, distance: 800 - i * 100 }));
   const running = { type: 'running', rows: [...tiedFive, ...runningTail] };
-  // 另外 4 个榜 me 都是第 1 名（各 50 分）：me 的"有效候选"正好 4 个，上限砍到 3 个
-  const others = ['cycling', 'hiking', 'swimming', 'walking'].map((type) =>
+  // cycling/hiking/swimming：me 都是第 1 名（50）→ me 跨 4 个榜、4 条候选分值全等 → 只留 3
+  const others = ['cycling', 'hiking', 'swimming'].map((type) =>
     boardWithMeAt(type, ME_DISTANCE_BY_RANK[1]),
   );
-  const boards = [running, ...others];
-  assert.ok(boards.every((b) => b.rows.length > OPTS.minParticipants), '夹具：5 个榜全过门槛');
+  // walking：10 行（me + 9 陪跑）不过门槛 → 整榜不发，也就不占 me 的额度（空榜不代打的最后一处）
+  const deadWalking = { type: 'walking', rows: [...many(9), { userId: 'me', distance: 1100 }] };
+  const boards = [running, ...others, deadWalking];
+  assert.ok(running.rows.length > OPTS.minParticipants, '夹具：并列榜过门槛，整组照发');
+  assert.equal(deadWalking.rows.length, OPTS.minParticipants, '夹具：walking 恰好 10 行＝不发');
 
   const got = planPeriodRewards('week', boards, OPTS);
   assert.deepEqual(
-    got.filter((r) => r.type === 'running'),
+    got.filter((r) => r.type === 'walking'),
     [],
-    'running 被总额上限截断＝一条不发，也就不该占 me 的三个额度',
+    '没发钱的榜一条都没有，自然也不占额度',
+  );
+  assert.equal(
+    got.filter((r) => r.type === 'running').length,
+    5,
+    '并列的 running 榜 5 条全发（上限结算之前它先拿到全额）',
   );
   const mine = got.filter((r) => r.userId === 'me');
-  assert.equal(mine.length, 3, 'me 的 4 个 50 分候选留 3 砍 1');
+  assert.equal(mine.length, 3, 'me 在 4 个等分（50）榜上只留 3 个——每人 3 榜上限压在并列全发之上');
   assert.deepEqual(
     mine.map((r) => r.type).sort(),
-    ['cycling', 'hiking', 'swimming'],
-    '同分值按 type 码点升序留（砍掉 walking）',
+    ['cycling', 'hiking', 'running'],
+    '同分值按 type 码点升序留（砍掉 swimming）；并列榜与正常榜在额度上平权',
   );
-  // 4 个正常榜各发 100 分，me 被砍掉一条 50 → 350
-  assert.equal(got.reduce((s, r) => s + r.points, 0), 350);
-  assert.equal(got.length, 11, '4 榜 × 3 条 − me 被砍的 1 条');
+  assert.deepEqual(mine.map((r) => r.points), [50, 50, 50]);
+  // running 250 + cycling/hiking 各 100 + swimming 剩 p0/p1 两条 50 ＝ 500；条数 5+3+3+2＝13
+  assert.equal(got.length, 13);
+  assert.equal(got.reduce((s, r) => s + r.points, 0), 500);
 });
