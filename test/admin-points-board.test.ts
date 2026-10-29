@@ -18,6 +18,7 @@ import {
   isThresholdSkip,
 } from '../src/models/point.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
+import { hasBoardSettlementAdminReadIndex } from '../src/utils/guard-index.js';
 import { creditPoints, debitPoints } from '../src/services/points-ledger.js';
 import {
   markBoardSettled,
@@ -43,7 +44,15 @@ import {
  * - AB-6/6b：settlePeriod 写出的两类 status='skipped' 哨兵行（门槛占位 / 完成标记）**不是发放行**，
  *   撤回必须被拒（不是静默成功），列表默认也不许把它们混进发放行；判别式是 reason 常量前缀 +
  *   结构（哨兵 userId），reason 认不出来的整榜行照样按整榜行处理（结构判定优先于自由文本）。
- * - AB-10：Task 6 评审点名的 {period,status} 读路径——新索引声明侧 + 真实库侧 + EXPLAIN 三处钉住。
+ * - AB-9/9b（修复轮 1，评审 Important 1+2；编号补上原本缺的 AB-9，文件顺序仍是 8→9→9b→10 单调）：
+ *   撤回前那道「对着原流水冲销」的对账闸门——recordId 指向一条已被删掉的流水（AB-9），以及台账行与
+ *   流水在 type / refId / userId / **delta（金额）** 四处任一对不上（AB-9b，金额这条就是修复轮 1 补的），
+ *   都必须 400 交人工对账，且一笔都不许多写（反向流水 0 条、通知 0 条、台账仍 credited、余额不动）。
+ *   钱账依据与到账侧的补翻牌同一条不变式（points-board.ts:705 的 dupRecord.delta !== r.points）。
+ * - AB-10：Task 6 评审点名的 {period,status} 读路径——新索引声明侧 + 真实库侧 + EXPLAIN 三处钉住；
+ *   修复轮 1（评审 Minor）把声明侧与库侧都改成调 src/utils/guard-index.ts 的同一个谓词
+ *   `hasBoardSettlementAdminReadIndex`：本文件原来只比 `Object.keys().join(',')`＝认得出键序、
+ *   认不出方向（status: -1 照样绿），谓词还要求每个键值都是 1，两侧从此核对同一件事。
  *
  * 共享 dev 库纪律（本文件绝不碰真实用户）：
  * - **不调用 settlePeriod / settleDueForUser**（一个真榜的 TOP3 在 dev 库里是真实用户，
@@ -66,7 +75,8 @@ const W_SENTINEL = '2034-03-20'; // AB-6：两种占位行各自落下
 const W_DIRTY = '2034-03-27';   // AB-6b：reason 不是任何常量的整榜行
 const W_OTHER = '2034-04-03';   // AB-8：给「按用户跨单元筛」当第二个单元
 const W_FILTER = '2034-04-10';  // AB-8：筛选用例独占单元（不与 AB-7 共用，免得计数互相踩）
-const OWN_WEEK_KEYS = [W_PAYOUT, W_MIX, W_SENTINEL, W_DIRTY, W_OTHER, W_FILTER];
+const W_RECONCILE = '2034-04-17'; // AB-9/9b：原流水对账分支独占（删/改流水的现场各起一行，不牵连别的用例）
+const OWN_WEEK_KEYS = [W_PAYOUT, W_MIX, W_SENTINEL, W_DIRTY, W_OTHER, W_FILTER, W_RECONCILE];
 
 const ADMIN_NOTE = '该周轨迹经复核为搭车刷量';
 
@@ -284,7 +294,11 @@ test('AB-3 备注缺失 → 400，文案点明「撤回备注必填」', async (
   for (const body of [{}, { note: '' }, { note: '   ' }, { note: null }, undefined]) {
     const res = await post(`${BASE}/points/board-settlements/${row._id}/revoke`, body);
     assert.equal(res.statusCode, 400, `缺备注必须 400（收到 ${JSON.stringify(body)}）：${res.body}`);
-    assert.match(res.json().message, /撤回备注必填/, `文案要点名「撤回备注必填」：${res.body}`);
+    const msg = res.json().message;
+    assert.match(msg, /撤回备注必填/, `文案要点名「撤回备注必填」：${msg}`);
+    // 修复轮 1（评审 Minor）：字段名只出现一次——原句是「撤回备注必填：…（撤回备注必填）」自己抄自己
+    assert.equal(msg.split('撤回备注必填').length - 1, 1, `同一句话里不许把字段名写两遍：${msg}`);
+    assert.match(msg, /通知/, `文案要说清为什么要紧（会出现在用户通知里）：${msg}`);
   }
   // 一笔都没动：没有反向流水、没有通知、台账还是 credited
   assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'board_reward_rollback' }), 0);
@@ -550,18 +564,116 @@ test('AB-8 筛选 type/userId/status 各自收窄，非法入参 400 点名收�
 });
 
 /* ==================================================================
+ * AB-9 / AB-9b 撤回前的原流水对账（修复轮 1：评审 Important 1+2）
+ * ================================================================== */
+
+/** 每笔现场共用的「什么都没写」自证：反向流水、通知、台账状态、余额都不许动（流水条数按改前的实测值比） */
+async function assertNothingWritten(
+  u: Types.ObjectId,
+  rowId: unknown,
+  expect: { recordId: string; balance: number; recordsBefore: number },
+) {
+  assert.equal(await PointRecordModel.countDocuments({ userId: u, type: BOARD_REVOKE_ROLLBACK_TYPE }), 0, '对账失败不得落下反向流水');
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: u }),
+    expect.recordsBefore,
+    '夹具自证：流水条数与动手之前一致（没多一笔撤回）',
+  );
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0, '对账失败也不许给用户发通知');
+  const led = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(led!.status, 'credited', '被拒的撤回不许翻牌');
+  assert.equal(String(led!.recordId), expect.recordId, '被拒的撤回不许顺手清掉 recordId');
+  const acct = await PointAccountModel.findOne({ userId: u }).lean();
+  assert.equal(acct!.balance, expect.balance, `余额一分未动（应为 ${expect.balance}）`);
+}
+
+test('AB-9 原流水已不存在（recordId 指向一条被删掉的流水）→ 400 交人工对账，不落任何一笔账', async () => {
+  const u = mkUser();
+  const { row, recordId } = await seedCreditedPayout({ userId: u, periodKey: W_RECONCILE, points: 50 });
+  // 现场：台账行还带着 recordId，库里那条流水却没了（历史手工删账 / 别的清理脚本干的）
+  const del = await PointRecordModel.deleteOne({ _id: recordId, userId: u });
+  assert.equal(del.deletedCount, 1, '夹具自证：原流水确实被删掉了');
+
+  const res = await post(`${BASE}/points/board-settlements/${row._id}/revoke`, { note: ADMIN_NOTE });
+  assert.equal(res.statusCode, 400, `原流水缺失必须 400：${res.body}`);
+  const msg = res.json().message;
+  // 专属话术（不是 AB-11 的「缺少流水凭据」：recordId 是有值的，缺的是那条流水本身）
+  assert.match(msg, /原流水已不存在/, `文案要用「原流水已不存在」专属分支：${msg}`);
+  assert.ok(msg.includes(recordId), `文案要点名是哪条流水（对象）：${msg}`);
+  assert.ok(msg.includes(String(row._id)), `文案要带上台账 id 便于人工对账：${msg}`);
+  assert.match(msg, /人工对账/, `对不上账的行只能交人工，文案要这么说：${msg}`);
+
+  await assertNothingWritten(u, row._id, { recordId, balance: 50, recordsBefore: 0 });
+});
+
+test('AB-9b 台账与原流水对不上（type / refId / userId / delta 四种漂移）→ 400 点名实际值，不落任何一笔账', async () => {
+  const drifts: Array<{
+    label: string;
+    patch: (ctx: { other: Types.ObjectId }) => Record<string, unknown>;
+    /** 文案必须点名的值（本仓纪律：对象 + 实际值；金额那条要求两个数同框） */
+    pins: (msg: string, ctx: { other: Types.ObjectId }) => Array<[RegExp, string]>;
+  }> = [
+    {
+      label: '流水 type 被改成别的种类',
+      patch: () => ({ type: 'makeup_reward' }),
+      pins: (msg) => [[/type=makeup_reward/, '文案要带流水那侧的 type 实际值'], [/delta=50/, '金额也要报出来'], [/points=50/, '金额也要报出来']],
+    },
+    {
+      label: '流水 refId 挂到另一张榜上',
+      patch: () => ({ refId: `walking:week:${W_RECONCILE}` }),
+      pins: (msg) => [[new RegExp(`refId=walking:week:${W_RECONCILE}`), '文案要带流水那侧的 refId 实际值'], [/delta=50/, '金额也要报出来'], [/points=50/, '金额也要报出来']],
+    },
+    {
+      label: '流水的 userId 与台账行不是同一个人',
+      patch: ({ other }) => ({ userId: other }),
+      pins: (msg, ctx) => [[new RegExp(`userId=${ctx.other}`), '文案要带流水那侧的 userId 实际值'], [/delta=50/, '金额也要报出来'], [/points=50/, '金额也要报出来']],
+    },
+    {
+      // 修复轮 1（评审 Important 1）：扣的是台账 points，凭据是流水 delta——不等＝撤得比发出来的多（少），
+      // 与到账侧补翻牌的同一条不变式（points-board.ts:705）对齐。两个数必须在文案里同框。
+      label: '流水 delta(40) ≠ 台账 points(50)：钱账漂移',
+      patch: () => ({ delta: 40 }),
+      pins: (msg) => [[/delta=40/, '文案要带流水的实际入账金额 40'], [/points=50/, '文案要带台账要扣回的金额 50']],
+    },
+  ];
+  for (const d of drifts) {
+    const u = mkUser();
+    const other = mkUser(); // 夹具用户（在 fixtureUsers 名单里）：改完仍归本文件清理，也不触发 G1 越界
+    const ctx = { other };
+    const { row, recordId } = await seedCreditedPayout({ userId: u, periodKey: W_RECONCILE, points: 50 });
+    const patched = d.patch(ctx);
+    const upd = await PointRecordModel.updateOne({ _id: recordId, userId: u }, { $set: patched });
+    assert.equal(upd.matchedCount, 1, `夹具自证：${d.label} 改到了（patch=${JSON.stringify(patched)}）`);
+    const recordsBefore = await PointRecordModel.countDocuments({ userId: u });
+
+    const res = await post(`${BASE}/points/board-settlements/${row._id}/revoke`, { note: ADMIN_NOTE });
+    assert.equal(res.statusCode, 400, `${d.label} 必须 400：${res.body}`);
+    const msg = res.json().message;
+    assert.match(msg, /与原流水对不上/, `${d.label}：文案要用对账分支：${msg}`);
+    assert.match(msg, /人工对账/, `${d.label}：对不上的钱只能交人工：${msg}`);
+    assert.ok(msg.includes(String(row._id)), `${d.label}：文案要带上台账 id：${msg}`);
+    for (const [re, why] of d.pins(msg, ctx)) assert.match(msg, re, `${d.label}：${why}：${msg}`);
+
+    await assertNothingWritten(u, row._id, { recordId, balance: 50, recordsBefore });
+  }
+});
+
+/* ==================================================================
  * AB-10 索引防线（Task 6 评审点名的 {period,status} 读路径）
  * ================================================================== */
 
 test('AB-10 管理端读索引：声明侧与真实库侧都在，且列表查询走 IXSCAN 不做集合扫描', async () => {
-  const declared = BoardSettlementModel.schema.indexes();
+  // 修复轮 1（评审 Minor）：声明侧改成调 guard-index 的**同一个谓词**——原来只比
+  // `Object.keys(keys).join(',')`＝认得出键序、认不出方向（status: -1 也照样绿），
+  // 谓词还要求每个键值都是 1，两侧从此核对同一件事（少一处"测试比防线宽"的口径）。
+  const declared = BoardSettlementModel.schema.indexes().map(([keys]) => ({ key: keys as Record<string, unknown> }));
   assert.ok(
-    declared.some(([keys]) => Object.keys(keys).join(',') === 'period,periodKey,status,type,userId'),
-    `schema 里没有 {period,periodKey,status,type,userId} 这条声明！现有声明：${JSON.stringify(declared.map(([k]) => k))}`,
+    hasBoardSettlementAdminReadIndex(declared),
+    `schema 里没有 {period,periodKey,status,type,userId}（全 1 方向）这条声明！现有声明：${JSON.stringify(declared.map((d) => d.key))}`,
   );
   await BoardSettlementModel.createIndexes();
   const idx = await BoardSettlementModel.collection.indexes();
-  const adminIdx = idx.find((i) => Object.keys(i.key ?? {}).join(',') === 'period,periodKey,status,type,userId');
+  const adminIdx = idx.find((i) => hasBoardSettlementAdminReadIndex([i]));
   assert.ok(adminIdx, `真实库里没有这条读索引！现有索引：${JSON.stringify(idx.map((i) => i.key))}`);
 
   // EXPLAIN：服务层实际构造的过滤器形状必须 IXSCAN 且「取到的文档数＝返回数」

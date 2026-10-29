@@ -320,7 +320,12 @@ boardSettlementSchema.index({ type: 1, period: 1, periodKey: 1, userId: 1 }, { u
  * 点名的 `{period, status}` 读路径就是这个缺口。
  * 键序（等值在前、按筛选频率递降）：period（周期档）→ periodKey（具体哪一期）→ status
  * （默认视图 = 三个发放态 $in / 显式 skipped = 整榜级行）→ type → userId。
- * 覆盖：period｜period+periodKey｜+status｜+type｜+userId（全部等值前缀组合）。
+ * 覆盖（等值前缀**必须连续**，只数能接上键序的那些）：period｜period+periodKey｜
+ * period+periodKey+status｜再 +type｜再 +userId —— 这五条走满索引。
+ * 修复轮 1 更正（原来写「覆盖 period｜period+periodKey｜+status…」被读成评审点名的 `{period, status}`
+ * 也整条覆盖，是过头话）：`{period, status}` 缺了中间的 periodKey ⇒ 只有 **period** 这一段算前缀，
+ * `status` 退化成键上的附加过滤（扫该 period 全部键再筛），不是 COLLSCAN，但也不叫"覆盖"。
+ * 服务层因此强制 periodKey 与 period 同传（AB-8 钉那条 400），主路径不落进这个残差形状。
  * 不覆盖（走 _id 索引 + 残差过滤，**不是**集合扫描）：只给 userId 或什么都不给的默认翻页。
  * 排序另走 _id（落库顺序＝结算顺序），与本索引无关——列表默认按 _id 倒序翻页，稳定不跳行。
  */

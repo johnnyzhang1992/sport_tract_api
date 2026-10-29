@@ -1012,7 +1012,8 @@ function shown(value: unknown): string {
 /**
  * 后台撤回（POST /admin/points/board-settlements/:id/revoke）。
  * 闸门顺序（每一步都在写库之前，任何一条被拒都不留下流水/通知/状态变更）：
- * id 形态 → 备注必填 → 行存在 → 整榜级 → pending/revoked → 分值与流水凭据 → 余额 → 钱 → 翻牌 → 通知。
+ * id 形态 → 备注必填 → 行存在 → 整榜级 → pending/revoked → 分值与流水凭据（存在性 + type/refId/userId/delta 对账）
+ * → 余额 → 钱 → 翻牌 → 通知。
  */
 export async function revokeBoardSettlement(
   id: string,
@@ -1021,7 +1022,7 @@ export async function revokeBoardSettlement(
 ): Promise<BoardSettlementRevokeResult> {
   assertObjectIdLike(id, '发放台账不存在');
   const rawNote = typeof input?.note === 'string' ? input.note.trim() : '';
-  if (!rawNote) throw new AppError(400, '撤回备注必填：它会原文出现在用户收到的通知里（撤回备注必填）');
+  if (!rawNote) throw new AppError(400, '撤回备注必填：它会原文出现在用户收到的通知里');
   if (rawNote.length > BOARD_REVOKE_NOTE_MAX) {
     throw new AppError(400, `撤回备注不能超过 ${BOARD_REVOKE_NOTE_MAX} 字（当前 ${rawNote.length}）`);
   }
@@ -1061,13 +1062,18 @@ export async function revokeBoardSettlement(
   const refId = `${row.type}:${row.period}:${row.periodKey}`;
 
   // 2) 原流水核对：撤回是对着那笔 board_reward 冲销，钱账对不上就停手（人工对账），别扣无凭据的分
+  //    修复轮 1（评审 Important 1）：金额也进对账判据——扣的是 row.points，凭据却是那条流水的 delta；
+  //    两者不等＝钱账漂移（外部改分/上游截断遗留），扣下去要么多扣用户的分、要么撤得比发出来的还少。
+  //    到账侧的补翻牌早就钉了同一条不变式（:705 的 dupRecord.delta !== r.points），撤回侧此前漏了，
+  //    会让「台账 points ≠ 原流水 delta」的行带着不属于自己的扣款金额通过闸门。
   const original = await PointRecordModel.findById(row.recordId).lean();
   if (!original) {
     throw new AppError(400, `台账行的原流水已不存在（recordId=${row.recordId}），不能自动撤回，请人工对账（id=${id}）`);
   }
-  if (original.type !== 'board_reward' || original.refId !== refId || String(original.userId) !== String(row.userId)) {
-    throw new AppError(400, `台账行与原流水对不上（流水 type=${original.type} refId=${original.refId} userId=${original.userId}，`
-      + `台账 refId=${refId} userId=${row.userId}），不能自动撤回，请人工对账（id=${id}）`);
+  if (original.type !== 'board_reward' || original.refId !== refId || String(original.userId) !== String(row.userId)
+    || Number(original.delta) !== points) {
+    throw new AppError(400, `台账行与原流水对不上（流水 type=${original.type} refId=${original.refId} userId=${original.userId} delta=${Number(original.delta)}，`
+      + `台账 refId=${refId} userId=${row.userId} points=${points}），不能自动撤回，请人工对账（id=${id}）`);
   }
 
   const now = opts.now ?? Date.now();
