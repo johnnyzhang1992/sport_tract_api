@@ -46,6 +46,19 @@ export interface CalcStatsOptions {
 /** 配速最小有效距离（米）：低于此值配速无意义（如刚起步/静止） */
 const MIN_PACE_DISTANCE_M = 200;
 
+/**
+ * 无配速概念的运动类型（唯一事实源）：这些类型 avgPace 恒为 null，是设计而非缺数据。
+ * 引用它的两处必须同源，否则「不算配速的类型」与「发分不要求配速的类型」会各自漂移：
+ * - calcStats / calcFastestKm：本就不为它们计算配速
+ * - services/points-board.ts：发分口径的配速判据对它们不生效（否则游泳/骑行全国榜永远空）
+ */
+export const NO_PACE_TYPES: readonly ActivityType[] = ['swimming', 'cycling'];
+
+/** 该运动类型是否根本不计算配速（入参允许任意字符串：库里/导入的历史值不受枚举约束） */
+export function hasNoPace(type: string): boolean {
+  return (NO_PACE_TYPES as readonly string[]).includes(type);
+}
+
 // 爬升算法（与小程序 services/tracker.js 同款，决策 D16 v2）：
 // 旧"单步>死区即累计"缓坡漏计严重（每步差值远小于阈值）而慢噪声单步大跳反被累计；
 // 改为 EMA 平滑 + 滞回确认——噪声上下抵消，缓坡可持续累计达标
@@ -125,8 +138,7 @@ export function calcStats(points: TrackPointLike[], opts: CalcStatsOptions): Cal
   }
 
   // 配速（秒/公里）；游泳/骑行不展示；距离过短配速无意义
-  const paceTypes: ActivityType[] = ['swimming', 'cycling'];
-  const avgPace = paceTypes.includes(type)
+  const avgPace = hasNoPace(type)
     ? null
     : distance >= MIN_PACE_DISTANCE_M
       ? durationSec / (distance / 1000)
@@ -215,13 +227,11 @@ export function calcPbMarks(points: TrackPointLike[]): PbMark[] {
  *      跨它拼出来的 1km 既不同段也不同路，实测就是这条规则把 3'41" 的假 PR 挡在门外
  * - 返回 null：轨迹不足 1km 或点缺少 timestamp；即「最快配速」必须是真实跑满 1km 的分段
  */
-/** 无配速概念的运动类型（与 calcStats 一致） */
-const NO_PACE_TYPES = ['swimming', 'cycling'];
 const GAP_MS = 60000;
 /** 最快配速分段长度（米）：必须跑满此距离才计一段 */
 const PACE_SEGMENT_M = 1000;
 export function calcFastestKm(points: TrackPointLike[], type?: string): number | null {
-  if (type && NO_PACE_TYPES.includes(type)) return null; // 游泳/骑行不统计配速
+  if (type && hasNoPace(type)) return null; // 游泳/骑行不统计配速
   const sorted = [...points]
     .filter((p) => p.timestamp != null)
     .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));

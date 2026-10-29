@@ -1,10 +1,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import mongoose, { Types } from 'mongoose';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { trustedBoardRows } from '../src/services/points-board.js';
+import { hasNoPace, NO_PACE_TYPES } from '../src/utils/pace.js';
 import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../src/config/constants.js';
 
 /**
@@ -15,6 +17,10 @@ import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../src/confi
  *   判据写成 $lte/$gte 形态会把老文档全排掉（发分少钱且无声）。
  * - avgPace 与上面相反是**强要求**（缺/为 null 不计），BR-2b 钉住这个不对称是有意的，
  *   有人把 $gte「顺手统一」成 $not/$lt 形态时这里先红。
+ * - 但配速判据只对「会算配速」的类型生效：游泳/骑行的 avgPace 恒为 null（utils/pace.ts
+ *   的设计），PB-9/PB-9b 钉住这两类照样能进发分口径，否则总距离榜对它们永远空榜
+ *   （spec §4.8「各运动类型的全国榜按总距离排名，前三名获得积分」就成了假话）；
+ *   同一条用例同时钉住「其余三道判据一个都没跟着松掉」。
  *
  * 共享 dev 库纪律：每个用例用自造 ObjectId（不落 user 文档），窗口取本次运行的专属
  * 1 分钟区间（startTime ∈ [WIN_START, WIN_END)），断言只按自己的 userId 收口，
@@ -53,10 +59,15 @@ async function mkActivity(
   return String(doc._id);
 }
 
+/** 本用户在某类型榜窗口内的可信总距离（无行＝0） */
+async function totalForType(type: string, userId: Types.ObjectId): Promise<number> {
+  const rows = await trustedBoardRows(type, WIN_START, WIN_END);
+  return rows.find((r) => r.userId === String(userId))?.distance ?? 0;
+}
+
 /** 本用户在 running 榜窗口内的可信总距离（无行＝0） */
 async function totalFor(userId: Types.ObjectId): Promise<number> {
-  const rows = await trustedBoardRows('running', WIN_START, WIN_END);
-  return rows.find((r) => r.userId === String(userId))?.distance ?? 0;
+  return totalForType('running', userId);
 }
 
 before(async () => {
@@ -65,7 +76,13 @@ before(async () => {
 });
 
 after(async () => {
-  await ActivityModel.deleteMany({ userId: { $in: seededUsers } }).catch(() => {});
+  // 清理失败必须可见：吞掉错误会把本文件种下的测试轨迹永久留在共享 dev 库，
+  // 后续所有按窗口/类型聚合的用例（含榜单类）会被无声污染
+  try {
+    await ActivityModel.deleteMany({ userId: { $in: seededUsers } });
+  } catch (err) {
+    console.error('[points-board.test] fixture 轨迹清理失败，dev 库有残留', err);
+  }
   await app.close();
   await mongoose.disconnect().catch(() => {});
 });
@@ -129,6 +146,43 @@ test('BR-2b avgPace 缺失/null 不计入发分距离（配速是强要求，与
   // 导入/老数据 avgPace 默认 null：$gte 判据把它挡在发分之外，这是 spec 拍板的不对称
   await mkActivity(u, 'running', 50_000, { avgPace: null });
   assert.equal(await totalFor(u), 5_000, 'avgPace 为 null 的行不该进发分合计（$not/$lt 化会让它混进来）');
+  // 字段整个缺失（连 null 都没有）同样被挡：$gte 不匹配 missing
+  const legacy = await mkActivity(u, 'running', 30_000, {});
+  await ActivityModel.updateOne({ _id: legacy }, { $unset: { avgPace: 1 } });
+  assert.equal(await totalFor(u), 5_000, 'avgPace 字段缺失的跑步行同样不该进发分合计');
+});
+
+test('PB-3b 跑步类 distance<200m 的行没有配速，继续被第三道判据挡在发分之外', async () => {
+  const u = mkUser();
+  await mkActivity(u, 'running', 5_000, {});
+  // utils/pace.ts：跑步/步行等有配速的类型，距离不足 MIN_PACE_DISTANCE_M 时 avgPace 也是 null
+  // → 发分口径下这类短行依然不计（有意保留，不是漏网）
+  const short = await mkActivity(u, 'running', 150, { avgPace: null });
+  await ActivityModel.updateOne({ _id: short }, { $unset: { avgPace: 1 } });
+  assert.equal(await totalFor(u), 5_000, '跑不出可信配速的短行不该进发分合计');
+});
+
+test('PB-9 骑行榜：avgPace 恒为 null 仍计入发分，其余三道判据一条不松', async () => {
+  const u = mkUser();
+  // 骑行的 avgPace 是 pace.ts 设计出来的 null（不展示配速），不该因此永远发不到分
+  await mkActivity(u, 'cycling', 5_000, { avgPace: null });
+  assert.equal(await totalForType('cycling', u), 5_000, '干净骑行行该进发分合计');
+  // 同一个用户挂上其它三道判据的脏行：只松配速判据，另外三道照旧拦
+  await mkActivity(u, 'cycling', 50_000, { avgPace: null, vehicleMs: 600_000 });
+  await mkActivity(u, 'cycling', 50_000, { avgPace: null, driftScore: DRIFT_SCORE_PB_GATE + 1 });
+  await mkActivity(u, 'cycling', 50_000, { avgPace: null, corrected: false });
+  await mkActivity(u, 'cycling', 50_000, { avgPace: null, status: 'cancelled' });
+  assert.equal(await totalForType('cycling', u), 5_000, '搭车/超漂移/未纠偏/未完成的骑行行一条都不该进合计');
+});
+
+test('PB-9b 游泳榜：avgPace 恒为 null 仍计入发分，其余三道判据一条不松', async () => {
+  const u = mkUser();
+  await mkActivity(u, 'swimming', 3_000, { avgPace: null });
+  assert.equal(await totalForType('swimming', u), 3_000, '干净游泳行该进发分合计');
+  await mkActivity(u, 'swimming', 40_000, { avgPace: null, vehicleMs: 600_000 });
+  await mkActivity(u, 'swimming', 40_000, { avgPace: null, driftScore: DRIFT_SCORE_PB_GATE + 1 });
+  await mkActivity(u, 'swimming', 40_000, { avgPace: null, corrected: false });
+  assert.equal(await totalForType('swimming', u), 3_000, '另外三道判据对游泳同样生效');
 });
 
 test('PB-5 只有 status=finished 的行进入发分口径', async () => {
@@ -166,4 +220,31 @@ test('PB-8 输出形状：userId 为字符串、按可信总距离降序', async
   assert.ok(idxA >= 0 && idxB >= 0, '两个用户都该在榜上');
   assert.ok(idxA < idxB, '可信距离 9000 的 a 应排在可信距离 5000 的 b 前（按可信合计排序）');
   assert.ok(rows.every((r) => typeof r.userId === 'string' && typeof r.distance === 'number'));
+});
+
+/**
+ * PB-10 源码级守卫：「哪些类型不配算配速」与「哪些类型发分不要求配速」必须是同一份表。
+ * 这两个规则分处 pace.ts 与 points-board.ts，一旦有人把泳/骑这对字面量抄进发分查询，
+ * 以后 pace.ts 改表就只改了一半——症状是某类运动无声地发不到分，运行时用例很难发现，
+ * 所以这里直接钉住：points-board 只许引符号，不许出现第二份字面量。
+ */
+test('PB-10 配速豁免表单一事实源（源码级守卫）', () => {
+  const pair = /'(?:swimming|cycling)'\s*,\s*'(?:swimming|cycling)'/;
+  const paceSrc = readFileSync(new URL('../src/utils/pace.ts', import.meta.url), 'utf8');
+  const boardSrc = readFileSync(new URL('../src/services/points-board.ts', import.meta.url), 'utf8');
+
+  // 事实源本身：pace.ts 导出的表内容 = 泳/骑，且这对字面量在 pace.ts 里只出现一次
+  assert.deepEqual([...NO_PACE_TYPES].sort(), ['cycling', 'swimming'], 'NO_PACE_TYPES 只能有游泳/骑行');
+  assert.equal(hasNoPace('cycling') && hasNoPace('swimming'), true);
+  assert.equal(hasNoPace('running'), false);
+  assert.equal(
+    (paceSrc.match(new RegExp(pair.source, 'g')) ?? []).length,
+    1,
+    'pace.ts 里这对字面量必须只有一份（豁免表被复制进局部常量＝迟早漂移）',
+  );
+
+  // 消费方：points-board 引的是 pace.js 的符号，自己没有第二份字面量
+  assert.match(boardSrc, /from '\.\.\/utils\/pace\.js'/, 'points-board 要从 pace.js 引豁免判据');
+  assert.match(boardSrc, /hasNoPace\(/, 'points-board 的配速判据要按 hasNoPace 生效');
+  assert.doesNotMatch(boardSrc, pair, 'points-board 不许再抄一份游泳/骑行字面量数组');
 });
