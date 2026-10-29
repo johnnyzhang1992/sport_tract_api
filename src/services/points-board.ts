@@ -11,6 +11,10 @@
  *   若照旧套 $gte 就把这两类永久挡在发分之外（榜面永远空、§4.8「各运动类型的全国榜按
  *   总距离排名，前三名获得积分」变假话）。豁免表用 pace.ts 导出的 NO_PACE_TYPES/hasNoPace，
  *   不在本文件另抄一份，其余三道判据对所有类型一律照旧生效。
+ * - 第五道（2026-10-29 主人定稿）：表内类型（当前仅游泳）另有**整场平均速度上限**
+ *   （config/constants.ts 的 MAX_AVG_SPEED_MPS_BY_TYPE，当前只有 swimming 一档），用 $expr 判
+ *   distance <= 上限 × duration。骑行**故意不限速**（「骑行可能是自行车也可能是摩托车，
+ *   不做速度追责」），勿把 cycling 补进表里；只作用于本聚合，入库/展示榜/排行榜不套。
  * - 本文件建发分查询 + 结算数学（门槛/并列全发/每人 3 榜上限）+ 台账抢锁原语 + **Task 7 的
  *   结算编排（settlePeriod / settleDueForUser）与 §4.8 定稿文案工具（boardLabel / boardPeriodTag）**
  *   + **Task 10 的后台面（listBoardSettlements 台账列表 / revokeBoardSettlement 撤回）**。
@@ -43,7 +47,9 @@ import {
   ACTIVITY_TYPES,
   ACTIVITY_TYPE_META,
   DRIFT_SCORE_PB_GATE,
+  MAX_AVG_SPEED_MPS_BY_TYPE,
   MIN_PLAUSIBLE_PACE_SEC_PER_KM,
+  type ActivityType,
 } from '../config/constants.js';
 import { BOARD_REWARDS } from '../config/points.js';
 import { creditPoints, debitPoints } from './points-ledger.js';
@@ -66,15 +72,50 @@ const BASE_TRUSTED_MATCH = {
   corrected: { $ne: false },
 };
 
+/** 表内类型的速度上限（m/s）；不在表内＝该类型不做速度判据（当前骑行故意豁免） */
+function maxAvgSpeedMps(type: string): number | undefined {
+  // hasOwnProperty 而不是直接下标：type 来自库里的历史字符串，不能让 'constructor' 之类撞到原型
+  return Object.prototype.hasOwnProperty.call(MAX_AVG_SPEED_MPS_BY_TYPE, type)
+    ? MAX_AVG_SPEED_MPS_BY_TYPE[type as ActivityType]
+    : undefined;
+}
+
+/**
+ * 整场平均速度判据（发分口径，只对 MAX_AVG_SPEED_MPS_BY_TYPE 里的类型生效）：
+ * 保留 distance <= 上限 × duration 的行。
+ * - `duration` 是秒、已扣暂停（models/activity.model.ts:59）。
+ * - duration 缺失或 <=0 ⇒ 速度不可验证 ⇒ **排除**（$gt 先兜住），不按"缺字段＝可信"放行：
+ *   能算出距离却算不出时长的行本身就是坏数据（导入/老文档 duration 默认 0）。
+ *   影响面：只读取证（dev 库 swimming 共 11 行、0 行 finished、其中 10 行 duration=0 且全部
+ *   非 finished）⇒ 现有已完成数据一条都不受影响，见 swim-speed-gate-report.md；
+ *   不接受"0 时长换距离"。
+ * - 上限判据是 <=：恰在「上限 × duration」上仍可信，超 1 米即剔除（SB-3 钉边界）。
+ */
+function speedCapMatch(type: string): Record<string, unknown> | null {
+  const maxSpeed = maxAvgSpeedMps(type);
+  if (maxSpeed === undefined) return null;
+  return {
+    $expr: {
+      $and: [
+        { $gt: ['$duration', 0] },
+        { $lte: ['$distance', { $multiply: [maxSpeed, '$duration'] }] },
+      ],
+    },
+  };
+}
+
 /**
  * 该类型的可信判据：配速判据只对会算配速的类型加（见文件头）。
  * 加了它就要接受：跑步/步行等短行（distance < MIN_PACE_DISTANCE_M，pace.ts 里 avgPace 也是
  * null）继续被挡在发分之外——短到跑不出可信配速的轨迹不发分，是有意的。
+ * 速度上限同理按类型生效，且只加 $expr——type/status/startTime 仍在 $match 顶层可走索引。
  */
 function trustedMatch(type: string) {
-  return hasNoPace(type)
+  const base = hasNoPace(type)
     ? BASE_TRUSTED_MATCH
     : { ...BASE_TRUSTED_MATCH, avgPace: { $gte: MIN_PLAUSIBLE_PACE_SEC_PER_KM } };
+  const speedCap = speedCapMatch(type);
+  return speedCap ? { ...base, ...speedCap } : base;
 }
 
 /**
@@ -596,6 +637,8 @@ export interface SettleUnit {
  * 候选行的可信判定（内存版）：与 trustedMatch() 的四道判据同源同口径。
  * **只用来筛"这个用户够格让哪些周期单元进结算候选"**（C2：没可信行的人排不上名，
  * 也就不该为那个单元触发 8 个聚合）；发不发分、发给谁，裁决权全在 trustedBoardRows+planPeriodRewards。
+ * 速度上限表不在这里复刻：枚举只是性能闸门（真实裁决在聚合的 $expr），多枚举一个单元
+ * 最多多跑一次 $match，不会多发一分钱。
  */
 function isTrustedRow(r: { type: string; vehicleMs?: number; driftScore?: number; corrected?: boolean; avgPace?: number | null }): boolean {
   if ((r.vehicleMs ?? 0) > 0) return false;

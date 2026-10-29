@@ -40,7 +40,12 @@ import {
 import { NotificationModel } from '../src/models/notification.model.js';
 import { hasNoPace, NO_PACE_TYPES } from '../src/utils/pace.js';
 import { hasBoardTrustedAggregateIndex } from '../src/utils/guard-index.js';
-import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM, ACTIVITY_TYPES } from '../src/config/constants.js';
+import {
+  DRIFT_SCORE_PB_GATE,
+  MAX_AVG_SPEED_MPS_BY_TYPE,
+  MIN_PLAUSIBLE_PACE_SEC_PER_KM,
+  ACTIVITY_TYPES,
+} from '../src/config/constants.js';
 import {
   BOARD_REWARDS,
   BOARD_SETTLE_FROM_DEFAULT,
@@ -281,12 +286,79 @@ test('PB-9 骑行榜：avgPace 恒为 null 仍计入发分，其余三道判据�
 
 test('PB-9b 游泳榜：avgPace 恒为 null 仍计入发分，其余三道判据一条不松', async () => {
   const u = mkUser();
-  await mkActivity(u, 'swimming', 3_000, { avgPace: null });
+  // duration 必须给：发了速度上限之后，duration=0 的游泳行按"速度不可验证"剔除（SB-4）
+  await mkActivity(u, 'swimming', 3_000, { avgPace: null, duration: 1_500 });
   assert.equal(await totalForType('swimming', u), 3_000, '干净游泳行该进发分合计');
-  await mkActivity(u, 'swimming', 40_000, { avgPace: null, vehicleMs: 600_000 });
-  await mkActivity(u, 'swimming', 40_000, { avgPace: null, driftScore: DRIFT_SCORE_PB_GATE + 1 });
-  await mkActivity(u, 'swimming', 40_000, { avgPace: null, corrected: false });
+  // 40km/20000s = 2.0 m/s，速度本身可信，被拦只能是因为各自挂的那道判据
+  await mkActivity(u, 'swimming', 40_000, { avgPace: null, duration: 20_000, vehicleMs: 600_000 });
+  await mkActivity(u, 'swimming', 40_000, { avgPace: null, duration: 20_000, driftScore: DRIFT_SCORE_PB_GATE + 1 });
+  await mkActivity(u, 'swimming', 40_000, { avgPace: null, duration: 20_000, corrected: false });
   assert.equal(await totalForType('swimming', u), 3_000, '另外三道判据对游泳同样生效');
+});
+
+/* ====================================================================
+ * SB-* 游泳整场平均速度上限（2026-10-29 主人定稿）：只作用于发分聚合、只对表内类型生效。
+ * 单一事实源＝config/constants.ts 的 MAX_AVG_SPEED_MPS_BY_TYPE（当前仅 swimming: 2.5 m/s）。
+ * 速度＝distance / duration（duration 是秒、已扣暂停，models/activity.model.ts:59）：
+ * - 3km/1500s＝2.0 m/s 计入（SB-1）；
+ * - 5km/1000s＝5.0 m/s 剔除（SB-2）；
+ * - 恰在 上限×duration 上计入、超 1 米剔除（SB-3 边界）；
+ * - duration<=0 / 缺失 ⇒ 速度不可验证 ⇒ 剔除（SB-4，写进服务注释）；
+ * - **骑行故意不限速**（「骑行可能是自行车也可能是摩托车，不做速度追责」）：
+ *   108 km/h 的骑行行照旧计入（SB-5）——这条用例就是防"顺手补全"的钉子；
+ * - 服务里不许出现上限字面量（SB-6 源码级守卫，同 PB-10 的纪律）。
+ * ================================================================== */
+
+test('SB-1 游泳 3km / 1500s（2.0 m/s）计入发分距离', async () => {
+  const u = mkUser();
+  await mkActivity(u, 'swimming', 3_000, { avgPace: null, duration: 1_500 });
+  assert.equal(await totalForType('swimming', u), 3_000, '速度在合理区间的游泳行照常计入');
+});
+
+test('SB-2 游泳 5km / 1000s（5.0 m/s）不计入发分距离', async () => {
+  const u = mkUser();
+  await mkActivity(u, 'swimming', 5_000, { avgPace: null, duration: 1_000 });
+  assert.equal(await totalForType('swimming', u), 0, '整场平均速度超过上限的游泳行必须剔除');
+});
+
+test('SB-3 边界：distance == 上限 × duration 计入，超 1 米剔除', async () => {
+  const cap = MAX_AVG_SPEED_MPS_BY_TYPE.swimming;
+  assert.equal(typeof cap, 'number', '游泳上限必须在表里');
+  const ok = mkUser();
+  await mkActivity(ok, 'swimming', (cap as number) * 1_000, { avgPace: null, duration: 1_000 });
+  assert.equal(await totalForType('swimming', ok), (cap as number) * 1_000, '恰在上限上的行计入（判据是 <=，不是 <）');
+  const over = mkUser();
+  await mkActivity(over, 'swimming', (cap as number) * 1_000 + 1, { avgPace: null, duration: 1_000 });
+  assert.equal(await totalForType('swimming', over), 0, '超上限 1 米即剔除');
+});
+
+test('SB-4 游泳行 duration=0 或缺失：速度不可验证，剔除', async () => {
+  const u = mkUser();
+  await mkActivity(u, 'swimming', 100, { avgPace: null, duration: 0 });
+  // 字段整个缺失（老文档/导入）同样不可验证：$gt 判据不匹配 missing
+  const missing = await mkActivity(u, 'swimming', 100, { avgPace: null });
+  await ActivityModel.updateOne({ _id: missing }, { $unset: { duration: 1 } });
+  assert.equal(await totalForType('swimming', u), 0, 'duration<=0 或缺失的游泳行按不确定处理，不发分');
+});
+
+test('SB-5 骑行不限速：108 km/h（30 m/s）的骑行行仍计入（产品口径「骑行不管」）', async () => {
+  const u = mkUser();
+  await mkActivity(u, 'cycling', 30_000, { avgPace: null, duration: 1_000 });
+  assert.equal(await totalForType('cycling', u), 30_000, '骑行不做速度追责，30 m/s 也照常计入');
+  assert.deepEqual(
+    [...Object.keys(MAX_AVG_SPEED_MPS_BY_TYPE)].sort(),
+    ['swimming'],
+    '限速表只许有游泳：骑行被"顺手"补进来时这里先红（骑行可能是摩托车，不做速度追责）',
+  );
+});
+
+test('SB-6 上限值单一事实源：points-board 里不出现 2.5 字面量', () => {
+  const boardSrc = readFileSync(new URL('../src/services/points-board.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(
+    boardSrc,
+    /2\.5/,
+    '上限值只许住在 config/constants.ts 的 MAX_AVG_SPEED_MPS_BY_TYPE，服务里不许抄字面量',
+  );
 });
 
 test('PB-5 只有 status=finished 的行进入发分口径', async () => {

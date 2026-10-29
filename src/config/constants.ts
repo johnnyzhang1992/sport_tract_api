@@ -80,6 +80,18 @@ export const DRIFT_SCORE_PB_GATE = 30;
 export const MIN_PLAUSIBLE_PACE_SEC_PER_KM = 130;
 
 /**
+ * 发分口径的**整场平均速度上限**（米/秒，按类型；唯一事实源，2026-10-29 主人定稿）。
+ * - 只对表内类型生效：`distance > 上限 × duration` 的轨迹视为 GPS 漂移/被搬运，不计入发分距离。
+ * - **骑行故意不在表内**：产品既定口径「骑行可能是自行车也可能是摩托车，不做速度追责」，
+ *   2026-10-29 主人再次确认「骑行不管」。别"顺手"把 cycling 补进来——test/points-board.test.ts
+ *   的 SB-5 用一条 108 km/h 的骑行行钉住这条豁免。
+ * - 只作用于发分聚合（services/points-board.ts 的 trustedMatch → $expr），入库、展示榜、
+ *   排行榜一律不套这个门禁（展示与发分口径本就允许不一致，见 §17.8）。
+ * - `duration` 缺失或 <=0 时速度不可验证：表内类型**直接排除**，不按"缺字段＝可信"放行。
+ */
+export const MAX_AVG_SPEED_MPS_BY_TYPE: Readonly<Partial<Record<ActivityType, number>>> = { swimming: 2.5 };
+
+/**
  * 档案缺失时的兜底体重（kg）：卡路里 = MET × 体重 × 小时，必须有个体重才能算。
  * 正常路径取 user.weightKg（user.model 的 default 就是这个值），只有查不到用户文档才会用到这里。
  */
