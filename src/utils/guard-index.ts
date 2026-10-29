@@ -67,6 +67,22 @@ export function hasUniqueDailyQuotaIndex(indexes: IndexShape[]): boolean {
 }
 
 /**
+ * 榜单发放台账（boardsettlements，Task 6）的 {type,period,periodKey,userId} unique 防线是否真在。
+ * 正确性防线不是性能索引：settlePeriod 是懒结算，同一期同一榜同一人会在并发请求里被触发多次，
+ * 「这笔发过没有」全靠这条唯一索引让败者撞 E11000 退化（services/points-board.ts 的 claimBoardSettlement）。
+ * 删了它的症状：同一笔榜单奖励发两遍（资损），而且不报错——台账只是多出一行，
+ * 败者分支（won=false）同时变成死代码。
+ * 认排序后的字段组合而不是键序（唯一性约束与键序无关），也不认名字（名字是 Mongoose 自动生成的）；
+ * 声明侧那半边的断言才钉 exact 键序，因为 Task 7 的读路径要 {type,period,periodKey} 这个前缀能用上索引。
+ */
+export function hasUniqueBoardSettlementIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const fields = Object.keys(i.key ?? {}).sort().join(',');
+    return fields === 'period,periodKey,type,userId' && i.unique === true;
+  });
+}
+
+/**
  * 定向通知（notifications，Task 8）读路径索引是否真在：{userId:1, published:1, publishedAt:-1}。
  * 性能索引（非 unique），但认键序与方向：登录侧过滤是
  * `{published:true, $or:[{userId:null},{userId:me}]}`，$or 的 isosolution 下每个分支都按

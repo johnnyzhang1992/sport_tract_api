@@ -21,10 +21,10 @@ import { config } from '../src/config/index.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { CampaignMemberModel } from '../src/models/campaign-member.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
-import { PointDailyQuotaModel, PointRecordModel } from '../src/models/point.model.js';
+import { PointDailyQuotaModel, PointRecordModel, BoardSettlementModel } from '../src/models/point.model.js';
 import {
   hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
-  hasNotificationRecipientIndex,
+  hasNotificationRecipientIndex, hasUniqueBoardSettlementIndex,
 } from '../src/utils/guard-index.js';
 
 before(async () => {
@@ -208,4 +208,43 @@ test('notifications：publishedAt 方向写成升序不算防线：列表口径�
 
 test('notifications：缺字段（没有 published）不算防线：草稿会混进结果集', () => {
   assert.equal(hasNotificationRecipientIndex([{ name: 'x', key: { userId: 1, publishedAt: -1 } }]), false);
+});
+
+/**
+ * 榜单发放台账（boardsettlements，Task 6）的 {type,period,periodKey,userId} unique 防线。
+ * 正确性防线，不是性能索引：settlePeriod 挂在用户入口上做懒结算（Task 9），同一期同一榜同一人
+ * 会被反复触发、还会并发触发，「这笔发过没有」只由这一行台账裁决。
+ * 声明被删时 autoIndex 只留一条 warning，症状是同一笔榜单奖励发两遍（真金白银的资损）且没有任何报错，
+ * 同时 E11000→安静退化的败者分支（claimBoardSettlement 的 won=false）也永不触发，变成死代码。
+ * 两侧都核对（同 pointrecords/pointdailyquotas 的教训）：只核对库里那份，被删了声明但 dev 库
+ * 还留着历史索引时会假绿；声明侧这条先红，且要连 opts.unique 一起断（把 unique: true 删成
+ * 同名普通索引，只认键组合的写法测不出来）。
+ */
+test('BS-3 索引自检：模型 init 后唯一索引存在（照 campaignmembers 那条的先例）', async () => {
+  // 声明侧：认 exact 键组合与**键序**（Task 7 的读路径要 {type,period,periodKey} 前缀能用上它）
+  // 加 opts.unique。键序只在声明侧钉，库侧谓词按排序后的字段组合认（唯一性约束与键序无关）。
+  const declared = BoardSettlementModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys, opts]) => Object.keys(keys).join(',') === 'type,period,periodKey,userId'
+      && (opts as { unique?: boolean } | undefined)?.unique === true),
+    `schema 里的索引声明没有 {type,period,periodKey,userId} + unique:true 这条！现有声明：${JSON.stringify(declared)}`,
+  );
+  await BoardSettlementModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
+  const idx = await BoardSettlementModel.collection.indexes();
+  assert.ok(
+    hasUniqueBoardSettlementIndex(idx),
+    `防线不在！现有索引：${JSON.stringify(idx.map((i) => ({ name: i.name, unique: i.unique, key: i.key })))}`,
+  );
+});
+
+test('boardsettlements：普通索引（非 unique）不算防线：并发懒结算会各插一行、各发一笔', () => {
+  assert.equal(hasUniqueBoardSettlementIndex([{ name: 'x', key: { type: 1, period: 1, periodKey: 1, userId: 1 } }]), false);
+});
+
+test('boardsettlements：字段不全（缺 periodKey）不算防线：不同期会互相顶掉发放', () => {
+  assert.equal(hasUniqueBoardSettlementIndex([{ name: 'x', key: { type: 1, period: 1, userId: 1 }, unique: true }]), false);
+});
+
+test('boardsettlements：只按 userId 唯一不算防线：一个人同期只能上一次榜', () => {
+  assert.equal(hasUniqueBoardSettlementIndex([{ name: 'x', key: { userId: 1 }, unique: true }]), false);
 });

@@ -9,10 +9,22 @@ import {
   trustedBoardRows,
   planPeriodRewards,
   flattenWithPerUserCap,
+  claimBoardSettlement,
+  flipBoardSettlementToCredited,
+  recordBoardSettlementSkipped,
+  isBoardSettlementSkipped,
   type BoardCandidate,
+  type BoardPeriod,
   type BoardReward,
   type PlanOpts,
 } from '../src/services/points-board.js';
+import {
+  BoardSettlementModel,
+  BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID,
+  BOARD_SETTLEMENT_PERIODS,
+  BOARD_SETTLEMENT_STATUSES,
+  type BoardSettlementPeriod,
+} from '../src/models/point.model.js';
 import { hasNoPace, NO_PACE_TYPES } from '../src/utils/pace.js';
 import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM, ACTIVITY_TYPES } from '../src/config/constants.js';
 
@@ -80,6 +92,9 @@ async function totalFor(userId: Types.ObjectId): Promise<number> {
 before(async () => {
   app = await buildApp({ logger: false });
   await app.ready();
+  // 台账的幂等全靠那条唯一索引，而 autoIndex 是异步的：不先等它建完就断言 E11000 会假绿
+  // （与 test/points-models.test.ts:12 同款）
+  await Promise.all([BoardSettlementModel.init()]);
 });
 
 after(async () => {
@@ -87,6 +102,8 @@ after(async () => {
   // 后续所有按窗口/类型聚合的用例（含榜单类）会被无声污染
   try {
     await ActivityModel.deleteMany({ userId: { $in: seededUsers } });
+    // 台账行按「本次运行独有的 periodKey」收口，只删自己种的（共享 dev 库纪律：不碰别人的行）
+    await BoardSettlementModel.deleteMany({ periodKey: TEST_PERIOD_KEY });
   } catch (err) {
     console.error('[points-board.test] fixture 轨迹清理失败，dev 库有残留', err);
   }
@@ -659,4 +676,213 @@ test('PR-7 并列全发照样占用每人 3 榜额度；没过门槛的空榜不
   // running 250 + cycling/hiking 各 100 + swimming 剩 p0/p1 两条 50 ＝ 500；条数 5+3+3+2＝13
   assert.equal(got.length, 13);
   assert.equal(got.reduce((s, r) => s + r.points, 0), 500);
+});
+
+/* ====================================================================
+ * BoardSettlement 发放台账（Task 6）：唯一键幂等 + 抢锁原语 + 索引形状
+ *
+ * 台账是「这笔榜单奖励发过没有」的唯一事实源。懒结算（Task 9）把 settlePeriod 挂在用户入口上，
+ * 同一期同一榜同一人会被反复触发，还会在两台设备／两个标签页里**同时**触发；积分是真金白银，
+ * 所以「一次且仅一次」只能钉在 DB 的唯一索引 {type,period,periodKey,userId} 上——
+ * 应用层「先查再插」总有并发窗口（与 PointDailyQuota / campaignmembers 同一条教训）。
+ *
+ * 夹具纪律（共享 dev 库）：
+ * - periodKey 用本次运行独有的 `t_<WIN_START>`，after 只按它删自己种的行，不碰别人的；
+ * - type 用 t_b* 前缀（真实榜单的 type 只会是 ACTIVITY_TYPES 那 8 个值，永不撞名）；
+ * - userId 全是自造 ObjectId（不落 user 文档），断言只按自己的键收口，不声明平台绝对值。
+ *
+ * 「发分」在这里用内存计数器代表：本任务不碰 creditPoints，也不往共享库的 pointrecords 里种假流水
+ * （真实流水与定稿文案的断言是 Task 7 的 SP-*）。fakeSettleOnce 里 `return 1` 那一行
+ * 就是 Task 7 换成 creditPoints(...) 的位置。
+ * ================================================================== */
+
+/** 本次运行独有的 periodKey＝台账行的清理锚点（见 after） */
+const TEST_PERIOD_KEY = `t_${WIN_START}`;
+
+function mkLedgerUser(): Types.ObjectId {
+  return new Types.ObjectId();
+}
+
+/**
+ * 一次「假想发放」＝ Task 7 settlePeriod 循环体里的一条：抢锁 → 翻牌 → 发分。
+ * 返回 1 表示本次真的发了钱，0 表示安静跳过（已有人占位／没拿到发放权）。
+ */
+async function fakeSettleOnce(type: string, userId: Types.ObjectId, period: BoardPeriod = 'week'): Promise<number> {
+  const key = { type, period, periodKey: TEST_PERIOD_KEY, userId: String(userId) };
+  const { won } = await claimBoardSettlement(key, { rank: 1, points: 50 });
+  if (!won) return 0;
+  const credited = await flipBoardSettlementToCredited(key);
+  if (!credited) return 0;
+  return 1; // ← Task 7：这一行换成 creditPoints(...)
+}
+
+test('BS-1 同一 (type, period, periodKey, userId) 重复结算只发一次（撞唯一键即跳过）', async () => {
+  const u = mkLedgerUser();
+  const board = 't_b1_running';
+  assert.equal(await fakeSettleOnce(board, u), 1, '首次结算要拿到发放权');
+  assert.equal(await fakeSettleOnce(board, u), 0, '第二次进页面不得再发');
+  assert.equal(await fakeSettleOnce(board, u), 0, '第三次同样不得再发，而且必须是安静跳过：抛错会把整批 8 个榜打断');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ type: board, periodKey: TEST_PERIOD_KEY }),
+    1,
+    '台账只能留一行（重复结算不留垃圾行）',
+  );
+
+  // 唯一键的四元组一个都不能少：换个维度就是另一笔奖励，照样要发得出去
+  assert.equal(await fakeSettleOnce(board, mkLedgerUser()), 1, '同榜不同人＝另一笔奖励');
+  assert.equal(await fakeSettleOnce('t_b1_cycling', u), 1, '同人不同榜＝另一笔奖励');
+  assert.equal(await fakeSettleOnce(board, u, 'month'), 1, '同人同榜不同周期＝另一笔奖励');
+
+  // DB 层直接取证（不经过抢锁原语）：裸 create 第二次必撞 E11000。
+  // Task 7 的「败者退化」钉的就是这条约束；摘掉 unique:true 这一句先红。
+  const raw = {
+    type: 't_b1_raw', period: 'week' as const, periodKey: TEST_PERIOD_KEY,
+    userId: u, rank: 2, points: 30, status: 'credited' as const,
+  };
+  await BoardSettlementModel.create(raw);
+  await assert.rejects(
+    () => BoardSettlementModel.create({ ...raw, points: 999 }),
+    /E11000/,
+    '唯一键没拦住第二行：同一笔奖励会被发两遍',
+  );
+});
+
+test('BS-1b 翻牌带 status=pending 条件：一行只许拿到一次发放权', async () => {
+  const u = mkLedgerUser();
+  const key = { type: 't_b1b_running', period: 'week' as const, periodKey: TEST_PERIOD_KEY, userId: String(u) };
+  assert.equal((await claimBoardSettlement(key, { rank: 1, points: 50 })).won, true, '抢锁要成功');
+  const first = await flipBoardSettlementToCredited(key);
+  assert.equal(first?.status, 'credited', '首次翻牌拿到发放权');
+  assert.equal(await flipBoardSettlementToCredited(key), null, '第二次翻牌必须拿不到发放权——这是「只发一次」的第二道闸');
+  assert.equal(await BoardSettlementModel.countDocuments(key), 1);
+
+  // 崩在翻牌之前留下的 pending 行：现在会被当成「已占位」继续挡住发放（won=false）。
+  // 这里先把现状钉住——Task 7 要么在失败路径删/改这行，要么加超时接管，语义变了必须显式改这条断言。
+  const stale = { type: 't_b1b_stale', period: 'week' as const, periodKey: TEST_PERIOD_KEY, userId: String(mkLedgerUser()) };
+  await claimBoardSettlement(stale, { rank: 3, points: 20 });
+  assert.equal((await claimBoardSettlement(stale, { rank: 3, points: 20 })).won, false, '遗留 pending 行仍占键（已知敞口，Task 7 收口）');
+});
+
+test('BS-2 并发双请求不双发', async () => {
+  const u = mkLedgerUser();
+  const board = 't_b2_running';
+  const paid = await Promise.all([fakeSettleOnce(board, u), fakeSettleOnce(board, u)]);
+  assert.equal(paid[0] + paid[1], 1, `并发双发！两次各自拿到发放权：${JSON.stringify(paid)}`);
+  const rows = await BoardSettlementModel.find({ type: board, periodKey: TEST_PERIOD_KEY }).lean();
+  assert.equal(rows.length, 1, '并发只留一行台账');
+  assert.equal(rows[0].status, 'credited', '留下的那行必须是已发放终态');
+
+  // 扇出更宽的并发：同一个人 6 个入口同时进来（两设备 × 三入口），仍然只发一笔
+  const many = await Promise.all(Array.from({ length: 6 }, () => fakeSettleOnce('t_b2_cycling', u)));
+  assert.equal(many.reduce((s, n) => s + n, 0), 1, `6 路并发只能发 1 笔，实际 ${JSON.stringify(many)}`);
+  assert.equal(await BoardSettlementModel.countDocuments({ type: 't_b2_cycling', periodKey: TEST_PERIOD_KEY }), 1);
+
+  // 抢锁层取证：证明「撞唯一键 → 安静跳过」这条分支真的走到了（不是被串行化侥幸躲过）
+  const key6 = { type: 't_b2_swimming', period: 'week' as const, periodKey: TEST_PERIOD_KEY, userId: String(u) };
+  const claims = await Promise.all(Array.from({ length: 6 }, () => claimBoardSettlement(key6, { rank: 1, points: 50 })));
+  assert.equal(claims.filter((c) => c.won).length, 1, '并发抢锁恰好一个胜者');
+  assert.equal(claims.filter((c) => !c.won).length, 5, '其余 5 路都要走败者分支');
+  assert.ok(
+    claims.filter((c) => !c.won).every((c) => c.existing !== null),
+    '败者要拿回已存在的那行（E11000 退化分支被真实执行，且不抛错）',
+  );
+});
+
+test('BS-4 未过人数门槛的榜写 skipped 占位行：不重复重算、reason 留痕、不替真人挡发放', async () => {
+  const board = { type: 't_b4_running', period: 'week' as const, periodKey: TEST_PERIOD_KEY };
+  assert.equal(await isBoardSettlementSkipped(board), false, '夹具自证：开跑前没有占位行');
+  assert.equal(await recordBoardSettlementSkipped(board, '参与人数 8 未过门槛 10'), true, '首次要落下占位行');
+  assert.equal(await isBoardSettlementSkipped(board), true, '第二次进页面直接跳过整榜聚合（发分口径一榜一个 aggregate，8 个榜都省掉）');
+  assert.equal(await recordBoardSettlementSkipped(board, '重复调用'), false, '占位行只写一次，第二次是安静跳过不是抛错');
+
+  const row = await BoardSettlementModel.findOne(board).lean();
+  assert.equal(row?.status, 'skipped');
+  assert.equal(row?.reason, '参与人数 8 未过门槛 10', 'reason 要留得下来：后台台账页（Task 10）要看为什么没发');
+  assert.equal(String(row?.userId), BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID, 'skipped 是「整榜级」行，不属于任何用户');
+  assert.equal(row?.rank, 0, '整榜级行没有名次可言，用 0 表达不适用');
+  assert.equal(row?.points, 0, '整榜级行不发分');
+
+  // 整榜级占位不能把真人的奖励一起挡掉：唯一键含 userId，哨兵行与真人行不同键
+  assert.equal(await fakeSettleOnce(board.type, mkLedgerUser()), 1, 'skipped 占位行不得替用户挡发放');
+});
+
+test('BS-5 revoked 不释放唯一键、recordId 回指流水：撤回过的行不会被懒结算再发一次', async () => {
+  const u = mkLedgerUser();
+  const key = { type: 't_b5_running', period: 'month' as const, periodKey: TEST_PERIOD_KEY, userId: String(u) };
+  assert.equal((await claimBoardSettlement(key, { rank: 1, points: 100 })).won, true);
+  const recordId = new Types.ObjectId(); // Task 7 写进来的是 creditPoints 落下的 pointrecords._id
+  const flipped = await flipBoardSettlementToCredited(key, recordId);
+  assert.equal(flipped?.status, 'credited');
+  assert.equal(String(flipped?.recordId), String(recordId), '台账要能回指那笔流水，Task 10 才冲得回去');
+
+  // 运营撤回（Task 10 的动作）：改状态、不删行
+  await BoardSettlementModel.updateOne(key, { $set: { status: 'revoked', reason: '运营复核：判定刷分' } });
+  assert.equal(await fakeSettleOnce(key.type, u, key.period), 0, '撤回后再来一次懒结算不得重发');
+  assert.equal(await BoardSettlementModel.countDocuments(key), 1, 'revoked 不删行＝唯一键继续占位，撤回才是终态');
+  const row = await BoardSettlementModel.findOne(key).lean();
+  assert.equal(row?.status, 'revoked');
+  assert.equal(String(row?.recordId), String(recordId), '撤回行仍然指着原流水（冲销凭据不能丢）');
+  assert.equal(await flipBoardSettlementToCredited(key), null, '已 revoked 的行不能被翻回 credited 再领一次发放权');
+});
+
+test('BS-6 status/period 枚举闸门：四态都能落库、拼错的值写不进去', async () => {
+  /**
+   * 编译期闸门：模型侧的 period 联合与 service 侧的 BoardPeriod 必须双向可赋值。
+   * 两边任一处改动而另一边没跟上，这个 const 的类型就塌成 false，`npm run typecheck` 直接红
+   * （BoardPeriod 是纯类型、没有运行值，所以运行时报不了这个漂移）。
+   */
+  const periodUnionMatches:
+    [BoardPeriod] extends [BoardSettlementPeriod]
+      ? ([BoardSettlementPeriod] extends [BoardPeriod] ? true : false)
+      : false = true;
+  assert.equal(periodUnionMatches, true, 'models 的 period 联合与 services 的 BoardPeriod 不同形');
+  assert.deepEqual([...BOARD_SETTLEMENT_PERIODS].sort(), ['month', 'week', 'year']);
+
+  // 四态逐个落库。'pending' 是控制器裁定加进来的：Task 7 先写 pending 行抢锁、再翻成 credited
+  const statuses = ['pending', 'credited', 'skipped', 'revoked'] as const;
+  assert.deepEqual([...BOARD_SETTLEMENT_STATUSES].sort(), [...statuses].sort());
+  for (const status of statuses) {
+    const created = await BoardSettlementModel.create({
+      type: `t_b6_${status}`, period: 'week', periodKey: TEST_PERIOD_KEY,
+      userId: mkLedgerUser(), rank: 1, points: 50, status,
+    });
+    assert.equal(created.status, status, `${status} 必须是合法终态`);
+  }
+
+  // 拼错的终态必须拒掉：静默入库的行既进不了后台台账（Task 10）的筛选，也挡不住下一次发放
+  const base = {
+    type: 't_b6_reject', period: 'week' as const, periodKey: TEST_PERIOD_KEY,
+    userId: mkLedgerUser(), rank: 1, points: 50,
+  };
+  await assert.rejects(
+    () => BoardSettlementModel.create({ ...base, status: 'creditd' }),
+    (e: unknown) => {
+      const err = e as { name?: string; errors?: Record<string, unknown> };
+      assert.equal(err.name, 'ValidationError');
+      assert.ok(err.errors?.status, '拒绝点要落在 status 上');
+      return true;
+    },
+    'enum 闸门没生效：拼错的 status 被静默写进台账',
+  );
+  await assert.rejects(
+    () => BoardSettlementModel.create({ ...base, status: 'credited', period: 'daily' }),
+    (e: unknown) => {
+      const err = e as { name?: string; errors?: Record<string, unknown> };
+      assert.equal(err.name, 'ValidationError');
+      assert.ok(err.errors?.period, '拒绝点要落在 period 上');
+      return true;
+    },
+    'enum 闸门没生效：未知周期被静默写进台账',
+  );
+  // 名次/分值有下限：0 只留给整榜级 skipped 行，负数一条都不许进台账（-1 分＝凭空造钱）
+  await assert.rejects(
+    () => BoardSettlementModel.create({ ...base, status: 'credited', rank: -1 }),
+    /min/,
+    'rank 的下限闸门没生效',
+  );
+  await assert.rejects(
+    () => BoardSettlementModel.create({ ...base, status: 'credited', points: -1 }),
+    /min/,
+    'points 的下限闸门没生效',
+  );
 });
