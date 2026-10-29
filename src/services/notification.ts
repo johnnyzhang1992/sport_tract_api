@@ -141,6 +141,32 @@ export async function markNotificationRead(userId: string, id: string) {
   return { unreadCount: unreadRows.length };
 }
 
+/** 一键全读（2026-10-29 消息中心「全部已读」按钮）：把我可见的全部已发布通知补齐已读行，返回最新未读数。
+ * 幂等：ordered:false 撞唯一键（并发单条已读上报）只跳过冲突行，其余错误照抛。
+ * 注册前那条「发现入口」也会被读掉——用户人在消息中心点全部已读，就是明确放弃了这个引导。 */
+export async function markAllNotificationsRead(userId: string) {
+  const rows = await publishedRows(userId);
+  const { unreadRows } = await unreadState(userId, rows);
+  if (unreadRows.length > 0) {
+    try {
+      await NotificationReadModel.insertMany(
+        unreadRows.map((r) => ({
+          userId: new Types.ObjectId(userId),
+          notificationId: r._id,
+          readAt: Date.now(),
+        })),
+        { ordered: false },
+      );
+    } catch (e) {
+      const err = e as { writeErrors?: Array<{ code?: number }>; code?: number };
+      const codes = err.writeErrors?.map((w) => w.code) ?? [err.code];
+      if (!codes.length || !codes.every((c) => c === 11000)) throw e;
+    }
+  }
+  const fresh = await unreadState(userId, rows);
+  return { unreadCount: fresh.unreadRows.length };
+}
+
 // ==================== 管理端 ====================
 
 export interface AdminNotification {

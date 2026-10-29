@@ -4,6 +4,7 @@ import {
   listNotifications,
   getNotificationDetail,
   markNotificationRead,
+  markAllNotificationsRead,
 } from '../services/notification.js';
 import { success } from '../utils/response.js';
 
@@ -26,6 +27,10 @@ export async function notificationRoutes(fastify: FastifyInstance) {
   });
 
   // 打开详情后标已读（幂等）
+  // 一键全读：消息中心「全部已读」按钮；幂等，返回最新未读数（恒 0）
+  fastify.post('/read-all', { onRequest: [fastify.authenticate] }, async (request) =>
+    success(await markAllNotificationsRead(request.user.userId)));
+
   fastify.post('/:id/read', { onRequest: [fastify.authenticate] }, async (request) => {
     const { id } = request.params as { id: string };
     return success(await markNotificationRead(request.user.userId, id));

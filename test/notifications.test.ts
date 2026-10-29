@@ -469,3 +469,60 @@ test('NT-DIR-5 游客看不到任何定向项', async () => {
   const guestSummary = (await getGuest('/notifications/summary')).json().data;
   assert.notEqual(guestSummary.item?.id, dir.id, '游客首页条不能取到定向行');
 });
+
+// ==================== NR 一键全读（消息中心「全部已读」） ====================
+
+test('NR-1 read-all：全部未读清零，列表全 read，幂等重放不炸', async () => {
+  const me = await loginFresh('notif-ra');
+  extraUsers.push(me);
+  const tick = () => new Promise<void>((r) => setImmediate(r));
+  // 本用例造的广播用完即删（NT2/NT3 对未读数做绝对断言，留一行都会毒化后面的用例）
+  const myNotices: Types.ObjectId[] = [];
+
+  // 共享 dev 库里有别的运行留下的广播：未读数全部用相对值断言
+  const base = (await getWith(me.token, '/notifications')).json().data.unreadCount;
+
+  // 三条已发布广播：刚注册的用户全未读
+  for (const i of [1, 2, 3]) {
+    const doc = await NotificationModel.create({
+      title: `公告 ${i}`, content: '内容', published: true, publishedAt: Date.now() + i, userId: null,
+    });
+    myNotices.push(doc._id);
+  }
+  await tick();
+  const before = await getWith(me.token, '/notifications');
+  assert.equal(before.json().data.unreadCount, base + 3, '新发三条全部计入未读');
+
+  const first = await postWith(me.token, '/notifications/read-all');
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(first.json().data.unreadCount, 0, 'read-all 后未读清零（含存量）');
+
+  // 列表全 read
+  const after = await getWith(me.token, '/notifications');
+  assert.ok(after.json().data.items.every((it: { read: boolean }) => it.read));
+
+  // 幂等：再来一次不炸、仍是 0
+  const replay = await postWith(me.token, '/notifications/read-all');
+  assert.equal(replay.statusCode, 200);
+  assert.equal(replay.json().data.unreadCount, 0);
+
+  // 部分已读后的增量路径：单条新公告 → 未读 1 → 再 read-all 清零
+  const extra = await NotificationModel.create({
+    title: '新公告', content: '内容', published: true, publishedAt: Date.now() + 100, userId: null,
+  });
+  myNotices.push(extra._id);
+  await tick();
+  const mid = await getWith(me.token, '/notifications');
+  assert.equal(mid.json().data.unreadCount, 1);
+  await postWith(me.token, '/notifications/read-all');
+  assert.equal((await getWith(me.token, '/notifications')).json().data.unreadCount, 0);
+
+  // 清场：本用例的广播全删（含已读行），不给 NT2/NT3 的绝对断言留脏数据
+  await NotificationModel.deleteMany({ _id: { $in: myNotices } });
+  await NotificationReadModel.deleteMany({ notificationId: { $in: myNotices } });
+});
+
+test('NR-2 read-all 需登录：游客 401', async () => {
+  const res = await app.inject({ method: 'POST', url: '/sport-track/api/notifications/read-all' });
+  assert.equal(res.statusCode, 401);
+});
