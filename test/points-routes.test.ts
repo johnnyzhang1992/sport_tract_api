@@ -10,6 +10,7 @@ import {
 import { UserModel } from '../src/models/user.model.js';
 import { LoginLogModel } from '../src/models/login-log.model.js';
 import { BOARD_REWARDS, POINTS, boardRulesText } from '../src/config/points.js';
+import { setBoardRewardsEnabled } from '../src/services/board-switch.js';
 import { creditPoints } from '../src/services/points-ledger.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { previousDateKey, shiftDateKey } from '../src/utils/points-domain.js';
@@ -606,7 +607,7 @@ test('PR-R1 进积分页会触发上一周结算（各一次请求内完成，�
     return pending;
   });
   const enabled = BOARD_REWARDS.enabled;
-  BOARD_REWARDS.enabled = true;
+  await setBoardRewardsEnabled(true);
   try {
     const before = Date.now();
     const res = await get('/points/summary');
@@ -618,14 +619,14 @@ test('PR-R1 进积分页会触发上一周结算（各一次请求内完成，�
     assert.equal(calls[0][0], userId, '调度必须只针对本人');
     assert.ok(calls[0][1] >= before && calls[0][1] <= Date.now(), 'now 由请求时刻传入');
   } finally {
-    BOARD_REWARDS.enabled = enabled;
+    await setBoardRewardsEnabled(enabled);
   }
 });
 
 test('PR-R2 结算失败不拖垮 summary（reject 与同步抛都吞掉，主响应 200 载荷照常）', async (t) => {
   resetLazySettleDebounceForTest();
   const enabled = BOARD_REWARDS.enabled;
-  BOARD_REWARDS.enabled = true;
+  await setBoardRewardsEnabled(true);
   try {
     // ① 后台 promise reject：必须被 .catch 吞掉（摘掉 swallow 会变 unhandledRejection 打挂进程）
     t.mock.method(lazySettleDeps, 'settle', async () => { throw new Error('boom：结算炸了'); });
@@ -651,7 +652,7 @@ test('PR-R2 结算失败不拖垮 summary（reject 与同步抛都吞掉，主�
     assert.ok(Array.isArray(res3.json().data.top), '榜单主体照常');
     t.mock.restoreAll();
   } finally {
-    BOARD_REWARDS.enabled = enabled;
+    await setBoardRewardsEnabled(enabled);
   }
 });
 
@@ -659,7 +660,7 @@ test('PR-R3 开关关闭时不调度（两个入口都零调度开销）', async
   resetLazySettleDebounceForTest();
   const calls: string[] = [];
   t.mock.method(lazySettleDeps, 'settle', (u: string) => { calls.push(u); return Promise.resolve(); });
-  assert.equal(BOARD_REWARDS.enabled, false, '灰度开关默认必须 false（spec §6），本用例不许翻它');
+  assert.equal(BOARD_REWARDS.enabled, false, '开关种子缺省必须 false（spec §6）；运行时态走 app_settings 由 BS-0 钉');
   try {
     const res = await get('/points/summary');
     assert.equal(res.statusCode, 200, res.body);
@@ -676,7 +677,7 @@ test('PR-D1 每用户限频：窗口内同用户第二次进页不再调度（�
   let n = 0;
   t.mock.method(lazySettleDeps, 'settle', () => { n += 1; return Promise.resolve(); });
   const enabled = BOARD_REWARDS.enabled;
-  BOARD_REWARDS.enabled = true;
+  await setBoardRewardsEnabled(true);
   try {
     const r1 = await get('/points/summary');
     assert.equal(r1.statusCode, 200, r1.body);
@@ -696,17 +697,23 @@ test('PR-D2 限频按注入时刻放行：窗口内拦、到点放（纯 helper 
   let n = 0;
   t.mock.method(lazySettleDeps, 'settle', () => { n += 1; return Promise.resolve(); });
   const enabled = BOARD_REWARDS.enabled;
-  BOARD_REWARDS.enabled = true;
+  await setBoardRewardsEnabled(true);
   try {
     const T = Date.now();
+    // 开关改 DB 态后检查进了异步壳：断言前先让壳跑完（一次 DB 读 + dep 调用）
+    const tick = () => new Promise<void>((r) => setImmediate(r));
     scheduleLazySettle(fake, T);
+    await tick();
     assert.equal(n, 1, '首次调度');
     scheduleLazySettle(fake, T + SETTLE_TRIGGER_WINDOW_MS - 1);
+    await tick();
     assert.equal(n, 1, '窗口内（差 1ms）拦截');
     scheduleLazySettle(fake, T + SETTLE_TRIGGER_WINDOW_MS);
+    await tick();
     assert.equal(n, 2, '整窗过后放行');
     // 空串 userId（游客防御的第二道闸）永不调度
     scheduleLazySettle('', T + SETTLE_TRIGGER_WINDOW_MS);
+    await tick();
     assert.equal(n, 2, '空 userId 不配占用闸门');
   } finally {
     BOARD_REWARDS.enabled = enabled;
@@ -722,7 +729,7 @@ test('PR-L1 游客看榜不给任何人触发结算；登录用户看榜触发�
     return Promise.resolve();
   });
   const enabled = BOARD_REWARDS.enabled;
-  BOARD_REWARDS.enabled = true;
+  await setBoardRewardsEnabled(true);
   try {
     // 游客：不带 token。榜单照常 200，但绝不允许替「某个用户」结算
     const guest = await app.inject({ method: 'GET', url: `${API}/stats/leaderboard?type=running&period=week` });

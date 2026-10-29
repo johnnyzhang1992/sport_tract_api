@@ -17,7 +17,7 @@
  *
  * 本模块不碰结算数学、台账与通知——它只做「调度 + 吞错 + 限频」。
  */
-import { BOARD_REWARDS } from '../config/points.js';
+import { isBoardRewardsEnabled } from './board-switch.js';
 import { settleDueForUser } from './points-board.js';
 
 /**
@@ -52,9 +52,6 @@ export function resetLazySettleDebounceForTest(): void {
  * reject 后同样被吞——挂在页面请求上的顺带动作不能把请求变 500。
  */
 export function scheduleLazySettle(userId: string, now: number = Date.now()): void {
-  // SP-4 语义在入口层先钉一道：开关关闭连调度都不发起（纯内存判定，零 DB 开销；
-  // settleDueForUser 内部还有第二道同款短路，defense in depth）
-  if (!BOARD_REWARDS.enabled) return;
   if (!userId) return; // 游客/空 id：绝不替「某个用户」结算
   const last = lastTriggerAt.get(userId);
   if (last !== undefined && now - last < SETTLE_TRIGGER_WINDOW_MS) return;
@@ -65,6 +62,9 @@ export function scheduleLazySettle(userId: string, now: number = Date.now()): vo
   }
   lastTriggerAt.set(userId, now);
   void (async () => {
+    // 开关检查挪进异步壳（2026-10-29 改 DB 开关）：入口保持同步零请求路径开销；
+    // settleDueForUser 内部还有第二道同款短路，defense in depth
+    if (!(await isBoardRewardsEnabled(now))) return;
     await lazySettleDeps.settle(userId, now);
   })().catch((e) => {
     console.error('[board-lazy-settle] 后台结算失败（主响应不受影响，下后进页重试）', { userId }, e);

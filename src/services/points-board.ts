@@ -52,6 +52,7 @@ import {
   type ActivityType,
 } from '../config/constants.js';
 import { BOARD_REWARDS } from '../config/points.js';
+import { isBoardRewardsEnabled } from './board-switch.js';
 import { creditPoints, debitPoints } from './points-ledger.js';
 import { createNotification } from './notification.js';
 import { bjDateStr, bjIsoWeekStart, bjMonthStart, bjYearMonth, bjYearStart, BJ_OFFSET_MS } from '../utils/bj-time.js';
@@ -731,7 +732,7 @@ export async function settlePeriod(
   now = Date.now(),
   deps: SettleDeps = {},
 ): Promise<{ credited: number; skippedTypes: string[] }> {
-  if (!BOARD_REWARDS.enabled) return { credited: 0, skippedTypes: [] }; // C5 灰度开关：SP-4
+  if (!(await isBoardRewardsEnabled())) return { credited: 0, skippedTypes: [] }; // C5 后台开关（DB）：SP-4
   const startMs = periodStartMsFromKey(period, periodKey); // 脏 periodKey 在这里炸，不许算出错窗口
   const boundaryMs = settleBoundaryMs(period, periodKey);
   if (now < boundaryMs) return { credited: 0, skippedTypes: [] }; // C1 滞后闸门：SP-5
@@ -871,7 +872,7 @@ export async function settlePeriod(
  * 返回 void：调用方不需要（也不该）拿结算结果做用户可见判断。
  */
 export async function settleDueForUser(userId: string, now: number = Date.now()): Promise<void> {
-  if (!BOARD_REWARDS.enabled) return; // C5：开关关闭连查询都不做（SP-4）
+  if (!(await isBoardRewardsEnabled())) return; // C5：开关关闭连查询都不做（SP-4）
   try {
     const units = await computeSettleUnits(userId, now);
     for (const u of units) {

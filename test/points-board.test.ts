@@ -53,6 +53,8 @@ import {
   parseSettleFrom,
   warnIfBoardSettleFromUnset,
 } from '../src/config/points.js';
+import { AppSettingModel } from '../src/models/app-setting.model.js';
+import { isBoardRewardsEnabled, resetBoardSwitchCacheForTest, setBoardRewardsEnabled } from '../src/services/board-switch.js';
 import { creditPoints, getBalance } from '../src/services/points-ledger.js';
 import { BJ_OFFSET_MS } from '../src/utils/bj-time.js';
 
@@ -77,7 +79,7 @@ import { BJ_OFFSET_MS } from '../src/utils/bj-time.js';
 const WIN_START = Date.now();
 const WIN_END = WIN_START + 60_000;
 const NOW = WIN_START + 1_000;
-/** 灰度开关在「import 时刻」的默认值快照：SP-4 钉它必须是 false（spec §6），下面的 before 会翻开供其余用例跑结算 */
+/** 开关缺省必须是关（无设置行=env 种子 false，spec §6）；下面的 before 翻开供其余用例跑结算 */
 const FLAG_DEFAULT_AT_IMPORT = BOARD_REWARDS.enabled;
 
 let app: FastifyInstance;
@@ -125,12 +127,25 @@ before(async () => {
   // 台账的幂等全靠那条唯一索引，而 autoIndex 是异步的：不先等它建完就断言 E11000 会假绿
   // （与 test/points-models.test.ts:12 同款）
   await Promise.all([BoardSettlementModel.init()]);
-  // SP-* 要真发钱：测试进程内把灰度开关翻开（默认值 false 由 SP-4 用 FLAG_DEFAULT_AT_IMPORT 钉住）。
-  // 开关不许写死进 service——结算就是读它，SP-4 关掉它验证短路。
-  BOARD_REWARDS.enabled = true;
+  // SP-* 要真发钱：把后台开关写进 app_settings（默认值 false 由 SP-4 钉住）
+  await setBoardRewardsEnabled(true);
+});
+
+test('BS-0 无设置行时回落 env 种子（部署即关），有行以后以库为准', async () => {
+  await AppSettingModel.deleteMany({ _id: 'boardRewardsEnabled' });
+  resetBoardSwitchCacheForTest();
+  assert.equal(await isBoardRewardsEnabled(), false, '种子=env BOARD_REWARDS_ENABLED（测试进程未设=false）');
+  await setBoardRewardsEnabled(true);
+  resetBoardSwitchCacheForTest(); // 写后清缓存再读：证明落的是库不是缓存
+  assert.equal(await isBoardRewardsEnabled(), true);
+  // 清场回到 before() 的「开」态：BS-0 跑在 SP 系前面，不留一行会让后面全文件读回种子 false
+  await setBoardRewardsEnabled(true);
 });
 
 after(async () => {
+  // 开关清场：删设置行（=种子 false）并清缓存，共享 dev 库不给别的测试文件留「开着」的态
+  await AppSettingModel.deleteMany({ _id: 'boardRewardsEnabled' }).catch(() => {});
+  resetBoardSwitchCacheForTest();
   // 清理失败必须可见：吞掉错误会把本文件种下的测试轨迹永久留在共享 dev 库，
   // 后续所有按窗口/类型聚合的用例（含榜单类）会被无声污染
   const fixtureUserIds = seededUsers.map((u) => String(u));
@@ -1329,7 +1344,7 @@ test('SP-4 开关关闭时 settleDueForUser 什么都不做', async () => {
   // （旧夹具用 2026-12 窗口把平台 year:2026 敲到期，替真实 TOP3 发了钱，见 after 守卫注释）。
   const units4 = await computeSettleUnits(String(t4), NOW4);
   assert.deepEqual(units4.map((u) => `${u.period}:${u.periodKey}`), [`week:${U4}`], 'SP-4 只允许派生出自家周单元：月/年未到期');
-  BOARD_REWARDS.enabled = false;
+  await setBoardRewardsEnabled(false);
   try {
     await settleDueForUser(String(t4), NOW4);
     const off = await settlePeriod('week', U4, U4_END, NOW4);
@@ -1337,7 +1352,7 @@ test('SP-4 开关关闭时 settleDueForUser 什么都不做', async () => {
     assert.equal(await BoardSettlementModel.countDocuments({ periodKey: U4 }), 0, '开关关闭：连 skipped 占位都不落');
     assert.equal(await PointRecordModel.countDocuments({ userId: { $in: cyc.map(String) }, type: 'board_reward' }), 0);
   } finally {
-    BOARD_REWARDS.enabled = true;
+    await setBoardRewardsEnabled(true);
   }
   // 翻开开关后同一入口立刻开工：证明上面短路的是开关，不是时窗/夹具
   await settleDueForUser(String(t4), NOW4);

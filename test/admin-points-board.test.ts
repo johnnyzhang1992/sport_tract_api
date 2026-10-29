@@ -18,6 +18,8 @@ import {
   isThresholdSkip,
 } from '../src/models/point.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
+import { AppSettingModel } from '../src/models/app-setting.model.js';
+import { isBoardRewardsEnabled, resetBoardSwitchCacheForTest } from '../src/services/board-switch.js';
 import { hasBoardSettlementAdminReadIndex } from '../src/utils/guard-index.js';
 import { creditPoints, debitPoints } from '../src/services/points-ledger.js';
 import {
@@ -749,4 +751,74 @@ test('AB-12 通知发送失败不吞撤回：反向流水与台账照样成对�
   assert.equal((await BoardSettlementModel.findById(row._id).lean())!.status, 'revoked');
   assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'board_reward_rollback' }), 1, '钱与台账成对，通知缺席是运营事故不是回滚理由');
   assert.equal(await NotificationModel.countDocuments({ userId: u }), 0);
+});
+
+// ==================== AB-S 榜单发放开关（后台点一下，不重启） ====================
+
+test('AB-S1 开关端点：GET 缺省关 → POST 开 → GET 开 → settlePeriod 真被放开 → POST 关还原', async () => {
+  // 清场：删设置行 + 清缓存，从「部署即关」的干净态出发（points-board 的 after 已删过，防别的文件留行）
+  await AppSettingModel.deleteMany({ _id: 'boardRewardsEnabled' });
+  resetBoardSwitchCacheForTest();
+
+  const get1 = await app.inject({
+    method: 'GET', url: '/sport-track/api/admin/points/board-switch',
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assert.equal(get1.statusCode, 200, get1.body);
+  const s1 = get1.json().data;
+  assert.equal(s1.enabled, false, '部署即关：无设置行=env 种子 false');
+  assert.ok(s1.settleFromText, '起点日期要展示给运营看');
+  assert.equal(typeof s1.settleFromIsDefault, 'boolean');
+
+  const post = await app.inject({
+    method: 'POST', url: '/sport-track/api/admin/points/board-switch',
+    headers: { authorization: `Bearer ${adminToken}` },
+    payload: { enabled: true },
+  });
+  assert.equal(post.statusCode, 200, post.body);
+  assert.equal(post.json().data.enabled, true);
+
+  // 服务侧真被放开（读侧 30s 缓存在写后立即可见，不必等 TTL）
+  assert.equal(await isBoardRewardsEnabled(), true);
+  // 再 GET：状态翻转可见
+  const get2 = await app.inject({
+    method: 'GET', url: '/sport-track/api/admin/points/board-switch',
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assert.equal(get2.json().data.enabled, true);
+
+  // 还原：关回去 + 删行清缓存（共享 dev 库不留「开着」的态）
+  await app.inject({
+    method: 'POST', url: '/sport-track/api/admin/points/board-switch',
+    headers: { authorization: `Bearer ${adminToken}` },
+    payload: { enabled: false },
+  });
+  await AppSettingModel.deleteMany({ _id: 'boardRewardsEnabled' });
+  resetBoardSwitchCacheForTest();
+});
+
+test('AB-S2 开关端点安全：用户 token 401；enabled 非 true 一律视为关（不猜真值）', async () => {
+  const userLogin = await app.inject({
+    method: 'POST', url: '/sport-track/api/auth/login',
+    payload: { code: `openid:abs-switch-user` },
+  });
+  assert.equal(userLogin.statusCode, 200);
+  const userToken = userLogin.json().data.token;
+
+  const forbidden = await app.inject({
+    method: 'POST', url: '/sport-track/api/admin/points/board-switch',
+    headers: { authorization: `Bearer ${userToken}` },
+    payload: { enabled: true },
+  });
+  assert.equal(forbidden.statusCode, 401, '用户 token 打管理开关必须 401');
+
+  const weird = await app.inject({
+    method: 'POST', url: '/sport-track/api/admin/points/board-switch',
+    headers: { authorization: `Bearer ${adminToken}` },
+    payload: { enabled: 'yes' },
+  });
+  assert.equal(weird.statusCode, 200);
+  assert.equal(weird.json().data.enabled, false, '只有布尔 true 算开，字符串一律按关处理');
+  await AppSettingModel.deleteMany({ _id: 'boardRewardsEnabled' });
+  resetBoardSwitchCacheForTest();
 });

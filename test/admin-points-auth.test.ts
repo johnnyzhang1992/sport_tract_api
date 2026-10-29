@@ -60,6 +60,8 @@ const POINTS_ADMIN_ROUTES: Array<[string, string]> = [
   // Task 10：榜单发放台账（列表 + 撤回）
   ['GET', `${BASE}/points/board-settlements`],
   ['POST', `${BASE}/points/board-settlements/${UID}/revoke`],
+  ['GET', `${BASE}/points/board-switch`],
+  ['POST', `${BASE}/points/board-switch`],
 ];
 
 /** printRoutes 的一行 → { 缩进层数, 路径段, 方法（去 HEAD） }；不匹配的行（空行、根 `/`）跳过 */
@@ -176,6 +178,7 @@ test('PT-15b 管理员凭证能过同一条闸门（反证上面的 401 不是�
     [`${BASE}/points/ad-free/roster`, 200],
     [`${BASE}/points/orders`, 200],
     [`${BASE}/points/board-settlements`, 200],
+    [`${BASE}/points/board-switch`, 200],
     // 幽灵 id：服务层 404「用户不存在」，证明路由已注册且鉴权已通过
     [`${BASE}/points/users/${UID}`, 404],
     [`${BASE}/points/users/${UID}/records`, 404],

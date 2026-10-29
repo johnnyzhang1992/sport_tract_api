@@ -155,7 +155,7 @@ test('CD-5 countUnusedCards 按道具分组，只数未过期未使用的卡', a
 // ==================== TC-L 用户侧卡列表（「我的卡」，三来源可见） ====================
 
 import { listCards } from '../src/services/points-cards.js';
-import { PointCardModel, PointExchangeModel, PointItemModel } from '../src/models/point.model.js';
+import { PointExchangeModel, PointItemModel } from '../src/models/point.model.js';
 
 test('TC-L1 三来源全可见：兑换/后台发放/系统赠送都在列表里，来源文案正确', async (t) => {
   const u = newUser();

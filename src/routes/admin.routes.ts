@@ -57,6 +57,8 @@ import {
   revokeBoardSettlement,
   type BoardSettlementListQuery,
 } from '../services/points-board.js';
+import { isBoardRewardsEnabled, setBoardRewardsEnabled } from '../services/board-switch.js';
+import { BOARD_REWARDS } from '../config/points.js';
 import { pointsOverview, pointsTrend, itemsOverview } from '../services/points-admin-stats.js';
 import { adFreeRoster } from '../services/points-roster.js';
 import {
@@ -1745,6 +1747,35 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 列表默认只出「发放行」（pending/credited/revoked）；status=skipped 才给整榜级占位行
   // （人数门槛占位 / 完成标记，两类都不是某个人的奖励，也永不提供撤回）。
   // query 全是字符串，校验与归一在 service 里做（非法值 400 点名收到的值）。
+  // 榜单发放开关（2026-10-29 方案 B：后台点一下，落 app_settings，30s 内全网生效，不用重启）
+  fastify.get('/points/board-switch', { onRequest: [adminAuth] }, async () => {
+    const enabled = await isBoardRewardsEnabled();
+    const settleFromIsDefault = !String(process.env.BOARD_SETTLE_FROM ?? '').trim();
+    return success({
+      enabled,
+      // 起点只展示（东八日期）；改动走部署期 env，不进开关接口
+      settleFromText: bjDateStr(BOARD_REWARDS.settleFrom),
+      settleFromIsDefault,
+    });
+  });
+
+  fastify.post('/points/board-switch', { onRequest: [adminAuth] }, async (request) => {
+    const body = (request.body ?? {}) as { enabled?: unknown };
+    const enabled = body.enabled === true;
+    await setBoardRewardsEnabled(enabled);
+    // 开审计日志：开关是钱闸，谁（adminId）何时拨到哪边要留痕
+    console.warn(`[points] 榜单发放开关 → ${enabled ? 'ON' : 'OFF'}（admin=${adminIdOf(request)}）`);
+    const settleFromIsDefault = !String(process.env.BOARD_SETTLE_FROM ?? '').trim();
+    return success({
+      enabled,
+      settleFromText: bjDateStr(BOARD_REWARDS.settleFrom),
+      settleFromIsDefault,
+      ...(enabled && settleFromIsDefault
+        ? { hint: '结算起点仍是缺省 2026-11-01：该日之前结束的周期不会发分；要提前开闸请配置 BOARD_SETTLE_FROM 后重启' }
+        : {}),
+    });
+  });
+
   fastify.get('/points/board-settlements', { onRequest: [adminAuth] }, async (request) => {
     const q = request.query as BoardSettlementListQuery;
     return success(await listBoardSettlements(q));

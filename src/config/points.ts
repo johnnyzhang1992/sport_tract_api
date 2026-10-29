@@ -106,11 +106,12 @@ export function warnIfBoardSettleFromUnset(
  * 榜单奖励结算配置（spec §4.1/§4.2/§6；2026-10-29 裁定后**没有**单榜总额上限项——
  * BOARD_PER_BOARD_CAP_FACTOR 已删，勿再加回：并列全发）。
  *
- * 可变对象（不 as const）：enabled 是灰度开关的运行时候，测试里成对翻/恢复（SP-4）；
- * 线上初值来自 env BOARD_REWARDS_ENABLED，默认 false（spec §6「先小流量验一轮结算再放开」）。
+ * enabled 只是**种子缺省**（2026-10-29 改后台开关方案 B）：运行时开关读 app_settings
+ * （services/board-switch.ts，webAdmin 点一下即生效），这里仅提供「无设置行时」的初值，
+ * 线上缺省 false——部署即关、后台再开。测试翻转请走 setBoardRewardsEnabled（SP-4）。
  */
 export const BOARD_REWARDS = {
-  /** 灰度开关：关 ⇒ settlePeriod / settleDueForUser 直接短路，一分钱都不发 */
+  /** 种子缺省：无 DB 设置行时的开关初值（真正运行时读数见 services/board-switch.ts） */
   enabled: config.boardRewardsEnabled,
   /** TOP1/2/3 分值（D4）：周 50/30/20、月 100/80/50、年 500/400/300 */
   rewards: {
