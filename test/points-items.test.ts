@@ -91,10 +91,11 @@ const findRow = async (key: string) => (await listActiveItems()).find((i) => i.k
 
 /**
  * 强制侧计数器行（Task 3 闸门的数据源）：{key,dateKey,userId}，userId 空串＝当日总量行。
- * dateKey 用 Date.now() 派生——DQ 用例传给 exchangeItem 的 now 也是当下时刻，两侧同一天。
+ * dateKey 用**用例捕获的 now** 派生（裁定 3 同款）：闸门建行就按调用方传入的 now，
+ * helper 若现取挂钟，用例恰在东八区零点前后跑就会两侧错位、断言假红（修复轮 1 finding 5）。
  */
-const quotaRow = (key: string, userId: string) => PointDailyQuotaModel
-  .findOne({ key, dateKey: bjDateStr(Date.now()), userId }).lean();
+const quotaRow = (key: string, userId: string, now: number) => PointDailyQuotaModel
+  .findOne({ key, dateKey: bjDateStr(now), userId }).lean();
 
 /** 清用例私有的目录行 + 它名下的计数器行（共享库纪律：t_ 前缀行连闸门计数器一起删） */
 async function dropTemp(keys: string | string[], ...users: Types.ObjectId[]): Promise<void> {
@@ -674,8 +675,8 @@ test('DQ-1 当日投放兑完后第 N+1 次 400，逐字文案含对象/张数/�
   const now = Date.now();
 
   await exchangeItem(String(uid), key, 'req-dq1-1', now);
-  assert.equal((await quotaRow(key, ''))?.count, 1, '第一张占了总量行一格');
-  assert.equal((await quotaRow(key, String(uid)))?.count, 1, '并占了个人行一格');
+  assert.equal((await quotaRow(key, '', now))?.count, 1, '第一张占了总量行一格');
+  assert.equal((await quotaRow(key, String(uid), now))?.count, 1, '并占了个人行一格');
 
   await assert.rejects(exchangeItem(String(uid), key, 'req-dq1-2', now), (e: unknown) => {
     const err = e as AppError;
@@ -687,7 +688,7 @@ test('DQ-1 当日投放兑完后第 N+1 次 400，逐字文案含对象/张数/�
     return true;
   });
 
-  assert.equal((await quotaRow(key, ''))?.count, 1, '被拒那次没再占格');
+  assert.equal((await quotaRow(key, '', now))?.count, 1, '被拒那次没再占格');
   assert.equal((await PointItemModel.findOne({ key }).lean())!.stock, 2, '额度闸门在库存之前：超限时库存一张没动');
   assert.equal(await PointCardModel.countDocuments({ userId: uid }), 1);
   assert.equal(await PointRecordModel.countDocuments({ userId: uid, type: 'exchange' }), 1, '超限不扣分');
@@ -712,13 +713,13 @@ test('DQ-2 每人每日上限独立于总投放：A 兑满不影响 B 抢剩余�
     assert.match(err.message, /明日 00:00 刷新/);
     return true;
   });
-  assert.equal((await quotaRow(key, ''))?.count, 1, '个人行挡下：总量行回退，不吃 B 的名额');
-  assert.equal((await quotaRow(key, String(a)))?.count, 1);
+  assert.equal((await quotaRow(key, '', now))?.count, 1, '个人行挡下：总量行回退，不吃 B 的名额');
+  assert.equal((await quotaRow(key, String(a), now))?.count, 1);
   assert.equal(await PointCardModel.countDocuments({ userId: a }), 1);
 
   // B 正常抢走剩余那格
   await exchangeItem(String(b), key, 'req-dq2-b1', now);
-  assert.equal((await quotaRow(key, ''))?.count, 2);
+  assert.equal((await quotaRow(key, '', now))?.count, 2);
   assert.equal((await findRow(key)).todayLeft, 0);
   // B 第二次：这次是总量真兑完 → 逐字批准文案
   await assert.rejects(exchangeItem(String(b), key, 'req-dq2-b2', now), (e: unknown) => {
@@ -727,7 +728,7 @@ test('DQ-2 每人每日上限独立于总投放：A 兑满不影响 B 抢剩余�
     assert.match(err.message, /今日 2 张已兑完（每人每日限 1 张），明日 00:00 刷新/);
     return true;
   });
-  assert.equal((await quotaRow(key, String(b)))?.count, 1, '总量行先拒：B 的个人行没被再占');
+  assert.equal((await quotaRow(key, String(b), now))?.count, 1, '总量行先拒：B 的个人行没被再占');
 });
 
 test('DQ-3 并发抢同一张日额度只发一张（Promise.all 两个用户，不许双花）', async (t) => {
@@ -755,7 +756,7 @@ test('DQ-3 并发抢同一张日额度只发一张（Promise.all 两个用户，
   assert.equal(await PointCardModel.countDocuments({ itemKey: key }), 1);
   assert.equal(await PointExchangeModel.countDocuments({ itemKey: key }), 1);
   assert.equal(await PointRecordModel.countDocuments({ type: 'exchange', refId: key }), 1, '败者没扣到分');
-  assert.equal((await quotaRow(key, ''))?.count, 1, '计数器与台账各 1，同真源');
+  assert.equal((await quotaRow(key, '', now))?.count, 1, '计数器与台账各 1，同真源');
   assert.equal((await findRow(key)).todayLeft, 0, '展示侧同步');
 });
 
@@ -769,8 +770,8 @@ test('DQ-4 抢到额度但扣分失败（余额不足）：日额度回补，tod
   const now = Date.now();
 
   await assert.rejects(exchangeItem(String(poor), key, 'req-dq4-poor', now), /积分不足/);
-  assert.equal((await quotaRow(key, ''))?.count, 0, '扣分失败：总量行已由 returnDailyQuota 回补');
-  assert.equal((await quotaRow(key, String(poor)))?.count, 0, '个人行一起回补');
+  assert.equal((await quotaRow(key, '', now))?.count, 0, '扣分失败：总量行已由 returnDailyQuota 回补');
+  assert.equal((await quotaRow(key, String(poor), now))?.count, 0, '个人行一起回补');
   assert.equal((await findRow(key)).todayLeft, 1,
     '裁定 2 的「两侧一致」：台账侧这次扣分从未落账所以显示 1，计数器侧也回补到 0——都表达「还剩 1 格」');
   await exchangeItem(String(rich), key, 'req-dq4-rich', now);
@@ -791,14 +792,14 @@ test('DQ-5 扣分之后的失败（发卡炸）：计数器与台账两侧一起
   } finally {
     cardCreate.restore();
   }
-  assert.equal((await quotaRow(key, ''))?.count, 0, 'returnDailyQuota 回补总量行');
-  assert.equal((await quotaRow(key, String(uid)))?.count, 0);
+  assert.equal((await quotaRow(key, '', now))?.count, 0, 'returnDailyQuota 回补总量行');
+  assert.equal((await quotaRow(key, String(uid), now))?.count, 0);
   assert.equal((await findRow(key)).todayLeft, 1,
     '裁定 2 的「两侧一致」：reverseDebit 把扣分行降级出台账，todayLeft 回到原值，与计数器回补同刻成立');
 
   // 额度真回去了：换新 requestId 当日重试必须成功（摘掉 returnDailyQuota 这里会 400「今日 1 张已兑完」）
   await exchangeItem(String(uid), key, 'req-dq5-retry', now);
-  assert.equal((await quotaRow(key, ''))?.count, 1);
+  assert.equal((await quotaRow(key, '', now))?.count, 1);
   assert.equal((await findRow(key)).todayLeft, 0);
 });
 
@@ -825,8 +826,8 @@ test('DQ-6 闸门顺序钉死：额度在库存之前（超额度报额度不报
 
   await exchangeItem(String(a), kStock, 'req-dq6-s1', now); // 总量 1、库存 0
   await assert.rejects(exchangeItem(String(b), kStock, 'req-dq6-s2', now), /已兑完（当前库存 0）/);
-  assert.equal((await quotaRow(kStock, ''))?.count, 1, '库存空这一步：b 抢到的额度已回补');
-  assert.equal((await quotaRow(kStock, String(b)))?.count, 0);
+  assert.equal((await quotaRow(kStock, '', now))?.count, 1, '库存空这一步：b 抢到的额度已回补');
+  assert.equal((await quotaRow(kStock, String(b), now))?.count, 0);
   assert.equal((await findRow(kStock)).todayLeft, 1, '台账侧同样只记 a 那一张');
 });
 
@@ -838,7 +839,7 @@ test('DQ-7 限购闸门在每日额度之前：超限报「每人限兑」，不
   const now = Date.now();
 
   await exchangeItem(String(uid), key, 'req-dq7-1', now);
-  assert.equal((await quotaRow(key, ''))?.count, 1);
+  assert.equal((await quotaRow(key, '', now))?.count, 1);
   await assert.rejects(exchangeItem(String(uid), key, 'req-dq7-2', now), (e: unknown) => {
     const err = e as AppError;
     assert.equal(err.statusCode, 400);
@@ -846,7 +847,7 @@ test('DQ-7 限购闸门在每日额度之前：超限报「每人限兑」，不
     assert.doesNotMatch(err.message, /已兑完/, '若把每日额度挪到限购前，这里会变成「今日 1 张已兑完」——顺序被改就红');
     return true;
   });
-  assert.equal((await quotaRow(key, ''))?.count, 1, '被限购挡下的那次没进额度闸门');
+  assert.equal((await quotaRow(key, '', now))?.count, 1, '被限购挡下的那次没进额度闸门');
 });
 
 test('DQ-8 实物链共用同一闸门：超限文案一致，扣分失败回补，两人各占其行', async (t) => {
@@ -864,14 +865,14 @@ test('DQ-8 实物链共用同一闸门：超限文案一致，扣分失败回补
   const r = await exchangeItem(String(a), key, 'req-dq8-a', now, address);
   assert.ok(r.orderId, '实物落订单');
   assert.equal(await PointCardModel.countDocuments({ itemKey: key }), 0, '实物不发卡（互斥链照旧）');
-  assert.equal((await quotaRow(key, ''))?.count, 1);
+  assert.equal((await quotaRow(key, '', now))?.count, 1);
 
   await assert.rejects(exchangeItem(String(poor), key, 'req-dq8-poor', now, address), /积分不足/);
-  assert.equal((await quotaRow(key, ''))?.count, 1, 'poor 抢到的总量行已回补');
-  assert.equal((await quotaRow(key, String(poor)))?.count, 0, 'poor 的个人行也回补');
+  assert.equal((await quotaRow(key, '', now))?.count, 1, 'poor 抢到的总量行已回补');
+  assert.equal((await quotaRow(key, String(poor), now))?.count, 0, 'poor 的个人行也回补');
 
   await exchangeItem(String(b), key, 'req-dq8-b', now, address);
-  assert.equal((await quotaRow(key, ''))?.count, 2);
+  assert.equal((await quotaRow(key, '', now))?.count, 2);
   // a 第二次：个人满 1、总量也满 2 → 逐字总量文案（与虚拟链同一口径）
   await assert.rejects(exchangeItem(String(a), key, 'req-dq8-a2', now, address), (e: unknown) => {
     const err = e as AppError;
@@ -879,4 +880,135 @@ test('DQ-8 实物链共用同一闸门：超限文案一致，扣分失败回补
     assert.match(err.message, /今日 2 张已兑完（每人每日限 1 张），明日 00:00 刷新/);
     return true;
   });
+});
+
+/**
+ * 修复轮 1（裁定进 spec §4.8 第 2 条）：文案由「实际拦下闸门的那一步」（判别式原因）决定，
+ * 不再回读计数器猜分支——猜分支在并发回补时会被降级成禁用文案「每人每日限 0 张」。
+ * 批准的两句逐字钉死：
+ * - 总量被抢光：「{商品名}」今日 {N} 张已兑完（每人每日限 {M} 张），明日 00:00 刷新；perUserDaily=0（不限）时省略括号
+ * - 只剩每人上限：「{商品名}」今日已兑 {K} 张（每人每日限 {M} 张），明日 00:00 刷新；K＝该用户当日自己的张数
+ */
+test('DQ-9 每人每日不限（perUserDaily=0）时总量兑完文案不带括号；并发回补竞态也不许降级成「限 0 张」', async (t) => {
+  const uid = newUser();
+  const key = await tempItem({ dailyQuota: 1, perUserDaily: 0 });
+  t.after(() => dropTemp(key, uid));
+  await seedPoints(uid, 400);
+  const now = Date.now();
+
+  await exchangeItem(String(uid), key, 'req-dq9-1', now);
+  // 稳定路径：总量行就在那（1>=1），批准文案逐字——perUserDaily=0 时括号整段省略
+  await assert.rejects(exchangeItem(String(uid), key, 'req-dq9-2', now), (e: unknown) => {
+    const err = e as AppError;
+    assert.equal(err.statusCode, 400);
+    assert.equal(err.message, '「测试道具」今日 1 张已兑完，明日 00:00 刷新');
+    assert.doesNotMatch(err.message, /每人每日限/, 'perUserDaily=0＝不限，「每人每日限 0 张」是批准文案明令禁止的');
+    return true;
+  });
+
+  // 竞态路径（修复前的降级点）：闸门按总量行拒绝之后、文案重读计数器之前，并发请求把总量行回补了。
+  // 读侧打桩模拟这一刻（find 拿回空行）。修复前按「total < cap」猜分支 → 掉进个人文案，
+  // 拼出「今日已兑 0 张（每人每日限 0 张）」；修复后文案由拦截步（'total'）决定，根本不读计数器。
+  const model = PointDailyQuotaModel as unknown as {
+    find: (...args: unknown[]) => { select: () => { lean: () => Promise<unknown[]> } };
+  };
+  const realFind = PointDailyQuotaModel.find.bind(PointDailyQuotaModel);
+  model.find = () => ({ select: () => ({ lean: async () => [] }) });
+  try {
+    await assert.rejects(exchangeItem(String(uid), key, 'req-dq9-3', now), (e: unknown) => {
+      const err = e as AppError;
+      assert.equal(err.statusCode, 400);
+      assert.equal(err.message, '「测试道具」今日 1 张已兑完，明日 00:00 刷新');
+      return true;
+    });
+  } finally {
+    model.find = realFind as unknown as typeof model.find;
+  }
+});
+
+test('DQ-10 个人上限文案的 {K} 是该用户当日自己的张数，不是平台当日数', async (t) => {
+  const a = newUser();
+  const b = newUser();
+  const key = await tempItem({ dailyQuota: 5, perUserDaily: 2 });
+  t.after(() => dropTemp(key, a, b));
+  await seedPoints(a, 600);
+  await seedPoints(b, 200);
+  const now = Date.now();
+
+  await exchangeItem(String(a), key, 'req-dq10-a1', now);
+  await exchangeItem(String(a), key, 'req-dq10-a2', now); // a 个人行 2＝满
+  await exchangeItem(String(b), key, 'req-dq10-b1', now); // 平台当日合计 3 张，其中 b 占 1 张
+
+  await assert.rejects(exchangeItem(String(a), key, 'req-dq10-a3', now), (e: unknown) => {
+    const err = e as AppError;
+    assert.equal(err.statusCode, 400);
+    // 逐字：K=2（a 自己兑的张数），不是 3（平台当日总张数）；M=配置的每人上限
+    assert.equal(err.message, '「测试道具」今日已兑 2 张（每人每日限 2 张），明日 00:00 刷新');
+    return true;
+  });
+  assert.equal((await quotaRow(key, '', now))?.count, 3, 'a 撞个人上限抢到的总量格已回退，不占平台名额');
+});
+
+test('DQ-11 个人行那步抛异常：已抢到的总量格当场退回，不许悬空（hold leak）', async (t) => {
+  const uid = newUser();
+  const key = await tempItem({ dailyQuota: 1, perUserDaily: 1 });
+  t.after(() => dropTemp(key, uid));
+  await seedPoints(uid, 400);
+  const now = Date.now();
+
+  const fua = patchModel(PointDailyQuotaModel, 'findOneAndUpdate');
+  const realFua = PointDailyQuotaModel.findOneAndUpdate.bind(PointDailyQuotaModel);
+  let calls = 0;
+  // 调用序：1＝总量行条件 $inc（成功抢到），2＝个人行条件 $inc（这里炸）——此刻 releaseQuota 还不存在
+  fua.set((...args: unknown[]) => {
+    calls += 1;
+    if (calls === 2) throw new Error('quota personal row boom');
+    return (realFua as unknown as (...a: unknown[]) => unknown)(...args);
+  });
+  try {
+    await assert.rejects(() => exchangeItem(String(uid), key, 'req-dq11', now), /quota personal row boom/);
+  } finally {
+    fua.restore();
+  }
+  assert.equal(calls, 2, '前置条件：确实炸在个人行那一步');
+  assert.equal((await quotaRow(key, '', now))?.count, 0, '总量行回到请求前的值：异常路径的回补补上了');
+  assert.equal((await quotaRow(key, String(uid), now))?.count ?? 0, 0, '个人行没被占住');
+
+  // 那一格真回去了：换新 requestId 当日重试必须成功（没回补的话总量行还压着 1，这里会 400）
+  await exchangeItem(String(uid), key, 'req-dq11-retry', now);
+  assert.equal((await quotaRow(key, '', now))?.count, 1);
+});
+
+test('DQ-12 额度回补失败要像库存缺口一样报出来：400 保留主文案、尾注格数、data 带 quotaRefundFailed', async (t) => {
+  const uid = newUser();
+  const key = await tempItem({ dailyQuota: 1, perUserDaily: 1 });
+  t.after(() => dropTemp(key, uid));
+  await seedPoints(uid, 100); // price 200：必在扣分闸门失败，链走到 releaseQuota
+  const now = Date.now();
+
+  const upd = patchModel(PointDailyQuotaModel, 'updateOne');
+  const realUpd = PointDailyQuotaModel.updateOne.bind(PointDailyQuotaModel);
+  // 只炸「回退一格」那步（$inc count:-1，undoQuota 专用）：ensureQuotaRow 的 $setOnInsert 照常放行
+  upd.set((...args: unknown[]) => {
+    const inc = (args[1] as { $inc?: { count?: number } } | undefined)?.$inc;
+    if (inc?.count === -1) throw new Error('quota refund boom');
+    return (realUpd as unknown as (...a: unknown[]) => unknown)(...args);
+  });
+  // undoQuota 仍会 console.error 留底（同库存 backStock 口径），测试里压掉噪音
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    await assert.rejects(() => exchangeItem(String(uid), key, 'req-dq12', now), (e: unknown) => {
+      const err = e as AppError;
+      assert.equal(err.statusCode, 400, '主状态码保留（前端按「积分不足」引导赚分）');
+      assert.match(err.message, /^积分不足/, '主文案原样，缺口以尾注追加');
+      assert.match(err.message, /（另：每日额度回补失败 2 格，请人工核对）/, '总量行＋个人行都没退回去');
+      assert.equal(err.extra?.quotaRefundFailed, 2);
+      return true;
+    });
+  } finally {
+    upd.restore();
+    console.error = originalError;
+  }
+  assert.equal((await quotaRow(key, '', now))?.count, 1, '退不回去的那格就是缺口——现在文案点名，不再无声少发');
 });

@@ -142,12 +142,15 @@ test('pointrecords：缺字段（没有 refType）不算防线', () => {
  * 声明被删时 autoIndex 只留 warning，基线行可能插成多份、闸门只守住其中一份（超发且无声）。
  * 两侧都核对（同 pointrecords 热路径索引的 10-29 教训）：删声明但库里留着旧索引时库侧假绿，
  * 声明侧这条先红。
+ * 修复轮 1（finding 4）：声明侧必须连 opts.unique 一起断——只认键组合时，
+ * 有人把 unique: true 删了（留一条同名普通索引）这条自检照样绿，防线没了却测不出来。
  */
 test('pointdailyquotas 防线：unique {key,dateKey,userId} 声明侧与真实库侧都在', async () => {
   const declared = PointDailyQuotaModel.schema.indexes();
   assert.ok(
-    declared.some(([keys]) => Object.keys(keys).sort().join(',') === 'dateKey,key,userId'),
-    `schema 里的索引声明没有 {key,dateKey,userId} 这条！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+    declared.some(([keys, opts]) => Object.keys(keys).sort().join(',') === 'dateKey,key,userId'
+      && (opts as { unique?: boolean } | undefined)?.unique === true),
+    `schema 里的索引声明没有 {key,dateKey,userId} + unique:true 这条！现有声明：${JSON.stringify(declared)}`,
   );
   await PointDailyQuotaModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
   const idx = await PointDailyQuotaModel.collection.indexes();

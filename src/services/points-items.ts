@@ -15,7 +15,9 @@
  * - 每日额度闸门（Task 3）：dailyQuota/perUserDaily 走 PointDailyQuota 计数器（行 {key,dateKey,userId}，
  *   userId 空串＝当日总量行），先建基线行再走「不带 upsert 的条件 $inc」，与库存闸门同一原子口径；
  *   dateKey 由调用方 now 派生（不许在闸门里现取 Date.now()）。展示字段 todayLeft 仍读兑换台账（Task 2 数据源）：
- *   台账能数不能原子扣退，强制与展示各走各的源，回补路径两侧一致由 DQ-4/DQ-5 钉住；
+ *   台账能数不能原子扣退，强制与展示各走各的源，回补路径两侧一致由 DQ-4/DQ-5 钉住。
+ *   超限文案由闸门返回的判别式拦截原因（'total'/'user'）决定，不回读计数器猜分支（DQ-9/DQ-10）；
+ *   个人步抛异常时当场退回已抢的总量格（DQ-11），回补失败的格数经 annotateQuotaGap 挂回异常尾注（DQ-12）；
  * - 兑换幂等键 `exchange:${userId}:${requestId}`：先查兑换记录短路重放；并发同一 requestId
  *   由账本 idemKey + 兑换记录唯一索引 (userId, requestId) 双重兜底，只扣一次分、只发一张卡、
  *   只扣一次库存——落败方删卡、回补库存，但绝不动那笔真实扣分（它的权益是胜出方的卡）；
@@ -304,74 +306,114 @@ async function bumpQuota(key: string, dateKey: string, userId: string, cap: numb
   return row !== null;
 }
 
-/** 撤销一格：个人行挡下时回退刚抢的总量行、以及抢到手之后链条任何一步失败的补偿。吞自家异常——它不许盖住原始失败 */
-async function undoQuota(key: string, dateKey: string, userId: string): Promise<void> {
+/** 撤销一格：count>0 条件是脏双退的自保（误调两次不能把计数器凿成负数）。
+ * 返回是否真退回去——吞自家异常不许盖住原始失败，但缺口要能上报（见 annotateQuotaGap），
+ * 只留一行 console.error 就是永久无声少发（修复轮 1 finding 3）。 */
+async function undoQuota(key: string, dateKey: string, userId: string): Promise<boolean> {
   try {
-    // count>0 条件是脏双退的自保（误调两次不能把计数器凿成负数）
     await PointDailyQuotaModel.updateOne(
       { key, dateKey, userId, count: { $gt: 0 } },
       { $inc: { count: -1 } },
     );
+    return true;
   } catch (e) {
     console.error('[points] 每日额度回补失败', key, dateKey, userId, e);
+    return false;
   }
 }
 
 /**
+ * 额度回补失败的可见化（与库存链 backStock→refundFailed→rethrowWithRefund 同一口径的镜像）：
+ * 把退不回去的格数挂回原始失败——状态码与主文案原样保留（前端可能按「积分不足」引导赚分），
+ * 缺口同时写进 message 尾注与 data.quotaRefundFailed，异常路径不许静默。
+ * 无缺口时原样返回 e，调用方（hold.rethrowWithRefund / throw）拿到的是没被改过的错误。
+ */
+function annotateQuotaGap(e: unknown, quotaRefundFailed: number): unknown {
+  if (quotaRefundFailed === 0) return e;
+  const note = `（另：每日额度回补失败 ${quotaRefundFailed} 格，请人工核对）`;
+  if (e instanceof AppError) {
+    return new AppError(e.statusCode, `${e.message}${note}`, { ...(e.extra ?? {}), quotaRefundFailed });
+  }
+  const err = e as Error;
+  if (err && typeof err.message === 'string') err.message = `${err.message}${note}`;
+  return err;
+}
+
+/** 闸门拦截方（修复轮 1 finding 1）：'total'＝当日全平台投放被抢光，'user'＝只剩每人每日上限被撞到。
+ * 文案句子由这一步实际决定，不再回读计数器猜分支——猜分支在并发回补时会把总量文案降级成
+ * 个人文案，拼出批准文案明令禁止的「每人每日限 0 张」（DQ-9 钉住）。 */
+type QuotaBlockedBy = 'total' | 'user';
+
+/**
  * 抢当日额度：总量行（userId=''）与个人行都要过，任一失败即回滚已抢的那一行（brief 接口）。
+ * 返回 true＝抢到（链继续），'total'/'user'＝被哪一步拦下（调用方据此出 400 文案）。
  * 为什么强制口径走计数器而不复用台账（todayLeft 的数据源）：台账只能数、不能原子地「先扣再核、失败退回」，
  * 裁定 2 定死两侧分工——闸门扣计数器，展示读台账，回补路径两侧一致由 DQ-4/DQ-5 钉住。
  * dateKey 一律 bjDateStr(now) 从调用方传入的时刻派生，不在闸门里现取 Date.now()（裁定 3）：
  * 展示路径读挂钟、写链带 now，闸门若也读挂钟就会在 UTC+8 零点前后与写入行错位。
  * 两字段都是 0（未配置限量投放）时整个闸门直通且不落任何计数器行——上线前的目录行行为零变化。
  */
-async function takeDailyQuota(item: ItemDoc, userId: string, now: number): Promise<boolean> {
+async function takeDailyQuota(item: ItemDoc, userId: string, now: number): Promise<true | QuotaBlockedBy> {
   const dailyQuota = Number(item.dailyQuota ?? 0);
   const perUserDaily = Number(item.perUserDaily ?? 0);
   if (dailyQuota <= 0 && perUserDaily <= 0) return true;
   const dateKey = bjDateStr(now);
   if (dailyQuota > 0) {
     await ensureQuotaRow(item.key, dateKey, '');
-    if (!(await bumpQuota(item.key, dateKey, '', dailyQuota))) return false;
+    if (!(await bumpQuota(item.key, dateKey, '', dailyQuota))) return 'total';
   }
   if (perUserDaily > 0) {
-    await ensureQuotaRow(item.key, dateKey, userId);
-    if (!(await bumpQuota(item.key, dateKey, userId, perUserDaily))) {
-      if (dailyQuota > 0) await undoQuota(item.key, dateKey, ''); // 个人满而总量未满：刚抢的总量格让给下一位（DQ-2）
-      return false;
+    try {
+      await ensureQuotaRow(item.key, dateKey, userId);
+      if (!(await bumpQuota(item.key, dateKey, userId, perUserDaily))) {
+        if (dailyQuota > 0) await undoQuota(item.key, dateKey, ''); // 个人满而总量未满：刚抢的总量格让给下一位（DQ-2）
+        return 'user';
+      }
+    } catch (e) {
+      // 总量格已抢到手、个人步炸在半路：此刻 exchange 链还没拿到 releaseQuota，谁都退不了这一格——
+      // 不在这当场退回就是永久悬空（修复轮 1 finding 2，DQ-11 钉住）。退失败也点名，不吞（finding 3 同一口径）。
+      if (dailyQuota > 0 && !(await undoQuota(item.key, dateKey, ''))) throw annotateQuotaGap(e, 1);
+      throw e;
     }
   }
   return true;
 }
 
-/** 兑换链失败补偿的镜像：抢到手之后任何一步没成，把那一格原路退回（与 takeStock 的 hold.rollback 同一职责） */
-async function returnDailyQuota(item: ItemDoc, userId: string, now: number): Promise<void> {
+/**
+ * 兑换链失败补偿的镜像：抢到手之后任何一步没成，把那一格原路退回（与 takeStock 的 hold.rollback 同一职责）。
+ * 返回回补失败的格数（0＝干净）——调用方累积后经 annotateQuotaGap 上报，不许只留日志。
+ */
+async function returnDailyQuota(item: ItemDoc, userId: string, now: number): Promise<number> {
   const dateKey = bjDateStr(now);
-  if (Number(item.dailyQuota ?? 0) > 0) await undoQuota(item.key, dateKey, '');
-  if (Number(item.perUserDaily ?? 0) > 0) await undoQuota(item.key, dateKey, userId);
+  let failed = 0;
+  if (Number(item.dailyQuota ?? 0) > 0 && !(await undoQuota(item.key, dateKey, ''))) failed += 1;
+  if (Number(item.perUserDaily ?? 0) > 0 && !(await undoQuota(item.key, dateKey, userId))) failed += 1;
+  return failed;
 }
 
 /**
- * 超限 400 文案（对象 + 实际值 + 上限 + 刷新时间，全仓文案纪律）：
- * - 总量投放兑完 → 逐字用批准过的「「${name}」今日 ${N} 张已兑完（每人每日限 ${M} 张），明日 00:00 刷新」；
- *   M 只在配置了个人上限时带上——perUserDaily=0 是「不限」，写成「限 0 张」与目录口径互相矛盾（brief 未覆盖的组合，这里收口）；
- * - 只撞个人上限（总量未兑完）时「今日 N 张已兑完」是谎话，换同三要素的个人口径文案。
- * 判据直接读计数器（与闸门同一数据源），不回查台账——展示归展示、闸门报错归闸门。
+ * 超限 400 文案（对象 + 实际值 + 上限 + 刷新时间，全仓文案纪律）——两句都是 spec §4.8 批准原文，逐字不许改写：
+ * - 'total'（当日投放被抢光）→ 「「${name}」今日 ${N} 张已兑完（每人每日限 ${M} 张），明日 00:00 刷新」，
+ *   N＝配置的当日投放数；perUserDaily=0（不限）时括号整段省略——「每人每日限 0 张」是批准口径明令禁止的；
+ * - 'user'（只剩每人每日上限被撞到）→ 「「${name}」今日已兑 ${K} 张（每人每日限 ${M} 张），明日 00:00 刷新」，
+ *   K＝该用户当日个人计数（计数器同源，不是平台计数，DQ-10 钉住）。
+ * 句子由 takeDailyQuota 的判别式拦截原因决定，不猜分支：个人步只在 perUserDaily>0 时执行，
+ * 'user' 分支的 M 恒 >0、括号永不缺席；'total' 分支根本不读计数器，并发回补改不了文案走向（DQ-9 钉住）。
  */
-async function dailyQuotaError(item: ItemDoc, userId: string, now: number): Promise<AppError> {
-  const dateKey = bjDateStr(now);
+async function dailyQuotaError(
+  item: ItemDoc, userId: string, now: number, blockedBy: QuotaBlockedBy,
+): Promise<AppError> {
   const dailyQuota = Number(item.dailyQuota ?? 0);
   const perUserDaily = Number(item.perUserDaily ?? 0);
-  const rows = await PointDailyQuotaModel.find(
-    { key: item.key, dateKey, userId: { $in: ['', userId] } },
-  ).select({ userId: 1, count: 1 }).lean();
-  const total = Number(rows.find((r) => (r.userId ?? '') === '')?.count ?? 0);
-  const mine = Number(rows.find((r) => r.userId === userId)?.count ?? 0);
-  if (dailyQuota > 0 && total >= dailyQuota) {
+  if (blockedBy === 'total') {
     const perUserNote = perUserDaily > 0 ? `（每人每日限 ${perUserDaily} 张）` : '';
     return new AppError(400, `「${item.name}」今日 ${dailyQuota} 张已兑完${perUserNote}，明日 00:00 刷新`);
   }
-  return new AppError(400, `「${item.name}」今日已兑 ${mine} 张（每人每日限 ${perUserDaily} 张），明日 00:00 刷新`);
+  const mine = await PointDailyQuotaModel.findOne(
+    { key: item.key, dateKey: bjDateStr(now), userId },
+  ).select({ count: 1 }).lean();
+  return new AppError(400,
+    `「${item.name}」今日已兑 ${Number(mine?.count ?? 0)} 张（每人每日限 ${perUserDaily} 张），明日 00:00 刷新`);
 }
 
 /** 虚拟道具：校验卡有效期 → 限购 → 每日额度 → 扣库存 → 扣分 → 发卡 → 落兑换记录（额度抢到手后任何失败回补额度 + 退分 + 回补库存） */
@@ -395,21 +437,25 @@ async function exchangeVirtual(
   if (await limitReached(userId, item, now)) throw await limitError(userId, item);
 
   // 闸门顺序固定（裁定 1）：限购 → 每日额度 → 库存 → 扣分（原「兑换满 180 天」已由产品去掉，不许加回）
-  if (!(await takeDailyQuota(item, userId, now))) throw await dailyQuotaError(item, userId, now);
+  const blocked = await takeDailyQuota(item, userId, now);
+  // 文案由实际拦下闸门的那一步决定（'total'/'user'），不回读计数器猜分支（finding 1）
+  if (blocked !== true) throw await dailyQuotaError(item, userId, now, blocked);
   // 额度抢在库存与扣分之前：此后任何一步失败——库存空、扣分失败、发卡/落记录失败，
   // 乃至同 requestId 重放落败（权益属于胜者那一单）——都要把手里这格原路退回；
-  // releaseQuota 幂等，一个请求至多退一次。
+  // releaseQuota 幂等，一个请求至多退一次；退不回去的格数累积进 quotaRefundFailed，
+  // 由 annotateQuotaGap 挂回每一个异常出口（finding 3，与库存 refundFailed 同一口径）。
   let quotaHeld = true;
+  let quotaRefundFailed = 0;
   const releaseQuota = async (): Promise<void> => {
     if (!quotaHeld) return;
     quotaHeld = false;
-    await returnDailyQuota(item, userId, now);
+    quotaRefundFailed += await returnDailyQuota(item, userId, now);
   };
 
   const hold = await takeStock(item);
   if (!hold) {
     await releaseQuota();
-    throw new AppError(400, `「${item.name}」已兑完（当前库存 0）`);
+    throw annotateQuotaGap(new AppError(400, `「${item.name}」已兑完（当前库存 0）`), quotaRefundFailed);
   }
 
   let debit: DebitResult;
@@ -424,11 +470,11 @@ async function exchangeVirtual(
   } catch (e) {
     await hold.rollback();
     await releaseQuota();
-    if (!isInsufficientBalance(e)) hold.rethrowWithRefund(e);
+    if (!isInsufficientBalance(e)) hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     // 余额恰好够一次的连点：A 扣光余额后、兑换记录落库前，B 会先撞余额闸门。
     // 补查在途记录：命中说明是同一笔点击，返回 A 那张卡（不再扣分/发卡）；否则才是真的余额不足。
     const inFlight = await findInFlightExchange(userId, rid);
-    if (!inFlight) hold.rethrowWithRefund(e);
+    if (!inFlight) hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     // 短路重放成功也是「本次没产出新兑换」：胜者那一击自带额度格，本请求的这格必须退回
     return { cardId: String(inFlight.cardId), balance: await getBalance(userId, now), refundFailed: hold.refundFailed };
   }
@@ -458,7 +504,7 @@ async function exchangeVirtual(
     await hold.rollback();
     await releaseQuota();
     await undoDebit();
-    hold.rethrowWithRefund(e);
+    hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
   }
 
   try {
@@ -481,14 +527,14 @@ async function exchangeVirtual(
     await releaseQuota();
     if (!isDuplicateKey(e)) {
       await undoDebit();
-      hold.rethrowWithRefund(e);
+      hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     }
     // 并发同一 requestId：另一请求已先落兑换记录（账本已按 idemKey 去重，不会重复扣分），
     // 返回胜出方那张卡。胜者的卡就是这笔扣分的权益，本次无论是否重放都不能退钱。
     const winner = await PointExchangeModel.findOne({ userId, requestId: rid }).lean();
     if (!winner) {
       await undoDebit();
-      hold.rethrowWithRefund(e);
+      hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     }
     return { cardId: String(winner.cardId), balance: await getBalance(userId, now), refundFailed: hold.refundFailed };
   }
@@ -511,19 +557,22 @@ async function exchangePhysical(
   const address = validateAddress(addressInput);
   if (await limitReached(userId, item, now)) throw await limitError(userId, item);
 
-  // 与虚拟链同一套闸门与顺序（裁定 1）：限购 → 每日额度 → 库存 → 扣分
-  if (!(await takeDailyQuota(item, userId, now))) throw await dailyQuotaError(item, userId, now);
+  // 与虚拟链同一套闸门与顺序（裁定 1）：限购 → 每日额度 → 库存 → 扣分；文案同样由拦截步决定（finding 1）
+  const blocked = await takeDailyQuota(item, userId, now);
+  if (blocked !== true) throw await dailyQuotaError(item, userId, now, blocked);
+  // 与虚拟链同一套回补与可见化（finding 3）：退不回去的格数累积后挂回每一个异常出口
   let quotaHeld = true;
+  let quotaRefundFailed = 0;
   const releaseQuota = async (): Promise<void> => {
     if (!quotaHeld) return;
     quotaHeld = false;
-    await returnDailyQuota(item, userId, now);
+    quotaRefundFailed += await returnDailyQuota(item, userId, now);
   };
 
   const hold = await takeStock(item);
   if (!hold) {
     await releaseQuota();
-    throw new AppError(400, `「${item.name}」已兑完（当前库存 0）`);
+    throw annotateQuotaGap(new AppError(400, `「${item.name}」已兑完（当前库存 0）`), quotaRefundFailed);
   }
 
   let debit: DebitResult;
@@ -536,10 +585,10 @@ async function exchangePhysical(
   } catch (e) {
     await hold.rollback();
     await releaseQuota();
-    if (!isInsufficientBalance(e)) hold.rethrowWithRefund(e);
+    if (!isInsufficientBalance(e)) hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     // 与虚拟路径同理：余额刚够一次的连点，胜者订单可能还没落库，补查在途订单
     const inFlight = await findInFlightOrder(userId, rid);
-    if (!inFlight) hold.rethrowWithRefund(e);
+    if (!inFlight) hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     // 短路重放：订单是胜者那一击落的，额度格也是胜者占的——本次这格退回去
     return { orderId: String(inFlight._id), balance: await getBalance(userId, now), refundFailed: hold.refundFailed };
   }
@@ -569,14 +618,14 @@ async function exchangePhysical(
     await releaseQuota();
     if (!isDuplicateKey(e)) {
       await undoDebit();
-      hold.rethrowWithRefund(e);
+      hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     }
     // 并发同一 requestId：另一请求已落订单（账本按 idemKey 去重，本次未真实扣分），返回胜出方订单。
     // 胜者订单就是这笔扣分的权益，本次绝不能退钱。
     const winner = await PointOrderModel.findOne({ userId, requestId: rid }).lean();
     if (!winner) {
       await undoDebit();
-      hold.rethrowWithRefund(e);
+      hold.rethrowWithRefund(annotateQuotaGap(e, quotaRefundFailed));
     }
     return { orderId: String(winner._id), balance: await getBalance(userId, now), refundFailed: hold.refundFailed };
   }
