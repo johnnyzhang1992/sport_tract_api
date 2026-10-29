@@ -41,9 +41,15 @@ import { NotificationModel } from '../src/models/notification.model.js';
 import { hasNoPace, NO_PACE_TYPES } from '../src/utils/pace.js';
 import { hasBoardTrustedAggregateIndex } from '../src/utils/guard-index.js';
 import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM, ACTIVITY_TYPES } from '../src/config/constants.js';
-import { BOARD_REWARDS, parseSettleFrom } from '../src/config/points.js';
+import {
+  BOARD_REWARDS,
+  BOARD_SETTLE_FROM_DEFAULT,
+  BOARD_SETTLE_FROM_DEFAULT_DATE,
+  parseSettleFrom,
+  warnIfBoardSettleFromUnset,
+} from '../src/config/points.js';
 import { creditPoints, getBalance } from '../src/services/points-ledger.js';
-import { BJ_OFFSET_MS, bjToday0 } from '../src/utils/bj-time.js';
+import { BJ_OFFSET_MS } from '../src/utils/bj-time.js';
 
 /**
  * 榜单发分专用的可信轨迹聚合（spec §7：发分口径比展示多四道防刷判据）。
@@ -1035,7 +1041,7 @@ const NOW_Y = Y_END + 8 * 3600_000; // 2028-01-01 08:00 BJ（bizDate '2028-01-01
 /** after 清理锚点：本文件独占的真实周期键。
  *  债务修复轮：SP-4 窗口移去 2031 后本文件不再结算 '2026' 单元——**真实平台键绝不许进这个名单**
  *  （既是删别人的台账，也是把「越界结算」洗成自家数据）。同时它是 after() 守卫 G1/G2 的「本文件拥有的单元集合」。 */
-const SP_PERIOD_KEYS: string[] = [...WEEK_KEYS, M_DEC, '2027'];
+const SP_PERIOD_KEYS: string[] = [...WEEK_KEYS, M_DEC, '2027', '2027-05-10'];
 
 /** 种一榜：按给定距离（降序自定）一人一条可信 finished 轨迹，返回 userId 数组（全部登记清理） */
 async function seedBoard(type: string, startMs: number, distances: number[]): Promise<Types.ObjectId[]> {
@@ -1767,13 +1773,13 @@ test('SP-20 3 榜上限跨结算轮次生效：重算一个未落定的榜，不
 
 test('SP-21 结算起点：窗口终点早于 settleFrom 的单元永不发分；跨越/等于起点的照常发（终审 must-fix #4）', async () => {
   const saved = BOARD_REWARDS.settleFrom;
-  assert.equal(typeof saved, 'number', 'settleFrom 必须是毫秒数（默认＝进程启动当天的东八零点）');
-  // 解析口径：BJ 日期串 = 当日 00:00；毫秒串原样；空/脏值退回「今天 00:00」而不是历史开头
+  assert.equal(typeof saved, 'number', 'settleFrom 必须是毫秒数');
+  // 解析口径：BJ 日期串 = 当日 00:00；毫秒串原样；空/脏值退回**固定文档日期**（既不是历史开头，也不是「今天」）
   assert.equal(parseSettleFrom('2027-01-15'), bjMid(2027, 1, 15), '日期串按东八零点解析');
   assert.equal(parseSettleFrom(String(bjMid(2027, 2, 1))), bjMid(2027, 2, 1), '毫秒串原样');
-  assert.equal(parseSettleFrom(undefined, NOW18), bjToday0(NOW18), '缺省＝当天东八零点');
+  assert.equal(parseSettleFrom(undefined, NOW18), BOARD_SETTLE_FROM_DEFAULT, '缺省＝固定的文档化日期');
   const dirty = await captureErrors(async () => {
-    assert.equal(parseSettleFrom('not-a-date', NOW18), bjToday0(NOW18), '脏值退回缺省（少发不多发）');
+    assert.equal(parseSettleFrom('not-a-date', NOW18), BOARD_SETTLE_FROM_DEFAULT, '脏值退回缺省（少发不多发）');
   });
   assert.match(dirty, /BOARD_SETTLE_FROM/, '脏值要留痕，别静默当成"从头算"');
 
@@ -1802,6 +1808,96 @@ test('SP-21 结算起点：窗口终点早于 settleFrom 的单元永不发分�
     assert.equal(exact.credited, 3, '终点 == 起点仍可结算（边界取 >=，不是 >）');
   } finally {
     BOARD_REWARDS.settleFrom = saved;
+  }
+});
+
+test('SP-21a 缺省结算起点是固定常量 2026-11-01（东八零点）：绝不随进程启动时钟漂移', () => {
+  assert.equal(BOARD_SETTLE_FROM_DEFAULT_DATE, '2026-11-01', '默认日期必须与文档/注释一致');
+  assert.equal(BOARD_SETTLE_FROM_DEFAULT, bjMid(2026, 11, 1), '默认＝2026-11-01 00:00 东八区');
+  // 缺省值必须与「今天」无关：把默认改回 Date.now()/bjToday0 相对计算时这里先红。
+  // 2026-10-30 是上线前的典型启动日，2030 是久后重启日，两端都必须给出同一个常量。
+  for (const now of [0, bjMid(2020, 1, 6), bjMid(2026, 10, 30), bjMid(2030, 6, 1), Date.now()]) {
+    assert.equal(parseSettleFrom(undefined, now), bjMid(2026, 11, 1), `缺省不许随 now=${now} 漂移`);
+  }
+  assert.equal(parseSettleFrom('  ', 0), bjMid(2026, 11, 1), '空串同样退回固定缺省');
+  const envRaw = String(process.env.BOARD_SETTLE_FROM ?? '').trim();
+  if (envRaw === '') {
+    assert.equal(BOARD_REWARDS.settleFrom, bjMid(2026, 11, 1), 'env 未设时进程配置必须等于文档化缺省');
+  }
+});
+
+test('SP-21b 缺省起点之前结束的周期单元零发放、零台账（周一 00:00 结束的周不会被静默吞掉）', async () => {
+  // 取 2020 年的一周：窗口终点 2020-01-13 00:00 远早于缺省起点 2026-11-01 00:00。
+  // 故意选平台上线前的年份——即使闸门被删，聚合窗口里也没有真实用户，不会给真人发钱。
+  const key = '2020-01-06';
+  const start = bjMid(2020, 1, 6);
+  const end = start + 7 * DAY_MS;
+  const saved = BOARD_REWARDS.settleFrom;
+  const users = await seedBoard('cycling', start, [5200, 5100, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200, 4100]);
+  try {
+    BOARD_REWARDS.settleFrom = BOARD_SETTLE_FROM_DEFAULT;
+    const now = Date.now();
+    const gated = await settlePeriod('week', key, end, now);
+    assert.equal(gated.credited, 0, '窗口终点早于缺省起点 ⇒ 一分不发');
+    assert.equal(
+      await PointRecordModel.countDocuments({ type: 'board_reward', refId: { $regex: `:week:${key}$` } }),
+      0,
+      '旧单元不许有流水',
+    );
+    assert.equal(await BoardSettlementModel.countDocuments({ periodKey: key }), 0, '不发也不许落任何台账行');
+    const units = await computeSettleUnits(String(users[0]), now);
+    assert.equal(units.some((u) => u.period === 'week' && u.periodKey === key), false, '懒结算不枚举起点之前的单元');
+  } finally {
+    BOARD_REWARDS.settleFrom = saved;
+    await BoardSettlementModel.deleteMany({ periodKey: key });
+  }
+});
+
+test('SP-21c 缺省起点之后结束的周期单元照常发 TOP3', async () => {
+  // 2027-05-10 00:00 起的周，窗口终点 2027-05-17 00:00 晚于缺省起点 ⇒ 正常结算。
+  const key = '2027-05-10';
+  const start = bjMid(2027, 5, 10);
+  const end = start + 7 * DAY_MS;
+  const saved = BOARD_REWARDS.settleFrom;
+  try {
+    BOARD_REWARDS.settleFrom = BOARD_SETTLE_FROM_DEFAULT;
+    await seedBoard('cycling', start, [5200, 5100, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200, 4100]);
+    const settled = await settlePeriod('week', key, end, end + 3600_000);
+    assert.equal(settled.credited, 3, '窗口终点晚于缺省起点 ⇒ 照常发 TOP3');
+    assert.equal(
+      await PointRecordModel.countDocuments({ type: 'board_reward', refId: { $regex: `:week:${key}$` } }),
+      3,
+      '三条流水到账',
+    );
+  } finally {
+    BOARD_REWARDS.settleFrom = saved;
+  }
+});
+
+test('SP-21d 开闸但未显式设 BOARD_SETTLE_FROM 时启动告警（不 throw）；显式设了就不告警', () => {
+  const logs: string[] = [];
+  const orig = console.warn;
+  console.warn = (...a: unknown[]) => { logs.push(a.map((x) => String(x)).join(' ')); };
+  try {
+    assert.equal(warnIfBoardSettleFromUnset({ BOARD_REWARDS_ENABLED: 'true' }), true, '开关开 + env 未设 ⇒ 必须告警');
+    const text = logs.join('\n');
+    assert.match(text, /BOARD_REWARDS_ENABLED/, '告警要点名开关');
+    assert.match(text, /BOARD_SETTLE_FROM/, '告警要点名缺的变量');
+    assert.match(text, /2026-11-01/, '告警要说出缺省日期');
+    assert.match(text, /钉/, '告警要告诉运营把起点钉成开闸日');
+
+    logs.length = 0;
+    assert.equal(
+      warnIfBoardSettleFromUnset({ BOARD_REWARDS_ENABLED: 'true', BOARD_SETTLE_FROM: '2026-11-05' }),
+      false,
+      '显式配置后不许再告警',
+    );
+    assert.equal(logs.length, 0, '显式配置时一条 warn 都不许有');
+
+    assert.equal(warnIfBoardSettleFromUnset({ BOARD_REWARDS_ENABLED: 'false' }), false, '开关关着不告警');
+    assert.equal(logs.length, 0, '开关关着一条 warn 都不许有');
+  } finally {
+    console.warn = orig;
   }
 });
 

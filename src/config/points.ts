@@ -1,5 +1,4 @@
 import { config } from './index.js';
-import { bjToday0 } from '../utils/bj-time.js';
 
 export const POINTS = {
   SIGNIN_MAX: 7,
@@ -45,18 +44,34 @@ export const POINT_TASKS = {
 export type TaskKey = keyof typeof POINT_TASKS;
 
 /**
+ * 榜单奖励的**缺省结算起点**：2026-11-01 00:00（东八区）——固定常量，绝不随进程启动时钟漂移。
+ *
+ * 为什么是 2026-11-01：这是本功能的上线日（2026-10-28/29 设计与终审，11-01 开闸）。
+ * 缺省必须写死一个日期，而不是「今天」：`BOARD_SETTLE_FROM` 在进程启动时只解析一次。
+ * 若缺省取启动当天 00:00，一个「周一 00:00 结束」的周单元通常在周一当天或次日才被首次处理，
+ * 此时 `boundary(= 周一 00:00) < 今天 00:00` 恒成立 ⇒ 该期被**永久跳过**且没有任何日志，
+ * 开关打开后几乎不发分。固定成上线日则与重启时刻无关：上线前结束的周期永不发（不补历史），
+ * 上线后结束的照常发。运营开闸时应把 `BOARD_SETTLE_FROM` 显式钉成实际开闸日期
+ * （未钉时启动会告警，见 warnIfBoardSettleFromUnset）。
+ */
+export const BOARD_SETTLE_FROM_DEFAULT_DATE = '2026-11-01';
+export const BOARD_SETTLE_FROM_DEFAULT = Date.parse(`${BOARD_SETTLE_FROM_DEFAULT_DATE}T00:00:00+08:00`);
+
+/**
  * 结算起点（2026-10-29 终审 must-fix #4）的解析：`BOARD_SETTLE_FROM` 收
- * **东八日期串 'YYYY-MM-DD'（按当日 00:00）或毫秒时间戳**；缺省/空＝进程启动当天的东八零点。
+ * **东八日期串 'YYYY-MM-DD'（按当日 00:00）或毫秒时间戳**；
+ * 缺省/空＝固定常量 BOARD_SETTLE_FROM_DEFAULT（2026-11-01 00:00 东八区），不再是「今天 00:00」。
  * 语义只有一条：**窗口终点 >= settleFrom 的周期单元才可结算**，早于它的单元永不发分。
- * 为什么缺省是"今天"：这一版之前 BOARD_REWARDS 没有起点，开关一拨就会把上线前的
- * 所有周/月/年榜一次性补发（全平台 8 个榜 × 全部历史周期，真金白银且没人预期）。
- * 缺省今天 ⇒ 开闸后只有「上线当天尚未结束、之后才到期」的第一期会发。
+ * 为什么缺省是固定日期而不是「今天」：这一版之前 BOARD_REWARDS 没有起点，开关一拨就会把上线前的
+ * 所有周/月/年榜一次性补发（全平台 8 个榜 × 全部历史周期，真金白银且没人预期）；另一方面，
+ * 用「启动当天」当缺省会让周一/月初刚结束的单元因启动时刻而永久漏发（见上方常量注释）。
  * 环境变量写错（既不是日期也不是正数毫秒）时**退回缺省并留一条 error 日志**：
  * 配错只许少发不许多发，绝不能因为一个笔误把开关当成"从历史开头算起"。
+ * `now` 仅为历史调用签名保留，缺省值已与它无关。
  */
-export function parseSettleFrom(raw: string | undefined, now = Date.now()): number {
+export function parseSettleFrom(raw: string | undefined, _now = Date.now()): number {
   const s = String(raw ?? '').trim();
-  if (!s) return bjToday0(now);
+  if (!s) return BOARD_SETTLE_FROM_DEFAULT;
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const ms = Date.parse(`${s}T00:00:00+08:00`);
     if (!Number.isNaN(ms)) return ms;
@@ -64,8 +79,26 @@ export function parseSettleFrom(raw: string | undefined, now = Date.now()): numb
     const n = Number(s);
     if (Number.isFinite(n) && n > 0) return n;
   }
-  console.error(`[points] BOARD_SETTLE_FROM 不是东八日期串（YYYY-MM-DD）也不是毫秒时间戳，已退回缺省（今天 00:00）：${s}`);
-  return bjToday0(now);
+  console.error(`[points] BOARD_SETTLE_FROM 不是东八日期串（YYYY-MM-DD）也不是毫秒时间戳，已退回固定缺省 ${BOARD_SETTLE_FROM_DEFAULT_DATE} 00:00（东八区）：${s}`);
+  return BOARD_SETTLE_FROM_DEFAULT;
+}
+
+/**
+ * 启动自检：`BOARD_REWARDS_ENABLED` 打开、但 `BOARD_SETTLE_FROM` 未显式配置时大声告警。
+ * 不 throw（api 必须照常启动）：只说清楚「正在用缺省日期发钱」，并要求运营把起点钉成实际开闸日。
+ * 显式配置后、或开关关着时，一条 warn 都不打。返回是否真的告警（供测试/调用方判断）。
+ */
+export function warnIfBoardSettleFromUnset(
+  env: Record<string, string | undefined> = process.env,
+  log: (msg: string) => void = (msg) => console.warn(msg),
+): boolean {
+  const enabled = env.BOARD_REWARDS_ENABLED === 'true' || env.BOARD_REWARDS_ENABLED === '1';
+  if (!enabled) return false;
+  if (String(env.BOARD_SETTLE_FROM ?? '').trim() !== '') return false;
+  log(
+    `[points] BOARD_REWARDS_ENABLED 已打开，但 BOARD_SETTLE_FROM 未显式配置：榜单发分将从缺省起点 ${BOARD_SETTLE_FROM_DEFAULT_DATE} 00:00（东八区）开始，早于该日结束的周期单元永不发分。请把 BOARD_SETTLE_FROM 钉成实际开闸日期（YYYY-MM-DD，东八区）后重启。`,
+  );
+  return true;
 }
 
 /**
@@ -88,9 +121,9 @@ export const BOARD_REWARDS = {
   minParticipants: 10,
   /**
    * 结算起点（ms，东八零点）：**窗口终点 >= 此值的单元才结算**（见 parseSettleFrom 的注释）。
-   * 运营含义：`BOARD_SETTLE_FROM`＝从哪一期开始发；缺省今天 ⇒ 上线不补发任何历史，
-   * 只有上线当天还没结束、之后才到期的那一期起发。早于它的单元懒结算不再枚举，
-   * 即便被直接调 settlePeriod 也只返回 0 且不落任何台账行（永远发不出分）。
+   * 缺省是固定常量 2026-11-01 00:00（东八区，功能上线日），与进程启动时刻无关；
+   * 运营用 `BOARD_SETTLE_FROM` 覆盖它，开闸时应显式钉成实际开闸日（未钉时启动告警）。
+   * 早于它的单元懒结算不再枚举，即便被直接调 settlePeriod 也只返回 0 且不落任何台账行（永远发不出分）。
    */
   settleFrom: parseSettleFrom(process.env.BOARD_SETTLE_FROM),
   /** 同一期每人最多计 N 个榜（D5，取分值最高的 N 个） */
