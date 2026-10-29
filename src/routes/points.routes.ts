@@ -7,6 +7,7 @@ import { confirmReceipt, listMyOrders } from '../services/points-orders.js';
 import { activateCard, adFreeUntilOf, countUnusedCards } from '../services/points-cards.js';
 import { getSigninCalendar } from '../services/points-calendar.js';
 import { expiringOf, streakPercentileOf } from '../services/points-summary.js';
+import { scheduleLazySettle } from '../services/board-lazy-settle.js';
 import { success } from '../utils/response.js';
 
 /**
@@ -18,6 +19,9 @@ import { success } from '../utils/response.js';
 export async function pointsRoutes(fastify: FastifyInstance) {
   fastify.get('/summary', { onRequest: [fastify.authenticate] }, async (request) => {
     const userId = request.user.userId;
+    // 懒结算后台触发（Task 9 / spec §4.2）：放在读汇总之前，但**不等它、也不因它失败**——
+    // 下面所有数据都不依赖结算结果，这趟没到账下趟进页自然看到（每用户限频＋吞错在调度器里）。
+    scheduleLazySettle(userId);
     // 先结算过期批次，保证余额/卡数与后续各接口看到的口径一致
     await settleExpired(userId);
     const now = Date.now();

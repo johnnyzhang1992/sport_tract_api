@@ -9,10 +9,13 @@ import {
 } from '../src/models/point.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { LoginLogModel } from '../src/models/login-log.model.js';
-import { POINTS } from '../src/config/points.js';
+import { BOARD_REWARDS, POINTS } from '../src/config/points.js';
 import { creditPoints } from '../src/services/points-ledger.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { previousDateKey, shiftDateKey } from '../src/utils/points-domain.js';
+import {
+  SETTLE_TRIGGER_WINDOW_MS, lazySettleDeps, resetLazySettleDebounceForTest, scheduleLazySettle,
+} from '../src/services/board-lazy-settle.js';
 
 /**
  * /points/* HTTP 接线：登录闸门、汇总结构（cells 原样下发、旧 makeupCardId 已撤）、
@@ -534,4 +537,165 @@ test('PR3 路由参数错误透出 service 的 400/404', async () => {
   const unknownTask = await post('/points/tasks/not_a_task/claim');
   assert.equal(unknownTask.statusCode, 404, unknownTask.body);
   assert.match(unknownTask.json().message, /任务不存在/);
+});
+
+/**
+ * ===== Task 9：懒结算挂用户入口（PR-R* / PR-D* / PR-L1）=====
+ *
+ * 共享 dev 库纪律：这些用例一律 stub 掉真结算实现（lazySettleDeps.settle），
+ * 绝不在开着的灰度开关下跑真 settleDueForUser——它每一脚做**全榜**结算，
+ * 在开发库上会替真实平台用户发钱、留下 board_reward 与台账行。
+ * 真结算的算法与时序语义由 test/points-board.test.ts 端到端覆盖；
+ * 本段只证三件事：入口挂上了（调度发生在请求内且只带 userId+now）、
+ * 主响应不依赖它（pending/抛错都照常 200）、开关关闭零调度。
+ *
+ * 调度只收 (userId, now) 两个入参：period/periodKey 一律由 settleDueForUser 自己派生，
+ * 路由的 query/body 不参与（Task 7 交接约束 3）。
+ */
+
+const summaryStatsGet = (url: string) =>
+  app.inject({ method: 'GET', url: `${API}/stats/${url}`, headers: auth() });
+
+test('PR-R1 进积分页会触发上一周结算（各一次请求内完成，不额外发请求）', async (t) => {
+  resetLazySettleDebounceForTest();
+  const calls: [string, number][] = [];
+  // 永不 resolve 的结算：响应若敢 await 它，inject 就会挂死——超时即红，反向证明懒（fire-and-forget）
+  const pending = new Promise<void>(() => {});
+  t.mock.method(lazySettleDeps, 'settle', (u: string, now: number) => {
+    calls.push([u, now]);
+    return pending;
+  });
+  const enabled = BOARD_REWARDS.enabled;
+  BOARD_REWARDS.enabled = true;
+  try {
+    const before = Date.now();
+    const res = await get('/points/summary');
+    assert.equal(res.statusCode, 200, res.body);
+    const s = data<Summary>(res);
+    assert.equal(typeof s.balance, 'number');
+    assert.equal(s.signin.cells.length, 7, 'summary 主体照常下发（不等同步结算）');
+    assert.equal(calls.length, 1, 'summary 请求内应调度一次懒结算');
+    assert.equal(calls[0][0], userId, '调度必须只针对本人');
+    assert.ok(calls[0][1] >= before && calls[0][1] <= Date.now(), 'now 由请求时刻传入');
+  } finally {
+    BOARD_REWARDS.enabled = enabled;
+  }
+});
+
+test('PR-R2 结算失败不拖垮 summary（reject 与同步抛都吞掉，主响应 200 载荷照常）', async (t) => {
+  resetLazySettleDebounceForTest();
+  const enabled = BOARD_REWARDS.enabled;
+  BOARD_REWARDS.enabled = true;
+  try {
+    // ① 后台 promise reject：必须被 .catch 吞掉（摘掉 swallow 会变 unhandledRejection 打挂进程）
+    t.mock.method(lazySettleDeps, 'settle', async () => { throw new Error('boom：结算炸了'); });
+    const res1 = await get('/points/summary');
+    assert.equal(res1.statusCode, 200, res1.body);
+    const s1 = data<Summary>(res1);
+    assert.ok(Array.isArray(s1.items), '载荷字段照常');
+    t.mock.restoreAll();
+
+    // ② 同步抛（比 reject 更狠：绕过 .catch 的写法会直接 500）
+    resetLazySettleDebounceForTest();
+    t.mock.method(lazySettleDeps, 'settle', (() => { throw new Error('boom：同步抛'); }) as typeof lazySettleDeps.settle);
+    const res2 = await get('/points/summary');
+    assert.equal(res2.statusCode, 200, res2.body);
+    assert.equal(typeof data<Summary>(res2).balance, 'number');
+    t.mock.restoreAll();
+
+    // ③ 榜单页同规格：后台抛错不许把 /leaderboard 变 500
+    resetLazySettleDebounceForTest();
+    t.mock.method(lazySettleDeps, 'settle', async () => { throw new Error('boom：榜单侧结算炸了'); });
+    const res3 = await summaryStatsGet('leaderboard?type=running&period=week');
+    assert.equal(res3.statusCode, 200, res3.body);
+    assert.ok(Array.isArray(res3.json().data.top), '榜单主体照常');
+    t.mock.restoreAll();
+  } finally {
+    BOARD_REWARDS.enabled = enabled;
+  }
+});
+
+test('PR-R3 开关关闭时不调度（两个入口都零调度开销）', async (t) => {
+  resetLazySettleDebounceForTest();
+  const calls: string[] = [];
+  t.mock.method(lazySettleDeps, 'settle', (u: string) => { calls.push(u); return Promise.resolve(); });
+  assert.equal(BOARD_REWARDS.enabled, false, '灰度开关默认必须 false（spec §6），本用例不许翻它');
+  try {
+    const res = await get('/points/summary');
+    assert.equal(res.statusCode, 200, res.body);
+    const lb = await summaryStatsGet('leaderboard?type=running&period=week');
+    assert.equal(lb.statusCode, 200, lb.body);
+    assert.equal(calls.length, 0, '开关关闭：连调度都不发起（SP-4 语义在入口层再钉一道）');
+  } finally {
+    t.mock.restoreAll();
+  }
+});
+
+test('PR-D1 每用户限频：窗口内同用户第二次进页不再调度（两入口共用同一闸门）', async (t) => {
+  resetLazySettleDebounceForTest();
+  let n = 0;
+  t.mock.method(lazySettleDeps, 'settle', () => { n += 1; return Promise.resolve(); });
+  const enabled = BOARD_REWARDS.enabled;
+  BOARD_REWARDS.enabled = true;
+  try {
+    const r1 = await get('/points/summary');
+    assert.equal(r1.statusCode, 200, r1.body);
+    assert.equal(n, 1);
+    // 同用户紧接着打榜单页：限频命中，不再调度（响应照常 200）
+    const r2 = await summaryStatsGet('leaderboard?type=running&period=week');
+    assert.equal(r2.statusCode, 200, r2.body);
+    assert.equal(n, 1, `${SETTLE_TRIGGER_WINDOW_MS / 60000} 分钟窗口内第二次进页必须被限频`);
+  } finally {
+    BOARD_REWARDS.enabled = enabled;
+    t.mock.restoreAll();
+  }
+});
+
+test('PR-D2 限频按注入时刻放行：窗口内拦、到点放（纯 helper 单测，假 id 不碰库）', async (t) => {
+  const fake = `debounce-unit-${Date.now()}`;
+  let n = 0;
+  t.mock.method(lazySettleDeps, 'settle', () => { n += 1; return Promise.resolve(); });
+  const enabled = BOARD_REWARDS.enabled;
+  BOARD_REWARDS.enabled = true;
+  try {
+    const T = Date.now();
+    scheduleLazySettle(fake, T);
+    assert.equal(n, 1, '首次调度');
+    scheduleLazySettle(fake, T + SETTLE_TRIGGER_WINDOW_MS - 1);
+    assert.equal(n, 1, '窗口内（差 1ms）拦截');
+    scheduleLazySettle(fake, T + SETTLE_TRIGGER_WINDOW_MS);
+    assert.equal(n, 2, '整窗过后放行');
+    // 空串 userId（游客防御的第二道闸）永不调度
+    scheduleLazySettle('', T + SETTLE_TRIGGER_WINDOW_MS);
+    assert.equal(n, 2, '空 userId 不配占用闸门');
+  } finally {
+    BOARD_REWARDS.enabled = enabled;
+    t.mock.restoreAll();
+  }
+});
+
+test('PR-L1 游客看榜不给任何人触发结算；登录用户看榜触发一次', async (t) => {
+  resetLazySettleDebounceForTest();
+  const calls: [string, number][] = [];
+  t.mock.method(lazySettleDeps, 'settle', (u: string, now: number) => {
+    calls.push([u, now]);
+    return Promise.resolve();
+  });
+  const enabled = BOARD_REWARDS.enabled;
+  BOARD_REWARDS.enabled = true;
+  try {
+    // 游客：不带 token。榜单照常 200，但绝不允许替「某个用户」结算
+    const guest = await app.inject({ method: 'GET', url: `${API}/stats/leaderboard?type=running&period=week` });
+    assert.equal(guest.statusCode, 200, guest.body);
+    assert.equal(guest.json().data.me, null, '游客 me 仍为 null（LB-G1 口径不回归）');
+    assert.equal(calls.length, 0, '游客请求不许触发结算');
+    // 登录用户：触发一次，且只带 (userId, now)——period 查询参数不参与调度
+    const member = await summaryStatsGet('leaderboard?type=running&period=month');
+    assert.equal(member.statusCode, 200, member.body);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], userId);
+  } finally {
+    BOARD_REWARDS.enabled = enabled;
+    t.mock.restoreAll();
+  }
 });

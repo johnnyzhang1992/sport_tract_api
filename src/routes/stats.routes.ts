@@ -10,6 +10,7 @@ import {
   leaderboardTypeCounts,
   homeLeaderboardSummary,
 } from '../services/leaderboard.js';
+import { scheduleLazySettle } from '../services/board-lazy-settle.js';
 import { collectSection } from '../utils/section.js';
 import { success } from '../utils/response.js';
 
@@ -108,8 +109,12 @@ export async function statsRoutes(fastify: FastifyInstance) {
   // 可选鉴权（2026-10-26）：游客可看榜单（me 为 null，前端不渲染"我的排名"卡）
   fastify.get('/leaderboard', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     const query = request.query as { type?: string; province?: string; period?: string };
+    const userId = request.user ? request.user.userId : null;
+    // 懒结算后台触发（Task 9 / spec §4.2）：游客绝不触发（替谁结算都不成立）；
+    // 只递 userId+时刻，query 里的 period 不参与调度——结算单元由 settleDueForUser 自己派生。
+    if (userId) scheduleLazySettle(userId);
     const result = await leaderboard(
-      request.user ? request.user.userId : null,
+      userId,
       query.type || 'running',
       query.province || '全国',
       (query.period || 'all') as 'week' | 'month' | 'year' | 'all',
