@@ -13,6 +13,11 @@ function int(v: string | undefined, def: number): number {
   return Number.isNaN(n) ? def : n;
 }
 
+function bool(v: string | undefined, def: boolean): boolean {
+  if (v === undefined || v === '') return def;
+  return v === 'true' || v === '1';
+}
+
 export const config = {
   nodeEnv: process.env.NODE_ENV ?? 'development',
   isDev: (process.env.NODE_ENV ?? 'development') !== 'production',
@@ -37,6 +42,10 @@ export const config = {
   // MongoDB
   mongodbUri:
     process.env.MONGODB_URI ?? 'mongodb://localhost:27017/sport-track-dev',
+
+  // 榜单奖励灰度开关（spec §6）：默认 false——线上先小流量验一轮结算再放开。
+  // 短路点在 settlePeriod/settleDueForUser 入口；回滚＝关掉它（已发的分不回收，台账保留）。
+  boardRewardsEnabled: bool(process.env.BOARD_REWARDS_ENABLED, false),
 
   // 管理后台（admin 接口独立鉴权，与小程序用户隔离）
   adminUsername: process.env.ADMIN_USERNAME ?? 'admin',

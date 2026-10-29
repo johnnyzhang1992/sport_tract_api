@@ -13,6 +13,12 @@ import {
   flipBoardSettlementToCredited,
   recordBoardSettlementSkipped,
   isBoardSettlementSkipped,
+  releaseBoardSettlementPending,
+  settlePeriod,
+  settleDueForUser,
+  computeSettleUnits,
+  boardLabel,
+  boardPeriodTag,
   type BoardCandidate,
   type BoardPeriod,
   type BoardReward,
@@ -20,13 +26,21 @@ import {
 } from '../src/services/points-board.js';
 import {
   BoardSettlementModel,
+  PointAccountModel,
+  PointDailyModel,
+  PointLotModel,
+  PointRecordModel,
   BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID,
   BOARD_SETTLEMENT_PERIODS,
   BOARD_SETTLEMENT_STATUSES,
   type BoardSettlementPeriod,
 } from '../src/models/point.model.js';
+import { NotificationModel } from '../src/models/notification.model.js';
 import { hasNoPace, NO_PACE_TYPES } from '../src/utils/pace.js';
 import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM, ACTIVITY_TYPES } from '../src/config/constants.js';
+import { BOARD_REWARDS } from '../src/config/points.js';
+import { creditPoints, getBalance } from '../src/services/points-ledger.js';
+import { BJ_OFFSET_MS } from '../src/utils/bj-time.js';
 
 /**
  * 榜单发分专用的可信轨迹聚合（spec §7：发分口径比展示多四道防刷判据）。
@@ -49,6 +63,8 @@ import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM, ACTIVITY_TYPES } fr
 const WIN_START = Date.now();
 const WIN_END = WIN_START + 60_000;
 const NOW = WIN_START + 1_000;
+/** 灰度开关在「import 时刻」的默认值快照：SP-4 钉它必须是 false（spec §6），下面的 before 会翻开供其余用例跑结算 */
+const FLAG_DEFAULT_AT_IMPORT = BOARD_REWARDS.enabled;
 
 let app: FastifyInstance;
 const seededUsers: Types.ObjectId[] = [];
@@ -95,15 +111,28 @@ before(async () => {
   // 台账的幂等全靠那条唯一索引，而 autoIndex 是异步的：不先等它建完就断言 E11000 会假绿
   // （与 test/points-models.test.ts:12 同款）
   await Promise.all([BoardSettlementModel.init()]);
+  // SP-* 要真发钱：测试进程内把灰度开关翻开（默认值 false 由 SP-4 用 FLAG_DEFAULT_AT_IMPORT 钉住）。
+  // 开关不许写死进 service——结算就是读它，SP-4 关掉它验证短路。
+  BOARD_REWARDS.enabled = true;
 });
 
 after(async () => {
   // 清理失败必须可见：吞掉错误会把本文件种下的测试轨迹永久留在共享 dev 库，
   // 后续所有按窗口/类型聚合的用例（含榜单类）会被无声污染
+  const fixtureUserIds = seededUsers.map((u) => String(u));
   try {
     await ActivityModel.deleteMany({ userId: { $in: seededUsers } });
-    // 台账行按「本次运行独有的 periodKey」收口，只删自己种的（共享 dev 库纪律：不碰别人的行）
-    await BoardSettlementModel.deleteMany({ periodKey: TEST_PERIOD_KEY });
+    // 台账行按「本次运行独有的 periodKey」收口，只删自己种的（共享 dev 库纪律：不碰别人的行）。
+    // SP_PERIOD_KEYS 是本文件自用的真实周期键（2026-12 之后的未来窗口，别的会话不会往这些周期落行）；
+    // skipped 占位行是哨兵 userId，按 user 删不掉，只能按 key 收口。
+    await BoardSettlementModel.deleteMany({
+      periodKey: { $in: [TEST_PERIOD_KEY, ...SP_PERIOD_KEYS] },
+    });
+    await PointRecordModel.deleteMany({ userId: { $in: fixtureUserIds } });
+    await PointAccountModel.deleteMany({ userId: { $in: fixtureUserIds } });
+    await PointLotModel.deleteMany({ userId: { $in: fixtureUserIds } });
+    await PointDailyModel.deleteMany({ userId: { $in: fixtureUserIds } });
+    await NotificationModel.deleteMany({ userId: { $in: seededUsers } });
   } catch (err) {
     console.error('[points-board.test] fixture 轨迹清理失败，dev 库有残留', err);
   }
@@ -885,4 +914,455 @@ test('BS-6 status/period 枚举闸门：四态都能落库、拼错的值写不�
     /min/,
     'points 的下限闸门没生效',
   );
+});
+
+/* ====================================================================
+ * settlePeriod / settleDueForUser 接线（Task 7）：发分 + 台账 + 通知 + 文案
+ *
+ * 夹具纪律（共享 dev 库 + 真实 money 路径）：
+ * - 周期单元全部取 **2026-12 之后的未来窗口**（周键=周一、月键='YYYY-MM'、年键='YYYY'，
+ *   规范形态）。别的会话不会在未来窗口种轨迹，trustedBoardRows 的聚合因此只看见本文件的数据；
+ *   「与平台真实历史数据隔离」靠时间窗实现，不靠假 type 名——settlePeriod 只扫 ACTIVITY_TYPES 真类型。
+ * - 发分对象是真实 ObjectId 用户（不落 user 文档）：creditPoints 的 settleExpired 无账户即静默返回，
+ *   过期结算不会在测试中途回收任何批次（所有夹具时刻都选在 expireAtFor 的未来端点之前）。
+ * - now 全部是**假时钟**（未来），台账/流水上的真实时间戳只用于唯一键与清理，不进断言。
+ * - after 按 seededUsers（含全部夹具用户）与本文件独占的 SP_PERIOD_KEYS 收口删除。
+ * ================================================================== */
+
+const DAY_MS = 86_400_000;
+const BJ = BJ_OFFSET_MS;
+/** 东八区墙上时间零点 → epoch ms */
+const bjMid = (y: number, m: number, d: number) => Date.UTC(y, m - 1, d) - BJ;
+
+const WEEK_KEYS = [
+  '2026-12-07', // U1：SP-1/2/9（cycling 12 人；running 8 人→回填到 11 人）
+  '2026-12-14', // U2：SP-3 幂等
+  '2026-12-21', // U3：SP-8 懒结算入口（触发者排第 13，不发钱）
+  '2026-12-28', // U4：SP-4 灰度开关
+  '2027-01-11', // U5：SP-11 超时接管
+  '2027-01-18', // U6：SP-10 每人 3 榜上限（4 个榜全过门槛）
+  '2027-02-01', // U7：SP-12 失败路径（release/金额不符/重试）
+  '2027-02-08', // U8：SP-13 通知失败不吞钱
+  '2027-02-15', // U9：SP-14 崩在发分与翻牌之间（幂等补翻牌）
+] as const;
+const U_START = (key: string) => bjMid(Number(key.slice(0, 4)), Number(key.slice(5, 7)), Number(key.slice(8, 10)));
+const U_END = (key: string) => U_START(key) + 7 * DAY_MS;
+const U1 = WEEK_KEYS[0]; const U1_START = U_START(U1); const U1_END = U_END(U1); const NOW1 = U1_END;
+const U2 = WEEK_KEYS[1]; const U2_START = U_START(U2); const U2_END = U_END(U2); const NOW2 = U2_END;
+const U3 = WEEK_KEYS[2]; const U3_START = U_START(U3); const U3_END = U_END(U3); const NOW3 = U3_END;
+const U4 = WEEK_KEYS[3]; const U4_START = U_START(U4); const U4_END = U_END(U4); const NOW4 = U4_END;
+const U5 = WEEK_KEYS[4]; const U5_START = U_START(U5); const U5_END = U_END(U5); const NOW5 = U5_END;
+const U6 = WEEK_KEYS[5]; const U6_START = U_START(U6); const U6_END = U_END(U6); const NOW6 = U6_END;
+const U7 = WEEK_KEYS[6]; const U7_START = U_START(U7); const U7_END = U_END(U7); const NOW7 = U7_END;
+const U8 = WEEK_KEYS[7]; const U8_START = U_START(U8); const U8_END = U_END(U8); const NOW8 = U8_END;
+const U9 = WEEK_KEYS[8]; const U9_START = U_START(U9); const U9_END = U_END(U9); const NOW9 = U9_END;
+/** 月/年单元：SP-5 滞后闸门（2026-12 的结算界是 2027-01-01）与 SP-7 年榜 500 分。
+ *  年榜夹具用 2027 年——2026/更早年份的窗口里有真实用户数据，绝不当结算对象。 */
+const M_DEC = '2026-12';
+const Y_START = bjMid(2027, 1, 1);
+const Y_END = bjMid(2028, 1, 1);
+const NOW_Y = Y_END + 8 * 3600_000; // 2028-01-01 08:00 BJ（bizDate '2028-01-01'）
+/** after 清理锚点：本文件独占的真实周期键（含 SP-4 顺带结算出的月/年键） */
+const SP_PERIOD_KEYS: string[] = [...WEEK_KEYS, M_DEC, '2026', '2027'];
+
+/** 种一榜：按给定距离（降序自定）一人一条可信 finished 轨迹，返回 userId 数组（全部登记清理） */
+async function seedBoard(type: string, startMs: number, distances: number[]): Promise<Types.ObjectId[]> {
+  const users: Types.ObjectId[] = [];
+  for (const distance of distances) {
+    const u = mkUser();
+    users.push(u);
+    await mkActivity(u, type, distance, { startTime: startMs + DAY_MS, avgPace: hasNoPace(type) ? null : MIN_PLAUSIBLE_PACE_SEC_PER_KM + 100 });
+  }
+  return users;
+}
+
+/** 钱账对账不变式：某单元的台账 credited 行数 == board_reward 流水条数（fixture 范围内） */
+async function assertUnitLedgerMatchesRecords(period: BoardPeriod, periodKey: string) {
+  const refIds = ACTIVITY_TYPES.map((t) => `${t}:${period}:${periodKey}`);
+  const [creditedRows, records] = await Promise.all([
+    BoardSettlementModel.countDocuments({ period, periodKey, status: 'credited' }),
+    PointRecordModel.countDocuments({ type: 'board_reward', refType: 'board', refId: { $in: refIds } }),
+  ]);
+  assert.equal(records, creditedRows, `单元 ${period}/${periodKey}：流水条数必须等于台账 credited 行数`);
+}
+
+/** 每人同期不超过 perUserBoards 个榜（credited 台账按 userId 分组数 type） */
+async function assertPerUserBoardCap(period: BoardPeriod, periodKey: string) {
+  const rows = await BoardSettlementModel.find({ period, periodKey, status: 'credited' }).select({ userId: 1, type: 1 }).lean();
+  const per = new Map<string, Set<string>>();
+  for (const r of rows) {
+    const set = per.get(String(r.userId)) ?? new Set<string>();
+    set.add(String(r.type));
+    per.set(String(r.userId), set);
+  }
+  for (const [u, types] of per) {
+    assert.ok(types.size <= BOARD_REWARDS.perUserBoards, `用户 ${u} 在 ${period}/${periodKey} 占了 ${types.size} 个榜，超过上限`);
+  }
+}
+
+/** 临时劫持 console.error 捕获留痕（node --test-concurrency=1 + 文件内串行，劫持安全） */
+async function captureErrors(fn: () => Promise<void>): Promise<string> {
+  const orig = console.error;
+  const cap: string[] = [];
+  console.error = (...a: unknown[]) => { cap.push(a.map((x) => (x instanceof Error ? x.message : String(x))).join(' ')); };
+  try {
+    await fn();
+  } finally {
+    console.error = orig;
+  }
+  return cap.join('\n');
+}
+
+test('SP-6 周期标签两套形态各自钉死（spec §4.8）', () => {
+  // 通知正文形态：日期内 '/'、区间「至」（spec §4.8 表第一行）
+  assert.equal(boardLabel('week', '2026-10-19'), '2026/10/19 至 2026/10/25 这一周');
+  assert.equal(boardLabel('month', '2026-10'), '2026年10月');
+  assert.equal(boardLabel('year', '2026'), '2026年');
+  // 流水标题后缀形态：周是 8 位无分隔紧凑形态（用户 2026-10-28 指定，与上面刻意不同式）
+  assert.equal(boardPeriodTag('week', '2026-10-19'), '20261019周');
+  assert.equal(boardPeriodTag('month', '2026-10'), '2026年10月');
+  assert.equal(boardPeriodTag('year', '2026'), '2026年');
+  // 两套不许被"顺手统一"：同入参两个输出形态不同（周），月/年恰好同式也各自钉住
+  assert.notEqual(boardLabel('week', '2026-12-07'), boardPeriodTag('week', '2026-12-07'));
+  assert.equal(boardLabel('week', '2026-12-07'), '2026/12/07 至 2026/12/13 这一周');
+  assert.equal(boardPeriodTag('week', '2026-12-07'), '20261207周');
+  assert.equal(boardLabel('month', '2027-01'), '2027年1月');
+});
+
+test('SP-5 滞后窗口未到不结算：本周结束于昨天，今天进页面不该发', async () => {
+  // C1：周单元要过"次周一 00:00（东八）"的滞后界才许结。U1 的界＝2026-12-14 00:00 BJ，
+  // 差 1ms 都不许动台账——一条占位都不落（占位是"已评估"的缓存，未评估不许伪造）。
+  const res = await captureErrors(async () => {
+    const r = await settlePeriod('week', U1, U1_END, NOW1 - 1);
+    assert.deepEqual(r, { credited: 0, skippedTypes: [] });
+  });
+  assert.equal(res, '', '滞后未到不该有任何留痕');
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U1 }), 0, '未到界：一行都不许落（含 skipped 占位）');
+  const u1Refs = ACTIVITY_TYPES.map((t) => `${t}:week:${U1}`);
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: { $in: u1Refs } }), 0, '未到界：一分钱都不该落账（收口到本单元 refId，不声明平台绝对值）');
+  // 月榜界=次月 1 日、年榜界=次年 1 月 1 日：12-14 进页面不许评估 2026-12 月榜（界 2027-01-01）
+  const m = await settlePeriod('month', M_DEC, Y_START, NOW1);
+  assert.deepEqual(m, { credited: 0, skippedTypes: [] });
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'month', periodKey: M_DEC }), 0);
+  // periodKey 规范形态之外的脏值必须炸出来而不是静默算出错窗（'20261207' 正是 boardPeriodTag 的形态，混进键＝双发隐患）
+  await assert.rejects(() => settlePeriod('week', '20261207', U1_END, NOW1), /periodKey/);
+});
+
+test('SP-1 周榜结算：发分流水 type=board_reward、idemKey 带周期、台账 credited', async () => {
+  // cycling 12 人过门槛；running 8 人不过（给 SP-2/SP-9 当占位夹具）
+  const cyc = await seedBoard('cycling', U1_START, [3000, 2900, 2800, 2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300, 1200]);
+  const run = await seedBoard('running', U1_START, [1000, 900, 800, 700, 600, 500, 400, 300]);
+  const res = await settlePeriod('week', U1, U1_END, NOW1);
+  assert.equal(res.credited, 3, 'TOP3 三条');
+  assert.deepEqual(
+    [...res.skippedTypes].sort(),
+    ['hiking', 'mountaineering', 'rowing', 'running', 'skiing', 'swimming', 'walking'],
+    '除 cycling 外 7 个榜全跳过（running 8 人未过 >10 门槛）',
+  );
+  // 流水（§4.8 第 5 条 + refId/idemKey/bizDate）
+  const rec1 = await PointRecordModel.findOne({ idemKey: `${cyc[0]}:board:cycling:week:${U1}` }).lean();
+  assert.ok(rec1, 'idemKey 必须逐字是 `${userId}:board:${type}:${period}:${periodKey}`');
+  assert.equal(rec1.type, 'board_reward');
+  assert.equal(rec1.title, '骑行·周榜第 1 名·20261207周');
+  assert.equal(rec1.delta, 50);
+  assert.equal(rec1.bizDate, '2026-12-14', 'bizDate＝结算日（now 的东八日期串）');
+  assert.equal(rec1.refType, 'board');
+  assert.equal(rec1.refId, `cycling:week:${U1}`);
+  const rec2 = await PointRecordModel.findOne({ userId: cyc[1] }).lean();
+  assert.equal(rec2?.title, '骑行·周榜第 2 名·20261207周');
+  assert.equal(rec2?.delta, 30);
+  // 没过门槛的榜一条不发（"nobody paid for a board that failed the threshold"）
+  assert.equal(await PointRecordModel.countDocuments({ userId: { $in: run.map(String) }, type: 'board_reward' }), 0);
+  // 台账行：credited + recordId 回指流水（Task 10 的冲销凭据）
+  const led = await BoardSettlementModel.findOne({ type: 'cycling', period: 'week', periodKey: U1, userId: cyc[0] }).lean();
+  assert.equal(led?.status, 'credited');
+  assert.equal(led?.rank, 1);
+  assert.equal(led?.points, 50);
+  assert.equal(String(led?.recordId), String(rec1._id), '台账必须回指那笔流水');
+  // 定向通知（§4.8 第 3 条逐字）
+  const notes = await NotificationModel.find({ userId: cyc[0] }).lean();
+  assert.equal(notes.length, 1, '每人一条，不许重发');
+  assert.equal(notes[0].title, '榜单积分奖励到账');
+  assert.equal(notes[0].content, '恭喜获得「骑行·周榜」第 1 名奖励 +50 积分（2026/12/07 至 2026/12/13 这一周）。');
+  assert.equal(notes[0].published, true);
+  // 不占每日上限：当天就这一笔，全额入账
+  assert.equal(await getBalance(String(cyc[0]), NOW1), 50);
+  // 钱账对账 + 每人 3 榜上限（fixture 范围内的不变式）
+  await assertUnitLedgerMatchesRecords('week', U1);
+  await assertPerUserBoardCap('week', U1);
+});
+
+test('SP-2 没过人数门槛 → 记 skipped 台账，不重复算（占位有效期内是缓存）', async () => {
+  const led = await BoardSettlementModel.findOne({ type: 'running', period: 'week', periodKey: U1 }).lean();
+  assert.equal(led?.status, 'skipped');
+  assert.equal(String(led?.userId), BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID);
+  assert.match(led?.reason ?? '', /人数/);
+  // 把占位行的 updatedAt 归一到 SP-1 的结算时刻（占位行是真实时钟落的，freshness 比较用假时钟）
+  // 用 driver 原始句柄写 updatedAt：mongoose 的 timestamps 插件会在 updateOne/findOneAndUpdate
+  // 上强行覆盖 updatedAt（模型开了 timestamps），"归一占位时间"必须绕过插件才落得下去。
+  await BoardSettlementModel.collection.updateOne({ _id: led?._id }, { $set: { updatedAt: new Date(NOW1) } });
+  // 回填把 running 从 8 人推到 11 人（越过门槛）——占位 24h 内是**缓存**：不许重算、不许补发
+  const rb = await seedBoard('running', U1_START, [5000, 4900, 4800]);
+  const res = await settlePeriod('week', U1, U1_END, NOW1 + 3600_000);
+  assert.equal(res.credited, 0, 'cycling 三条已被 SP-1 发完（claim 败者路径），running 被占位挡住');
+  assert.ok(res.skippedTypes.includes('running'));
+  assert.equal(await PointRecordModel.countDocuments({ userId: { $in: rb.map(String) }, type: 'board_reward' }), 0, '有效期内不许重算门槛');
+  assert.equal(await BoardSettlementModel.countDocuments({ type: 'running', period: 'week', periodKey: U1 }), 1, '占位行不重复落');
+});
+
+test('SP-9 skipped 是缓存不是判决：占位过期（>24h）后重算，回填过门槛就补发', async () => {
+  const rb = await PointRecordModel.countDocuments({ type: 'board_reward', refId: `running:week:${U1}` });
+  assert.equal(rb, 0, '夹具：SP-2 之后 running 还没发过分');
+  // 假时钟推过占位的 24h 有效期（updatedAt 在 SP-2 里归一到 NOW1，这里 now＝NOW1+25h）
+  const res = await settlePeriod('week', U1, U1_END, NOW1 + DAY_MS + 3600_000);
+  assert.equal(res.credited, 3, '11 人越门槛，回填的三个头部用户补发 TOP3');
+  assert.ok(!res.skippedTypes.includes('running'), '重算后 running 不再是 skipped');
+  const top = await PointRecordModel.findOne({ type: 'board_reward', refId: `running:week:${U1}`, delta: 50 }).lean();
+  assert.equal(top?.title, '跑步·周榜第 1 名·20261207周');
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `running:week:${U1}` }), 3);
+  await assertUnitLedgerMatchesRecords('week', U1);
+});
+
+test('SP-3 重复调用 settlePeriod 不二次发分（幂等）', async () => {
+  const cyc = await seedBoard('cycling', U2_START, [2700, 2600, 2500, 2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300, 1200]);
+  const first = await settlePeriod('week', U2, U2_END, NOW2);
+  assert.equal(first.credited, 3);
+  const recs = await PointRecordModel.countDocuments({ type: 'board_reward', refId: `cycling:week:${U2}` });
+  const notes = await NotificationModel.countDocuments({ userId: cyc[0] });
+  // 串行重复：三条已 credited 的行 claim 撞键败者路径，一分不再
+  const again = await settlePeriod('week', U2, U2_END, NOW2 + 60_000);
+  assert.equal(again.credited, 0);
+  // 并发双请求（懒结算的真场景：两台设备同时进页面）也必须颗粒不进
+  const both = await Promise.all([settlePeriod('week', U2, U2_END, NOW2 + 61_000), settlePeriod('week', U2, U2_END, NOW2 + 61_000)]);
+  assert.equal(both.reduce((s, r) => s + r.credited, 0), 0, '重复调用/并发重入都不得二次发分');
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `cycling:week:${U2}` }), recs, '流水一条不多');
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[0] }), notes, '通知不重发');
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U2, status: 'credited' }), 3);
+  await assertUnitLedgerMatchesRecords('week', U2);
+});
+
+test('SP-8 懒结算入口：只评估该用户有可信行的到期单元，但一脚结全榜', async () => {
+  // U3 cycling 13 行：t3 排第 13（1000m，不发钱），TOP3 是别的用户
+  const cyc = await seedBoard('cycling', U3_START, [2400, 2300, 2200, 2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300, 1200]);
+  const t3 = mkUser();
+  await mkActivity(t3, 'cycling', 1000, { startTime: U3_START + DAY_MS, avgPace: null });
+  // 单元枚举（C2）：t3 的行落在 2026-12-22 → 周/月/年都是候选，但 NOW3=2026-12-28 只有周过了滞后界
+  const units = await computeSettleUnits(String(t3), NOW3);
+  assert.deepEqual(units.map((u) => `${u.period}:${u.periodKey}`), [`week:${U3}`], '月/年滞后界（2027-01-01）未到，不许进结算');
+  await settleDueForUser(String(t3), NOW3);
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(
+      await PointRecordModel.countDocuments({ type: 'board_reward', userId: cyc[i], refId: `cycling:week:${U3}` }),
+      1,
+      `触发者不是赢家也要把全榜 TOP${i + 1} 发出去（第一个人替所有人干活）`,
+    );
+  }
+  assert.equal(await PointRecordModel.countDocuments({ userId: t3, type: 'board_reward' }), 0, '第 13 名没有奖励');
+  // 与该用户无关的到期单元（2026-11-02 的周榜，早过滞后界）一条台账都不许碰——
+  // 摘掉"用户有行"过滤器，这里就会冒出整批哨兵占位行
+  assert.equal(await BoardSettlementModel.countDocuments({ periodKey: '2026-11-02' }), 0);
+  // 月/年未到期：同样一行不落
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'month', periodKey: M_DEC }), 0);
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'year', periodKey: '2026' }), 0);
+  // 入口永不抛错：畸形 userId 也要安静吞掉（Task 9 挂在页面请求上，500 会把积分页打挂）
+  await captureErrors(async () => { await settleDueForUser('not-an-objectid', NOW3); });
+  await assertUnitLedgerMatchesRecords('week', U3);
+});
+
+test('SP-4 开关关闭时 settleDueForUser 什么都不做', async () => {
+  assert.equal(FLAG_DEFAULT_AT_IMPORT, false, '灰度开关默认值必须是 false（spec §6：线上小流量验完再放开）');
+  const cyc = await seedBoard('cycling', U4_START, [2100, 2050, 2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300, 1200, 1100]);
+  const t4 = mkUser();
+  await mkActivity(t4, 'cycling', 1000, { startTime: U4_START + DAY_MS, avgPace: null });
+  BOARD_REWARDS.enabled = false;
+  try {
+    await settleDueForUser(String(t4), NOW4);
+    const off = await settlePeriod('week', U4, U4_END, NOW4);
+    assert.deepEqual(off, { credited: 0, skippedTypes: [] });
+    assert.equal(await BoardSettlementModel.countDocuments({ periodKey: U4 }), 0, '开关关闭：连 skipped 占位都不落');
+    assert.equal(await PointRecordModel.countDocuments({ userId: { $in: cyc.map(String) }, type: 'board_reward' }), 0);
+  } finally {
+    BOARD_REWARDS.enabled = true;
+  }
+  // 翻开开关后同一入口立刻开工：证明上面短路的是开关，不是时窗/夹具
+  await settleDueForUser(String(t4), NOW4);
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', userId: cyc[0], refId: `cycling:week:${U4}` }), 1);
+});
+
+test('SP-10 同期第 4 个榜一条不发（每人 3 榜上限在结算侧同样生效）', async () => {
+  // multi 在 4 个榜全是第 1 名（各 9000）：plan 只留分值降序→type 码点升序的前 3 个
+  // （cycling < hiking < rowing < walking；walking 那条必须被砍）
+  const multi = mkUser();
+  const others: Record<string, Types.ObjectId[]> = {};
+  for (const type of ['cycling', 'hiking', 'rowing', 'walking']) {
+    others[type] = await seedBoard(type, U6_START, [8000, 7900, 7000, 6900, 6800, 6700, 6600, 6500, 6400, 6300, 6200]);
+    await mkActivity(multi, type, 9000, { startTime: U6_START + DAY_MS, avgPace: hasNoPace(type) ? null : MIN_PLAUSIBLE_PACE_SEC_PER_KM + 100 });
+  }
+  const res = await settlePeriod('week', U6, U6_END, NOW6);
+  assert.equal(res.credited, 11, '4 榜×3 条=12，multi 的第 4 条被 3 榜上限砍掉');
+  assert.equal(await PointRecordModel.countDocuments({ userId: multi, type: 'board_reward' }), 3);
+  assert.equal(await PointRecordModel.countDocuments({ userId: multi, refId: `walking:week:${U6}` }), 0, '被砍的榜连台账都不该有');
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U6, userId: multi, type: 'walking' }), 0);
+  // walking 榜的第 2、3 名不受 multi 被砍影响，照发
+  assert.equal(await PointRecordModel.countDocuments({ userId: others.walking[0], type: 'board_reward' }), 1);
+  await assertUnitLedgerMatchesRecords('week', U6);
+  await assertPerUserBoardCap('week', U6);
+});
+
+test('SP-11 卡死的 pending 可超时接管：进程崩在半路的用户不会永远拿不到钱', async () => {
+  const cyc = await seedBoard('cycling', U5_START, [9000, 8900, 8800, 8000, 7900, 7800, 7700, 7600, 7500, 7400, 7300, 7200]);
+  const key1 = { type: 'cycling', period: 'week' as const, periodKey: U5, userId: String(cyc[0]) };
+  assert.equal((await claimBoardSettlement(key1, { rank: 1, points: 50 })).won, true, '夹具：先模拟"上一个进程抢到锁就死了"');
+  // 把那行 pending 的 updatedAt 推到接管窗口（10min）之外（raw handle 绕过 timestamps 插件，同上）
+  await BoardSettlementModel.collection.updateOne({ ...key1, status: 'pending' }, { $set: { updatedAt: new Date(NOW5 - 11 * 60_000) } });
+  const res = await settlePeriod('week', U5, U5_END, NOW5);
+  assert.equal(res.credited, 3, '超时 pending 被重领，TOP1 也被发出去');
+  assert.equal(await PointRecordModel.countDocuments({ userId: cyc[0], type: 'board_reward', refId: `cycling:week:${U5}` }), 1);
+  const led = await BoardSettlementModel.findOne(key1).lean();
+  assert.equal(led?.status, 'credited');
+  assert.ok(led?.recordId, '接管后照样回指流水');
+});
+
+test('BS-1c claim 超时接管窗口：新鲜 pending 仍挡路，终态行永不重领', async () => {
+  const u = mkLedgerUser();
+  const key = { type: 't_b1c_running', period: 'week' as const, periodKey: TEST_PERIOD_KEY, userId: String(u) };
+  assert.equal((await claimBoardSettlement(key, { rank: 1, points: 50 })).won, true);
+  assert.equal(
+    (await claimBoardSettlement(key, { rank: 2, points: 30 }, Date.now() + 9 * 60_000)).won,
+    false,
+    '9 分钟的 pending 仍在锁持有期：两条路径同时领发放权会各发一笔（creditPoints 兜住双发，但台账会被搅乱）',
+  );
+  const re = await claimBoardSettlement(key, { rank: 1, points: 50 }, Date.now() + 11 * 60_000);
+  assert.equal(re.won, true, '>10min 的 pending 视为持有者已死，可接管');
+  const row = await BoardSettlementModel.findOne(key).lean();
+  assert.equal(row?.status, 'pending', '接管只是续锁（仍 pending），不是发放凭据——翻牌仍须 flip 的 status 条件');
+  // 终态行不吃超时窗口：credited/skipped/revoked 是判决，不是锁
+  const k2 = { type: 't_b1c_cycling', period: 'week' as const, periodKey: TEST_PERIOD_KEY, userId: String(mkLedgerUser()) };
+  await claimBoardSettlement(k2, { rank: 1, points: 50 });
+  await flipBoardSettlementToCredited(k2, new Types.ObjectId());
+  assert.equal((await claimBoardSettlement(k2, { rank: 1, points: 50 }, Date.now() + 60 * 60_000)).won, false, 'credited 行永不重领');
+  const k3 = { type: 't_b1c_swimming', period: 'week' as const, periodKey: TEST_PERIOD_KEY, userId: String(mkLedgerUser()) };
+  await claimBoardSettlement(k3, { rank: 3, points: 20 });
+  const oid3 = new Types.ObjectId();
+  const flippedRow = await flipBoardSettlementToCredited(k3, oid3);
+  assert.equal(flippedRow?.status, 'credited', '翻牌必须回传翻完的那行（returnDocument after 口径）');
+  assert.equal(String(flippedRow?.recordId), String(oid3), 'recordId 随翻牌写入并原样回传');
+  assert.equal((await claimBoardSettlement(k3, { rank: 3, points: 20 }, Date.now() + 60 * 60_000)).won, false);
+});
+
+test('BS-1d release：只删自己那行 pending，终态行一个不碰', async () => {
+  const u = mkLedgerUser();
+  const key = { type: 't_b1d_running', period: 'week' as const, periodKey: TEST_PERIOD_KEY, userId: String(u) };
+  await claimBoardSettlement(key, { rank: 3, points: 20 });
+  assert.equal(await releaseBoardSettlementPending(key), true);
+  assert.equal(await BoardSettlementModel.countDocuments(key), 0);
+  assert.equal((await claimBoardSettlement(key, { rank: 3, points: 20 })).won, true, 'release 之后锁放开，重试能重领');
+  // 已翻成 credited 的行不许被 release 删掉：那是发放凭据，删了＝下一次懒结算双发
+  assert.ok(await flipBoardSettlementToCredited(key, new Types.ObjectId()));
+  assert.equal(await releaseBoardSettlementPending(key), false);
+  assert.equal((await BoardSettlementModel.findOne(key).lean())?.status, 'credited');
+  // 哨兵 skipped 占位行 status≠pending，同样不碰
+  const board = { type: 't_b1d_swimming', period: 'week' as const, periodKey: TEST_PERIOD_KEY };
+  await recordBoardSettlementSkipped(board, '人数不足');
+  assert.equal(await releaseBoardSettlementPending({ ...board, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID }), false);
+  assert.equal(await isBoardSettlementSkipped(board), true);
+});
+
+test('SP-12 发分失败/金额不符：不翻牌、释放锁、大声留痕；重试补发', async () => {
+  const cyc = await seedBoard('cycling', U7_START, [5500, 5400, 5300, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200]);
+  const neverNotify = async () => { throw new Error('注入：发分失败时根本不该走到通知'); };
+  // (a) creditPoints 抛错：钱没出去，pending 必须被 release 删行，否则唯一键永远占位（那个用户 silently 拿不到钱）
+  const logsA = await captureErrors(async () => {
+    const r = await settlePeriod('week', U7, U7_END, NOW7, {
+      credit: async () => { throw new Error('注入：发分炸了'); },
+      notify: neverNotify as never,
+    });
+    assert.equal(r.credited, 0);
+  });
+  assert.match(logsA, /榜单|结算/, '失败路径必须 console.error 留痕（资损事故不能静默）');
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U7, type: 'cycling', status: 'pending' }), 0, '失败后锁必须释放（删行）');
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U7, type: 'cycling', status: 'skipped' }), 0, '失败绝不退化成 skipped（那是门槛缓存语义）');
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `cycling:week:${U7}` }), 0);
+  // (b) 金额不符（credited !== points，比如被上限截断）：不许静默翻牌——钱账漂移要炸出来，同时释放锁待重试
+  const logsB = await captureErrors(async () => {
+    const r = await settlePeriod('week', U7, U7_END, NOW7 + 1000, {
+      credit: async () => ({ credited: 49, balance: 49, duplicated: false, capped: true, recordId: null }),
+      notify: neverNotify as never,
+    });
+    assert.equal(r.credited, 0);
+  });
+  assert.match(logsB, /不符|漂移/, '金额不符的留痕要能指认是钱账漂移');
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U7, type: 'cycling', status: 'credited' }), 0, '金额不符不许翻牌');
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U7, type: 'cycling', status: 'pending' }), 0, '金额不符也要释放锁');
+  // (c) 真正可用的重试：前两轮都没把钱发出去，这一轮三条全补上，一条不多
+  const ok = await settlePeriod('week', U7, U7_END, NOW7 + 2000);
+  assert.equal(ok.credited, 3);
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `cycling:week:${U7}` }), 3);
+  await assertUnitLedgerMatchesRecords('week', U7);
+});
+
+test('SP-13 通知失败不吞钱：台账与流水保持成对，缺席的通知大声留痕', async () => {
+  const cyc = await seedBoard('cycling', U8_START, [5100, 5050, 5000, 4900, 4800, 4700, 4600, 4500, 4400, 4300, 4200, 4100]);
+  const logs = await captureErrors(async () => {
+    const r = await settlePeriod('week', U8, U8_END, NOW8, { notify: async () => { throw new Error('注入：通知服务挂了'); } });
+    assert.equal(r.credited, 3, '通知失败不回滚钱——发放已成事实');
+  });
+  assert.match(logs, /通知/, '通知失败要单独留痕（定向通知缺席是运营事故，不是资损）');
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `cycling:week:${U8}` }), 3);
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U8, status: 'credited' }), 3);
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[0] }), 0);
+  await assertUnitLedgerMatchesRecords('week', U8);
+});
+
+test('SP-14 崩在「已发分未翻牌」之间：release 后重试靠 idemKey 幂等补翻牌，绝不双发', async () => {
+  const cyc = await seedBoard('cycling', U9_START, [4600, 4550, 4500, 4400, 4300, 4200, 4100, 4000, 3900, 3800, 3700, 3600]);
+  // 注入：credit 真的落了账，然后进程"死在"翻牌之前（return 被换成 throw）
+  await captureErrors(async () => {
+    const r = await settlePeriod('week', U9, U9_END, NOW9, {
+      credit: async (uid, input, n) => {
+        await creditPoints(uid, input, n ?? NOW9);
+        throw new Error('注入：落账后翻牌前进程死掉');
+      },
+      notify: (async () => { throw new Error('不该走到'); }) as never,
+    });
+    assert.equal(r.credited, 0);
+  });
+  // 钱已出、行被 release：台账零行、流水三条（这正是"删行而不是翻牌"的设计要救的现场）
+  assert.equal(await BoardSettlementModel.countDocuments({ period: 'week', periodKey: U9, type: 'cycling', status: 'credited' }), 0);
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `cycling:week:${U9}` }), 3, '夹具自证：注入确实把钱发出去了（否则本用例假绿）');
+  // 重试：重新抢锁 → creditPoints 撞 idemKey 返回 duplicated+recordId → 补翻牌，不再落第二笔钱
+  const again = await settlePeriod('week', U9, U9_END, NOW9 + 60_000);
+  assert.equal(again.credited, 3, '重复路径也要把台账补到终态（credited 计数含补翻牌）');
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `cycling:week:${U9}` }), 3, '重试绝不双发——还是那三条流水');
+  assert.equal(await getBalance(String(cyc[0]), NOW9 + 60_000), 50, '余额只进一笔 50');
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[0] }), 1, '补翻牌路径把到账通知也补齐');
+  const led = await BoardSettlementModel.findOne({ type: 'cycling', period: 'week', periodKey: U9, userId: cyc[0] }).lean();
+  assert.equal(led?.status, 'credited');
+  assert.ok(led?.recordId, '补翻牌也要写下 recordId（指向那笔早已存在的流水）');
+  await assertUnitLedgerMatchesRecords('week', U9);
+});
+
+test('SP-7 年榜 500 一笔不被每日上限截断；流水标题与通知按定稿文案拼', async () => {
+  // 年榜夹具：2027 年窗口（未来年，真实数据不会混进来）
+  const yUsers = await seedBoard('cycling', Y_START + 60 * DAY_MS, [9900, 9800, 9700, 8900, 8800, 8700, 8600, 8500, 8400, 8300, 8200, 8100]);
+  const y1 = String(yUsers[0]);
+  // 先把结算日的日常额度花到 95（走正常上限通道），再结年榜 500——
+  // 若发分吃了 DAILY_CAP，年榜那笔只会被截成 5
+  const pre = await creditPoints(y1, { type: 'daily', title: '运动记录', points: 95, bizDate: '2028-01-01', idemKey: `t7-pre-${WIN_START}:y1` }, NOW_Y);
+  assert.equal(pre.credited, 95);
+  const res = await settlePeriod('year', '2027', Y_END, NOW_Y);
+  const recY = await PointRecordModel.findOne({ type: 'board_reward', userId: yUsers[0] }).lean();
+  assert.equal(recY?.title, '骑行·年榜第 1 名·2027年', '年榜后缀是「2027年」（boardPeriodTag 的年形态），周榜的 8 位紧凑形态只属于周');
+  assert.equal(recY?.delta, 500, '不占每日上限 100：年榜 500 一笔全额入账');
+  assert.equal(recY?.bizDate, '2028-01-01');
+  assert.equal(await getBalance(y1, NOW_Y), 595);
+  const daily = await PointDailyModel.findOne({ userId: yUsers[0], bizDate: '2028-01-01' }).lean();
+  assert.equal(daily?.earned, 95, '榜单发放不进每日投放计数器（否则挤占日常额度）');
+  const noteY = await NotificationModel.findOne({ userId: yUsers[0] }).lean();
+  assert.equal(noteY?.content, '恭喜获得「骑行·年榜」第 1 名奖励 +500 积分（2027年）。');
+  // 年榜整体：cycling/hiking/rowing/walking（U6 那四个 2027-01 的榜）各 3 条，其余 4 个空榜 skipped
+  assert.equal(res.credited, 12);
+  assert.deepEqual([...res.skippedTypes].sort(), ['mountaineering', 'running', 'skiing', 'swimming']);
+  await assertUnitLedgerMatchesRecords('year', '2027');
+  await assertPerUserBoardCap('year', '2027');
 });

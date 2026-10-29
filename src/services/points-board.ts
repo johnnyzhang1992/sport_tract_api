@@ -1,4 +1,4 @@
-/**
+  /**
  * 榜单发分专用的可信轨迹聚合（spec §7：发分口径比展示榜多四道防刷判据）。
  * - 四道判据：疑似搭车（vehicleMs>0）、漂移超标（driftScore>DRIFT_SCORE_PB_GATE）、
  *   配速不合理（avgPace<MIN_PLAUSIBLE_PACE_SEC_PER_KM）、未纠偏（corrected:false），
@@ -11,8 +11,8 @@
  *   若照旧套 $gte 就把这两类永久挡在发分之外（榜面永远空、§4.8「各运动类型的全国榜按
  *   总距离排名，前三名获得积分」变假话）。豁免表用 pace.ts 导出的 NO_PACE_TYPES/hasNoPace，
  *   不在本文件另抄一份，其余三道判据对所有类型一律照旧生效。
- * - 本文件建发分查询 + 结算数学（门槛/并列全发/每人 3 榜上限）+ 台账抢锁原语（Task 6 末尾一段）。
- *   发分本身（creditPoints/通知/文案）仍是 Task 7 的 settlePeriod，本文件不含任何结算编排。
+ * - 本文件建发分查询 + 结算数学（门槛/并列全发/每人 3 榜上限）+ 台账抢锁原语 + **Task 7 的
+ *   结算编排（settlePeriod / settleDueForUser）与 §4.8 定稿文案工具（boardLabel / boardPeriodTag）**。
  *   **不改 leaderboard() 的展示口径**（榜面与发分结果可能不一致，由规则页文案说明），
  *   也不做省份过滤（发分是全平台口径）。
  */
@@ -21,9 +21,19 @@ import { ActivityModel } from '../models/activity.model.js';
 import {
   BoardSettlementModel,
   BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID,
-  type BoardSettlementStatus,
+  type BoardSettlement,
 } from '../models/point.model.js';
-import { DRIFT_SCORE_PB_GATE, MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../config/constants.js';
+import {
+  ACTIVITY_TYPES,
+  ACTIVITY_TYPE_META,
+  DRIFT_SCORE_PB_GATE,
+  MIN_PLAUSIBLE_PACE_SEC_PER_KM,
+} from '../config/constants.js';
+import { BOARD_REWARDS } from '../config/points.js';
+import { creditPoints } from './points-ledger.js';
+import { createNotification } from './notification.js';
+import { bjDateStr, bjIsoWeekStart, bjMonthStart, bjYearMonth, bjYearStart, BJ_OFFSET_MS } from '../utils/bj-time.js';
+import { AppError } from '../utils/app-error.js';
 import { hasNoPace } from '../utils/pace.js';
 
 export interface BoardCandidate {
@@ -228,19 +238,15 @@ export interface BoardSettlementKey {
 /** 整榜级（skipped）占位行的键：没有 userId，由哨兵值补上 */
 export type BoardSettlementBoardKey = Omit<BoardSettlementKey, 'userId'>;
 
-/** 台账行的读取形状（lean）。抢锁失败时把它带回给调用方留痕/对账 */
-export interface BoardSettlementRow {
+/**
+ * 台账行的读取形状（lean）。**字段派生自模型导出的 infer 类型**（Task 6 评审收尾）：
+ * schema 加字段时这里不再"手抄漂移"；_id/时间戳是 lean 读回来一定有的运行字段，补进交集。
+ */
+export type BoardSettlementRow = BoardSettlement & {
   _id: Types.ObjectId;
-  type: string;
-  period: BoardPeriod;
-  periodKey: string;
-  userId: Types.ObjectId;
-  rank: number;
-  points: number;
-  status: BoardSettlementStatus;
-  reason: string;
-  recordId: Types.ObjectId | null;
-}
+  createdAt?: Date;
+  updatedAt?: Date;
+};
 
 function boardRowFilter(key: BoardSettlementKey): Record<string, unknown> {
   return { type: key.type, period: key.period, periodKey: key.periodKey, userId: key.userId };
@@ -257,8 +263,13 @@ async function findBoardSettlementRow(filter: Record<string, unknown>): Promise<
  *   本次**安静跳过**并把 existing 带回：既不能再发一笔，也不能抛错。
  *
  * pending 是「锁持有中」的中间态：拿到 won 不等于发完了钱，还要走
- * flipBoardSettlementToCredited 才算真正取得发放权（崩在中间留下的 pending 行会继续占键，
- * 这是已知敞口，Task 7 要在失败路径处理：删行或加超时接管，BS-1b 末尾把现状钉着）。
+ * flipBoardSettlementToCredited 才算真正取得发放权。崩溃遗留的 pending 行不再永远占键
+ * （Task 7 评审裁定 1 收口）：
+ * - 失败路径由 settlePeriod 调 releaseBoardSettlementPending 当场删行；
+ * - 当场删行也没删掉的（进程整个没了），updatedAt 落后超过 pendingStaleMs（10min）的
+ *   pending 行在这里被**超时接管**（CAS 条件 status=pending，接管动作只刷新 rank/points
+ *   并续期 updatedAt，状态照旧 pending——发放凭据仍然只有 flip 能给）。
+ * 双接管也发不出两笔钱：creditPoints 对同一 idemKey 幂等（BS-1c 钉窗口，SP-11 端到端钉接管）。
  *
  * existing 只在 won=false 时回读，且可能是 null：败者撞键之后、回读之前那一行被删掉（后台清理）。
  * 调用方只许拿它做留痕/对账，不许拿它当「一定有一行」的依据再往下发钱。
@@ -266,12 +277,21 @@ async function findBoardSettlementRow(filter: Record<string, unknown>): Promise<
 export async function claimBoardSettlement(
   key: BoardSettlementKey,
   reward: { rank: number; points: number },
+  /** 结算侧的（可为假的）当前时刻；超时接管窗口与它比，测试才能用受控时钟演"进程死在半路" */
+  now = Date.now(),
 ): Promise<{ won: boolean; existing: BoardSettlementRow | null }> {
   try {
     await BoardSettlementModel.create({ ...key, ...reward, status: 'pending' });
     return { won: true, existing: null };
   } catch (e) {
     if (!isDuplicateKey(e)) throw e;
+    const staleBefore = new Date(now - BOARD_REWARDS.pendingStaleMs);
+    const taken = await BoardSettlementModel.findOneAndUpdate(
+      { ...boardRowFilter(key), status: 'pending', updatedAt: { $lt: staleBefore } },
+      { $set: { rank: reward.rank, points: reward.points } },
+      { returnDocument: 'after' },
+    ).lean();
+    if (taken) return { won: true, existing: null };
     return { won: false, existing: await findBoardSettlementRow(boardRowFilter(key)) };
   }
 }
@@ -290,8 +310,20 @@ export async function flipBoardSettlementToCredited(
   const set: Record<string, unknown> = { status: 'credited' };
   if (recordId) set.recordId = recordId;
   return (await BoardSettlementModel
-    .findOneAndUpdate({ ...boardRowFilter(key), status: 'pending' }, { $set: set }, { new: true })
+    .findOneAndUpdate({ ...boardRowFilter(key), status: 'pending' }, { $set: set }, { returnDocument: 'after' })
     .lean()) as BoardSettlementRow | null;
+}
+
+/**
+ * 释放发放锁（Task 7 评审裁定 1-i）：把**自己刚落下、还没翻牌**的那行 pending 删掉，
+ * 让下一次重试能重新 create 抢锁。条件 deleteOne 只吃 status='pending'——
+ * credited/skipped/revoked 是判决/终态，release 是失败路径，不是撤回工具（撤回归 Task 10），
+ * 误删一行 credited 就等于给同一笔奖励开了二次发放的口子。
+ * 返回 true＝删掉了自己那行；false＝行不存在或已离开 pending（不必然是错，别拿它当发放依据）。
+ */
+export async function releaseBoardSettlementPending(key: BoardSettlementKey): Promise<boolean> {
+  const r = await BoardSettlementModel.deleteOne({ ...boardRowFilter(key), status: 'pending' });
+  return r.deletedCount === 1;
 }
 
 /**
@@ -317,11 +349,313 @@ export async function recordBoardSettlementSkipped(key: BoardSettlementBoardKey,
   }
 }
 
-/** 这个榜这一期是否已经判定过「人数不够」——命中就整榜跳过，不用重算聚合 */
-export async function isBoardSettlementSkipped(key: BoardSettlementBoardKey): Promise<boolean> {
-  return (await BoardSettlementModel.exists({
-    ...key,
-    userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID,
-    status: 'skipped',
-  })) !== null;
+/**
+ * 这个榜这一期的「人数不够」占位还作不作数？——**skipped 是缓存，不是判决**（评审裁定 2）：
+ * 导入/回填行没有 startTime 上限，占位落下之后参与人数 9→11 真实可能发生。
+ * 有效期内（skippedFreshMs=24h）命中即整榜跳过（8 个聚合省掉）；过期后返回 false 让
+ * settlePeriod 重算门槛。Task 10 另有后台"删占位"的逃生口，本函数不等它。
+ * 读不到 updatedAt 的行（理论不该有——schema 开了 timestamps）保守当作新鲜占位：
+ * 最多多跳一次重算，不会把钱发重。
+ */
+export async function isBoardSettlementSkipped(
+  key: BoardSettlementBoardKey,
+  now = Date.now(),
+): Promise<boolean> {
+  const row = await BoardSettlementModel
+    .findOne({ ...key, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID, status: 'skipped' })
+    .select({ updatedAt: 1, createdAt: 1 })
+    .lean();
+  if (!row) return false;
+  const ts = row.updatedAt ?? row.createdAt;
+  if (!ts) return true;
+  return now - new Date(ts).getTime() < BOARD_REWARDS.skippedFreshMs;
+}
+
+/* ==========================================================================
+ * 结算编排（Task 7）：settlePeriod 是"一个周期单元"的 8 步（spec §4.2），
+ * settleDueForUser 是懒结算入口（C2：只评估该用户有可信行的到期单元，
+ * 但每一脚做的是**全榜**结算——第一个触发的人替所有 qualify 的人干活）。
+ *
+ * 时序闸门（C1）：单元过滞后界才许结——周＝次周一 00:00（东八）、月＝次月 1 日、年＝次年 1 月 1 日。
+ * 界与"窗口终点"是同一个东八零点（周榜 Mon..Sun 的自然右界就是下周一 00:00），
+ * 判据一律 `dueMs <= now`（§4.8 规则页文案"上周的周榜在下周一到账"钉的就是边界当刻起可结）。
+ * ========================================================================== */
+
+const DAY_MS = 86_400_000;
+
+/** 周期中文标签（§4.8「周榜/月榜/年榜」；服务端此前没有这份表，唯一事实源在此） */
+export const PERIOD_LABEL: Record<BoardPeriod, string> = { week: '周榜', month: '月榜', year: '年榜' };
+
+/** 运动类型中文名：直接派生自 ACTIVITY_TYPE_META.label（再抄一份字面量＝漂移之源，PB-10 同一条纪律） */
+export const TYPE_LABEL: Record<string, string> = Object.fromEntries(
+  ACTIVITY_TYPES.map((t) => [t, ACTIVITY_TYPE_META[t].label]),
+);
+
+/** periodKey 规范形态 → 窗口起点（epoch ms）。脏形态直接炸：键拼错一次＝同一期两套键双发（模型注释钉过） */
+export function periodStartMsFromKey(period: BoardPeriod, periodKey: string): number {
+  if (period === 'week') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(periodKey)) {
+      throw new AppError(500, `非法榜单 periodKey（周规范形态＝该周周一日期串）：${periodKey}`);
+    }
+    const ms = Date.parse(`${periodKey}T00:00:00+08:00`);
+    if (Number.isNaN(ms)) throw new AppError(500, `非法榜单 periodKey（周）：${periodKey}`);
+    return ms;
+  }
+  if (period === 'month') {
+    const m = /^(\d{4})-(\d{2})$/.exec(periodKey);
+    if (!m) throw new AppError(500, `非法榜单 periodKey（月规范形态 '2026-10'）：${periodKey}`);
+    return Date.UTC(Number(m[1]), Number(m[2]) - 1, 1) - BJ_OFFSET_MS;
+  }
+  if (!/^\d{4}$/.test(periodKey)) throw new AppError(500, `非法榜单 periodKey（年规范形态 '2026'）：${periodKey}`);
+  return Date.UTC(Number(periodKey), 0, 1) - BJ_OFFSET_MS;
+}
+
+/** 下一期起点＝滞后/结算界（周＝+7 天、月＝次月 1 日、年＝次年 1 月 1 日；均东八 00:00） */
+export function settleBoundaryMs(period: BoardPeriod, periodKey: string): number {
+  const startMs = periodStartMsFromKey(period, periodKey);
+  if (period === 'week') return startMs + 7 * DAY_MS;
+  if (period === 'month') {
+    const b = new Date(startMs + BJ_OFFSET_MS);
+    return Date.UTC(b.getUTCFullYear(), b.getUTCMonth() + 1, 1) - BJ_OFFSET_MS;
+  }
+  return Date.UTC(bjYearMonth(startMs).y + 1, 0, 1) - BJ_OFFSET_MS;
+}
+
+/**
+ * §4.8 定稿文案，两套形态**同一模块、不许互相统一**（SP-6 各自钉死）：
+ * 通知正文用这个：周展开成「2026/10/19 至 2026/10/25 这一周」（日期内 '/'、区间「至」）。
+ */
+export function boardLabel(period: BoardPeriod, periodKey: string): string {
+  if (period === 'week') {
+    const start = periodStartMsFromKey('week', periodKey);
+    const end = start + 6 * DAY_MS; // 周日＝窗口最后一天的 00:00
+    return `${bjDateStr(start).replace(/-/g, '/')} 至 ${bjDateStr(end).replace(/-/g, '/')} 这一周`;
+  }
+  if (period === 'month') {
+    const m = /^(\d{4})-(\d{2})$/.exec(periodKey);
+    if (!m) throw new AppError(500, `非法榜单 periodKey（月）：${periodKey}`);
+    return `${Number(m[1])}年${Number(m[2])}月`; // 月不补零：'2027-01' → 「2027年1月」
+  }
+  if (!/^\d{4}$/.test(periodKey)) throw new AppError(500, `非法榜单 periodKey（年）：${periodKey}`);
+  return `${Number(periodKey)}年`;
+}
+
+/** 积分流水标题后缀用这个：周是 8 位无分隔紧凑形态 `20261019周`（用户 2026-10-28 指定）；月/年与正文同式 */
+export function boardPeriodTag(period: BoardPeriod, periodKey: string): string {
+  if (period === 'week') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(periodKey)) throw new AppError(500, `非法榜单 periodKey（周）：${periodKey}`);
+    return `${periodKey.replace(/-/g, '')}周`;
+  }
+  return boardLabel(period, periodKey);
+}
+
+/** 懒结算单元：一个 (period, periodKey) 及其窗口/滞后界（epoch ms） */
+export interface SettleUnit {
+  period: BoardPeriod;
+  periodKey: string;
+  startMs: number;
+  /** 发分聚合窗口右界（＝滞后界） */
+  endMs: number;
+  dueMs: number;
+}
+
+/**
+ * 候选行的可信判定（内存版）：与 trustedMatch() 的四道判据同源同口径。
+ * **只用来筛"这个用户够格让哪些周期单元进结算候选"**（C2：没可信行的人排不上名，
+ * 也就不该为那个单元触发 8 个聚合）；发不发分、发给谁，裁决权全在 trustedBoardRows+planPeriodRewards。
+ */
+function isTrustedRow(r: { type: string; vehicleMs?: number; driftScore?: number; corrected?: boolean; avgPace?: number | null }): boolean {
+  if ((r.vehicleMs ?? 0) > 0) return false;
+  if ((r.driftScore ?? 0) > DRIFT_SCORE_PB_GATE) return false;
+  if (r.corrected === false) return false;
+  if (!hasNoPace(r.type)) {
+    if (typeof r.avgPace !== 'number' || r.avgPace < MIN_PLAUSIBLE_PACE_SEC_PER_KM) return false;
+  }
+  return true;
+}
+
+/**
+ * 该用户的到期单元清单（C2 懒结算入口的枚举部分）：
+ * 只枚举**该用户有可信 finished 行**的周/月/年单元（否则他不可能在榜上），再按滞后界筛掉未到期——
+ * 这挡住的是"每次进页面全平台 8 类型 × 全部历史周期"的扫描放大。
+ * 每个单元里 settlePeriod 照旧做全榜结算：qualify 的别人也一并拿到钱（先到先得地替大家干活）。
+ */
+export async function computeSettleUnits(userId: string, now: number): Promise<SettleUnit[]> {
+  const rows = await ActivityModel.find({ userId, status: 'finished', startTime: { $lt: now } })
+    .select({ startTime: 1, type: 1, vehicleMs: 1, driftScore: 1, corrected: 1, avgPace: 1 })
+    .lean();
+  const units: SettleUnit[] = [];
+  const seen = new Set<string>();
+  for (const period of ['week', 'month', 'year'] as BoardPeriod[]) {
+    for (const r of rows) {
+      if (!isTrustedRow(r)) continue;
+      const startMs = period === 'week' ? bjIsoWeekStart(r.startTime) : period === 'month' ? bjMonthStart(r.startTime) : bjYearStart(r.startTime);
+      let periodKey: string;
+      if (period === 'week') periodKey = bjDateStr(startMs);
+      else if (period === 'month') {
+        const { y, m } = bjYearMonth(startMs);
+        periodKey = `${y}-${String(m).padStart(2, '0')}`;
+      } else periodKey = String(bjYearMonth(startMs).y);
+      const mark = `${period}:${periodKey}`;
+      if (seen.has(mark)) continue;
+      const dueMs = settleBoundaryMs(period, periodKey);
+      if (dueMs > now) continue; // C1：滞后界未到（含正在进行中的当前周/月/年）
+      seen.add(mark);
+      units.push({ period, periodKey, startMs, endMs: dueMs, dueMs });
+    }
+  }
+  return units;
+}
+
+/** 结算侧依赖注入口：只有测试会传（演"发分炸了/通知挂了/崩在中间"），生产走默认实现 */
+export interface SettleDeps {
+  credit?: typeof creditPoints;
+  notify?: typeof createNotification;
+}
+
+/** 到账通知（§4.8 第 3 条逐字）。通知失败不回滚钱——钱与台账此刻已成对，通知缺席是运营事故，大声留痕 */
+async function notifyReward(
+  notify: NonNullable<SettleDeps['notify']>,
+  r: BoardReward,
+  period: BoardPeriod,
+  periodKey: string,
+): Promise<void> {
+  try {
+    await notify({
+      userId: r.userId,
+      published: true,
+      title: '榜单积分奖励到账',
+      content: `恭喜获得「${TYPE_LABEL[r.type] ?? r.type}·${PERIOD_LABEL[period]}」第 ${r.rank} 名奖励 +${r.points} 积分（${boardLabel(period, periodKey)}）。`,
+    });
+  } catch (e) {
+    console.error('[points-board] 到账通知发送失败（发放已落定，通知缺席需补发）', { userId: r.userId, type: r.type, period, periodKey }, e);
+  }
+}
+
+/**
+ * 一个周期单元（某 period 某 periodKey 的整期 8 榜）：滞后闸门 → 占位缓存 → 门槛 → 聚合 →
+ * plan（纯函数，Task 5）→ 逐条「抢锁 → 发分 → 翻牌 → 定向通知」。
+ *
+ * - idemKey `${userId}:board:${type}:${period}:${periodKey}` 与台账唯一键同形：台账管"谁拿到发放权"，
+ *   creditPoints 的幂等管"钱只落一次"——两层各自能独立兜双发（SP-3/SP-14）。
+ * - `ignoreDailyCap: true`：spec §4.2「不占每日上限 100」，年榜 500 一笔不许被截（CR2/SP-7）。
+ * - 翻牌前断言 `credited === points`（裁定 4）：不等＝钱账漂移，不静默翻牌，释放锁并 error 级留痕。
+ * - 失败路径（裁定 1）：release 删 pending 让重试重领；绝不把失败写成 skipped（那是门槛缓存语义）。
+ * - 单条 reward 失败只影响该条（catch 住），整批不中断——一次 pass 里 24 条奖励，一条炸不能带走其余人。
+ */
+export async function settlePeriod(
+  period: BoardPeriod,
+  periodKey: string,
+  /** 聚合窗口右界（[startMs, endMs)）：懒结算传 computeSettleUnits 算出的滞后界 */
+  endMs: number,
+  now = Date.now(),
+  deps: SettleDeps = {},
+): Promise<{ credited: number; skippedTypes: string[] }> {
+  if (!BOARD_REWARDS.enabled) return { credited: 0, skippedTypes: [] }; // C5 灰度开关：SP-4
+  const startMs = periodStartMsFromKey(period, periodKey); // 脏 periodKey 在这里炸，不许算出错窗口
+  if (now < settleBoundaryMs(period, periodKey)) return { credited: 0, skippedTypes: [] }; // C1 滞后闸门：SP-5
+  const credit = deps.credit ?? creditPoints;
+  const notify = deps.notify ?? createNotification;
+  const opts: PlanOpts = {
+    rewards: BOARD_REWARDS.rewards,
+    minParticipants: BOARD_REWARDS.minParticipants,
+    perUserBoards: BOARD_REWARDS.perUserBoards,
+  };
+  const boards: Array<{ type: string; rows: BoardCandidate[] }> = [];
+  const skippedTypes: string[] = [];
+  for (const type of ACTIVITY_TYPES) {
+    const boardKey = { type, period, periodKey };
+    if (await isBoardSettlementSkipped(boardKey, now)) {
+      skippedTypes.push(type);
+      continue; // 占位有效期内：整榜跳过，连聚合都省（§4.2 第 2 步的"避免每次进页重算"）
+    }
+    const rows = await trustedBoardRows(type, startMs, endMs);
+    if (rows.length <= opts.minParticipants) {
+      await recordBoardSettlementSkipped(boardKey, `参与人数 ${rows.length} 未过门槛 ${opts.minParticipants}，本期不发`);
+      skippedTypes.push(type);
+      continue;
+    }
+    boards.push({ type, rows });
+  }
+  const rewards = planPeriodRewards(period, boards, opts);
+  const bizDate = bjDateStr(now);
+  let credited = 0;
+  for (const r of rewards) {
+    const key: BoardSettlementKey = { type: r.type, period, periodKey, userId: r.userId };
+    const { won } = await claimBoardSettlement(key, { rank: r.rank, points: r.points }, now);
+    if (!won) continue; // 败者：已发/已撤/他人持有新鲜锁——安静跳过，一条重复键不许打断整批
+    try {
+      const c = await credit(r.userId, {
+        type: 'board_reward',
+        // §4.8 第 5 条：骑行·周榜第 1 名·20261207周
+        title: `${TYPE_LABEL[r.type] ?? r.type}·${PERIOD_LABEL[period]}第 ${r.rank} 名·${boardPeriodTag(period, periodKey)}`,
+        points: r.points,
+        bizDate,
+        refType: 'board',
+        refId: `${r.type}:${period}:${periodKey}`,
+        idemKey: `${r.userId}:board:${r.type}:${period}:${periodKey}`,
+        ignoreDailyCap: true,
+      }, now);
+      if (c.duplicated) {
+        // 上一次尝试把钱落了、死在翻牌之前（SP-14 的现场）：这笔发放的流水就是 recordId，
+        // 补翻牌继续走——不重新发钱、也不再按 idemKey 反查（recordId 是返回值带的，裁定 3）。
+        const recovered = await flipBoardSettlementToCredited(key, c.recordId ?? undefined);
+        if (!recovered) {
+          console.error('[points-board] 重复发放未能补翻牌（行已不在 pending：并发补完或后台撤回）', { key, recordId: c.recordId });
+          continue;
+        }
+        credited += 1;
+        await notifyReward(notify, r, period, periodKey);
+        continue;
+      }
+      if (c.credited !== r.points) {
+        // 裁定 4：钱账漂移——ignoreDailyCap 之下这本不该可达，走到这里就是上游（额度/明细）出错
+        console.error('[points-board] 榜单结算金额不符：台账 points 与实际入账不等，拒绝翻牌并释放锁待重试（钱账漂移！）', {
+          key, expected: r.points, credited: c.credited, capped: c.capped, recordId: c.recordId,
+        });
+        await releaseBoardSettlementPending(key);
+        continue;
+      }
+      const flipped = await flipBoardSettlementToCredited(key, c.recordId ?? undefined);
+      if (!flipped) {
+        // 钱已到账而翻牌落空：行不是 pending 了（接管/撤回竞态）。不删行、不重试——大声停在这里等对账
+        console.error('[points-board] 发放已落账但翻牌未命中（pending 行在翻牌前已易主），台账/流水需人工对账', key);
+        continue;
+      }
+      credited += 1;
+      await notifyReward(notify, r, period, periodKey);
+    } catch (e) {
+      // 裁定 1：credit/翻牌炸了 ⇒ 释放锁。credit 内部对"已落账"有自己的回滚，走到 catch 就说明
+      // 这笔钱没有以本次尝试的名义入账；删行让下一次进页面能重新抢锁再试（idemKey 兜住万一落账成功的双发）。
+      let released = false;
+      try {
+        released = await releaseBoardSettlementPending(key);
+      } catch (re) {
+        console.error('[points-board] 释放发放锁本身失败（行卡 pending，等超时接管窗口重领）', key, re);
+      }
+      console.error('[points-board] 榜单发分失败，锁已按失败路径处理', { key, released }, e);
+    }
+  }
+  return { credited, skippedTypes };
+}
+
+/**
+ * 懒结算入口（挂 Task 9 的积分页/榜单页请求上）：**永不抛错**——结算只是页面数据的顺带动作，
+ * 炸了不能把用户的积分页变 500。所有异常在单元粒度被吞并 error 留痕，下后进页面自动重试。
+ * 返回 void：调用方不需要（也不该）拿结算结果做用户可见判断。
+ */
+export async function settleDueForUser(userId: string, now: number = Date.now()): Promise<void> {
+  if (!BOARD_REWARDS.enabled) return; // C5：开关关闭连查询都不做（SP-4）
+  try {
+    const units = await computeSettleUnits(userId, now);
+    for (const u of units) {
+      try {
+        await settlePeriod(u.period, u.periodKey, u.endMs, now);
+      } catch (e) {
+        console.error('[points-board] 懒结算单元失败（下后进页面重试）', { userId, period: u.period, periodKey: u.periodKey }, e);
+      }
+    }
+  } catch (e) {
+    console.error('[points-board] settleDueForUser 入口异常（吞掉：挂在页面请求上不能变 500）', { userId }, e);
+  }
 }

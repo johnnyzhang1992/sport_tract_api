@@ -1,3 +1,5 @@
+import { config } from './index.js';
+
 export const POINTS = {
   SIGNIN_MAX: 7,
   DAILY_CAP: 100,
@@ -40,3 +42,37 @@ export const POINT_TASKS = {
 } as const;
 
 export type TaskKey = keyof typeof POINT_TASKS;
+
+/**
+ * 榜单奖励结算配置（spec §4.1/§4.2/§6；2026-10-29 裁定后**没有**单榜总额上限项——
+ * BOARD_PER_BOARD_CAP_FACTOR 已删，勿再加回：并列全发）。
+ *
+ * 可变对象（不 as const）：enabled 是灰度开关的运行时候，测试里成对翻/恢复（SP-4）；
+ * 线上初值来自 env BOARD_REWARDS_ENABLED，默认 false（spec §6「先小流量验一轮结算再放开」）。
+ */
+export const BOARD_REWARDS = {
+  /** 灰度开关：关 ⇒ settlePeriod / settleDueForUser 直接短路，一分钱都不发 */
+  enabled: config.boardRewardsEnabled,
+  /** TOP1/2/3 分值（D4）：周 50/30/20、月 100/80/50、年 500/400/300 */
+  rewards: {
+    week: [50, 30, 20],
+    month: [100, 80, 50],
+    year: [500, 400, 300],
+  } as Record<'week' | 'month' | 'year', [number, number, number]>,
+  /** 单榜参与人数**严格大于**该值才发（D2；恰好 10 人不发＝产品拍板） */
+  minParticipants: 10,
+  /** 同一期每人最多计 N 个榜（D5，取分值最高的 N 个） */
+  perUserBoards: 3,
+  /**
+   * 卡死 pending 的接管窗口（评审裁定 1）：抢锁进程崩在半路时，行会永远占住唯一键。
+   * updatedAt 落后超过这个窗口的 pending 行可被重领——creditPoints 对 idemKey 幂等，
+   * 接管不会双发。定 10min：远大于一次结算 pass 的正常耗时，又短到用户刷一下页面就能拿到。
+   */
+  pendingStaleMs: 10 * 60_000,
+  /**
+   * skipped 占位的有效期（评审裁定 2）：占位是**缓存不是判决**——导入/回填行没有时间上限，
+   * 参与人数 9→11 真实可能发生。超过这个窗口就重算门槛。定 24h：与活动懒清理同档，
+   * 页面浏览的高频路径上一次聚合都不多跑；后台另有删占位的逃生口（Task 10）。
+   */
+  skippedFreshMs: 24 * 60 * 60_000,
+};
