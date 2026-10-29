@@ -121,6 +121,42 @@ after(async () => {
   // 清理失败必须可见：吞掉错误会把本文件种下的测试轨迹永久留在共享 dev 库，
   // 后续所有按窗口/类型聚合的用例（含榜单类）会被无声污染
   const fixtureUserIds = seededUsers.map((u) => String(u));
+  /*
+   * 结构性防线（债务修复轮 2026-10-29）：本文件只许给「自己种下的夹具用户」发榜奖。
+   * 旧 SP-4 把窗口种在 2026-12、假时钟 NOW4 敲到平台 year:2026 的到期界，settleDueForUser
+   * 替全平台真实 TOP3 发了钱；after 的流水清理按 seededUsers 收口删不掉真实用户的钱，
+   * 台账却按 key 删了 ⇒ 钱滞留、Task 10 撤回面失明（取证：devdb-stranded-board-rewards.md）。
+   * 两道核对都在清理**之前**取数（清理会删掉 G2 的现场），失败先记账、清理照跑、最后 throw：
+   * - G1 流水：本文件拥有的单元（SP_PERIOD_KEYS×3 period×8 类型）下出现 userId∉夹具 的
+   *   board_reward 流水。跨轮重放的泄漏（idemKey 幂等、不再新增流水）也会被这里按 refId 抓住。
+   * - G2 台账：同一 key 集合下出现 userId∉夹具 的 credited 行——泄漏本轮新抢锁补翻牌的现场。
+   * 已知取舍：两个会话并发跑本文件会互看夹具台账（同 key 不同用户）触发 G2——但那种并发本来
+   * 就会打爆 SP-1「credited==3」的绝对计数断言，属既有并发纪律，不是守卫的新增负担。
+   * TEST_PERIOD_KEY（BS-* 假类型域）不在名单内：那里的非夹具台账用户是设计行为。
+   */
+  const guardMsgs: string[] = [];
+  try {
+    const ownedRefIds: string[] = [];
+    for (const key of SP_PERIOD_KEYS) {
+      for (const t of ACTIVITY_TYPES) {
+        for (const p of ['week', 'month', 'year'] as const) ownedRefIds.push(`${t}:${p}:${key}`);
+      }
+    }
+    const [foreignRecs, foreignLedger] = await Promise.all([
+      PointRecordModel.find({ type: 'board_reward', refId: { $in: ownedRefIds }, userId: { $nin: fixtureUserIds } })
+        .select({ userId: 1, refId: 1, delta: 1 }).lean(),
+      BoardSettlementModel.find({ status: 'credited', periodKey: { $in: SP_PERIOD_KEYS }, userId: { $nin: seededUsers } })
+        .select({ userId: 1, type: 1, periodKey: 1, points: 1 }).lean(),
+    ]);
+    if (foreignRecs.length > 0) {
+      guardMsgs.push(`G1 越界流水 ${foreignRecs.length} 条：${foreignRecs.slice(0, 3).map((r) => `user=${r.userId} ref=${r.refId} delta=${r.delta}`).join(' | ')}`);
+    }
+    if (foreignLedger.length > 0) {
+      guardMsgs.push(`G2 越界台账 ${foreignLedger.length} 行：${foreignLedger.slice(0, 3).map((r) => `user=${r.userId} ${r.type}:${r.periodKey} +${r.points}`).join(' | ')}`);
+    }
+  } catch (e) {
+    guardMsgs.push(`守卫查询自身失败（不许因此放行）：${(e as Error).message}`);
+  }
   try {
     await ActivityModel.deleteMany({ userId: { $in: seededUsers } });
     // 台账行按「本次运行独有的 periodKey」收口，只删自己种的（共享 dev 库纪律：不碰别人的行）。
@@ -139,6 +175,12 @@ after(async () => {
   }
   await app.close();
   await mongoose.disconnect().catch(() => {});
+  // 守卫红要在清理**之后**才 throw：清理没跑完就红，会把越界现场连同夹具一起留在共享 dev 库
+  if (guardMsgs.length > 0) {
+    throw new Error(
+      `[points-board.test] 夹具给真实用户发钱越界（结构性防线红，取证见 devdb-stranded-board-rewards.md）：\n${guardMsgs.join('\n')}`,
+    );
+  }
 });
 
 test('BR-1 疑似搭车/漂移超标/配速不合理/未纠偏的轨迹不计入发分距离', async () => {
@@ -921,9 +963,12 @@ test('BS-6 status/period 枚举闸门：四态都能落库、拼错的值写不�
  * settlePeriod / settleDueForUser 接线（Task 7）：发分 + 台账 + 通知 + 文案
  *
  * 夹具纪律（共享 dev 库 + 真实 money 路径）：
- * - 周期单元全部取 **2026-12 之后的未来窗口**（周键=周一、月键='YYYY-MM'、年键='YYYY'，
+ * - 周单元全部取 **2026-12 之后的未来窗口**（周键=周一、月键='YYYY-MM'、年键='YYYY'，
  *   规范形态）。别的会话不会在未来窗口种轨迹，trustedBoardRows 的聚合因此只看见本文件的数据；
  *   「与平台真实历史数据隔离」靠时间窗实现，不靠假 type 名——settlePeriod 只扫 ACTIVITY_TYPES 真类型。
+ * - **settleDueForUser 的假时钟绝不许敲到任何真实平台单元到期**：它一脚做全榜结算，
+ *   2026 及更早的真实用户会被发钱（债务修复轮教训，SP-4 窗口因此整体挪到 2031-01，
+ *   月/年派生单元在 NOW 下未到期）。
  * - 发分对象是真实 ObjectId 用户（不落 user 文档）：creditPoints 的 settleExpired 无账户即静默返回，
  *   过期结算不会在测试中途回收任何批次（所有夹具时刻都选在 expireAtFor 的未来端点之前）。
  * - now 全部是**假时钟**（未来），台账/流水上的真实时间戳只用于唯一键与清理，不进断言。
@@ -939,7 +984,7 @@ const WEEK_KEYS = [
   '2026-12-07', // U1：SP-1/2/9（cycling 12 人；running 8 人→回填到 11 人）
   '2026-12-14', // U2：SP-3 幂等
   '2026-12-21', // U3：SP-8 懒结算入口（触发者排第 13，不发钱）
-  '2026-12-28', // U4：SP-4 灰度开关
+  '2031-01-06', // U4：SP-4 灰度开关（窗口整体落在 2031-01：NOW4 只到周界的到期，派生的月/年单元都未到期，绝不顺带结算真实平台单元——债务修复轮，见文件头守卫注释）
   '2027-01-11', // U5：SP-11 超时接管
   '2027-01-18', // U6：SP-10 每人 3 榜上限（4 个榜全过门槛）
   '2027-02-01', // U7：SP-12 失败路径（release/金额不符/重试）
@@ -977,8 +1022,10 @@ const M_DEC = '2026-12';
 const Y_START = bjMid(2027, 1, 1);
 const Y_END = bjMid(2028, 1, 1);
 const NOW_Y = Y_END + 8 * 3600_000; // 2028-01-01 08:00 BJ（bizDate '2028-01-01'）
-/** after 清理锚点：本文件独占的真实周期键（含 SP-4 顺带结算出的月/年键） */
-const SP_PERIOD_KEYS: string[] = [...WEEK_KEYS, M_DEC, '2026', '2027'];
+/** after 清理锚点：本文件独占的真实周期键。
+ *  债务修复轮：SP-4 窗口移去 2031 后本文件不再结算 '2026' 单元——**真实平台键绝不许进这个名单**
+ *  （既是删别人的台账，也是把「越界结算」洗成自家数据）。同时它是 after() 守卫 G1/G2 的「本文件拥有的单元集合」。 */
+const SP_PERIOD_KEYS: string[] = [...WEEK_KEYS, M_DEC, '2027'];
 
 /** 种一榜：按给定距离（降序自定）一人一条可信 finished 轨迹，返回 userId 数组（全部登记清理） */
 async function seedBoard(type: string, startMs: number, distances: number[]): Promise<Types.ObjectId[]> {
@@ -1189,6 +1236,11 @@ test('SP-4 开关关闭时 settleDueForUser 什么都不做', async () => {
   const cyc = await seedBoard('cycling', U4_START, [2100, 2050, 2000, 1900, 1800, 1700, 1600, 1500, 1400, 1300, 1200, 1100]);
   const t4 = mkUser();
   await mkActivity(t4, 'cycling', 1000, { startTime: U4_START + DAY_MS, avgPace: null });
+  // 窗口形状钉死（债务修复轮）：夹具整体落在 2031-01 的同一个周单元里，NOW4 只敲开**周**的到期界——
+  // 派生的月/年单元滞后界都在未来，settleDueForUser 结构性碰不到任何会混进真实平台数据的单元
+  // （旧夹具用 2026-12 窗口把平台 year:2026 敲到期，替真实 TOP3 发了钱，见 after 守卫注释）。
+  const units4 = await computeSettleUnits(String(t4), NOW4);
+  assert.deepEqual(units4.map((u) => `${u.period}:${u.periodKey}`), [`week:${U4}`], 'SP-4 只允许派生出自家周单元：月/年未到期');
   BOARD_REWARDS.enabled = false;
   try {
     await settleDueForUser(String(t4), NOW4);
@@ -1202,6 +1254,7 @@ test('SP-4 开关关闭时 settleDueForUser 什么都不做', async () => {
   // 翻开开关后同一入口立刻开工：证明上面短路的是开关，不是时窗/夹具
   await settleDueForUser(String(t4), NOW4);
   assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', userId: cyc[0], refId: `cycling:week:${U4}` }), 1);
+  assert.equal(await BoardSettlementModel.countDocuments({ periodKey: { $in: ['2031-01', '2031'] } }), 0, '翻开开关也只结到周单元：未到期的月/年一行不落（夹具窗口与平台数据结构性隔离）');
 });
 
 test('SP-10 同期第 4 个榜一条不发（每人 3 榜上限在结算侧同样生效）', async () => {

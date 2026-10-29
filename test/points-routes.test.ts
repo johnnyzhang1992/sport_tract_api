@@ -16,6 +16,7 @@ import { previousDateKey, shiftDateKey } from '../src/utils/points-domain.js';
 import {
   SETTLE_TRIGGER_WINDOW_MS, lazySettleDeps, resetLazySettleDebounceForTest, scheduleLazySettle,
 } from '../src/services/board-lazy-settle.js';
+import { settleDueForUser } from '../src/services/points-board.js';
 
 /**
  * /points/* HTTP 接线：登录闸门、汇总结构（cells 原样下发、旧 makeupCardId 已撤）、
@@ -698,4 +699,11 @@ test('PR-L1 游客看榜不给任何人触发结算；登录用户看榜触发�
     BOARD_REWARDS.enabled = enabled;
     t.mock.restoreAll();
   }
+});
+
+test('PR-L2 测试缝的默认绑定就是 settleDueForUser（Task 9 接线钉死，不许悄悄换成 no-op）', () => {
+  // 上面 PR-R*/PR-D*/PR-L1 全用 t.mock.method 替换 lazySettleDeps.settle——若默认绑定被改成
+  // 空函数，那些用例照样绿（mock 覆盖了缝），1039 也全绿，但线上懒结算从此停摆。
+  // 这条不经 mock 的直断言补上唯一的钉：入口层挂进 Map 闸门、后台调用的那个函数**本体**是谁。
+  assert.equal(lazySettleDeps.settle, settleDueForUser, 'board-lazy-settle.ts 的 lazySettleDeps.settle 必须绑定 points-board 的 settleDueForUser');
 });
