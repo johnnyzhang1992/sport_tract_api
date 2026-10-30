@@ -1113,6 +1113,10 @@ const WEEK_KEYS = [
   '2027-07-26', // U31：NB-6 撤回即时通知盖戳丢失 → 补投按去重键不重发
   '2027-08-02', // U32：PB-F3-3 11 人参与、撤回 TOP1 后门槛按原参与人数判
   '2027-08-09', // U33：PB-F4-4 幂等重放返回当前余额（不是历史 balanceAfter）
+  '2027-08-16', // U34：RT-1 nextAttemptAt 未到期不投、到期后恰好一条
+  '2027-08-23', // U35：RT-2 发送失败记 attempts/backoff，重试成功清空错误字段
+  '2027-08-30', // U36：RT-3 连续 5 次失败后放弃（不再投递、lastError 保留）
+  '2027-09-06', // U37：RT-4 未知通道只记录一次并不再重试（不会死循环）
 ] as const;
 const U_START = (key: string) => bjMid(Number(key.slice(0, 4)), Number(key.slice(5, 7)), Number(key.slice(8, 10)));
 const U_END = (key: string) => U_START(key) + 7 * DAY_MS;
@@ -1149,6 +1153,10 @@ const U30 = WEEK_KEYS[29]; const U30_START = U_START(U30); const U30_END = U_END
 const U31 = WEEK_KEYS[30]; const U31_START = U_START(U31); const U31_END = U_END(U31); const NOW31 = U31_END;
 const U32 = WEEK_KEYS[31]; const U32_START = U_START(U32); const U32_END = U_END(U32); const NOW32 = U32_END;
 const U33 = WEEK_KEYS[32]; const U33_START = U_START(U33); const U33_END = U_END(U33); const NOW33 = U33_END;
+const U34 = WEEK_KEYS[33]; const U34_START = U_START(U34); const U34_END = U_END(U34); const NOW34 = U34_END;
+const U35 = WEEK_KEYS[34]; const U35_START = U_START(U35); const U35_END = U_END(U35); const NOW35 = U35_END;
+const U36 = WEEK_KEYS[35]; const U36_START = U_START(U36); const U36_END = U_END(U36); const NOW36 = U36_END;
+const U37 = WEEK_KEYS[36]; const U37_START = U_START(U37); const U37_END = U_END(U37); const NOW37 = U37_END;
 /** 月/年单元：SP-5 滞后闸门（2026-12 的结算界是 2027-01-01）与 SP-7 年榜 500 分。
  *  年榜夹具用 2027 年——2026/更早年份的窗口里有真实用户数据，绝不当结算对象。 */
 const M_DEC = '2026-12';
@@ -2554,4 +2562,98 @@ test('PB-F4-4（F4 minor）幂等重放返回当前余额，而不是那笔历�
   assert.equal(res.deducted, 50, '重放沿用既有反向流水的实际扣减额，不双扣');
   assert.equal(res.shortfall, 0);
   assert.equal(res.balance, 30, '重放分支必须返回**当前**余额，不是旧流水的 balanceAfter(0)');
+});
+
+/* ====================================================================
+ * 2026-10-31 通知出箱：通道 + 重试计划字段（为订阅消息预留；当前通道仍只有 inapp）。
+ * 出箱行仍是 BoardSettlement：status='credited' + notifiedAt=null（或 revoked + revokeNotifiedAt=null）。
+ * ================================================================== */
+
+test('RT-1 nextAttemptAt 未到期不投递，到期后恰好一条（重试计划生效）', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U34, now: NOW34 });
+  await BoardSettlementModel.updateOne({ _id: rowId }, { $set: { nextAttemptAt: NOW34 + 120_000 } });
+
+  await deliverPendingBoardNotifications(20, NOW34);
+  await deliverPendingBoardNotifications(20, NOW34 + 119_999);
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0, '未到 nextAttemptAt 不许投递');
+
+  await deliverPendingBoardNotifications(20, NOW34 + 120_000);
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 1, '到期后恰好一条');
+  const row = await BoardSettlementModel.findById(rowId).lean();
+  assert.ok(Number(row?.notifiedAt) > 0, '成功要盖投递戳');
+  assert.equal(row?.lastError, '', '成功要清空 lastError');
+  assert.equal(row?.nextAttemptAt, null, '成功要清空 nextAttemptAt（回到「立即可投」）');
+});
+
+test('RT-2 发送失败记 attempts/lastError/backoff，重试成功清空错误字段', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U35, now: NOW35 });
+  const logs = await captureErrors(async () => {
+    const r = await deliverPendingBoardNotifications(20, NOW35, {
+      notify: async () => { throw new Error('注入：通道超时'); },
+    });
+    assert.equal(r.failed, 1);
+  });
+  assert.match(logs, /补投失败/, '失败要留痕');
+  const failed = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(failed?.attempts, 1, '第一次失败 attempts=1');
+  assert.ok(String(failed?.lastError).includes('注入'), 'lastError 要带出失败原因');
+  assert.equal(failed?.nextAttemptAt, NOW35 + 60_000, '第一次失败退避 1 分钟');
+  assert.equal(failed?.notifiedAt, null, '失败绝不伪造投递戳');
+
+  // 未到期：第二枪什么都不做（连 attempts 都不涨）
+  await deliverPendingBoardNotifications(20, NOW35 + 59_999);
+  const before = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(before?.attempts, 1, '未到期不重试');
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0);
+
+  // 到期且发送恢复：成功，清空错误字段并盖戳
+  await deliverPendingBoardNotifications(20, NOW35 + 60_000);
+  const ok = await BoardSettlementModel.findById(rowId).lean();
+  assert.ok(Number(ok?.notifiedAt) > 0);
+  assert.equal(ok?.lastError, '');
+  assert.equal(ok?.nextAttemptAt, null);
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 1);
+});
+
+test('RT-3 连续 5 次失败后放弃：lastError 保留、不再投递、notifiedAt 仍为空', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U36, now: NOW36 });
+  const failing = { notify: async () => { throw new Error('注入：第三方通道持续 500'); } };
+  // 退避表 1m / 5m / 15m / 1h：第五枪在累计 81 分钟时仍是到期行
+  const times = [NOW36, NOW36 + 60_000, NOW36 + 6 * 60_000, NOW36 + 21 * 60_000, NOW36 + 81 * 60_000];
+  for (const t of times) await deliverPendingBoardNotifications(20, t, failing);
+  const row = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(row?.attempts, 5, '第五次失败后 attempts 停在 5');
+  assert.ok(String(row?.lastError).includes('持续 500'), '放弃也保留最后一次错误');
+  assert.equal(row?.notifiedAt, null, '放弃绝不伪造投递戳');
+  const parkedAt = Number(row?.nextAttemptAt);
+  assert.ok(parkedAt > NOW36 + 6 * 3600_000, '放弃后 nextAttemptAt 推到远期，drain 不再命中');
+
+  // 即便发送恢复、时间也过去了，放弃的行也不再投递
+  await deliverPendingBoardNotifications(20, NOW36 + 10 * 365 * 24 * 3600_000);
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0, '放弃的行不再重试');
+  const still = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(still?.attempts, 5, '放弃后 attempts 不再增长');
+  assert.ok(String(still?.lastError).includes('持续 500'));
+});
+
+test('RT-4 未知通道行：记录 lastError 后停投，不会永远循环', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U37, now: NOW37 });
+  await BoardSettlementModel.updateOne({ _id: rowId }, { $set: { channel: 'subscribe' } });
+
+  const first = await deliverPendingBoardNotifications(20, NOW37);
+  const row = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(row?.attempts, 5, '未知通道按终止态记录（点满 attempts）');
+  assert.match(String(row?.lastError), /subscribe/, 'lastError 要点名未知通道');
+  assert.ok(Number(row?.nextAttemptAt) > NOW37 + 6 * 3600_000, '未知通道推到远期，不再入选');
+  assert.equal(first.failed >= 1, true, '未知通道计入 failed（不静默丢弃）');
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0, '未知通道不许落到 in-app');
+
+  await deliverPendingBoardNotifications(20, NOW37 + 1);
+  const again = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(again?.attempts, 5, '第二枪不再重复记录');
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0);
 });

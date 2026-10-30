@@ -154,3 +154,21 @@ export function hasBoardTrustedAggregateIndex(indexes: IndexShape[]): boolean {
       && Object.values(key).every((v) => v === 1);
   });
 }
+
+/**
+ * 榜单通知出箱的投递计划索引是否真在（boardsettlements，2026-10-31）：
+ * `{status:1, channel:1, notifiedAt:1, nextAttemptAt:1}`（全 1、非 unique）。
+ * drain 的信侧真实过滤器是 `{status:'credited', channel:{$in:['inapp',null]}, notifiedAt:null,
+ * nextAttemptAt:{$lte:now}|null}`：status 等值 → channel（$in 两个等值点，null 兜住老行）→
+ * notifiedAt 等值 null → nextAttemptAt 区间/null 收尾，与键序一一对应。
+ * 性能防线，同 pointrecords/notifications 的两侧核对教训：删声明但 dev 库留着旧索引时库侧假绿，
+ * 声明侧先红；exact 键组合 + 键序 + 方向一起认，不认名字（Mongoose 自动生成）。
+ * 它静默消失时：每次页面访问的补投全表扫台账，且「未到期」的行会占满 limit=20 把到期行饿死。
+ */
+export function hasBoardSettlementNotificationDrainIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    return Object.keys(key).join(',') === 'status,channel,notifiedAt,nextAttemptAt'
+      && Object.values(key).every((v) => v === 1);
+  });
+}

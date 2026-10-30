@@ -78,7 +78,8 @@ const W_DIRTY = '2034-03-27';   // AB-6b：reason 不是任何常量的整榜行
 const W_OTHER = '2034-04-03';   // AB-8：给「按用户跨单元筛」当第二个单元
 const W_FILTER = '2034-04-10';  // AB-8：筛选用例独占单元（不与 AB-7 共用，免得计数互相踩）
 const W_RECONCILE = '2034-04-17'; // AB-9/9b：原流水对账分支独占（删/改流水的现场各起一行，不牵连别的用例）
-const OWN_WEEK_KEYS = [W_PAYOUT, W_MIX, W_SENTINEL, W_DIRTY, W_OTHER, W_FILTER, W_RECONCILE];
+const W_DELIVERY = '2034-04-24'; // AB-13：通知出箱字段（channel/attempts/lastError/nextAttemptAt）下发
+const OWN_WEEK_KEYS = [W_PAYOUT, W_MIX, W_SENTINEL, W_DIRTY, W_OTHER, W_FILTER, W_RECONCILE, W_DELIVERY];
 
 const ADMIN_NOTE = '该周轨迹经复核为搭车刷量';
 
@@ -844,4 +845,37 @@ test('AB-S2 开关端点安全：用户 token 401；enabled 非 true 一律视�
   assert.equal(weird.json().data.enabled, false, '只有布尔 true 算开，字符串一律按关处理');
   await AppSettingModel.deleteMany({ _id: 'boardRewardsEnabled' });
   resetBoardSwitchCacheForTest();
+});
+
+/* ==================================================================
+ * AB-13 通知出箱字段：后台能看到「卡在哪」——通道、尝试次数、最后一次错误、下次重试时刻。
+ * 当前只有 inapp 通道在投递；这些字段先于订阅消息落地，运维据此判断某行是否已放弃。
+ * ================================================================== */
+
+test('AB-13 台账列表下发 channel/attempts/lastError/nextAttemptAt（默认 inapp 即时可投）', async () => {
+  const u = mkUser();
+  const { row } = await seedCreditedPayout({ userId: u, periodKey: W_DELIVERY, points: 50 });
+  const list = (await get(`${BASE}/points/board-settlements?period=week&periodKey=${W_DELIVERY}`)).json().data;
+  assert.equal(list.items.length, 1);
+  const fresh = list.items[0];
+  assert.equal(fresh.channel, 'inapp', '未表态的行按 inapp 下发');
+  assert.equal(fresh.attempts, 0);
+  assert.equal(fresh.lastError, '');
+  assert.equal(fresh.nextAttemptAt, null, 'null = 立即可投');
+
+  // 演一条卡住的投递：三次失败、下次重试在未来
+  const nextAt = 1_999_999_999_999;
+  await BoardSettlementModel.updateOne(
+    { _id: row._id },
+    { $set: { attempts: 3, lastError: '第三方通道超时（模拟）', nextAttemptAt: nextAt } },
+  );
+  const stuck = (await get(`${BASE}/points/board-settlements?period=week&periodKey=${W_DELIVERY}`)).json().data.items[0];
+  assert.equal(stuck.channel, 'inapp');
+  assert.equal(stuck.attempts, 3);
+  assert.equal(stuck.lastError, '第三方通道超时（模拟）');
+  assert.equal(stuck.nextAttemptAt, nextAt);
+  // 既有字段不受影响（避免「加字段顺手改口径」）
+  assert.equal(stuck.id, String(row._id));
+  assert.equal(stuck.status, 'credited');
+  assert.equal(stuck.points, 50);
 });

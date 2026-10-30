@@ -779,6 +779,8 @@ async function notifyReward(
  * 给台账行盖「通知已投递」的时刻。修复轮 1 / I-1 之后它**只是补投扫描的优化**：
  * 键的唯一性由 Notification.dedupeKey 决定，盖戳写失败/丢失只会让补投多扫一次（然后撞键
  * 识别为已发送），不会重发。字段只有 null → now 一个方向：已盖过戳的行绝不回退。
+ * 同时清空重试计划字段（lastError/nextAttemptAt）：投出去了就不该再显示「卡住」。
+ * attempts 保留（运维审计：这一条重试过几次）。
  * 写失败只留痕不抛。
  */
 async function markBoardNotified(
@@ -787,10 +789,55 @@ async function markBoardNotified(
   now: number,
 ): Promise<void> {
   try {
-    await BoardSettlementModel.updateOne({ _id: rowId, [field]: null }, { $set: { [field]: now } });
+    await BoardSettlementModel.updateOne(
+      { _id: rowId, [field]: null },
+      { $set: { [field]: now, lastError: '', nextAttemptAt: null } },
+    );
   } catch (e) {
     console.error('[points-board] 写通知投递标记失败（不影响幂等：补投会撞去重键识别为已发送）', { rowId, field }, e);
   }
+}
+
+/**
+ * 通知出箱的重试计划（2026-10-31，为订阅消息预留；当前通道仍只有 inapp）。
+ * 失败退避表固定为 1m/5m/15m/1h/6h；第 5 次失败即放弃（不再重试，lastError 留证）。
+ * 放弃与未知通道都把 nextAttemptAt 推到远期哨兵——drain 的 `nextAttemptAt <= now` 永远不命中。
+ * 不用 `attempts < 5` 当查询条件：那会把 attempts 插进索引第二段，索引就不再是选定形状；
+ * 停投语义只由 nextAttemptAt 表达（运维手工清掉该字段即可让一行复活）。
+ */
+export const BOARD_NOTIFICATION_MAX_ATTEMPTS = 5;
+export const BOARD_NOTIFICATION_BACKOFF_MS = [60_000, 5 * 60_000, 15 * 60_000, 3600_000, 6 * 3600_000] as const;
+/** 放弃后的 nextAttemptAt 偏移：100 年，远超任何真实时钟，等价于「永不再投」 */
+export const BOARD_NOTIFICATION_GIVE_UP_OFFSET_MS = 100 * 365 * 24 * 3600_000;
+export const BOARD_NOTIFICATION_LAST_ERROR_MAX = 200;
+
+/** 第 n 次失败后的退避（超出表长按最后一档：调用方在 MAX 次时已放弃，不会走到这里） */
+export function boardNotificationBackoffMs(attempts: number): number {
+  const i = Math.min(Math.max(1, Math.trunc(attempts)), BOARD_NOTIFICATION_BACKOFF_MS.length) - 1;
+  return BOARD_NOTIFICATION_BACKOFF_MS[i];
+}
+
+/** 错误文案落库前收口：单行、去首尾空白、截断到 200 字（DTO 会直接展示） */
+function deliveryErrorText(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  return raw.replace(/\s+/g, ' ').trim().slice(0, BOARD_NOTIFICATION_LAST_ERROR_MAX);
+}
+
+/** 记一次投递失败/终止：单独 try/catch，写失败只留痕——绝不让它抛回 drain */
+async function recordDeliveryFailure(
+  rowId: Types.ObjectId | string,
+  patch: { attempts: number; lastError: string; nextAttemptAt: number },
+): Promise<void> {
+  try {
+    await BoardSettlementModel.updateOne({ _id: rowId }, { $set: patch });
+  } catch (e) {
+    console.error('[points-board] 写通知重试计划字段失败（下轮会按旧值重试，不丢通知）', { rowId }, e);
+  }
+}
+
+/** 补投侧依赖注入口：只有测试会传（演「发送挂了」），生产走默认 createNotification */
+export interface DeliveryDeps {
+  notify?: typeof createNotification;
 }
 
 /**
@@ -799,19 +846,32 @@ async function markBoardNotified(
  * 逐行直接调 createNotification（带 `board:credit|revoke:…` 去重键）。
  * - **不再认领**：两条并发补投各发一次 create，唯一索引只会留一行，败者撞 E11000 被
  *   createNotification 当成「已发送」返回既有行。因此没有「认领后崩掉 → 永远不发」的丢件窗口；
- * - **不再退回**：发送抛错就留 null，下一次进页面重试；成功（含幂等命中）后盖戳，盖戳丢失也只是
+ * - **不再退回**：发送抛错就留 null，按重试计划退避后再试；成功（含幂等命中）后盖戳，盖戳丢失也只是
  *   多扫一次。at-least-once + 键去重 = 恰好一条。
+ * - **通道**：目前只投 `inapp`（老行缺字段按 inapp）。未知通道的行不静默跳过：记 lastError、
+ *   点满 attempts、nextAttemptAt 推远后离开队列（后台 DTO 可见），不会每次进页都重扫/重刷日志。
  * 正文算不出的脏行（历史手工行/夹具行）仍然盖戳跳过，否则会永远占据补投队列前 20 名。
  * 返回本次投递/失败条数（运维与测试用）。
  */
 export async function deliverPendingBoardNotifications(
   limit = 20,
   now = Date.now(),
+  deps: DeliveryDeps = {},
 ): Promise<{ delivered: number; failed: number }> {
+  const notify = deps.notify ?? createNotification;
+  // 实际下发的过滤器（2026-10-31）：主分支 = inapp（$in 兜住老行缺字段）+ 已到期
+  // （nextAttemptAt 为 null 或 <= now）；未知通道分支只捞 lastError 为空的行（标记一次即离开）。
+  // 索引 {status,channel,notifiedAt,nextAttemptAt} 照主分支的等值前缀 + 区间收尾选定；
+  // 撤回侧仍由既有的 {status,revokeNotifiedAt} 服务（量级小，不为它再建第二条）。
+  const inapp = { channel: { $in: ['inapp', null] } };
   const rows = (await BoardSettlementModel.find({
     $or: [
-      { status: 'credited', notifiedAt: null },
-      { status: 'revoked', revokeNotifiedAt: null },
+      { status: 'credited', notifiedAt: null, ...inapp, nextAttemptAt: { $lte: now } },
+      { status: 'credited', notifiedAt: null, ...inapp, nextAttemptAt: null },
+      { status: 'revoked', revokeNotifiedAt: null, ...inapp, nextAttemptAt: { $lte: now } },
+      { status: 'revoked', revokeNotifiedAt: null, ...inapp, nextAttemptAt: null },
+      { status: 'credited', notifiedAt: null, channel: { $nin: ['inapp', null] }, lastError: '' },
+      { status: 'revoked', revokeNotifiedAt: null, channel: { $nin: ['inapp', null] }, lastError: '' },
     ],
   })
     .sort({ _id: 1 })
@@ -822,6 +882,22 @@ export async function deliverPendingBoardNotifications(
   for (const row of rows) {
     const creditSide = row.status === 'credited';
     const field = creditSide ? 'notifiedAt' : 'revokeNotifiedAt';
+    // 未知通道：不静默丢弃。选择「记录并停投」而不是 throw：drain 挂在页面请求上，
+    // throw 只会让同一条坏行每次进页都在日志里刷一遍，还会顺带跳过本次后面排队的行；
+    // 落到台账（attempts 点满 + nextAttemptAt 推远）才可运维、可手工复活。
+    if (row.channel != null && row.channel !== 'inapp') {
+      failed += 1;
+      const lastError = deliveryErrorText(`不支持的投递通道「${String(row.channel)}」（当前只支持 inapp）`);
+      await recordDeliveryFailure(row._id, {
+        attempts: BOARD_NOTIFICATION_MAX_ATTEMPTS,
+        lastError,
+        nextAttemptAt: now + BOARD_NOTIFICATION_GIVE_UP_OFFSET_MS,
+      });
+      console.error('[points-board] 榜单通知出箱遇到未知通道，已记录并停止重试', {
+        id: String(row._id), status: row.status, channel: row.channel, lastError,
+      });
+      continue;
+    }
     // 正文先算：脏 periodKey 的遗留行（历史手工行/夹具行）永远算不出 boardLabel，
     // 这类行重试多少次都不会成功——**盖戳跳过**而不是留 null，
     // 否则它会永远占着补投队列的前 20 名，把真需要补的行饿死。
@@ -859,7 +935,7 @@ export async function deliverPendingBoardNotifications(
       userId: String(row.userId),
     });
     try {
-      await createNotification({
+      await notify({
         userId: String(row.userId),
         published: true,
         title: creditSide ? CREDIT_NOTIFICATION_TITLE : REVOKE_NOTIFICATION_TITLE,
@@ -869,9 +945,23 @@ export async function deliverPendingBoardNotifications(
       await markBoardNotified(row._id, field, now);
     } catch (e) {
       failed += 1;
-      console.error('[points-board] 榜单通知补投失败（戳保持 null，下一次进页面重试）', {
-        id: String(row._id), status: row.status,
-      }, e);
+      const attempts = Number(row.attempts ?? 0) + 1;
+      const lastError = deliveryErrorText(e) || '未知错误';
+      const giveUp = attempts >= BOARD_NOTIFICATION_MAX_ATTEMPTS;
+      await recordDeliveryFailure(row._id, {
+        attempts,
+        lastError,
+        nextAttemptAt: giveUp
+          ? now + BOARD_NOTIFICATION_GIVE_UP_OFFSET_MS
+          : now + boardNotificationBackoffMs(attempts),
+      });
+      console.error(
+        giveUp
+          ? '[points-board] 榜单通知补投连续失败达到上限，放弃重试（lastError 留证、notifiedAt 仍为空；可手工清 nextAttemptAt 复活）'
+          : '[points-board] 榜单通知补投失败（记录 attempts/nextAttemptAt，到期后再试）',
+        { id: String(row._id), status: row.status, attempts },
+        e,
+      );
     }
   }
   return { delivered, failed };
@@ -1133,6 +1223,14 @@ export interface BoardSettlementListRow {
   points: number;
   /** 坏账差额（F4 minor）：撤回时没能追回的分（points − 实际扣回）；未撤回/无差额＝0 */
   shortfall: number;
+  /** 投递通道（当前只有 inapp；'subscribe' 等第三方通道为订阅消息预留） */
+  channel: string;
+  /** 通知投递已失败次数（成功不清零；达到上限即放弃） */
+  attempts: number;
+  /** 最后一次投递失败原因（空串＝没失败过或已成功清空）——运维据此看「卡在哪」 */
+  lastError: string;
+  /** 下次可投时刻（ms）；null＝立即可投；放弃的行是远期哨兵（可手工清字段复活） */
+  nextAttemptAt: number | null;
   status: BoardSettlementStatus;
   /** 判别式：payout / threshold_skip / settled_marker / board_level（reason 不认识的整榜行） */
   kind: 'payout' | 'threshold_skip' | 'settled_marker' | 'board_level';
@@ -1256,6 +1354,11 @@ function toListRow(row: BoardSettlementRow, users: Map<string, { uid: number; ni
     rank: row.rank,
     points: row.points,
     shortfall: Number(row.shortfall ?? 0),
+    // 老行没有 channel 字段：与 drain 的读口径一致，按 inapp 下发
+    channel: row.channel == null ? 'inapp' : String(row.channel),
+    attempts: Number(row.attempts ?? 0),
+    lastError: row.lastError ?? '',
+    nextAttemptAt: row.nextAttemptAt == null ? null : Number(row.nextAttemptAt),
     status: row.status as BoardSettlementStatus,
     kind,
     boardLevel,

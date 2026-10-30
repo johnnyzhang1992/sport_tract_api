@@ -313,6 +313,18 @@ const boardSettlementSchema = new Schema({
   /** 撤回通知的投递时刻（ms），语义与 notifiedAt 完全对称（status='revoked' 那侧） */
   revokeNotifiedAt: { type: Number, default: null },
   /**
+   * 投递通道（2026-10-31，为订阅消息预留）。目前**只有 `inapp`**（站内 Notification），
+   * deliverPendingBoardNotifications 只处理 inapp；'subscribe' 等第三方通道等接入后再开。
+   * 老行没有这个字段：读侧按 `channel: { $in: ['inapp', null] }` 兜住，与 default 等价。
+   */
+  channel: { type: String, default: 'inapp' }, // 预留 'subscribe' 等第三方通道，目前只有 inapp
+  /** 已失败次数（成功不清零，留作运维审计；5 次即放弃） */
+  attempts: { type: Number, default: 0 },
+  /** 下次可投时刻（ms）；null = 立即可投。放弃（5 次失败/未知通道）时推到远期哨兵，drain 永不再命中 */
+  nextAttemptAt: { type: Number, default: null }, // null = 立即可投
+  /** 最后一次投递失败的原因（截断到 200 字）；成功清空 */
+  lastError: { type: String, default: '' },
+  /**
    * 撤回时**没能扣回**的分（2026-10-30 产品拍板：余额不足扣到 0，不再拒单）。
    * 不变式：points = 实际扣回 + shortfall（余额充足时 shortfall=0，行为与旧版逐字节一致）。
    * 落到台账是为了：① 补投的撤回通知能还原「实际扣回 / 差额」两个数（不靠反查流水猜）；
@@ -357,6 +369,18 @@ boardSettlementSchema.index({ period: 1, periodKey: 1, status: 1, type: 1, userI
  */
 boardSettlementSchema.index({ status: 1, notifiedAt: 1 });
 boardSettlementSchema.index({ status: 1, revokeNotifiedAt: 1 });
+
+/**
+ * 通知出箱的投递计划索引（2026-10-31，重试计划字段为订阅消息预留）：
+ * drain 的信侧过滤器实际是
+ * `{status:'credited', channel:{$in:['inapp',null]}, notifiedAt:null, nextAttemptAt:{$lte:now}|null}`，
+ * 键序照它选：status（等值）→ channel（$in 两个等值点，含 null 兜住老行）→ notifiedAt（等值 null）
+ * → nextAttemptAt（区间/null，收尾）。缺了它每次页面访问的补投都要扫台账，且未来才该重试的行
+ * 会占满 limit=20，把已经到期的行饿死。撤回侧（revokeNotifiedAt）仍用上面那条 {status, revokeNotifiedAt}
+ * 索引：撤回通知量级远小于到账通知，不为它再建一条带 channel/nextAttemptAt 的索引。
+ * 未知通道的行由单独的 $or 分支捞一次（status + channel $nin + lastError:''），标记后即离开队列。
+ */
+boardSettlementSchema.index({ status: 1, channel: 1, notifiedAt: 1, nextAttemptAt: 1 });
 
 export type BoardSettlement = mongoose.InferSchemaType<typeof boardSettlementSchema>;
 

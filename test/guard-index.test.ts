@@ -25,7 +25,7 @@ import { PointDailyQuotaModel, PointRecordModel, BoardSettlementModel } from '..
 import {
   hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
   hasNotificationRecipientIndex, hasUniqueBoardSettlementIndex, hasBoardSettlementAdminReadIndex,
-  hasBoardTrustedAggregateIndex, hasUniqueNotificationDedupeIndex,
+  hasBoardTrustedAggregateIndex, hasUniqueNotificationDedupeIndex, hasBoardSettlementNotificationDrainIndex,
 } from '../src/utils/guard-index.js';
 
 before(async () => {
@@ -375,4 +375,34 @@ test('activities：缺 type（只剩 status+startTime）不算发分防线：一
 
 test('activities：startTime 方向写成倒序不算发分防线：区间是正序收尾', () => {
   assert.equal(hasBoardTrustedAggregateIndex([{ name: 'x', key: { type: 1, status: 1, startTime: -1 } }]), false);
+});
+
+/**
+ * 榜单通知出箱的投递索引（2026-10-31，为订阅消息预留重试计划）：drain 的真实过滤器是
+ * `{status, channel, notifiedAt, nextAttemptAt}`（信侧分支；channel 是 $in ['inapp', null]
+ * 以兜住老行缺字段，notifiedAt 等值 null，nextAttemptAt 区间/等值 null）。
+ * 没有它，每次页面访问的补投都会全表扫台账，且「未到期」的行会占满 limit=20 把到期行饿死。
+ * 性能索引（非 unique），同 pointrecords/notifications 的两侧核对教训：删声明但 dev 库留着旧索引时
+ * 库侧假绿，声明侧先红；exact 键组合 + 键序 + 全 1 方向一起认。
+ */
+test('boardsettlements 通知投递索引：声明侧与真实库侧的防线都在（{status,channel,notifiedAt,nextAttemptAt}）', async () => {
+  const declared = BoardSettlementModel.schema.indexes();
+  assert.ok(
+    declared.some(([keys]) => Object.keys(keys).join(',') === 'status,channel,notifiedAt,nextAttemptAt'
+      && Object.values(keys).every((v) => v === 1)),
+    `schema 里的索引声明没有 {status,channel,notifiedAt,nextAttemptAt} 这条！现有声明：${JSON.stringify(declared.map(([keys]) => keys))}`,
+  );
+  await BoardSettlementModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
+  const idx = await BoardSettlementModel.collection.indexes();
+  assert.ok(
+    hasBoardSettlementNotificationDrainIndex(idx),
+    `防线不在！现有索引：${JSON.stringify(idx.map((i) => ({ name: i.name, key: i.key })))}`,
+  );
+});
+
+test('boardsettlements：投递索引键序不对（nextAttemptAt 提前）不算防线：等值前缀断了', () => {
+  assert.equal(
+    hasBoardSettlementNotificationDrainIndex([{ name: 'x', key: { status: 1, channel: 1, nextAttemptAt: 1, notifiedAt: 1 } }]),
+    false,
+  );
 });
