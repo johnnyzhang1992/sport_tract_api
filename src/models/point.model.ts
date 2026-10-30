@@ -301,6 +301,24 @@ const boardSettlementSchema = new Schema({
   /** 撤回留痕：操作人（admin 的 _id/username）与时刻。反向流水按 idemKey 反查得到，不另存字段 */
   revokedBy: { type: String, default: '' },
   revokedAt: { type: Number, default: 0 },
+  /**
+   * 到账通知的投递时刻（ms，2026-10-30 积压修复 F1）。null/缺省＝还没投出去。
+   * 为什么必须落库：通知是「钱已落定」之后发的第二条副作用，进程崩在翻牌与通知之间时
+   * 行已经是 credited 终态，没有任何东西会再找它——通知就永久丢了。
+   * services/points-board.ts 的 deliverPendingBoardNotifications 按
+   * `status='credited' && notifiedAt == null` 捞回来补投；投递前先用条件更新把本字段
+   * 「认领」成 now，两个并发补投任务因此只有一路会真的发（另一路条件不中）。
+   */
+  notifiedAt: { type: Number, default: null },
+  /** 撤回通知的投递时刻（ms），语义与 notifiedAt 完全对称（status='revoked' 那侧） */
+  revokeNotifiedAt: { type: Number, default: null },
+  /**
+   * 撤回时**没能扣回**的分（2026-10-30 产品拍板：余额不足扣到 0，不再拒单）。
+   * 不变式：points = 实际扣回 + shortfall（余额充足时 shortfall=0，行为与旧版逐字节一致）。
+   * 落到台账是为了：① 补投的撤回通知能还原「实际扣回 / 差额」两个数（不靠反查流水猜）；
+   * ② 后台对账能直接看到这笔坏账。0 分扣款的现场不写反向流水（不造 delta=0 的账）。
+   */
+  shortfall: { type: Number, default: 0, min: 0 },
 }, { timestamps: true, versionKey: false });
 
 // unique 是**正确性防线**不是性能索引：一期 8 个榜的懒结算会被反复、并发地触发，
@@ -330,6 +348,15 @@ boardSettlementSchema.index({ type: 1, period: 1, periodKey: 1, userId: 1 }, { u
  * 排序另走 _id（落库顺序＝结算顺序），与本索引无关——列表默认按 _id 倒序翻页，稳定不跳行。
  */
 boardSettlementSchema.index({ period: 1, periodKey: 1, status: 1, type: 1, userId: 1 });
+
+/**
+ * 通知补投的扫描索引（2026-10-30 F1）：`{status, notifiedAt}` 与 `{status, revokeNotifiedAt}`。
+ * 补投任务挂在懒结算入口上（每次页面访问）、每次扫 limit=20 行；没有索引就是全表扫台账。
+ * 两条分开建而不是合成一条：$or 的两个分支各自走自己的等值前缀（status 等值 + 标记键等值/null）。
+ * 注意 `notifiedAt: null` 同时命中「字段缺失」的老行——正是要补投的那批。
+ */
+boardSettlementSchema.index({ status: 1, notifiedAt: 1 });
+boardSettlementSchema.index({ status: 1, revokeNotifiedAt: 1 });
 
 export type BoardSettlement = mongoose.InferSchemaType<typeof boardSettlementSchema>;
 

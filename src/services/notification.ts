@@ -217,7 +217,14 @@ function validateInput(input: NotificationInput, { partial }: { partial: boolean
     out.content = content;
   }
   if (input.published !== undefined) out.published = Boolean(input.published);
+  // 收件人（userId）是**收件人**不是操作人，且只在创建时写：
+  //  - 创建（partial=false）：null＝广播、24 位 hex＝定向（榜单到账/撤回等系统流水走这条）；
+  //  - 更新（partial=true）：一律 400。定向行在后台列表不可见，允许改 userId 等于让
+  //    后台把一条系统流水改成广播发给全站（或把广播改成一个看不见的定向行）。
   if (input.userId !== undefined) {
+    if (partial) {
+      throw new AppError(400, '收件人只能在创建时指定（userId 是这条通知的收件人，更新/编辑不允许改写；定向流水不进后台公告台账）');
+    }
     if (input.userId === null) {
       out.userId = null; // 显式 null＝广播
     } else {
@@ -247,20 +254,31 @@ export async function createNotification(input: NotificationInput): Promise<Admi
   return toAdminNotification(doc.toObject() as never);
 }
 
+/**
+ * 管理端更新：**只动广播行**（userId: null）。定向通知是系统自动发的流水（榜单到账/撤回…），
+ * 后台列表看不见它，写接口也必须结构性不可达——否则一个从别处拿到的 id 就能改写/删除
+ * 某个用户的定向通知。find 与 findOneAndUpdate 两处都带 `userId: null`：
+ * 查得到才改得到，两道条件之间不留「先查后改」的窗口。
+ */
 export async function updateNotification(id: string, input: NotificationInput): Promise<AdminNotification> {
   assertObjectIdLike(id, '通知不存在');
   const data = validateInput(input, { partial: true });
-  const before = await NotificationModel.findById(id).lean();
+  const before = await NotificationModel.findOne({ _id: id, userId: null }).lean();
   if (!before) throw new AppError(404, '通知不存在');
   if (data.published === true && !before.published) data.publishedAt = Date.now();
-  const doc = await NotificationModel.findByIdAndUpdate(id, { $set: data }, { new: true }).lean();
+  const doc = await NotificationModel.findOneAndUpdate(
+    { _id: id, userId: null },
+    { $set: data },
+    { returnDocument: 'after' },
+  ).lean();
   if (!doc) throw new AppError(404, '通知不存在');
   return toAdminNotification(doc as never);
 }
 
+/** 管理端删除：同样只动广播行（定向行按 404 处理，与更新同一条纪律）；级联只清广播行的已读记录 */
 export async function deleteNotification(id: string): Promise<void> {
   assertObjectIdLike(id, '通知不存在');
-  const doc = await NotificationModel.findByIdAndDelete(id).lean();
+  const doc = await NotificationModel.findOneAndDelete({ _id: id, userId: null }).lean();
   if (!doc) throw new AppError(404, '通知不存在');
   await NotificationReadModel.deleteMany({ notificationId: new Types.ObjectId(id) });
 }

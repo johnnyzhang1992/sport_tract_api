@@ -526,3 +526,68 @@ test('NR-2 read-all 需登录：游客 401', async () => {
   const res = await app.inject({ method: 'POST', url: '/sport-track/api/notifications/read-all' });
   assert.equal(res.statusCode, 401);
 });
+
+// ==================== 2026-10-30 积压修复 F2：后台只动广播 ====================
+// userId 是**收件人**，不是操作人；后台列表只回广播行，所以定向行必须从后台写接口里
+// 结构性不可达（404），并且局部更新不许改写收件人（否则能把系统流水改成广播发给全站）。
+
+test('NT-DIR-6 后台改/删定向通知一律 404，且那一行原封不动', async () => {
+  const dir = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR6-TARGET`,
+    content: '系统定向流水',
+    published: true,
+    userId,
+  })).json().data;
+  madeNotices.push(dir.id);
+  const before = await NotificationModel.findById(dir.id).lean();
+  assert.ok(before, '夹具：定向行已落库');
+  assert.equal(String(before!.userId), userId);
+
+  const put = await adminReq('PUT', `/notifications/${dir.id}`, { title: `${PREFIX}DIR6-HIJACK` });
+  assert.equal(put.statusCode, 404, `定向行不属于后台公告台账，更新必须 404：${put.body}`);
+  assert.match(put.json().message, /通知不存在/, `外来 id 藏进 404（不外泄「存在但不可见」）：${put.body}`);
+
+  const del = await adminReq('DELETE', `/notifications/${dir.id}`);
+  assert.equal(del.statusCode, 404, `删除定向行同样必须 404：${del.body}`);
+
+  const after = await NotificationModel.findById(dir.id).lean();
+  assert.ok(after, '定向行绝不能被后台删掉');
+  assert.equal(after!.title, before!.title, '标题不许被改');
+  assert.equal(after!.content, before!.content, '正文不许被改');
+  assert.equal(String(after!.userId), userId, '收件人一个字都不许动');
+  // 收件人照旧能读到自己的定向行
+  assert.equal((await get(`/notifications/${dir.id}`)).statusCode, 200);
+});
+
+test('NT-DIR-7 局部更新传 userId → 400 点名「收件人只能在创建时指定」；创建时仍可指定', async () => {
+  const bcast = (await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR7-BC`,
+    content: '广播正文',
+    published: true,
+  })).json().data;
+  madeNotices.push(bcast.id);
+
+  for (const uid of [userId, null]) {
+    const res = await adminReq('PUT', `/notifications/${bcast.id}`, { userId: uid });
+    assert.equal(res.statusCode, 400, `局部更新携带 userId（${JSON.stringify(uid)}）必须 400：${res.body}`);
+    const msg = res.json().message;
+    assert.match(msg, /userId/, `文案要点名字段 userId：${msg}`);
+    assert.match(msg, /收件人只能在创建时指定/, `文案要说清为什么不能改：${msg}`);
+  }
+  // 广播行仍是广播，且普通字段照旧可改
+  assert.equal((await NotificationModel.findById(bcast.id).lean())!.userId, null, '被拒的 PUT 不许留下任何收件人');
+  const okPut = await adminReq('PUT', `/notifications/${bcast.id}`, { title: `${PREFIX}DIR7-BC-2` });
+  assert.equal(okPut.statusCode, 200, okPut.body);
+  assert.equal(okPut.json().data.userId, null);
+
+  // 创建时指定收件人（榜单到账/撤回等内部定向通知的入口）不受影响
+  const created = await adminReq('POST', '/notifications', {
+    title: `${PREFIX}DIR7-TARGET`,
+    content: '创建时指定收件人',
+    published: true,
+    userId,
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  madeNotices.push(created.json().data.id);
+  assert.equal(created.json().data.userId, userId, '创建时 userId 照旧可写');
+});

@@ -17,6 +17,8 @@ import {
   releaseBoardSettlementPending,
   settlePeriod,
   settleDueForUser,
+  deliverPendingBoardNotifications,
+  revokeBoardSettlement,
   computeSettleUnits,
   periodStartMsFromKey,
   boardLabel,
@@ -55,8 +57,8 @@ import {
 } from '../src/config/points.js';
 import { AppSettingModel } from '../src/models/app-setting.model.js';
 import { isBoardRewardsEnabled, resetBoardSwitchCacheForTest, setBoardRewardsEnabled } from '../src/services/board-switch.js';
-import { creditPoints, getBalance } from '../src/services/points-ledger.js';
-import { BJ_OFFSET_MS } from '../src/utils/bj-time.js';
+import { creditPoints, debitPoints, getBalance } from '../src/services/points-ledger.js';
+import { BJ_OFFSET_MS, bjDateStr } from '../src/utils/bj-time.js';
 
 /**
  * 榜单发分专用的可信轨迹聚合（spec §7：发分口径比展示多四道防刷判据）。
@@ -1096,6 +1098,15 @@ const WEEK_KEYS = [
   '2027-04-19', // U18：SP-21 结算起点之前的单元永不发分（must-fix #4）
   '2027-04-26', // U19：SP-21 窗口跨越结算起点 ⇒ 照常发
   '2027-05-03', // U20：SP-21 窗口终点恰好等于结算起点 ⇒ 照常发（>= 语义）
+  '2027-05-17', // U21：NB-1 到账通知崩溃后补投
+  '2027-05-24', // U22：NB-2 并发补投只发一条
+  '2027-05-31', // U23：NB-3 正常路径即时发送 + 补投不重复
+  '2027-06-07', // U24：NB-4 撤回通知崩溃后补投
+  '2027-06-14', // U25：PB-F3-1 撤回 TOP1 → 第 4 名补位
+  '2027-06-21', // U26：PB-F3-2 补位后再跑结算不双发
+  '2027-06-28', // U27：PB-F4-1 余额不足扣到 0
+  '2027-07-05', // U28：PB-F4-2 余额 0 不落扣款流水
+  '2027-07-12', // U29：PB-F4-3 余额充足保持原行为
 ] as const;
 const U_START = (key: string) => bjMid(Number(key.slice(0, 4)), Number(key.slice(5, 7)), Number(key.slice(8, 10)));
 const U_END = (key: string) => U_START(key) + 7 * DAY_MS;
@@ -1119,6 +1130,15 @@ const U17 = WEEK_KEYS[16]; const U17_START = U_START(U17); const U17_END = U_END
 const U18 = WEEK_KEYS[17]; const U18_START = U_START(U18); const U18_END = U_END(U18); const NOW18 = U18_END;
 const U19 = WEEK_KEYS[18]; const U19_START = U_START(U19); const U19_END = U_END(U19); const NOW19 = U19_END;
 const U20 = WEEK_KEYS[19]; const U20_START = U_START(U20); const U20_END = U_END(U20); const NOW20 = U20_END;
+const U21 = WEEK_KEYS[20]; const U21_START = U_START(U21); const U21_END = U_END(U21); const NOW21 = U21_END;
+const U22 = WEEK_KEYS[21]; const U22_START = U_START(U22); const U22_END = U_END(U22); const NOW22 = U22_END;
+const U23 = WEEK_KEYS[22]; const U23_START = U_START(U23); const U23_END = U_END(U23); const NOW23 = U23_END;
+const U24 = WEEK_KEYS[23]; const U24_START = U_START(U24); const U24_END = U_END(U24); const NOW24 = U24_END;
+const U25 = WEEK_KEYS[24]; const U25_START = U_START(U25); const U25_END = U_END(U25); const NOW25 = U25_END;
+const U26 = WEEK_KEYS[25]; const U26_START = U_START(U26); const U26_END = U_END(U26); const NOW26 = U26_END;
+const U27 = WEEK_KEYS[26]; const U27_START = U_START(U27); const U27_END = U_END(U27); const NOW27 = U27_END;
+const U28 = WEEK_KEYS[27]; const U28_START = U_START(U28); const U28_END = U_END(U28); const NOW28 = U28_END;
+const U29 = WEEK_KEYS[28]; const U29_START = U_START(U29); const U29_END = U_END(U29); const NOW29 = U29_END;
 /** 月/年单元：SP-5 滞后闸门（2026-12 的结算界是 2027-01-01）与 SP-7 年榜 500 分。
  *  年榜夹具用 2027 年——2026/更早年份的窗口里有真实用户数据，绝不当结算对象。 */
 const M_DEC = '2026-12';
@@ -2041,5 +2061,344 @@ test('IDX-1 发分聚合的 $match 走 {type,status,startTime} 索引：声明�
   assert.ok(
     Number(statsFinal.totalDocsExamined) < finishedTotal,
     `一次榜聚合不该扫完全部 finished 轨迹：docs=${statsFinal.totalDocsExamined} / 全库=${finishedTotal}`,
+  );
+});
+
+/* ====================================================================
+ * 2026-10-30 积压修复（产品拍板的四条）：F1 通知可重试投递 / F3 第 4 名补位 /
+ * F4 余额不足扣到 0。F2 在通知侧（test/notifications.test.ts 的 NT-DIR-6/7）。
+ *
+ * 夹具纪律同上：全部用 WEEK_KEYS 里新加的 2027-05-17 之后的未来周（已进 SP_PERIOD_KEYS，
+ * after 按 key 收口清理），用户全是 mkUser() 记录的 ObjectId，绝不碰真实用户。
+ * ================================================================== */
+
+/** 手工种一笔「已发放」的榜奖（钱走真实 creditPoints，台账行手工落 credited + recordId） */
+async function seedCreditedPayout(opts: {
+  userId: Types.ObjectId;
+  type?: string;
+  period?: BoardPeriod;
+  periodKey: string;
+  rank?: number;
+  points?: number;
+  now: number;
+}): Promise<{ rowId: Types.ObjectId; recordId: string }> {
+  const type = opts.type ?? 'cycling';
+  const period = opts.period ?? 'week';
+  const rank = opts.rank ?? 1;
+  const points = opts.points ?? 50;
+  const c = await creditPoints(String(opts.userId), {
+    type: 'board_reward',
+    title: `夹具榜奖·${type}·${rank}`,
+    points,
+    bizDate: bjDateStr(opts.now),
+    refType: 'board',
+    refId: `${type}:${period}:${opts.periodKey}`,
+    idemKey: `${opts.userId}:board:${type}:${period}:${opts.periodKey}`,
+    ignoreDailyCap: true,
+  }, opts.now);
+  const row = await BoardSettlementModel.create({
+    type, period, periodKey: opts.periodKey, userId: opts.userId,
+    rank, points, status: 'credited', recordId: c.recordId,
+  });
+  return { rowId: row._id as Types.ObjectId, recordId: c.recordId as string };
+}
+
+/** 把本单元整榜占位/完成标记的 updatedAt 归一到假时钟（raw handle 绕过 timestamps 插件，SP-15 同款） */
+async function normalizeMarkers(periodKey: string, now: number, period: BoardPeriod = 'week') {
+  await BoardSettlementModel.collection.updateMany(
+    { period, periodKey, userId: new Types.ObjectId(BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID) },
+    { $set: { updatedAt: new Date(now) } },
+  );
+}
+
+test('NB-1（F1）到账通知投递失败留痕：台账 credited 且 notifiedAt 为空，下次进页恰好补投一条', async () => {
+  const cyc = await seedBoard('cycling', U21_START, [3100, 3050, 3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200, 2100]);
+  const logs = await captureErrors(async () => {
+    const r = await settlePeriod('week', U21, U21_END, NOW21, {
+      notify: async () => { throw new Error('注入：通知服务挂了'); },
+    });
+    assert.equal(r.credited, 3, '通知失败不回滚钱——发放已成事实');
+  });
+  assert.match(logs, /通知/, '通知失败要留痕');
+  const led = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U21, userId: cyc[0],
+  }).lean();
+  assert.equal(led?.status, 'credited');
+  assert.equal(led?.notifiedAt, null, '发送失败的行必须留 notifiedAt=null（否则永远补不回来）');
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[0] }), 0);
+
+  // 任意一次页面访问（该用户在这个单元有可信行）都要把崩溃遗留的通知补上
+  await settleDueForUser(String(cyc[0]), NOW21 + 60_000);
+  const notes = await NotificationModel.find({ userId: cyc[0] }).lean();
+  assert.equal(notes.length, 1, '补投必须恰好一条（不许一条都不发，也不许重发）');
+  assert.equal(
+    notes[0].content,
+    '恭喜获得「骑行·周榜」第 1 名奖励 +50 积分（2027/05/17 至 2027/05/23 这一周）。',
+    '补投正文与即时发送逐字相同（§4.8 第 3 条）',
+  );
+  const fresh = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U21, userId: cyc[0],
+  }).lean();
+  assert.ok(Number(fresh?.notifiedAt) > 0, '补投成功要盖上 notifiedAt（否则每次进页都重发）');
+
+  // 再跑一次补投：已盖戳的行不再投递
+  await deliverPendingBoardNotifications(20, NOW21 + 120_000);
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[0] }), 1, '已盖戳的行绝不重复投递');
+});
+
+test('NB-2（F1）两个并发补投任务对同一行只发一条（先条件认领再发送）', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U22, now: NOW22 });
+  const [a, b] = await Promise.all([
+    deliverPendingBoardNotifications(20, NOW22),
+    deliverPendingBoardNotifications(20, NOW22),
+  ]);
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 1, '并发补投只能发一条（认领必须是原子的）');
+  const row = await BoardSettlementModel.findById(rowId).lean();
+  assert.ok(Number(row?.notifiedAt) > 0);
+  assert.ok(a.delivered + b.delivered >= 1, '至少一路真的投递了');
+  // 并发两路的 delivered 计数合计只能覆盖这一行一次：再取一次该用户的通知数仍是 1
+  assert.equal(await NotificationModel.countDocuments({ userId: u, title: '榜单积分奖励到账' }), 1);
+});
+
+test('NB-3（F1）正常路径即时发送一条并盖戳：紧接着补投不重复', async () => {
+  const cyc = await seedBoard('cycling', U23_START, [3100, 3050, 3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200, 2100]);
+  const r = await settlePeriod('week', U23, U23_END, NOW23);
+  assert.equal(r.credited, 3);
+  const led = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U23, userId: cyc[0],
+  }).lean();
+  assert.ok(Number(led?.notifiedAt) > 0, '即时发送成功就要盖戳');
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[0], title: '榜单积分奖励到账' }), 1);
+  await deliverPendingBoardNotifications(20, NOW23 + 1000);
+  assert.equal(
+    await NotificationModel.countDocuments({ userId: cyc[0], title: '榜单积分奖励到账' }),
+    1,
+    '补投任务紧接着跑也不许给即时发送过的行再发一条',
+  );
+});
+
+test('NB-4（F1）撤回通知投递失败：台账 revoked 且 revokeNotifiedAt 为空，补投恰好一条', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U24, now: NOW24 - 3600_000 });
+  const logs = await captureErrors(async () => {
+    const r = await revokeBoardSettlement(String(rowId), { note: '复核判定刷量' }, {
+      adminId: 'admin-nb4',
+      now: NOW24,
+      deps: { notify: async () => { throw new Error('注入：撤回通知挂了'); } },
+    });
+    assert.equal(r.status, 'revoked');
+  });
+  assert.match(logs, /撤回通知/, '撤回通知失败要留痕');
+  const led = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(led?.status, 'revoked');
+  assert.equal(led?.revokeNotifiedAt, null, '发送失败必须留 null 让补投能捞到');
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0);
+
+  await deliverPendingBoardNotifications(20, NOW24 + 60_000);
+  const notes = await NotificationModel.find({ userId: u }).lean();
+  assert.equal(notes.length, 1, '撤回通知补投恰好一条');
+  assert.equal(notes[0].title, '榜单积分奖励调整');
+  assert.equal(
+    notes[0].content,
+    '「骑行·周榜」第 1 名奖励 +50 积分已撤回 −50 积分（2027/06/07 至 2027/06/13 这一周）。原因：复核判定刷量',
+    '补投正文与撤回即时发送逐字相同（§4.8 第 4 条）',
+  );
+  const fresh = await BoardSettlementModel.findById(rowId).lean();
+  assert.ok(Number(fresh?.revokeNotifiedAt) > 0, '补投成功要盖上 revokeNotifiedAt');
+  await deliverPendingBoardNotifications(20, NOW24 + 120_000);
+  assert.equal(await NotificationModel.countDocuments({ userId: u }), 1, '已盖戳的撤回通知不重发');
+});
+
+test('PB-F3-1 撤回 TOP1 后第 4 名补位到第 3 名（20 分）；被撤者不重发、其他榜一个聚合都不跑', async () => {
+  const cyc = await seedBoard('cycling', U25_START, [3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200, 2100, 2000, 1900]);
+  const run = await seedBoard('running', U25_START, [3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200, 2100, 2000, 1900]);
+  const first = await settlePeriod('week', U25, U25_END, NOW25);
+  assert.equal(first.credited, 6, '两个榜各发 TOP3');
+  // 完成标记落的是真实时钟：归一到假时钟，才能演「其他榜的标记仍然新鲜」（SP-15 同款）
+  await normalizeMarkers(U25, NOW25);
+  const notesBefore = new Map<string, number>();
+  for (const u of [cyc[0], cyc[1], cyc[2], run[0], run[1], run[2]]) {
+    notesBefore.set(String(u), await NotificationModel.countDocuments({ userId: u }));
+  }
+
+  const top = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U25, userId: cyc[0],
+  }).lean();
+  assert.equal(top?.status, 'credited');
+  const spy = await withAggSpy(() => revokeBoardSettlement(String(top!._id), { note: '复核：搭车刷量' }, {
+    adminId: 'admin-f3',
+    now: NOW25 + 60_000,
+  }));
+  assert.equal(spy.result.status, 'revoked');
+  assert.equal(spy.count, 1, '只重算被撤的那一个榜（其余 7 个榜的完成标记仍然新鲜、必须短路）');
+
+  // 第 4 名（2700）补到第 3 名：rank=3、points=20
+  assert.deepEqual(
+    spy.result.promoted.map((p) => `${p.userId}#r${p.rank}/${p.points}`),
+    [`${cyc[3]}#r3/20`],
+    '补位结果要回传给后台（「已补位」）',
+  );
+  assert.equal(await getBalance(String(cyc[3]), NOW25 + 120_000), 20, '第 4 名拿到第 3 名的 20 分');
+  const led4 = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U25, userId: cyc[3],
+  }).lean();
+  assert.equal(led4?.status, 'credited');
+  assert.equal(led4?.rank, 3);
+  assert.equal(led4?.points, 20);
+  assert.equal(
+    await NotificationModel.countDocuments({ userId: cyc[3], title: '榜单积分奖励到账' }),
+    1,
+    '补位到账也要发一条到账通知',
+  );
+
+  // 被撤者不重发：只有一条 revoked 台账行与一条原流水，余额归零
+  assert.equal(
+    await BoardSettlementModel.countDocuments({
+      type: 'cycling', period: 'week', periodKey: U25, userId: cyc[0], status: 'credited',
+    }),
+    0,
+    '被撤者绝不能被重算再发一次',
+  );
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: cyc[0], type: 'board_reward', refId: `cycling:week:${U25}` }),
+    1,
+    '被撤者的原流水只有那一条，不许出现第二笔 board_reward',
+  );
+  assert.equal(await getBalance(String(cyc[0]), NOW25 + 120_000), 0, '被撤者余额归零');
+
+  // 其他榜原封不动：流水/台账/通知一条不多
+  assert.equal(await PointRecordModel.countDocuments({ type: 'board_reward', refId: `running:week:${U25}` }), 3);
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ type: 'running', period: 'week', periodKey: U25, status: 'credited' }),
+    3,
+  );
+  for (const [uid, n] of notesBefore) {
+    if (uid === String(cyc[0])) {
+      assert.equal(await NotificationModel.countDocuments({ userId: uid }), n + 1, '被撤者收到一条撤回通知');
+    } else {
+      assert.equal(await NotificationModel.countDocuments({ userId: uid }), n, `其他用户的通知数不许被重跑改动（${uid}）`);
+    }
+  }
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[3] }), 1);
+});
+
+test('PB-F3-2 补位之后再跑结算不双发：第 4 名只拿一次，台账/流水/余额各一条', async () => {
+  const cyc = await seedBoard('cycling', U26_START, [3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200, 2100, 2000, 1900]);
+  const first = await settlePeriod('week', U26, U26_END, NOW26);
+  assert.equal(first.credited, 3);
+  const top = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U26, userId: cyc[0],
+  }).lean();
+  const revoked = await revokeBoardSettlement(String(top!._id), { note: '复核：刷量' }, { now: NOW26 + 60_000 });
+  assert.equal(revoked.promoted.length, 1);
+  assert.equal(revoked.promoted[0].userId, String(cyc[3]));
+
+  // 标记过期后重评（推过 24h）：排除 revoked 用户 + 补位者已有 credited 终态 ⇒ 一分不再发
+  const again = await settlePeriod('week', U26, U26_END, NOW26 + DAY_MS + 3600_000);
+  assert.equal(again.credited, 0, '重算不得再发一分（补位者撞 credited 终态、被撤者被排除）');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ userId: cyc[3], period: 'week', periodKey: U26 }),
+    1,
+    '补位者只有一行台账',
+  );
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: cyc[3], refId: `cycling:week:${U26}` }),
+    1,
+    '补位者只有一条流水',
+  );
+  assert.equal(await getBalance(String(cyc[3]), NOW26 + 2 * DAY_MS), 20, '余额只进一笔 20');
+  // 第二次撤回同样被拒（revoked 是终态）
+  await assert.rejects(
+    () => revokeBoardSettlement(String(top!._id), { note: '再撤一次' }, { now: NOW26 + 2 * DAY_MS }),
+    /已撤回/,
+  );
+});
+
+test('PB-F4-1 余额 30 应扣 50：扣到 0 不拒单，shortfall 20 落台账，通知追加差额子句', async () => {
+  const u = mkUser();
+  const { rowId, recordId } = await seedCreditedPayout({ userId: u, periodKey: U27, now: NOW27 });
+  // 花掉 20：余额 30
+  await debitPoints(String(u), {
+    type: 'exchange', title: '夹具兑换', points: 20, bizDate: '2027-06-28',
+    refType: 'item', refId: 'fixture-item', idemKey: `${u}:exchange:fixture`,
+  }, NOW27);
+  assert.equal(await getBalance(String(u), NOW27), 30, '夹具自证：余额 30 < 应扣 50');
+
+  const res = await revokeBoardSettlement(String(rowId), { note: '余额不足也要撤' }, { now: NOW27 + 1000 });
+  assert.equal(res.status, 'revoked');
+  assert.equal(res.deducted, 30, '实际扣回＝min(余额, 应扣)');
+  assert.equal(res.shortfall, 20, '差额＝应扣 − 实际扣回');
+  assert.equal(res.balance, 0, '余额扣到 0，绝不为负');
+  assert.ok(res.rollbackRecordId, '只要扣了钱就必须有反向流水');
+
+  const back = await PointRecordModel.findById(res.rollbackRecordId).lean();
+  assert.equal(back?.delta, -30, '反向流水的 delta 是实际扣回金额，不是台账 points');
+  assert.equal((await PointAccountModel.findOne({ userId: u }).lean())?.balance, 0, '余额不许为负');
+  const led = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(led?.status, 'revoked');
+  assert.equal(led?.points, 50);
+  assert.equal(led?.shortfall, 20, '差额要落台账（补投通知与后台对账都读它）');
+  assert.equal(String(led?.recordId), recordId, '原流水凭据不动');
+
+  const notes = await NotificationModel.find({ userId: u }).lean();
+  assert.equal(notes.length, 1);
+  assert.equal(
+    notes[0].content,
+    '「骑行·周榜」第 1 名奖励 +50 积分已撤回 −50 积分（2027/06/28 至 2027/07/04 这一周）。原因：余额不足也要撤'
+      + '（余额不足，实际扣回 30 分，差额 20 分未追回）',
+    '余额不足时在 §4.8 原句后追加差额子句（新文案，钉死）',
+  );
+});
+
+test('PB-F4-2 余额 0：不落零值扣款流水，shortfall＝应扣全额，照样翻 revoked', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U28, now: NOW28 });
+  await debitPoints(String(u), {
+    type: 'exchange', title: '夹具兑换', points: 50, bizDate: '2027-07-05',
+    refType: 'item', refId: 'fixture-item', idemKey: `${u}:exchange:fixture`,
+  }, NOW28);
+  assert.equal(await getBalance(String(u), NOW28), 0, '夹具自证：余额 0');
+
+  const res = await revokeBoardSettlement(String(rowId), { note: '一分都扣不到' }, { now: NOW28 + 1000 });
+  assert.equal(res.status, 'revoked');
+  assert.equal(res.deducted, 0);
+  assert.equal(res.shortfall, 50);
+  assert.equal(res.rollbackRecordId, null, '扣 0 分不写零值流水');
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: u, type: 'board_reward_rollback' }),
+    0,
+    '余额 0 时跳过扣减：账本里不许出现 delta=0 的撤回流水',
+  );
+  const led = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(led?.status, 'revoked', '余额 0 也要翻 revoked（撤回是判决，不是扣款结果）');
+  assert.equal(led?.shortfall, 50);
+  const notes = await NotificationModel.find({ userId: u }).lean();
+  assert.equal(notes.length, 1);
+  assert.equal(
+    notes[0].content,
+    '「骑行·周榜」第 1 名奖励 +50 积分已撤回 −50 积分（2027/07/05 至 2027/07/11 这一周）。原因：一分都扣不到'
+      + '（余额不足，实际扣回 0 分，差额 50 分未追回）',
+    '余额 0 的差额子句同样逐字钉住',
+  );
+});
+
+test('PB-F4-3 余额充足：扣满应扣、shortfall 0，通知与 §4.8 定稿逐字一致（无新增子句）', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U29, now: NOW29 });
+  const res = await revokeBoardSettlement(String(rowId), { note: '复核刷量' }, { now: NOW29 + 1000 });
+  assert.equal(res.deducted, 50);
+  assert.equal(res.shortfall, 0);
+  assert.equal(res.balance, 0);
+  const back = await PointRecordModel.findById(res.rollbackRecordId).lean();
+  assert.equal(back?.delta, -50, '余额充足时反向流水与今天逐字相同');
+  const led = await BoardSettlementModel.findById(rowId).lean();
+  assert.equal(led?.shortfall, 0);
+  assert.ok(Number(led?.revokeNotifiedAt) > 0, '撤回通知即时发送成功也要盖戳（否则补投会再发一条）');
+  const notes = await NotificationModel.find({ userId: u }).lean();
+  assert.equal(
+    notes[0].content,
+    '「骑行·周榜」第 1 名奖励 +50 积分已撤回 −50 积分（2027/07/12 至 2027/07/18 这一周）。原因：复核刷量',
+    'shortfall=0 时必须是 §4.8 原句，不许带任何新增子句',
   );
 });

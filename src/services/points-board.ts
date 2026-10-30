@@ -22,6 +22,9 @@
  *   models/point.model.ts 的 isBoardLevelRow / isThresholdSkip / isSettledMarker（读侧谓词）：
  *   status='skipped' 的哨兵行是**缓存不是发放**，列表默认排除、撤回直接拒绝。
  *   热路径（修复轮 1）：门槛占位 + 完成标记让已评估过的单元在聚合之前短路（有效期 24h，过期重评）。
+ *   **2026-10-30 积压修复**：F1 通知改「即时发送 + 台账盖戳 + 崩溃后补投」（deliverPendingBoardNotifications，
+ *   挂在 settleDueForUser 尾部）；F3 撤回后第 4 名补位（settlePeriod 剔除 revoked 用户 + revoke 重算本榜）；
+ *   F4 余额不足扣到 0、差额记 shortfall（不再拒单）。
  *   **不改 leaderboard() 的展示口径**（榜面与发分结果可能不一致，由规则页文案说明），
  *   也不做省份过滤（发分是全平台口径）。
  */
@@ -693,29 +696,173 @@ export interface SettleDeps {
   notify?: typeof createNotification;
 }
 
-/** 到账通知（§4.8 第 3 条逐字）。通知失败不回滚钱——钱与台账此刻已成对，通知缺席是运营事故，大声留痕 */
+/** 到账通知正文（§4.8 第 3 条逐字）：即时发送与崩溃后补投共用同一份，绝不各拼一套 */
+function creditNotificationContent(
+  row: { type: string; period: BoardPeriod; periodKey: string; rank: number; points: number },
+): string {
+  return `恭喜获得「${TYPE_LABEL[row.type] ?? row.type}·${PERIOD_LABEL[row.period]}」第 ${row.rank} 名奖励 +${row.points} 积分（${boardLabel(row.period, row.periodKey)}）。`;
+}
+
+/** 到账通知标题（§4.8 第 3 条） */
+const CREDIT_NOTIFICATION_TITLE = '榜单积分奖励到账';
+/** 撤回通知标题（§4.8 第 4 条） */
+const REVOKE_NOTIFICATION_TITLE = '榜单积分奖励调整';
+
+/**
+ * 撤回通知正文（§4.8 第 4 条逐字）：即时发送与崩溃后补投共用。
+ * 余额不足时（shortfall > 0）在**同一句**末尾追加差额子句（2026-10-30 新增文案，待主人确认）：
+ * `（余额不足，实际扣回 X 分，差额 Y 分未追回）`。X = points − shortfall（实际扣回），
+ * Y = shortfall。shortfall=0 时输出与旧版逐字节一致。
+ */
+function revokeNotificationContent(
+  row: {
+    type: string;
+    period: BoardPeriod;
+    periodKey: string;
+    rank: number;
+    points: number;
+    reason?: string;
+    shortfall?: number;
+  },
+): string {
+  const typeLabel = TYPE_LABEL[row.type] ?? row.type;
+  const base = `「${typeLabel}·${PERIOD_LABEL[row.period]}」第 ${row.rank} 名奖励 +${row.points} 积分已撤回 −${row.points} 积分（${boardLabel(row.period, row.periodKey)}）。原因：${row.reason ?? ''}`;
+  const shortfall = Number(row.shortfall ?? 0);
+  if (shortfall <= 0) return base;
+  return `${base}（余额不足，实际扣回 ${row.points - shortfall} 分，差额 ${shortfall} 分未追回）`;
+}
+
+/**
+ * 单条到账通知（§4.8 第 3 条逐字）。返回是否真的发出去了——调用方据此给台账盖 notifiedAt。
+ * 通知失败不回滚钱：钱与台账此刻已成对，通知缺席是运营事故，大声留痕后由
+ * deliverPendingBoardNotifications 在下一次页面访问时补投。
+ */
 async function notifyReward(
   notify: NonNullable<SettleDeps['notify']>,
   r: BoardReward,
   period: BoardPeriod,
   periodKey: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await notify({
       userId: r.userId,
       published: true,
-      title: '榜单积分奖励到账',
-      content: `恭喜获得「${TYPE_LABEL[r.type] ?? r.type}·${PERIOD_LABEL[period]}」第 ${r.rank} 名奖励 +${r.points} 积分（${boardLabel(period, periodKey)}）。`,
+      title: CREDIT_NOTIFICATION_TITLE,
+      content: creditNotificationContent({ type: r.type, period, periodKey, rank: r.rank, points: r.points }),
     });
+    return true;
   } catch (e) {
     console.error('[points-board] 到账通知发送失败（发放已落定，通知缺席需补发）', { userId: r.userId, type: r.type, period, periodKey }, e);
+    return false;
   }
 }
 
 /**
+ * 给台账行盖「通知已投递」的时刻（F1）。字段只有 null → now 一个方向：
+ * 已经盖过戳的行绝不回退（并发补投/重试不会把已投递的行重新标成待投）。
+ * 写失败只留痕不抛：通知已经发出去了，这里是「下次会不会重发」的乐观标记。
+ */
+async function markBoardNotified(
+  rowId: Types.ObjectId | string,
+  field: 'notifiedAt' | 'revokeNotifiedAt',
+  now: number,
+): Promise<void> {
+  try {
+    await BoardSettlementModel.updateOne({ _id: rowId, [field]: null }, { $set: { [field]: now } });
+  } catch (e) {
+    console.error('[points-board] 写通知投递标记失败（补投可能重复发送，需人工核对）', { rowId, field }, e);
+  }
+}
+
+/**
+ * 崩溃遗留通知的补投（F1，2026-10-30 产品拍板「不能依次通知吗？为啥要同步处理」）：
+ * 扫 `status='credited' && notifiedAt==null` 与 `status='revoked' && revokeNotifiedAt==null` 两类行，
+ * 逐行**先条件认领再发送**：
+ *  1. `findOneAndUpdate({_id, status, [field]: null}, {$set:{[field]: now}})`——两个并发补投任务
+ *     只有一个能把 null 改成 now，另一路拿到 null 直接跳过（不会双发）；
+ *  2. 认领后才真正发通知；发送抛错就把认领**退回 null** 并留痕，下一次进页面重试。
+ * 取舍是 at-most-once：认领后进程立刻崩会丢这一条（不会重复骚扰用户），与「钱不许双发」同一取向。
+ * 返回本次投递/失败条数（运维与测试用；调用方不需要据此做用户可见判断）。
+ */
+export async function deliverPendingBoardNotifications(
+  limit = 20,
+  now = Date.now(),
+): Promise<{ delivered: number; failed: number }> {
+  const rows = (await BoardSettlementModel.find({
+    $or: [
+      { status: 'credited', notifiedAt: null },
+      { status: 'revoked', revokeNotifiedAt: null },
+    ],
+  })
+    .sort({ _id: 1 })
+    .limit(Math.max(0, Math.trunc(limit)))
+    .lean()) as BoardSettlementRow[];
+  let delivered = 0;
+  let failed = 0;
+  for (const row of rows) {
+    const creditSide = row.status === 'credited';
+    const field = creditSide ? 'notifiedAt' : 'revokeNotifiedAt';
+    const claimed = await BoardSettlementModel.findOneAndUpdate(
+      { _id: row._id, status: row.status, [field]: null },
+      { $set: { [field]: now } },
+      { returnDocument: 'after' },
+    ).lean();
+    if (!claimed) continue; // 另一路补投刚认领走 / 行状态已变：安静跳过
+    // 正文先算：脏 periodKey 的遗留行（历史手工行/夹具行）永远算不出 boardLabel，
+    // 这类行重试多少次都不会成功——**保留认领**（盖戳跳过）而不是退回 null，
+    // 否则它会永远占着补投队列的前 20 名，把真需要补的行饿死。
+    let content: string;
+    try {
+      content = creditSide
+        ? creditNotificationContent({
+          type: row.type,
+          period: row.period,
+          periodKey: row.periodKey,
+          rank: Number(row.rank),
+          points: Number(row.points),
+        })
+        : revokeNotificationContent({
+          type: row.type,
+          period: row.period,
+          periodKey: row.periodKey,
+          rank: Number(row.rank),
+          points: Number(row.points),
+          reason: row.reason ?? '',
+          shortfall: Number(row.shortfall ?? 0),
+        });
+    } catch (e) {
+      failed += 1;
+      console.error('[points-board] 榜单通知补投跳过：正文无法生成（periodKey 不是规范形态的遗留行，重试也不会成功）', {
+        id: String(row._id), period: row.period, periodKey: row.periodKey,
+      }, e);
+      continue;
+    }
+    try {
+      await createNotification({
+        userId: String(row.userId),
+        published: true,
+        title: creditSide ? CREDIT_NOTIFICATION_TITLE : REVOKE_NOTIFICATION_TITLE,
+        content,
+      });
+      delivered += 1;
+    } catch (e) {
+      failed += 1;
+      console.error('[points-board] 榜单通知补投失败（认领已退回，下一次进页面重试）', {
+        id: String(row._id), status: row.status,
+      }, e);
+      await BoardSettlementModel.updateOne({ _id: row._id }, { $set: { [field]: null } }).catch((re) => {
+        console.error('[points-board] 退回通知认领失败（该行会停在已认领，需人工补发）', { id: String(row._id) }, re);
+      });
+    }
+  }
+  return { delivered, failed };
+}
+
+/**
  * 一个周期单元（某 period 某 periodKey 的整期 8 榜）：滞后闸门 → 占位缓存 → 门槛 → 聚合 →
- * plan（纯函数，Task 5）→ 逐条「抢锁 → 发分 → 翻牌 → 定向通知」→ 完成标记（修复轮 1：
+ * plan（纯函数，Task 5）→ 逐条「抢锁 → 发分 → 翻牌 → 定向通知（成功盖 notifiedAt）」→ 完成标记（修复轮 1：
  * 已落定的榜留哨兵占位，下一次进页在聚合之前短路；标记过期后仍会重评，迟到赢家补发）。
+ * 被撤回过的获奖者不进榜（F3 补位），聚合结果里的名次因此整体前移。
  *
  * - idemKey `${userId}:board:${type}:${period}:${periodKey}` 与台账唯一键同形：台账管"谁拿到发放权"，
  *   creditPoints 的幂等管"钱只落一次"——两层各自能独立兜双发（SP-3/SP-14）。
@@ -751,13 +898,30 @@ export async function settlePeriod(
   };
   const boards: Array<{ type: string; rows: BoardCandidate[] }> = [];
   const skippedTypes: string[] = [];
+  // 补位（F3，2026-10-30 产品拍板「第 4 名补位」）：被**运营撤回**过的获奖者要从榜上剔除。
+  // 为什么必须剔除而不是靠抢锁败者路径：撤回行的唯一键仍在，plan 若把他算成第 1 名，
+  // 他抢锁必败 ⇒ 第 2/3 名不动、第 4 名永远等不到补位。剔除后名次整体前移（4th→3rd），
+  // 榜首变成原来的第 2 名（他已有 credited 终态，抢锁安静跳过），第 4 名这次能拿到发放权。
+  // 每单元只读一次（读索引 {period,periodKey,status}），按榜分组成 Set 后逐榜过滤。
+  const revokedByBoard = new Map<string, Set<string>>();
+  for (const r of await BoardSettlementModel.find({ period, periodKey, status: 'revoked' })
+    .select({ type: 1, userId: 1 })
+    .lean()) {
+    const type = String(r.type);
+    const set = revokedByBoard.get(type) ?? new Set<string>();
+    set.add(String(r.userId));
+    revokedByBoard.set(type, set);
+  }
   for (const type of ACTIVITY_TYPES) {
     const boardKey = { type, period, periodKey };
     if (await isBoardSettlementSkipped(boardKey, now)) {
       skippedTypes.push(type);
       continue; // 占位有效期内：整榜跳过，连聚合都省（§4.2 第 2 步的"避免每次进页重算"）
     }
-    const rows = await trustedBoardRows(type, startMs, endMs);
+    const allRows = await trustedBoardRows(type, startMs, endMs);
+    // 撤回者的距离不再算作参赛成绩：门槛也按剔除后的人数判（被撤的人不占榜位）
+    const banned = revokedByBoard.get(type);
+    const rows = banned ? allRows.filter((r) => !banned.has(r.userId)) : allRows;
     if (rows.length <= opts.minParticipants) {
       await recordBoardSettlementSkipped(boardKey, thresholdSkipReason(rows.length, opts.minParticipants));
       skippedTypes.push(type);
@@ -823,7 +987,10 @@ export async function settlePeriod(
           continue;
         }
         credited += 1;
-        await notifyReward(notify, r, period, periodKey);
+        // F1：通知发成功才盖戳；失败留 null，下一次进页面由 deliverPendingBoardNotifications 补投
+        if (await notifyReward(notify, r, period, periodKey)) {
+          await markBoardNotified(recovered._id, 'notifiedAt', now);
+        }
         continue;
       }
       if (c.credited !== r.points) {
@@ -843,7 +1010,9 @@ export async function settlePeriod(
         continue;
       }
       credited += 1;
-      await notifyReward(notify, r, period, periodKey);
+      if (await notifyReward(notify, r, period, periodKey)) {
+        await markBoardNotified(flipped._id, 'notifiedAt', now);
+      }
     } catch (e) {
       // 裁定 1：credit/翻牌炸了 ⇒ 释放锁。credit 内部对"已落账"有自己的回滚，走到 catch 就说明
       // 这笔钱没有以本次尝试的名义入账；删行让下一次进页面能重新抢锁再试（idemKey 兜住万一落账成功的双发）。
@@ -885,6 +1054,13 @@ export async function settleDueForUser(userId: string, now: number = Date.now())
   } catch (e) {
     console.error('[points-board] settleDueForUser 入口异常（吞掉：挂在页面请求上不能变 500）', { userId }, e);
   }
+  // F1：任何一次页面访问都顺带把「进程崩在翻牌与通知之间」遗留的定向通知补投掉。
+  // 放在结算循环之后、单独 try/catch：结算单元全炸了也不耽误补通知，且本入口依旧永不抛错。
+  try {
+    await deliverPendingBoardNotifications(20, now);
+  } catch (e) {
+    console.error('[points-board] 补投崩溃遗留的榜单通知失败（下后进页面重试）', { userId }, e);
+  }
 }
 
 /* ==========================================================================
@@ -897,13 +1073,16 @@ export async function settleDueForUser(userId: string, now: number = Date.now())
  *    拒绝——不是静默成功，也不是"扣 0 分"空转；判据走 isBoardLevelRow 谓词，reason 认不出常量的
  *    历史整榜行同样按整榜行处理（结构优先于自由文本）。
  * 2. **撤回必须成对**（照 points-signin 的 makeup_reward_rollback 形状：先落反向流水，再翻台账，
- *    最后发通知）：反向流水用 debitPoints 的余额闸门（禁止扣成负数）+ 行级 idemKey
+ *    最后发通知）：反向流水用 debitPoints 的余额闸门（**禁止扣成负数**）+ 行级 idemKey
  *    `${userId}:board_rollback:${type}:${period}:${periodKey}`（与发放侧 idemKey 同形），
  *    所以并发双撤最多扣一次；台账行**不删**（唯一键继续占位，懒结算不会再发）。
+ *    2026-10-30 产品拍板（F4）：余额不足不再拒单——扣 min(余额, 应扣)，扣到 0 就不落扣款流水，
+ *    差额记台账 shortfall；余额 ≥ 应扣时行为与旧版逐字节一致。
  * 3. **审计链要留全**：台账行的 recordId 指向原流水，撤回后不清空；反向流水的 refId/idemKey
  *    指回同一个榜单单元，人是「流水 → 台账行 → 通知」三头都能对上的（本仓没有事务，成对靠顺序 + 幂等键）。
  *
- * 通知（§4.8 第 4 条）走**定向** userId；发通知失败不回滚钱——与到账通知同一条纪律，大声留痕。
+ * 通知（§4.8 第 4 条）走**定向** userId；发通知失败不回滚钱——与到账通知同一条纪律，大声留痕，
+ * 并靠台账的 revokeNotifiedAt=null 让下一次页面访问补投（F1）。
  * ========================================================================== */
 
 /** 撤回写出的反向流水类型（`_rollback` 结尾＝points-admin-stats 的撤回族口径，总览自动归类） */
@@ -1098,14 +1277,23 @@ export interface BoardSettlementRevokeResult {
   points: number;
   /** 原流水（保持不变，审计链） */
   recordId: string;
-  /** 本次落下的反向流水 pointrecords._id（幂等重放时是同一笔） */
-  rollbackRecordId: string;
-  /** 撤回后的余额（反向流水的 balanceAfter） */
+  /** 本次落下的反向流水 pointrecords._id；余额 0 时跳过扣减 ⇒ null（幂等重放时是同一笔） */
+  rollbackRecordId: string | null;
+  /** 撤回后的余额（反向流水的 balanceAfter；没扣款时是当前余额 0） */
   balance: number;
+  /** 实际扣回的金额（＝min(应扣, 余额)；余额 0 时是 0） */
+  deducted: number;
+  /** 没能扣回的差额（＝points − deducted）：后台对账与通知里的「差额」用它 */
+  shortfall: number;
+  /**
+   * 补位结果（F3）：本次撤回后重算**这一个榜**新拿到发放权的人（第 4 名补到第 3 名…）。
+   * 被撤者永远不会出现在这里（他的台账行是 revoked，重算时被排除在榜外）。
+   */
+  promoted: { userId: string; rank: number; points: number }[];
   note: string;
   revokedBy: string;
   revokedAt: number;
-  /** 通知落空时为 null（钱与台账照样成对，缺席的通知由日志留痕，见文件头纪律 3） */
+  /** 通知落空时为 null（钱与台账照样成对，缺席的通知由补投任务兜底，见 notifiedAt 字段） */
   notification: { id: string; title: string; content: string } | null;
 }
 
@@ -1119,7 +1307,8 @@ function shown(value: unknown): string {
  * 后台撤回（POST /admin/points/board-settlements/:id/revoke）。
  * 闸门顺序（每一步都在写库之前，任何一条被拒都不留下流水/通知/状态变更）：
  * id 形态 → 备注必填 → 行存在 → 整榜级 → pending/revoked → 分值与流水凭据（存在性 + type/refId/userId/delta 对账）
- * → 余额 → 钱 → 翻牌 → 通知。
+ * → 钱（扣 min(余额, 应扣)）→ 翻牌 → 通知 → 补位（删本榜完成标记 + 重算这一期）。
+ * 余额不足**不是**闸门（F4）：扣到 0、差额记 shortfall，撤回照样生效。
  */
 export async function revokeBoardSettlement(
   id: string,
@@ -1155,12 +1344,12 @@ export async function revokeBoardSettlement(
   if (!row.recordId) throw new AppError(400, `台账行缺少流水凭据（recordId 为空），不能自动撤回，请人工对账（id=${id}）`);
   if (!row.periodKey) throw new AppError(400, `台账行缺少 periodKey，不能撤回（id=${id}）`);
 
-  // 文案派生（脏 periodKey 在这里就拒，别让 boardPeriodTag 的 500 冒到后台）
+  // 文案派生（脏 periodKey 在这里就拒，别让 boardLabel 的 500 冒到后台）。
+  // label 本身在 revokeNotificationContent 里现拼（即时发送与补投共用一份），这里只做一次校验。
   let tag: string;
-  let label: string;
   try {
     tag = boardPeriodTag(row.period, row.periodKey);
-    label = boardLabel(row.period, row.periodKey);
+    boardLabel(row.period, row.periodKey);
   } catch (e) {
     throw new AppError(400, `台账行的 periodKey 不是规范形态（${shown(row.periodKey)}），不能自动撤回，请人工对账：${(e as Error).message}`);
   }
@@ -1186,51 +1375,103 @@ export async function revokeBoardSettlement(
   const notify = opts.deps?.notify ?? createNotification;
   const userId = String(row.userId);
 
-  // 3) 余额闸门（AB-5）：先给操作台一句能看懂的话，再让 debitPoints 的原子条件做并发兜底
-  //    （预检与扣减之间有窗口，扣减那枪才是真相：余额被并发花光时它自己抛「积分不足」，同样不会扣成负数）
-  const account = await PointAccountModel.findOne({ userId }).select({ balance: 1 }).lean();
-  const balance = account?.balance ?? 0;
-  if (balance < points) {
-    throw new AppError(400, `撤回被拒绝：该用户积分余额不足（用户 ${userId}，当前余额 ${balance}，`
-      + `本次需扣回 ${points}，可扣上限＝当前余额 ${balance}）`);
+  // 3) 余额不足时扣到 0（2026-10-30 产品拍板 F4：余额不能变负，也不许因此拒单）
+  //    扣减金额 = min(余额, 应扣)；扣 0 分时**整段跳过扣减**（账本里不留 delta=0 的流水）。
+  //    预读余额只用来算「这次最多能扣多少」，真正的闸门仍是 debitPoints 的原子条件
+  //    （balance >= points）——预读与扣减之间被并发花光时它抛「积分不足」，这里重读余额再试
+  //    （最多 3 枪；仍抢不到就把异常照抛，绝不为了"成功"去扣一笔没核对的账）。
+  let balance = (await PointAccountModel.findOne({ userId }).select({ balance: 1 }).lean())?.balance ?? 0;
+  let debit: Awaited<ReturnType<typeof debitPoints>> | null = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const deductible = Math.min(balance, points);
+    if (deductible <= 0) break;
+    try {
+      debit = await debitPoints(userId, {
+        type: BOARD_REVOKE_ROLLBACK_TYPE,
+        // §4.8 第 5 条的形态 + 「撤回」前缀（与补签那条 makeup_reward_rollback 同一命名法）
+        title: `撤回${typeLabel}·${PERIOD_LABEL[row.period]}第 ${row.rank} 名·${tag}`,
+        points: deductible,
+        bizDate: bjDateStr(now),
+        refType: 'board',
+        refId,
+        idemKey: `${userId}:board_rollback:${row.type}:${row.period}:${row.periodKey}`,
+      }, now);
+      break;
+    } catch (e) {
+      const insufficient = e instanceof AppError && e.statusCode === 400 && /积分不足/.test(e.message);
+      if (!insufficient) throw e;
+      balance = (await PointAccountModel.findOne({ userId }).select({ balance: 1 }).lean())?.balance ?? 0;
+    }
   }
+  // 重放（duplicated）时 debit.points 是那笔既有流水的实际扣减额，差额因此可重算、不双扣
+  const deducted = debit ? debit.points : 0;
+  const shortfall = points - deducted;
 
-  // 4) 反向流水（成对的第一步）。idemKey 定死在行身份上 ⇒ 并发/重放第二枪是 duplicated，不再扣钱
-  const debit = await debitPoints(userId, {
-    type: BOARD_REVOKE_ROLLBACK_TYPE,
-    // §4.8 第 5 条的形态 + 「撤回」前缀（与补签那条 makeup_reward_rollback 同一命名法）
-    title: `撤回${typeLabel}·${PERIOD_LABEL[row.period]}第 ${row.rank} 名·${tag}`,
-    points,
-    bizDate: bjDateStr(now),
-    refType: 'board',
-    refId,
-    idemKey: `${userId}:board_rollback:${row.type}:${row.period}:${row.periodKey}`,
-  }, now);
-
-  // 5) 翻牌：credited → revoked。条件写 + **不动 recordId**（审计链），也不删行（唯一键继续占位）
+  // 4) 翻牌：credited → revoked。条件写 + **不动 recordId**（审计链），也不删行（唯一键继续占位）。
+  //    shortfall 一并落台账：补投的撤回通知要还原「实际扣回 / 差额」，后台对账也读它。
   const flipped = (await BoardSettlementModel.findOneAndUpdate(
     { _id: row._id, status: 'credited' },
-    { $set: { status: 'revoked', reason: rawNote, revokedBy: String(opts.adminId ?? ''), revokedAt: now } },
+    { $set: { status: 'revoked', reason: rawNote, revokedBy: String(opts.adminId ?? ''), revokedAt: now, shortfall } },
     { returnDocument: 'after' },
   ).lean()) as BoardSettlementRow | null;
   if (!flipped) {
     // 钱已按幂等键扣了、行却不是 credited：并发另一路刚撤完（或状态被别的入口改过）。大声留痕等对账
     console.error('[points-board] 撤回归档落空（行已不是 credited），反向流水已落账需人工核对', {
-      id, userId, refId, rollbackRecordId: debit.recordId,
+      id, userId, refId, rollbackRecordId: debit?.recordId ?? null, deducted,
     });
     throw new AppError(400, `撤回未生效：该行状态已变更（并发撤回或别的入口改过），请刷新后核对（id=${id}）`);
   }
 
-  // 6) 定向通知（§4.8 第 4 条逐字）。失败不回滚钱——与到账通知同一条纪律
-  const content = `「${typeLabel}·${PERIOD_LABEL[row.period]}」第 ${row.rank} 名奖励 +${points} 积分已撤回 −${points} 积分（${label}）。原因：${rawNote}`;
+  // 5) 定向通知（§4.8 第 4 条逐字；余额不足时追加差额子句）。失败不回滚钱——与到账通知同一条纪律，
+  //    且台账的 revokeNotifiedAt 留 null，下一次进页面由 deliverPendingBoardNotifications 补投。
+  const content = revokeNotificationContent({
+    type: row.type,
+    period: row.period,
+    periodKey: row.periodKey,
+    rank: row.rank,
+    points,
+    reason: rawNote,
+    shortfall,
+  });
   let notification: BoardSettlementRevokeResult['notification'] = null;
+  let notified = false;
   try {
-    const n = await notify({ userId, published: true, title: '榜单积分奖励调整', content });
+    const n = await notify({ userId, published: true, title: REVOKE_NOTIFICATION_TITLE, content });
     notification = { id: n.id, title: n.title, content: n.content };
+    notified = true;
   } catch (e) {
     console.error('[points-board] 撤回通知发送失败（撤回已落定，通知缺席需补发）', { id, userId, refId, note: rawNote }, e);
   }
+  if (notified) await markBoardNotified(flipped._id, 'revokeNotifiedAt', now);
 
+  // 6) 补位（F3，2026-10-30 产品拍板「第 4 名补位」）：撤掉一个奖 ⇒ 这个榜的名次前移，
+  //    下一个够格的人要拿到钱。两步：
+  //    a) 删掉**这个榜**的新鲜完成标记——它记的是「这一榜已结算完」，现在结论变了；
+  //       其他 7 个榜的标记原样保留，重算时整榜短路（只有被撤的榜跑聚合）。
+  //    b) 用同一套 settlePeriod 重算这一期：revoked 用户被排除在榜外、已有 credited 的人撞终态，
+  //       所以只有被补位的那位真的拿到新发放。补位失败不回滚撤回（钱已扣、行已翻），只留痕。
+  const body = { type: row.type, period: row.period, periodKey: row.periodKey };
+  const promoted: BoardSettlementRevokeResult['promoted'] = [];
+  try {
+    await BoardSettlementModel.deleteOne({ ...body, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID });
+    const creditedBefore = new Set((await BoardSettlementModel.find({ ...body, status: 'credited' })
+      .select({ userId: 1 })
+      .lean()).map((r) => String(r.userId)));
+    const deps: SettleDeps = opts.deps?.notify ? { notify: opts.deps.notify } : {};
+    await settlePeriod(row.period, row.periodKey, settleBoundaryMs(row.period, row.periodKey), now, deps);
+    const creditedAfter = await BoardSettlementModel.find({ ...body, status: 'credited' })
+      .select({ userId: 1, rank: 1, points: 1 })
+      .sort({ rank: 1, _id: 1 })
+      .lean();
+    for (const r of creditedAfter) {
+      if (creditedBefore.has(String(r.userId))) continue;
+      promoted.push({ userId: String(r.userId), rank: Number(r.rank), points: Number(r.points) });
+    }
+  } catch (e) {
+    console.error('[points-board] 撤回后补位重算失败（名额暂空，下一次进页面重算或人工补发）', { id, userId, refId }, e);
+  }
+
+  const balanceAfter = debit ? debit.balance : balance;
   return {
     id: String(row._id),
     status: 'revoked',
@@ -1241,8 +1482,11 @@ export async function revokeBoardSettlement(
     rank: row.rank,
     points,
     recordId: String(row.recordId),
-    rollbackRecordId: debit.recordId,
-    balance: debit.balance,
+    rollbackRecordId: debit?.recordId ?? null,
+    balance: balanceAfter,
+    deducted,
+    shortfall,
+    promoted,
     note: rawNote,
     revokedBy: String(opts.adminId ?? ''),
     revokedAt: now,

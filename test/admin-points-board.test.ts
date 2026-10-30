@@ -283,6 +283,9 @@ test('AB-2 撤回：反向流水（type=board_reward_rollback）+ 台账 revoked
   assert.equal(data.notification.content, notes[0].content, '响应带回通知正文（弹窗二次确认之外还要能核对）');
   // 钱真扣回来了
   assert.equal(data.balance, 0);
+  assert.equal(data.deducted, 50, '余额充足：实际扣回＝应扣全额');
+  assert.equal(data.shortfall, 0, '余额充足：没有未追回差额');
+  assert.ok(Array.isArray(data.promoted), '撤回结果要带回补位名单（后台据此提示「已补位」）');
   assert.equal((await PointAccountModel.findOne({ userId: u }).lean())!.balance, 0);
 });
 
@@ -337,10 +340,10 @@ test('AB-4 撤回幂等：已 revoked 再撤 → 400，不产生第二条反向�
 });
 
 /* ==================================================================
- * AB-5 余额闸门
+ * AB-5 余额不足扣到 0（2026-10-30 产品拍板：不再拒单）
  * ================================================================== */
 
-test('AB-5 撤回不能把余额扣成负数（余额不足时 400 并说明实际余额）', async () => {
+test('AB-5 余额不足时扣到 0 不拒单：扣 min(余额, 应扣)，差额记 shortfall，余额绝不为负', async () => {
   const u = mkUser();
   const { row } = await seedCreditedPayout({ userId: u, periodKey: W_PAYOUT, points: 50 });
   // 用户已把这 50 分花掉 30：余额只剩 20
@@ -352,19 +355,36 @@ test('AB-5 撤回不能把余额扣成负数（余额不足时 400 并说明实�
   assert.equal(before, 20, '夹具自证：余额 20 < 应撤 50');
 
   const res = await post(`${BASE}/points/board-settlements/${row._id}/revoke`, { note: ADMIN_NOTE });
-  assert.equal(res.statusCode, 400, `余额不足必须 400：${res.body}`);
-  const msg = res.json().message;
-  // 对象 + 实际值 + 上限（本仓错误文案纪律：点名收到/实际的数，别只说「操作失败」）
-  assert.match(msg, /余额不足/, `文案要点名余额不足：${msg}`);
-  assert.ok(msg.includes('20'), `文案要带实际余额 20：${msg}`);
-  assert.ok(msg.includes('50'), `文案要带应扣回的上限 50：${msg}`);
-  assert.match(msg, /上限/, `文案要点名可扣上限：${msg}`);
+  assert.equal(res.statusCode, 200, `余额不足不再拒单：${res.body}`);
+  const data = res.json().data;
+  assert.equal(data.status, 'revoked');
+  assert.equal(data.deducted, 20, '实际扣回＝余额 20');
+  assert.equal(data.shortfall, 30, '差额＝应扣 50 − 实际扣回 20');
+  assert.equal(data.balance, 0, '余额扣到 0');
 
-  // 什么都没发生：钱没扣、台账没翻、没有反向流水与通知
-  assert.equal((await PointAccountModel.findOne({ userId: u }).lean())!.balance, 20);
-  assert.equal((await BoardSettlementModel.findById(row._id).lean())!.status, 'credited');
-  assert.equal(await PointRecordModel.countDocuments({ userId: u, type: 'board_reward_rollback' }), 0);
-  assert.equal(await NotificationModel.countDocuments({ userId: u }), 0);
+  // 钱：反向流水只扣实际扣得到的 20，余额 0（不为负）
+  assert.equal((await PointAccountModel.findOne({ userId: u }).lean())!.balance, 0, '余额绝不能被扣成负数');
+  const back = await PointRecordModel.findOne({ userId: u, type: BOARD_REVOKE_ROLLBACK_TYPE }).lean();
+  assert.ok(back, '扣到了钱就要有反向流水');
+  assert.equal(back!.delta, -20, '反向流水 delta＝实际扣回金额');
+  assert.equal(String(back!._id), String(data.rollbackRecordId));
+
+  // 台账：revoked + 差额留痕 + 原流水凭据不动
+  const led = await BoardSettlementModel.findById(row._id).lean();
+  assert.equal(led!.status, 'revoked');
+  assert.equal(led!.points, 50, '应扣金额仍是台账 points，差额靠 shortfall 表达');
+  assert.equal(led!.shortfall, 30);
+  assert.equal(led!.reason, ADMIN_NOTE);
+
+  // 通知：§4.8 原句 + 差额子句（新文案，逐字钉住）
+  const notes = await NotificationModel.find({ userId: u }).lean();
+  assert.equal(notes.length, 1);
+  assert.equal(
+    notes[0].content,
+    `「骑行·周榜」第 1 名奖励 +50 积分已撤回 −50 积分（${WEEK_LABEL_PAYOUT}）。原因：${ADMIN_NOTE}`
+      + '（余额不足，实际扣回 20 分，差额 30 分未追回）',
+    '余额不足的差额子句逐字钉死（改动会在这里先红）',
+  );
 });
 
 /* ==================================================================
