@@ -491,7 +491,7 @@ test('AB-7 台账列表默认只出发放行（pending/credited/revoked 在列�
   });
   await BoardSettlementModel.create({
     type: 'walking', period: 'week', periodKey: W_MIX, userId: mkUser(), rank: 3, points: 20,
-    status: 'revoked', reason: '运营复核：判定刷分',
+    status: 'revoked', reason: '运营复核：判定刷分', shortfall: 17,
   });
   await recordBoardSettlementSkipped({ type: 'hiking', period: 'week', periodKey: W_MIX }, thresholdSkipReason(4, 10));
   await markBoardSettled({ type: 'skiing', period: 'week', periodKey: W_MIX });
@@ -519,6 +519,9 @@ test('AB-7 台账列表默认只出发放行（pending/credited/revoked 在列�
   assert.equal(byStatus.credited.points, 50);
   assert.equal(byStatus.credited.rank, 1);
   assert.equal(byStatus.credited.recordId, credited.recordId);
+  // 坏账差额（F4 minor）：台账页要能直接显示「没追回的差额」，DTO 必须下发 shortfall（缺省 0）
+  assert.equal(byStatus.credited.shortfall, 0, '没有坏账的发放行下发 0（不是 undefined/null）');
+  assert.equal(byStatus.revoked.shortfall, 17, '撤回行的未追回差额要原样下发（坏账可见）');
 
   // 分页：按筛选后的总数翻页
   const p1 = (await get(`${BASE}/points/board-settlements?period=week&periodKey=${W_MIX}&pageSize=2&page=1`)).json().data;

@@ -7,6 +7,7 @@ import { NotificationModel } from '../src/models/notification.model.js';
 import { NotificationReadModel } from '../src/models/notification-read.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
+import { createNotification } from '../src/services/notification.js';
 
 /**
  * 系统通知公开接口：/notifications/summary、/notifications、/notifications/:id、
@@ -590,4 +591,32 @@ test('NT-DIR-7 局部更新传 userId → 400 点名「收件人只能在创建�
   assert.equal(created.statusCode, 200, created.body);
   madeNotices.push(created.json().data.id);
   assert.equal(created.json().data.userId, userId, '创建时 userId 照旧可写');
+});
+
+// ==================== 修复轮 1（I-1）：通知投递幂等去重键 ====================
+// 带 dedupeKey 的系统流水「同键只一条」由 partial unique 索引裁决：第二次 create 撞 E11000
+// 一律视为「已经发过」，返回既有行（不抛）。不带键的普通广播不受约束——schema 默认写 null，
+// 若用裸 sparse（null 仍进索引）第二条广播就会撞键。
+
+test('NT-DEDUPE-1 去重键：同键第二次 create 返回既有行；不带键的广播可任意多条', async () => {
+  const key = `${PREFIX}dedupe:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const input = { title: `${PREFIX}DEDUPE-1`, content: '系统流水正文', published: true, userId };
+  const first = await createNotification(input, key);
+  const second = await createNotification(input, key);
+  madeNotices.push(first.id);
+  assert.equal(second.id, first.id, '同键重复创建必须返回既有行（视为已发送），不许抛 E11000');
+  assert.equal(
+    await NotificationModel.countDocuments({ dedupeKey: key }),
+    1,
+    '库里同键只能有一行',
+  );
+
+  // 普通广播（不传 dedupeKey）连续多条都允许：default:null 不进 partial 唯一索引
+  const b1 = await createNotification({ title: `${PREFIX}DEDUPE-BC-1`, content: '广播一', published: true });
+  const b2 = await createNotification({ title: `${PREFIX}DEDUPE-BC-2`, content: '广播二', published: true });
+  madeNotices.push(b1.id, b2.id);
+  assert.notEqual(b1.id, b2.id, '不带去重键的广播是两条独立通知');
+  const rows = await NotificationModel.find({ _id: { $in: [b1.id, b2.id] } }).lean();
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.dedupeKey), [null, null], '广播行的 dedupeKey 落 null（partial 索引不收）');
 });

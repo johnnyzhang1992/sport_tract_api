@@ -25,7 +25,7 @@ import { PointDailyQuotaModel, PointRecordModel, BoardSettlementModel } from '..
 import {
   hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
   hasNotificationRecipientIndex, hasUniqueBoardSettlementIndex, hasBoardSettlementAdminReadIndex,
-  hasBoardTrustedAggregateIndex,
+  hasBoardTrustedAggregateIndex, hasUniqueNotificationDedupeIndex,
 } from '../src/utils/guard-index.js';
 
 before(async () => {
@@ -209,6 +209,55 @@ test('notifications：publishedAt 方向写成升序不算防线：列表口径�
 
 test('notifications：缺字段（没有 published）不算防线：草稿会混进结果集', () => {
   assert.equal(hasNotificationRecipientIndex([{ name: 'x', key: { userId: 1, publishedAt: -1 } }]), false);
+});
+
+/**
+ * 通知投递幂等键（notifications.dedupeKey，修复轮 1 / I-1）的唯一防线：{dedupeKey} unique +
+ * partialFilterExpression `{dedupeKey: {$type:'string'}}`。
+ * 正确性防线：榜单到账/撤回通知的「只发一次」全靠它——`createNotification` 撞 E11000 即视为
+ * 已投递（返回既有行）。字段是 `default: null`，所以**裸 sparse 不够**：sparse 只跳过"字段缺失"，
+ * 而本 schema 每条广播都显式写了 `dedupeKey: null`，null 仍会进索引 → 第二条广播就撞唯一键。
+ * partial `$type:'string'` 才是"只有带键的系统流水进索引"，广播行一律不被约束。
+ * 两侧都核对（同 pointrecords/pointdailyquotas 的教训）：删声明但 dev 库留着旧索引时库侧假绿。
+ */
+test('notifications 投递去重键：声明侧（unique + partial $type:string）与真实库侧都在', async () => {
+  const declared = NotificationModel.schema.indexes();
+  const hit = declared.find(([keys]) => Object.keys(keys).join(',') === 'dedupeKey');
+  assert.ok(hit, `schema 里没有 {dedupeKey:1} 的索引声明！现有声明：${JSON.stringify(declared.map(([k]) => k))}`);
+  const opts = hit![1] as { unique?: boolean; partialFilterExpression?: Record<string, unknown>; sparse?: boolean };
+  assert.equal(opts.unique, true, '去重键必须是 unique：普通索引拦不住并发重发');
+  assert.deepEqual(
+    opts.partialFilterExpression,
+    { dedupeKey: { $type: 'string' } },
+    'partial 必须只收 string：default:null 的广播行不能进唯一索引（裸 sparse 挡不住 null）',
+  );
+  await NotificationModel.createIndexes(); // 与 plugins/mongodb.ts 同款：显式等建完再核对形状
+  const idx = await NotificationModel.collection.indexes();
+  assert.ok(
+    hasUniqueNotificationDedupeIndex(idx),
+    `防线不在！现有索引：${JSON.stringify(idx.map((i) => ({ name: i.name, unique: i.unique, key: i.key, partial: i.partialFilterExpression, sparse: i.sparse })))}`,
+  );
+});
+
+test('notifications：普通索引（非 unique）不算去重防线：并发投递会各插一行', () => {
+  assert.equal(hasUniqueNotificationDedupeIndex([{ name: 'x', key: { dedupeKey: 1 } }]), false);
+});
+
+test('notifications：全量 unique（缺 partial）不算防线：两条不带键的广播会互相顶掉', () => {
+  assert.equal(hasUniqueNotificationDedupeIndex([{ name: 'x', key: { dedupeKey: 1 }, unique: true }]), false);
+});
+
+test('notifications：裸 sparse 不算防线：schema 默认写 null，null 仍进索引会撞键', () => {
+  assert.equal(hasUniqueNotificationDedupeIndex([{ name: 'x', key: { dedupeKey: 1 }, unique: true, sparse: true }]), false);
+});
+
+test('notifications：partial 写成 $exists 不算防线：null 也 exists，广播照样撞键', () => {
+  assert.equal(
+    hasUniqueNotificationDedupeIndex([{
+      name: 'x', key: { dedupeKey: 1 }, unique: true, partialFilterExpression: { dedupeKey: { $exists: true } },
+    }]),
+    false,
+  );
 });
 
 /**

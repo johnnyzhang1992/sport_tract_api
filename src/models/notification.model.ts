@@ -11,6 +11,12 @@ const notificationSchema = new Schema(
     publishedAt: { type: Number, default: null },
     /** 定向收件人（方案 A/D14：榜单结算等系统流水只发给赢家）；null/缺省＝全站广播 */
     userId: { type: Schema.Types.ObjectId, default: null },
+    /**
+     * 投递幂等键（修复轮 1 / I-1）：系统流水（榜单到账/撤回）一事件一键，
+     * `board:credit|revoke:{type}:{period}:{periodKey}:{userId}`。普通广播/公告不填（null）。
+     * 唯一性由下面的 partial unique 索引裁决：同键第二次 create 撞 E11000 ⇒ 视为「已经发过」。
+     */
+    dedupeKey: { type: String, default: null },
   },
   { timestamps: true, versionKey: false },
 );
@@ -19,6 +25,13 @@ notificationSchema.index({ published: 1, publishedAt: -1 });
 // 用户侧读路径：{published:true, $or:[{userId:null},{userId:me}]}（含游客 {userId:null}）
 // 每个 $or 分支都是 userId+published 等值前缀、publishedAt 倒序收尾；见 guard-index 自检。
 notificationSchema.index({ userId: 1, published: 1, publishedAt: -1 });
+// 投递幂等键：**只对带键的系统流水**唯一。不能用裸 sparse——字段 default:null，广播行
+// 显式写 null，sparse 只跳过「字段缺失」，null 照样进索引 ⇒ 第二条广播就撞键。
+// partial $type:'string' 让 null/缺省值完全不在索引里；guard-index 两侧自检钉住这个形状。
+notificationSchema.index(
+  { dedupeKey: 1 },
+  { unique: true, partialFilterExpression: { dedupeKey: { $type: 'string' } } },
+);
 
 export type Notification = mongoose.InferSchemaType<typeof notificationSchema>;
 export const NotificationModel = models.Notification ?? model('Notification', notificationSchema);

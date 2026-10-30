@@ -2,6 +2,7 @@
 type IndexShape = {
   name?: string;
   unique?: boolean;
+  sparse?: boolean;
   key?: Record<string, unknown>;
   partialFilterExpression?: Record<string, unknown>;
 };
@@ -96,6 +97,25 @@ export function hasNotificationRecipientIndex(indexes: IndexShape[]): boolean {
     const key = i.key ?? {};
     return Object.keys(key).join(',') === 'userId,published,publishedAt'
       && key.userId === 1 && key.published === 1 && key.publishedAt === -1;
+  });
+}
+
+/**
+ * 通知投递幂等键（notifications.dedupeKey，修复轮 1 / I-1）的唯一防线是否真在：
+ * `{dedupeKey:1}` unique + partialFilterExpression `{dedupeKey:{$type:'string'}}`。
+ * 正确性防线：榜单到账/撤回通知「只发一次」全靠它——createNotification 撞 E11000 即视为
+ * 已投递并返回既有行；删了它，崩溃后补投会把同一条通知重复插进用户消息中心（重复骚扰），
+ * 而且 send-then-stamp 的失败窗口从此无法靠重试收敛。
+ * **不能是裸 sparse**：字段声明是 `default: null`，每条广播都显式写 null，sparse 只跳过
+ * 「字段缺失」而 null 仍进索引——第二条广播就会撞唯一键。partial `$type:'string'` 才是
+ * 「只有带键的系统流水进索引」。partial 写成 $exists 同样不算（null 也 exists）。
+ * 认字段组合与键序（只有一列），不认名字（Mongoose 自动生成）。
+ */
+export function hasUniqueNotificationDedupeIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    const p = i.partialFilterExpression?.dedupeKey as { $type?: unknown } | undefined;
+    return Object.keys(key).join(',') === 'dedupeKey' && i.unique === true && p?.$type === 'string';
   });
 }
 

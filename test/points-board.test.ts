@@ -37,6 +37,8 @@ import {
   BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID,
   BOARD_SETTLEMENT_PERIODS,
   BOARD_SETTLEMENT_STATUSES,
+  isSettledMarker,
+  isThresholdSkip,
   type BoardSettlementPeriod,
 } from '../src/models/point.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
@@ -1107,6 +1109,10 @@ const WEEK_KEYS = [
   '2027-06-28', // U27：PB-F4-1 余额不足扣到 0
   '2027-07-05', // U28：PB-F4-2 余额 0 不落扣款流水
   '2027-07-12', // U29：PB-F4-3 余额充足保持原行为
+  '2027-07-19', // U30：NB-5 即时发送成功但盖戳丢失 → 补投按去重键不重发
+  '2027-07-26', // U31：NB-6 撤回即时通知盖戳丢失 → 补投按去重键不重发
+  '2027-08-02', // U32：PB-F3-3 11 人参与、撤回 TOP1 后门槛按原参与人数判
+  '2027-08-09', // U33：PB-F4-4 幂等重放返回当前余额（不是历史 balanceAfter）
 ] as const;
 const U_START = (key: string) => bjMid(Number(key.slice(0, 4)), Number(key.slice(5, 7)), Number(key.slice(8, 10)));
 const U_END = (key: string) => U_START(key) + 7 * DAY_MS;
@@ -1139,6 +1145,10 @@ const U26 = WEEK_KEYS[25]; const U26_START = U_START(U26); const U26_END = U_END
 const U27 = WEEK_KEYS[26]; const U27_START = U_START(U27); const U27_END = U_END(U27); const NOW27 = U27_END;
 const U28 = WEEK_KEYS[27]; const U28_START = U_START(U28); const U28_END = U_END(U28); const NOW28 = U28_END;
 const U29 = WEEK_KEYS[28]; const U29_START = U_START(U29); const U29_END = U_END(U29); const NOW29 = U29_END;
+const U30 = WEEK_KEYS[29]; const U30_START = U_START(U30); const U30_END = U_END(U30); const NOW30 = U30_END;
+const U31 = WEEK_KEYS[30]; const U31_START = U_START(U31); const U31_END = U_END(U31); const NOW31 = U31_END;
+const U32 = WEEK_KEYS[31]; const U32_START = U_START(U32); const U32_END = U_END(U32); const NOW32 = U32_END;
+const U33 = WEEK_KEYS[32]; const U33_START = U_START(U33); const U33_END = U_END(U33); const NOW33 = U33_END;
 /** 月/年单元：SP-5 滞后闸门（2026-12 的结算界是 2027-01-01）与 SP-7 年榜 500 分。
  *  年榜夹具用 2027 年——2026/更早年份的窗口里有真实用户数据，绝不当结算对象。 */
 const M_DEC = '2026-12';
@@ -2401,4 +2411,147 @@ test('PB-F4-3 余额充足：扣满应扣、shortfall 0，通知与 §4.8 定稿
     '「骑行·周榜」第 1 名奖励 +50 积分已撤回 −50 积分（2027/07/12 至 2027/07/18 这一周）。原因：复核刷量',
     'shortfall=0 时必须是 §4.8 原句，不许带任何新增子句',
   );
+});
+
+/* ====================================================================
+ * 修复轮 1（评审 I-1 / I-2 + F4 minors）：通知投递改幂等去重键、
+ * 门槛按当期参与人数判、台账 DTO 下发坏账差额。
+ * ================================================================== */
+
+test('NB-5（I-1a）即时发送成功但盖戳丢失：补投按去重键识别已发送，仍恰好一条', async () => {
+  const cyc = await seedBoard('cycling', U30_START, [3100, 3050, 3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200, 2100]);
+  const r = await settlePeriod('week', U30, U30_END, NOW30);
+  assert.equal(r.credited, 3);
+  const top = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U30, userId: cyc[0],
+  }).lean();
+  assert.ok(Number(top?.notifiedAt) > 0, '夹具自证：即时发送成功并盖了戳');
+  assert.equal(await NotificationModel.countDocuments({ userId: cyc[0], title: '榜单积分奖励到账' }), 1);
+
+  // 模拟「发送成功、盖章写失败 / 进程崩在盖章之前」：把戳退回 null（通知行不动）
+  await BoardSettlementModel.updateOne({ _id: top!._id }, { $set: { notifiedAt: null } });
+  const before = await NotificationModel.find({ userId: cyc[0] }).lean();
+  assert.equal(before.length, 1);
+  assert.equal(
+    before[0].dedupeKey,
+    `board:credit:cycling:week:${U30}:${cyc[0]}`,
+    '即时发送必须带幂等去重键（补投靠它识别「已经发过」）',
+  );
+
+  // 补投重试：createNotification 撞 dedupeKey 唯一键 ⇒ 视为已发送，不再插第二条
+  await deliverPendingBoardNotifications(20, NOW30 + 60_000);
+  assert.equal(
+    await NotificationModel.countDocuments({ userId: cyc[0], title: '榜单积分奖励到账' }),
+    1,
+    '盖戳丢失后补投必须靠去重键识别，绝不能重复发送',
+  );
+  const fresh = await BoardSettlementModel.findOne({ _id: top!._id }).lean();
+  assert.ok(Number(fresh?.notifiedAt) > 0, '重复识别成功后要把迟到的戳补上');
+});
+
+test('NB-6（I-1a 撤回侧）撤回即时通知盖戳丢失：补投按去重键不重发', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U31, now: NOW31 - 3600_000 });
+  const res = await revokeBoardSettlement(String(rowId), { note: '复核：补位验证' }, { now: NOW31 });
+  assert.equal(res.status, 'revoked');
+  assert.equal(await NotificationModel.countDocuments({ userId: u, title: '榜单积分奖励调整' }), 1);
+  const notes = await NotificationModel.find({ userId: u }).lean();
+  assert.equal(notes[0].dedupeKey, `board:revoke:cycling:week:${U31}:${u}`, '撤回即时通知也要带去重键');
+
+  // 盖戳丢失（revokeNotifiedAt 退回 null）→ 补投只允许「识别为已发送」，不许第二条
+  await BoardSettlementModel.updateOne({ _id: rowId }, { $set: { revokeNotifiedAt: null } });
+  await deliverPendingBoardNotifications(20, NOW31 + 60_000);
+  assert.equal(
+    await NotificationModel.countDocuments({ userId: u, title: '榜单积分奖励调整' }),
+    1,
+    '撤回通知盖戳丢失后补投必须靠去重键幂等',
+  );
+  const fresh = await BoardSettlementModel.findById(rowId).lean();
+  assert.ok(Number(fresh?.revokeNotifiedAt) > 0, '补投命中重复键后补盖戳');
+});
+
+test('PB-F3-3（I-2）11 人参与、撤回 TOP1 后门槛仍按当期参与人数判：第 4 名补位到第 3 名', async () => {
+  // 11 人参与（> 10）。撤回 1 人后名单只剩 10 人——门槛是当期参与事实，不因事后除名而失效，
+  // 所以这一榜必须照常发：第 4 名补到第 3 名拿 20 分，而不是被判「门槛未过」整榜不发。
+  const cyc = await seedBoard('cycling', U32_START, [3100, 3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200, 2100]);
+  assert.equal(cyc.length, 11);
+  const first = await settlePeriod('week', U32, U32_END, NOW32);
+  assert.equal(first.credited, 3, '11 人过门槛，TOP3 首轮发放');
+
+  const top = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U32, userId: cyc[0],
+  }).lean();
+  const revoked = await revokeBoardSettlement(String(top!._id), { note: '复核：TOP1 刷量' }, {
+    now: NOW32 + 60_000,
+    adminId: 'admin-i2',
+  });
+  assert.equal(revoked.status, 'revoked');
+  assert.deepEqual(
+    revoked.promoted.map((p) => `${p.userId}#r${p.rank}/${p.points}`),
+    [`${cyc[3]}#r3/20`],
+    '第 4 名（2800）补位到第 3 名：剩余 10 人名单里 rank=3、20 分',
+  );
+  assert.equal(await getBalance(String(cyc[3]), NOW32 + 120_000), 20);
+  const led4 = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U32, userId: cyc[3],
+  }).lean();
+  assert.equal(led4?.status, 'credited');
+  assert.equal(led4?.rank, 3);
+  assert.equal(led4?.points, 20);
+  assert.equal(
+    await PointRecordModel.countDocuments({ userId: cyc[3], type: 'board_reward', refId: `cycling:week:${U32}` }),
+    1,
+    '补位只能有一条发放流水',
+  );
+  assert.equal(
+    await NotificationModel.countDocuments({ userId: cyc[3], title: '榜单积分奖励到账' }),
+    1,
+    '补位到账通知恰好一条',
+  );
+
+  // 榜级标记是「已完成结算」，不是「门槛未过」——后者正是本次要修的错判
+  const marker = await BoardSettlementModel.findOne({
+    type: 'cycling', period: 'week', periodKey: U32, userId: BOARD_SETTLEMENT_BOARD_LEVEL_USER_ID,
+  }).lean();
+  assert.ok(marker, '过门槛并落定的榜要留完成标记');
+  assert.equal(isSettledMarker(marker), true, `标记必须是「已完成结算」，实际 reason=${marker?.reason}`);
+  assert.equal(isThresholdSkip(marker), false, '11 人参与不许因为撤回后剩 10 人而被判「门槛未过」');
+  assert.equal(
+    await BoardSettlementModel.countDocuments({ type: 'cycling', period: 'week', periodKey: U32, status: 'skipped' }),
+    1,
+    '这一榜只允许一条整榜级标记（完成标记），没有门槛占位',
+  );
+
+  // 每人 3 榜上限把 revoked 行也算一个名额：被撤者的榜只计一次，补位者没有多拿榜
+  await assertPerUserBoardCap('week', U32);
+  assert.equal(
+    await BoardSettlementModel.countDocuments({
+      type: 'cycling', period: 'week', periodKey: U32, userId: cyc[0], status: 'revoked',
+    }),
+    1,
+    '被撤者的台账行保持一条 revoked（占位只计一次）',
+  );
+});
+
+test('PB-F4-4（F4 minor）幂等重放返回当前余额，而不是那笔历史流水的 balanceAfter', async () => {
+  const u = mkUser();
+  const { rowId } = await seedCreditedPayout({ userId: u, periodKey: U33, now: NOW33 });
+  const idemKey = `${u}:board_rollback:cycling:week:${U33}`;
+  // 模拟上一次撤回：钱已扣（余额 0）、台账还没翻牌就崩了
+  await debitPoints(String(u), {
+    type: 'board_reward_rollback', title: '模拟崩溃前的撤回扣款', points: 50, bizDate: bjDateStr(NOW33),
+    refType: 'board', refId: `cycling:week:${U33}`, idemKey,
+  }, NOW33);
+  assert.equal(await getBalance(String(u), NOW33), 0, '夹具自证：上一枪已把余额扣到 0');
+  // 之后用户又挣了 30：当前余额 30，与那笔旧流水的 balanceAfter=0 不同
+  await creditPoints(String(u), {
+    type: 'signin', title: '夹具补分', points: 30, bizDate: bjDateStr(NOW33),
+    refType: 'signin', refId: 'fixture', idemKey: `${u}:signin:fixture`,
+  }, NOW33);
+  assert.equal(await getBalance(String(u), NOW33), 30, '夹具自证：当前余额 30');
+
+  const res = await revokeBoardSettlement(String(rowId), { note: '重放核对' }, { now: NOW33 + 1000 });
+  assert.equal(res.deducted, 50, '重放沿用既有反向流水的实际扣减额，不双扣');
+  assert.equal(res.shortfall, 0);
+  assert.equal(res.balance, 30, '重放分支必须返回**当前**余额，不是旧流水的 balanceAfter(0)');
 });

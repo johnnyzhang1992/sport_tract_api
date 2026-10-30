@@ -243,15 +243,42 @@ export async function adminListNotifications(): Promise<AdminNotification[]> {
   return rows.map((r) => toAdminNotification(r as never));
 }
 
-export async function createNotification(input: NotificationInput): Promise<AdminNotification> {
+/** dedupeKey 撞唯一索引？（只认 dedupeKey 这一列，别的唯一键冲突照抛） */
+function isDedupeKeyDuplicate(e: unknown): boolean {
+  const err = e as { code?: number; keyPattern?: Record<string, unknown>; keyValue?: Record<string, unknown> };
+  if (err?.code !== 11000) return false;
+  return Boolean(err.keyPattern?.dedupeKey) || Boolean(err.keyValue?.dedupeKey);
+}
+
+/**
+ * 创建通知。第二个参数 `dedupeKey`（可选，仅系统流水用）是**投递幂等键**：
+ * 同键第二次创建撞 notifications 的 partial unique 索引（`{dedupeKey}` + `$type:'string'`），
+ * 这里视为「已经发过」，返回既有行而不是抛错——崩溃/重试/并发补投因此天然收敛到一条。
+ * 不带键（普通广播/公告）完全不受约束；`dedupeKey` 不进 NotificationInput，后台接口无法设置。
+ */
+export async function createNotification(
+  input: NotificationInput,
+  dedupeKey?: string,
+): Promise<AdminNotification> {
   const data = validateInput(input, { partial: false });
   const published = Boolean(data.published);
-  const doc = await NotificationModel.create({
-    ...data,
-    published,
-    publishedAt: published ? Date.now() : null,
-  });
-  return toAdminNotification(doc.toObject() as never);
+  const key = typeof dedupeKey === 'string' && dedupeKey.trim() ? dedupeKey.trim() : null;
+  try {
+    const doc = await NotificationModel.create({
+      ...data,
+      published,
+      publishedAt: published ? Date.now() : null,
+      dedupeKey: key,
+    });
+    return toAdminNotification(doc.toObject() as never);
+  } catch (e) {
+    if (key && isDedupeKeyDuplicate(e)) {
+      const existing = await NotificationModel.findOne({ dedupeKey: key }).lean();
+      // 竞态窗口里对手刚插完又删掉的极端情况：没有既有行就把原错误照抛，别静默吞掉
+      if (existing) return toAdminNotification(existing as never);
+    }
+    throw e;
+  }
 }
 
 /**
