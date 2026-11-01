@@ -96,7 +96,12 @@ test('EN-3 空批次/已过期/剩余 0 都不出话', () => {
 test('SP-1 分母是全部注册用户，没签过到的人算 0 天', () => {
   // 12 人里只有 3 人链还活着（9/6/6），其余 9 人都是 0 天
   assert.equal(streakPercentile({ totalUsers: 12, activeStreaks: [9, 6, 6], mine: 6 }), 75);
-  assert.equal(streakPercentile({ totalUsers: 12, activeStreaks: [9, 6, 6], mine: 9 }), 91, '向下取整，91.6 → 91');
+  assert.equal(streakPercentile({ totalUsers: 12, activeStreaks: [9, 6, 6], mine: 9 }), 91.67,
+    '小数点后两位（2026-10-29 用户拍板）：11/12 = 91.6667 → 91.67');
+  // 近满值两位化：643/644 = 99.8447 → 99.84
+  assert.equal(streakPercentile({ totalUsers: 644, activeStreaks: [9], mine: 9 }), 99.84);
+  // 四舍五入到 100.00 会变成「超过全部用户」的假话 → 钳 99.99（19999/20000 = 99.995）
+  assert.equal(streakPercentile({ totalUsers: 20000, activeStreaks: [7], mine: 7 }), 99.99);
   // 1 天与 6 天同为 75%：中间没人连签 1~5 天，被超过的只有那 9 个 0 天的人
   assert.equal(streakPercentile({ totalUsers: 12, activeStreaks: [9, 6, 6], mine: 1 }), 75);
   assert.equal(streakPercentile({ totalUsers: 12, activeStreaks: [9, 6, 6, 2], mine: 6 }), 75,

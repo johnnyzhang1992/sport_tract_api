@@ -16,6 +16,14 @@ import {
   reprocessActivity,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
+import {
+  assertExportRate,
+  contentDisposition,
+  exportGpxZip,
+  exportStamp,
+  exportSummaryCsv,
+  EXPORT_CSV_MAX_ROWS,
+} from '../services/export.js';
 import { ActivityModel } from '../models/activity.model.js';
 import { deleteOssObjects, getSignedUrl, getThumbUrl } from '../services/oss.js';
 import { importActivity } from '../services/import.js';
@@ -175,6 +183,41 @@ export async function activityRoutes(fastify: FastifyInstance) {
     reply.header('Content-Type', 'application/gpx+xml; charset=utf-8');
     reply.header('Content-Disposition', `attachment; filename="activity-${id}.gpx"`);
     return toGpx(activity);
+  });
+
+  // 批量导出汇总 CSV（本人已完成活动：昵称/类型/起止时间/三类时长/距离/点数；不含坐标明细与照片）
+  fastify.get('/export/summary', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const q = request.query as { type?: string; from?: string; to?: string };
+    assertExportRate(`summary:${request.user.userId}`);
+    const stream = await exportSummaryCsv({
+      userId: String(request.user.userId),
+      status: 'finished', // 用户端固定只导已完成（与列表口径一致）
+      type: q.type || undefined,
+      from: q.from ? Number(q.from) : undefined,
+      to: q.to ? Number(q.to) : undefined,
+      cap: EXPORT_CSV_MAX_ROWS,
+    });
+    reply.header('Content-Type', 'text/csv; charset=utf-8');
+    reply.header('Content-Disposition', contentDisposition(`activity-summary-${exportStamp()}.csv`, `运动记录_${exportStamp()}.csv`));
+    reply.send(stream);
+    return reply;
+  });
+
+  // 批量导出 GPX zip（ids 或时间范围二选一；与单条导出同一份 toGpx 口径：WGS-84 + 打点航点）
+  fastify.get('/export/gpx', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const q = request.query as { ids?: string; from?: string; to?: string };
+    assertExportRate(`gpx:${request.user.userId}`);
+    const { archive, done } = await exportGpxZip({
+      userId: String(request.user.userId),
+      ids: q.ids ? q.ids.split(',') : undefined,
+      from: q.from ? Number(q.from) : undefined,
+      to: q.to ? Number(q.to) : undefined,
+    });
+    reply.header('Content-Type', 'application/zip');
+    reply.header('Content-Disposition', contentDisposition(`track-export-${exportStamp()}.zip`, `轨迹导出_${exportStamp()}.zip`));
+    reply.send(archive);
+    await done; // 打包完成后才落 handler：流中途出错交给 Fastify 断连，结束前的校验已全部前置
+    return reply;
   });
 
   // 重新纠偏（事后清洗历史轨迹）

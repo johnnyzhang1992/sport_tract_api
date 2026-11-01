@@ -5,7 +5,7 @@ import { config } from '../src/config/index.js';
 import { POINTS } from '../src/config/points.js';
 import {
   PointAccountModel, PointCardModel, PointDailyModel, PointDailyQuotaModel, PointExchangeModel,
-  PointItemModel, PointLotModel, PointOrderModel, PointRecordModel,
+  PointItemModel, PointLotModel, PointRecordModel,
 } from '../src/models/point.model.js';
 import { creditPoints, debitPoints, getBalance } from '../src/services/points-ledger.js';
 import { seedPointItems } from '../src/services/points-catalog.js';
@@ -29,7 +29,6 @@ function newUser(): Types.ObjectId {
 const wipe = (u: Types.ObjectId) => Promise.all([
   PointExchangeModel.deleteMany({ userId: u }),
   PointCardModel.deleteMany({ userId: u }),
-  PointOrderModel.deleteMany({ userId: u }),
   PointRecordModel.deleteMany({ userId: u }),
   PointAccountModel.deleteMany({ userId: u }),
   PointLotModel.deleteMany({ userId: u }),
@@ -152,9 +151,6 @@ test('PI1 按目录实时价兑换一张卡，30 天有效，兑换记录可查'
       '兑换后不退积分',
     ],
     effect: { kind: 'makeup', days: 0 },
-    // 实物批次新增的三字段：补签卡是虚拟道具、不限购、无详情图，端上 DTO 必须照样带上
-    kind: 'virtual',
-    detailImages: [],
     perUserLimit: 0,
     // 2026-10-28 每日投放批次新增的三字段：未配置时 0＝不限，不限时 todayLeft 必须下发 null
     dailyQuota: 0,
@@ -850,38 +846,6 @@ test('DQ-7 限购闸门在每日额度之前：超限报「每人限兑」，不
     return true;
   });
   assert.equal((await quotaRow(key, '', now))?.count, 1, '被限购挡下的那次没进额度闸门');
-});
-
-test('DQ-8 实物链共用同一闸门：超限文案一致，扣分失败回补，两人各占其行', async (t) => {
-  const a = newUser();
-  const poor = newUser();
-  const b = newUser();
-  const key = await tempItem({ kind: 'physical', dailyQuota: 2, perUserDaily: 1, unlimited: true });
-  t.after(() => dropTemp(key, a, poor, b));
-  await seedPoints(a, 200);
-  await seedPoints(poor, 100);
-  await seedPoints(b, 200);
-  const now = Date.now();
-  const address = { receiver: '张三', phone: '13800138000', detail: '浙江省杭州市西湖区测试路 100 号' };
-
-  const r = await exchangeItem(String(a), key, 'req-dq8-a', now, address);
-  assert.ok(r.orderId, '实物落订单');
-  assert.equal(await PointCardModel.countDocuments({ itemKey: key }), 0, '实物不发卡（互斥链照旧）');
-  assert.equal((await quotaRow(key, '', now))?.count, 1);
-
-  await assert.rejects(exchangeItem(String(poor), key, 'req-dq8-poor', now, address), /积分不足/);
-  assert.equal((await quotaRow(key, '', now))?.count, 1, 'poor 抢到的总量行已回补');
-  assert.equal((await quotaRow(key, String(poor), now))?.count, 0, 'poor 的个人行也回补');
-
-  await exchangeItem(String(b), key, 'req-dq8-b', now, address);
-  assert.equal((await quotaRow(key, '', now))?.count, 2);
-  // a 第二次：个人满 1、总量也满 2 → 逐字总量文案（与虚拟链同一口径）
-  await assert.rejects(exchangeItem(String(a), key, 'req-dq8-a2', now, address), (e: unknown) => {
-    const err = e as AppError;
-    assert.equal(err.statusCode, 400);
-    assert.match(err.message, /今日 2 张已兑完（每人每日限 1 张），明日 00:00 刷新/);
-    return true;
-  });
 });
 
 /**

@@ -132,7 +132,12 @@ test('CAL-2 可补只出现在窗口内；历史月份漏签日一律 missed', a
   const old = data<Calendar>(await getCal(LAST_MONTH));
   const lastDim = new Date(Number(LAST_MONTH.slice(0, 4)), Number(LAST_MONTH.slice(5, 7)), 0).getDate();
   assert.equal(old.days.length, lastDim + 12, '历史月同样带前后各 6 天补位');
-  assert.equal(old.days.some((d) => d.state === 'makeup'), false, '历史月份不得出现可补格');
+  // 可补窗口是滚动的 [今天-6, 昨天]：每月头 6 天窗口会跨进上一月，历史月视图里落在窗口内的
+  // 漏签日照样可补（服务端判据只认窗口，端上七格/月历同口径）。断言按窗口收口，
+  // 不能写死「历史月一律无可补格」——那种说法只在每月 7 号之后成立
+  const winLeft = shiftDateKey(TODAY, -6);
+  const stray = old.days.filter((d) => d.state === 'makeup' && (d.dateKey < winLeft || d.dateKey >= TODAY));
+  assert.equal(stray.length, 0, `历史月视图里的可补格也必须落在窗口内：${stray.map((d) => d.dateKey).join(',')}`);
   assert.equal(byKey(old, OLD_MISSED)!.state, 'missed', '窗口外的漏签日是 missed：端上点了由补签接口回 400，判据不能错标');
 });
 

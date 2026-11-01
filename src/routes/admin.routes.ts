@@ -23,6 +23,12 @@ import {
 import { autoFinishStaleActivities, toActivityDto, reprocessActivity } from '../services/activity.js';
 import { purgeCancelledActivities } from '../services/cancelled-purge.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
+import {
+  contentDisposition,
+  exportStamp,
+  exportSummaryCsv,
+  EXPORT_CSV_MAX_ROWS_ADMIN,
+} from '../services/export.js';
 import { adminListCampaigns, adminGetCampaign, adminMemberActivities } from '../services/campaign.js';
 import {
   adminListTopics,
@@ -51,7 +57,6 @@ import {
   listIssuances,
   type GrantInput,
 } from '../services/points-grant.js';
-import { listOrders, shipOrder, completeOrder } from '../services/points-orders.js';
 import {
   listBoardSettlements,
   revokeBoardSettlement,
@@ -1010,6 +1015,26 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
+  // 导出活动汇总 CSV（跨用户逐行昵称；默认 finished，status=all 含进行中/已取消的全部状态）
+  // 参数口径与上面 /activities 列表一致：userId / type / startTimeFrom / startTimeTo（ms）
+  fastify.get('/activities/export/summary', { onRequest: [adminAuth] }, async (request, reply) => {
+    const q = request.query as {
+      userId?: string; type?: string; status?: string; startTimeFrom?: string; startTimeTo?: string;
+    };
+    const stream = await exportSummaryCsv({
+      userId: q.userId?.trim() || undefined,
+      type: q.type || undefined,
+      status: q.status === 'all' ? undefined : 'finished',
+      from: q.startTimeFrom ? Number(q.startTimeFrom) : undefined,
+      to: q.startTimeTo ? Number(q.startTimeTo) : undefined,
+      cap: EXPORT_CSV_MAX_ROWS_ADMIN,
+    });
+    reply.header('Content-Type', 'text/csv; charset=utf-8');
+    reply.header('Content-Disposition', contentDisposition(`activity-summary-${exportStamp()}.csv`, `活动汇总_${exportStamp()}.csv`));
+    reply.send(stream);
+    return reply;
+  });
+
   // 足迹数据概况：today/week/month/year/all 五档一次给全（前端切档不再请求）
   // 时间一律按「记录创建时间 createdAt」——到访日期是用户手填的，可以填三年前，讲不清「这段时间进了多少数据」
   // 传 userId 则收口到单个用户（用户详情页的个人足迹概况用），不传是全站
@@ -1651,33 +1676,6 @@ export async function adminRoutes(fastify: FastifyInstance) {
       page: Math.max(1, Number(q.page) || 1),
       pageSize: Number(q.pageSize) || 20,
     }));
-  });
-
-  // ==================== 积分管理 · 实物订单（列表 / 发货 / 代确认） ====================
-  // 状态机 pending_ship → shipped → completed；列表只下发打码手机号（完整号码不出后台列表）。
-
-  // 订单列表：status 筛 + keyword 搜持单人昵称/UID，newest first，pageSize 上限 100
-  fastify.get('/points/orders', { onRequest: [adminAuth] }, async (request) => {
-    const q = request.query as { status?: string; keyword?: string; page?: string; pageSize?: string };
-    return success(await listOrders({
-      status: q.status,
-      keyword: q.keyword,
-      page: q.page,
-      pageSize: q.pageSize,
-    }));
-  });
-
-  // 发货：快递公司 + 单号，只允许 pending_ship → shipped；重复发货 400 点名当前状态
-  fastify.patch('/points/orders/:id/ship', { onRequest: [adminAuth] }, async (request) => {
-    const { id } = request.params as { id: string };
-    const b = (request.body ?? {}) as { trackingCompany?: string; trackingNo?: string };
-    return success(await shipOrder(id, b, adminIdOf(request)));
-  });
-
-  // 代确认收货：只允许 shipped → completed（用户忘了点确认时由客服代收）
-  fastify.patch('/points/orders/:id/complete', { onRequest: [adminAuth] }, async (request) => {
-    const { id } = request.params as { id: string };
-    return success(await completeOrder(id, adminIdOf(request)));
   });
 
   // ==================== 积分管理 · 概况与双趋势 ====================

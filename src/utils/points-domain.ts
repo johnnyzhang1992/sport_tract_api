@@ -50,6 +50,8 @@ export function expiringNotice(
  * 当前连签天数在全库注册用户里的百分位（「超过 X% 用户」）。
  * 活跃链之外的人有效连签天然是 0：所以 mine=0 时没人被超过，返回 0 而不是「所有零天的人」。
  * 并列不算被超过。脏行（活跃链比注册数还多，例如签到行对应的用户已删）钳到 0，不出负数。
+ * 精度：四舍五入到小数点后两位（2026-10-29 用户拍板，91.6667 → 91.67）；并钳 99.99——
+ * 分母含本人，本就不可能真超过 100%，四舍五入出 100.00 会变成「超过全部用户」的假话。
  */
 export function streakPercentile(opts: {
   totalUsers: number; activeStreaks: number[]; mine: number;
@@ -58,5 +60,5 @@ export function streakPercentile(opts: {
   if (totalUsers <= 0 || mine <= 0) return 0;
   const below = (totalUsers - activeStreaks.length) + activeStreaks.filter((s) => s < mine).length;
   const clamped = Math.min(Math.max(below, 0), totalUsers);
-  return Math.floor((clamped * 100) / totalUsers);
+  return Math.min(Math.round((clamped * 10000) / totalUsers) / 100, 99.99);
 }

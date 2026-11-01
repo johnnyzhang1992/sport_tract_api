@@ -22,34 +22,28 @@ import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import {
   ITEM_EFFECT_KINDS,
-  ITEM_KINDS,
   PointCardModel,
   PointExchangeModel,
   PointItemModel,
   type ItemEffectKind,
-  type ItemKind,
 } from '../models/point.model.js';
-import { getSignedUrl, getThumbUrl } from './oss.js';
+import { getSignedUrl } from './oss.js';
 import type { ItemDoc } from './points-catalog.js';
 
 export const ITEM_KEY_RE = /^[a-z][a-z0-9_]{1,39}$/;
 const DUPLICATE_KEY = 11000;
 
-/** 实物详情图上限：schema 的 [String] 拦不住条数，条数与文案都归 assertItemInput */
-export const DETAIL_IMAGE_MAX = 6;
 /** 每人限购上限：0 = 不限，其余取 1–99（整数与范围都在 assertItemInput 校验，schema 只兜负数） */
 export const PER_USER_LIMIT_MAX = 99;
 
 /**
- * PUT /points/items/:id 拥有的内容字段：十三个全部必传，缺哪个就 400 点名哪个。
+ * PUT /points/items/:id 拥有的内容字段：全部必传，缺哪个就 400 点名哪个。
  * stock / unlimited 故意不在这张单子上——它们是 PATCH /points/items/:id/stock 的独占字段，
  * PUT 无论带不带都不写，免得「可选 + 默认值」把售罄的道具悄悄复活成 9999。
- * kind / detailImages / perUserLimit 是实物批次加进来的三项：管理端表单必须一起提交，
- * 实物默认限购 1 只属于「新建」，改档缺字段一律 400 而不是猜默认值。
  */
 export const ITEM_CONTENT_FIELDS = [
   'name', 'subtitle', 'description', 'notes', 'price', 'validDays', 'effect', 'active', 'sortOrder', 'image',
-  'kind', 'detailImages', 'perUserLimit',
+  'perUserLimit',
 ] as const;
 export type ItemContentField = typeof ITEM_CONTENT_FIELDS[number];
 
@@ -63,10 +57,6 @@ export interface ItemInput {
   price: number;
   validDays: number;
   effect: { kind: ItemEffectKind; days: number };
-  /** virtual（默认）/ physical；实物可省略 perUserLimit（新建落 1） */
-  kind?: ItemKind;
-  /** 实物详情图裸链，最多 DETAIL_IMAGE_MAX 张 */
-  detailImages?: string[];
   /** 0 = 不限购 */
   perUserLimit?: number;
   stock?: number;
@@ -107,11 +97,6 @@ export interface AdminItemRow {
   price: number;
   validDays: number;
   effect: { kind: ItemEffectKind; days: number };
-  kind: ItemKind;
-  /** 入库裸链（回填写回它）；端上下发的是逐张签名后的缩略链 */
-  detailImages: string[];
-  /** 与 detailImages 一一对应的签名缩略链：后台表单只认这个，裸链进 `<img>` 会 403 */
-  detailPreviewUrls: string[];
   /** 0 = 不限购 */
   perUserLimit: number;
   /** 每日投放：0 = 不限（Task 11 后台表单的投放档位） */
@@ -193,12 +178,6 @@ export function assertItemInput(input: ItemInput): void {
   if (name.length > 20) throw new AppError(400, `道具名称最多 20 字（当前 ${name.length} 字）`);
   if (!(input.price >= 1)) throw new AppError(400, `兑换价至少 1 分（收到 ${input.price}）`);
   if (!(input.validDays >= 1)) throw new AppError(400, `卡有效期至少 1 天（收到 ${input.validDays}）`);
-  // kind 与 effect.kind 同理：enum 只写在 schema 里，放行到落库就是 ValidationError → 500。
-  // 省略/ null 走 schema 默认 virtual（只有新建会省略；PUT 由 assertItemContent 先拦住缺字段）。
-  const rawKind = (input as { kind?: unknown }).kind;
-  if (rawKind !== undefined && rawKind !== null && !ITEM_KINDS.includes(rawKind as ItemKind)) {
-    throw new AppError(400, `道具类型只能是 ${ITEM_KINDS.join(' 或 ')}（收到「${shown(rawKind)}」）`);
-  }
   const effect = input.effect as { kind?: unknown; days?: unknown } | null | undefined;
   if (!effect || typeof effect !== 'object') {
     throw new AppError(400, `道具效果必须提供 effect 对象，kind 只能是 ${ITEM_EFFECT_KINDS.join(' 或 ')}（收到「${shown(input.effect)}」）`);
@@ -225,14 +204,6 @@ export function assertItemInput(input: ItemInput): void {
   }
   const notes = Array.isArray(rawNotes) ? rawNotes : [];
   if (notes.length > 8) throw new AppError(400, `兑换说明最多 8 条（当前 ${notes.length} 条）`);
-  // detailImages：同 notes，非数组会先在 normalize 的 .map 上 TypeError（500）；条数上限 schema 表达不了
-  const rawImages = (input as { detailImages?: unknown }).detailImages;
-  if (rawImages !== undefined && rawImages !== null && !Array.isArray(rawImages)) {
-    throw new AppError(400, `商品详情图必须是字符串数组，最多 ${DETAIL_IMAGE_MAX} 张（收到「${shown(rawImages)}」）`);
-  }
-  if (Array.isArray(rawImages) && rawImages.length > DETAIL_IMAGE_MAX) {
-    throw new AppError(400, `商品详情图最多 ${DETAIL_IMAGE_MAX} 张（当前 ${rawImages.length} 张）`);
-  }
   // perUserLimit：0 = 不限；其余只收 1–99 的整数（'abc' → NaN、1.5、100 都要在这道闸门拦下，
   // 否则负数落库是 schema ValidationError → 500，小数/超上限则静默存成没有意义的值）。
   // '' 单独判掉：Number('')===0 会被当成「不限」，后台输入框清空就等于静默放开限购。
@@ -281,7 +252,6 @@ export function assertItemContent(input: ItemInput): void {
 /** 入参 → 落库文档：trim/Number/Boolean 归一，可选字段取目录默认口径（只有新建走这里，更新用 normalizeContent） */
 function normalize(input: ItemInput): Omit<ItemDoc, '_id' | 'createdAt' | 'updatedAt'> {
   const effect = input.effect;
-  const kind = (input.kind ?? 'virtual') as ItemKind;
   return {
     key: String(input.key).trim(),
     name: String(input.name).trim(),
@@ -290,7 +260,6 @@ function normalize(input: ItemInput): Omit<ItemDoc, '_id' | 'createdAt' | 'updat
     notes: (input.notes ?? []).map((n) => String(n)),
     price: Number(input.price),
     validDays: Number(input.validDays),
-    kind,
     effect: { kind: effect.kind, days: Number(effect.days ?? 0) },
     // 四个字段 assertItemInput 已收成「有限整数 / 真布尔」，这里只做缺省回填：
     // null 与 undefined 同义（都是没表态，走目录默认），不能再 Boolean()/Number() 硬转 ——
@@ -300,11 +269,8 @@ function normalize(input: ItemInput): Omit<ItemDoc, '_id' | 'createdAt' | 'updat
     active: input.active ?? true,
     sortOrder: input.sortOrder ?? 0,
     image: String(input.image ?? '').trim(),
-    detailImages: (input.detailImages ?? []).map((u) => String(u)),
-    // 实物「没表态」→ 每人限购 1；虚拟默认 0（不限）。显式 0 是后台明确选的「不限」，不许被覆盖
-    perUserLimit: input.perUserLimit == null
-      ? (kind === 'physical' ? 1 : 0)
-      : Number(input.perUserLimit),
+    // 每人限购「没表态」默认 0（不限）。显式 0 是后台明确选的「不限」，不许被覆盖
+    perUserLimit: input.perUserLimit == null ? 0 : Number(input.perUserLimit),
     // 每日投放两字段：新建一律 0＝不限——它们是 PATCH /stock 的独占字段（裁定 2），
     // ItemInput 根本不收这两个键，这里只是把落库文档补全（schema 默认同为 0）
     dailyQuota: 0,
@@ -312,7 +278,7 @@ function normalize(input: ItemInput): Omit<ItemDoc, '_id' | 'createdAt' | 'updat
   };
 }
 
-/** PUT 落库的那一份：就是 ITEM_CONTENT_FIELDS 那十三个字段（key/stock/unlimited 一个都不在里面） */
+/** PUT 落库的那一份：就是 ITEM_CONTENT_FIELDS 那些内容字段（key/stock/unlimited 一个都不在里面） */
 type ItemContentPatch = Pick<ItemDoc, ItemContentField>;
 
 /** 入参 → PUT 的 $set 文档：只做归一，不补默认值（字段齐不齐由 assertItemContent 决定） */
@@ -329,25 +295,16 @@ function normalizeContent(input: ItemInput): ItemContentPatch {
     active: Boolean(input.active),
     sortOrder: Number(input.sortOrder),
     image: String(input.image).trim(),
-    kind: input.kind!,
-    detailImages: input.detailImages!.map((u) => String(u)),
     perUserLimit: Number(input.perUserLimit),
   };
 }
 
-/** 详情图逐张签发缩略链（顺序与裸链数组一一对应，表单按下标取预览） */
-const detailPreviewsOf = (urls: string[]): string[] => urls.map((u) => getThumbUrl(String(u)))
-
 function toSavedRow(r: ItemDoc): SavedItemRow {
   const { _id, createdAt: _c, updatedAt: _u, ...rest } = r as ItemDoc & Record<string, unknown>;
   const image = String(rest.image ?? '');
-  const detailImages = (rest.detailImages ?? []) as string[];
   return {
     ...rest,
-    // 老行物理上没有这三个字段：回执按默认口径补齐，调用方不必再判 undefined
-    kind: (rest.kind ?? 'virtual') as ItemKind,
-    detailImages,
-    detailPreviewUrls: detailPreviewsOf(detailImages),
+    // 老行物理上没有这个字段：回执按默认口径补齐，调用方不必再判 undefined
     perUserLimit: Number(rest.perUserLimit ?? 0),
     // 每日投放两字段同款兜底：PATCH /stock 改完的回执/读回不能是 undefined
     dailyQuota: Number(rest.dailyQuota ?? 0),
@@ -388,10 +345,7 @@ export async function listItemsForAdmin(): Promise<AdminItemRow[]> {
     price: r.price,
     validDays: r.validDays,
     effect: { kind: r.effect?.kind ?? 'makeup', days: r.effect?.days ?? 0 },
-    // 本批次前入库的老行没有这三个字段：按虚拟/无图/不限的默认口径回给表单，别让编辑表单拿到 undefined
-    kind: (r.kind ?? 'virtual') as ItemKind,
-    detailImages: r.detailImages ?? [],
-    detailPreviewUrls: detailPreviewsOf(r.detailImages ?? []),
+    // 本批次前入库的老行没有这个字段：按不限（0）的默认口径回给表单，别让编辑表单拿到 undefined
     perUserLimit: Number(r.perUserLimit ?? 0),
     // 每日投放两字段（Task 2）：上线前入库的老行物理上没有它们，同 perUserLimit 的兜底惯用法
     dailyQuota: Number(r.dailyQuota ?? 0),

@@ -228,13 +228,11 @@ test('PR1 未登录访问 /points/* 全部 401', async () => {
     ['POST', '/points/tasks/daily_video/claim'],
     ['GET', '/points/items'],
     ['POST', '/points/items/makeup_card/exchange'],
-    ['GET', '/points/orders'],
-    ['POST', '/points/orders/000000000000000000000000/confirm'],
     ['POST', '/points/signin/makeup'],
     ['POST', '/points/cards/000000000000000000000000/activate'],
     ['GET', '/points/exchanges'],
   ] as const;
-  assert.equal(cases.length, 11, '用户侧 /points 路由共 11 条，漏一条就是漏一道登录闸门');
+  assert.equal(cases.length, 9, '用户侧 /points 路由共 9 条，漏一条就是漏一道登录闸门');
   for (const [method, url] of cases) {
     const res = await app.inject({ method, url: `${API}${url}` });
     assert.equal(res.statusCode, 401, `${method} ${url} 游客应 401`);

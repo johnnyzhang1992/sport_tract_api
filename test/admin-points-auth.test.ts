@@ -53,10 +53,6 @@ const POINTS_ADMIN_ROUTES: Array<[string, string]> = [
   // Task 8：道具概况与免广告名单
   ['GET', `${BASE}/points/items/overview`],
   ['GET', `${BASE}/points/ad-free/roster`],
-  // 实物批次：订单列表 / 发货 / 代确认
-  ['GET', `${BASE}/points/orders`],
-  ['PATCH', `${BASE}/points/orders/${UID}/ship`],
-  ['PATCH', `${BASE}/points/orders/${UID}/complete`],
   // Task 10：榜单发放台账（列表 + 撤回）
   ['GET', `${BASE}/points/board-settlements`],
   ['POST', `${BASE}/points/board-settlements/${UID}/revoke`],
@@ -176,7 +172,6 @@ test('PT-15b 管理员凭证能过同一条闸门（反证上面的 401 不是�
     [`${BASE}/points/users`, 200],
     [`${BASE}/points/items/overview`, 200],
     [`${BASE}/points/ad-free/roster`, 200],
-    [`${BASE}/points/orders`, 200],
     [`${BASE}/points/board-settlements`, 200],
     [`${BASE}/points/board-switch`, 200],
     // 幽灵 id：服务层 404「用户不存在」，证明路由已注册且鉴权已通过

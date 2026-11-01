@@ -13,7 +13,7 @@
  */
 import type { PipelineStage } from 'mongoose';
 import {
-  PointAccountModel, PointCardModel, PointItemModel, PointOrderModel, PointRecordModel, PointSigninModel,
+  PointAccountModel, PointCardModel, PointItemModel, PointRecordModel, PointSigninModel,
 } from '../models/point.model.js';
 import { AppError } from '../utils/app-error.js';
 import { bjDateStr } from '../utils/bj-time.js';
@@ -185,8 +185,6 @@ export interface ItemsOverview {
   totalSpentPoints: number;
   /** 生效中免广告人数：与名单同一份 replayAdFree 推导，长度等于当天名单行数 */
   adFreeUsers: number;
-  /** 实物订单待发货数（status = pending_ship）：概况里的「待发货 N 单」，不含已发货/已完成 */
-  physicalPendingShip: number;
 }
 
 /**
@@ -200,7 +198,7 @@ export interface ItemsOverview {
  *   指标格与导出的行数必须一字不差（不许在概况里再写一份到期推导）。
  */
 export async function itemsOverview(now = Date.now()): Promise<ItemsOverview> {
-  const [sourceRows, itemRows, [sums], roster, physicalPendingShip] = await Promise.all([
+  const [sourceRows, itemRows, [sums], roster] = await Promise.all([
     PointCardModel.aggregate<{ _id: string; count: number }>([
       { $addFields: { source: { $ifNull: ['$source', 'exchange'] } } },
       { $group: { _id: '$source', count: { $sum: 1 } } },
@@ -213,8 +211,6 @@ export async function itemsOverview(now = Date.now()): Promise<ItemsOverview> {
     ]),
     PointRecordModel.aggregate<RecordSums>(RECORD_SUM_STAGES),
     adFreeRoster(now),
-    // 只数待发货：已发货/已完成不是「待办」，混进来运营会照着错数去催单
-    PointOrderModel.countDocuments({ status: 'pending_ship' }),
   ]);
 
   const countBySource = new Map(sourceRows.map((r) => [String(r._id), Number(r.count)]));
@@ -241,7 +237,6 @@ export async function itemsOverview(now = Date.now()): Promise<ItemsOverview> {
     byItem,
     totalSpentPoints: sums?.spentExchange ?? 0,
     adFreeUsers: roster.length,
-    physicalPendingShip,
   };
 }
 
