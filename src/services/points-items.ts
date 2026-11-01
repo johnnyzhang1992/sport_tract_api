@@ -202,7 +202,7 @@ export async function exchangeItem(
   return exchangeVirtual(userId, item, rid, now);
 }
 
-/** 库存持有：抢到的那一张 + 回补/回滚/缺口上报。虚拟与实物共用同一份（all-or-nothing 的唯一实现） */
+/** 库存持有：抢到的那一张 + 回补/回滚/缺口上报（all-or-nothing 的唯一实现） */
 interface StockHold {
   readonly refundFailed: number;
   rollback(): Promise<void>;
@@ -210,7 +210,7 @@ interface StockHold {
 }
 
 /**
- * 库存闸门（虚拟/实物共用）：unlimited 只过闸门不落写；限量用带 stock>0 条件的原子 findOneAndUpdate。
+ * 库存闸门：unlimited 只过闸门不落写；限量用带 stock>0 条件的原子 findOneAndUpdate。
  * 返回 null 表示库存已空（调用方按「已兑完」回 400，此时未扣分也未落单）。
  */
 async function takeStock(item: ItemDoc): Promise<StockHold | null> {

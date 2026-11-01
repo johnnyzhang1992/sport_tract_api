@@ -234,8 +234,8 @@ export function assertItemInput(input: ItemInput): void {
 /**
  * 更新入口的字段闸门（PUT）：十三个内容字段逐个查在不在，null 视同没传，然后叠上通用校验。
  * 为什么逐字段必传而不是「缺了就补默认值/取库里的值」：后台表单是整行提交，缺字段说明这次提交
- * 本身就不完整——猜一个下去就是静默改写（售罄复活成 9999、道具图清空、ad_free 换成补签、
- * 实物限购被默认成 1），而且这些改写还会绕过 PATCH /stock 的目标值语义。缺字段就该 400 点名缺哪个。
+ * 本身就不完整——猜一个下去就是静默改写（售罄复活成 9999、道具图清空、ad_free 换成补签），
+ * 而且这些改写还会绕过 PATCH /stock 的目标值语义。缺字段就该 400 点名缺哪个。
  */
 export function assertItemContent(input: ItemInput): void {
   assertItemObject(input);
