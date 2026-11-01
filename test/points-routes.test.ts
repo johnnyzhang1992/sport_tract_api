@@ -10,7 +10,7 @@ import {
 import { UserModel } from '../src/models/user.model.js';
 import { LoginLogModel } from '../src/models/login-log.model.js';
 import { BOARD_REWARDS, POINTS, boardRulesText } from '../src/config/points.js';
-import { setBoardRewardsEnabled } from '../src/services/board-switch.js';
+import { setBoardRewardsEnabled, isBoardRewardsEnabled } from '../src/services/board-switch.js';
 import { creditPoints } from '../src/services/points-ledger.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 import { previousDateKey, shiftDateKey } from '../src/utils/points-domain.js';
@@ -266,14 +266,28 @@ test('PR-RULES-1 boardRulesText 六句逐字定稿，数字全部来自配置插
   assert.ok(custom[2].includes('成绩最好的 2 个榜单'));
 });
 
-test('PR-RULES-2 GET /points/rules 公开可读（不带 token），下发与 boardRulesText 逐字相等', async () => {
-  // 规则是配置不是用户数据（先例：公开 GET /ads）：游客进规则页也要能看到榜单说明
-  const res = await app.inject({ method: 'GET', url: `${API}/points/rules` });
-  assert.equal(res.statusCode, 200, res.body);
-  const rules = (res.json().data as { boardRules: string[] }).boardRules;
-  assert.equal(rules.length, 6);
-  // 路由层不得改写文案：必须与函数本体逐字相等（防止「顺手」在路由里重排/加前缀）
-  assert.deepEqual(rules, boardRulesText(BOARD_REWARDS.rewards, BOARD_REWARDS));
+test('PR-RULES-2 GET /points/rules 公开可读：开关关 → 空数组（端上整段隐藏），开关开 → 与 boardRulesText 逐字相等', async () => {
+  // 规则是配置不是用户数据（先例：公开 GET /ads）：游客进规则页也要能读到；
+  // 但榜单奖励未放量（后台开关关）时不下发榜单段落——端上「榜单奖励」整块不出现。
+  // 开关状态在 DB（app_settings），测试显式翻转两态，不假设 env 缺省
+  const before = await isBoardRewardsEnabled();
+  await setBoardRewardsEnabled(false);
+  try {
+    const off = await app.inject({ method: 'GET', url: `${API}/points/rules` });
+    assert.equal(off.statusCode, 200, off.body);
+    assert.deepEqual((off.json().data as { boardRules: string[] }).boardRules, [], '开关关闭必须下发空数组');
+
+    // 开关打开：逐字相等（路由层不得改写文案：防止「顺手」在路由里重排/加前缀）
+    await setBoardRewardsEnabled(true);
+    const on = await app.inject({ method: 'GET', url: `${API}/points/rules` });
+    assert.equal(on.statusCode, 200, on.body);
+    const rules = (on.json().data as { boardRules: string[] }).boardRules;
+    assert.equal(rules.length, 6);
+    assert.deepEqual(rules, boardRulesText(BOARD_REWARDS.rewards, BOARD_REWARDS));
+  } finally {
+    // 还原开关（写侧缓存立即可见），测试不留痕
+    await setBoardRewardsEnabled(before);
+  }
 });
 
 test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', async () => {

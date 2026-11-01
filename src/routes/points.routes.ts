@@ -8,6 +8,7 @@ import { getSigninCalendar } from '../services/points-calendar.js';
 import { expiringOf, streakPercentileOf } from '../services/points-summary.js';
 import { scheduleLazySettle } from '../services/board-lazy-settle.js';
 import { BOARD_REWARDS, boardRulesText } from '../config/points.js';
+import { isBoardRewardsEnabled } from '../services/board-switch.js';
 import { success } from '../utils/response.js';
 
 /**
@@ -18,9 +19,14 @@ import { success } from '../utils/response.js';
  */
 export async function pointsRoutes(fastify: FastifyInstance) {
   // 规则页榜单文案（公开，先例 GET /ads）：规则是配置不是用户数据，游客也要能读；
-  // 文案唯一真值是 boardRulesText()，路由只透传、不改写（PR-RULES-2 钉住逐字相等）
-  fastify.get('/rules', async () =>
-    success({ boardRules: boardRulesText(BOARD_REWARDS.rewards, BOARD_REWARDS) }));
+  // 文案唯一真值是 boardRulesText()，路由只透传、不改写（PR-RULES-2 钉住逐字相等）。
+  // 榜单奖励开关关闭时下发空数组：端上按 wx:if 整段隐藏，规则页只剩静态说明。
+  fastify.get('/rules', async () => {
+    const enabled = await isBoardRewardsEnabled();
+    return success({
+      boardRules: enabled ? boardRulesText(BOARD_REWARDS.rewards, BOARD_REWARDS) : [],
+    });
+  });
 
   fastify.get('/summary', { onRequest: [fastify.authenticate] }, async (request) => {
     const userId = request.user.userId;
