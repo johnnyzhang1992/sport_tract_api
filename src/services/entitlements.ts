@@ -39,7 +39,11 @@ export interface Entitlements {
 
 function effectiveEnd(r: MembershipRow): number {
   if (r.periodEnd <= 0 || r.periodStart <= 0) return 0;
-  return r.truncatedAt > 0 ? Math.min(r.periodEnd, r.truncatedAt) : r.periodEnd;
+  if (r.truncatedAt <= 0) return r.periodEnd;
+  // 退款受理时刻不晚于起点＝这笔从未生效就被退掉：一天都不给。
+  // 少了这一句，「还没生效的顺延单退款」会把会员到期白送到它的起点。
+  if (r.truncatedAt <= r.periodStart) return 0;
+  return Math.min(r.periodEnd, r.truncatedAt);
 }
 
 /**
