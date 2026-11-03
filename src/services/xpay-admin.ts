@@ -279,6 +279,15 @@ export async function manualQuery(id: string) {
       },
     },
   );
+  // 退款对账兑底：delivered/refunding 的单若微信侧已退而本地缺记，按差额补落账（与懒查单同一口径）
+  if (row.status === 'delivered' || row.status === 'refunding') {
+    const refundedTotal = Math.max(0, r.paidFeeFen - r.leftFeeFen);
+    const delta = refundedTotal - Number(row.refundedFen ?? 0);
+    if (delta > 0) {
+      console.warn(`[xpay] 手动查单对出退款差额 ${delta} 分（${row.outTradeNo}），补落账`);
+      await applyRefund({ outTradeNo: row.outTradeNo, refundFeeFen: delta, refundedAt: Date.now() });
+    }
+  }
   if (!r.paid) return { paid: false, status: r.status, leftFeeFen: r.leftFeeFen };
   const d = await deliverOrder({ outTradeNo: row.outTradeNo, wxOrderId: r.wxOrderId || row.wxOrderId || `q_${row.outTradeNo}` });
   return { paid: true, status: r.status, leftFeeFen: r.leftFeeFen, deliverResult: d };

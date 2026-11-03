@@ -356,3 +356,18 @@ test('RF-7 伪造退款推送：查单未支付 → 拒绝落账（一分都不�
   assert.equal(row?.refundedAt ?? 0, 0);
   assert.match(String(row?.lastError), /拒绝落账/);
 });
+
+test('LQ-4 退款对账：delivered 单微信侧已退而本地缺记 → 按差额补落账并截断', async () => {
+  const o = await mkOrder({ status: 'delivered', wxOrderId: 'wxl4', periodStart: Date.now() - 3600_000, periodEnd: Date.now() + 30 * DAY });
+  __setXpayFetcherForTest(async (api) => {
+    assert.equal(api, 'query_order');
+    return { errcode: 0, order: { status: 3, left_fee: 99, paid_fee: 199 } }; // 已退 100 分
+  });
+  const n = await lazySyncOrders(String(uid), Date.now() + 61_000);
+  assert.equal(n, 0, '没有新发货');
+  const row = await XpayOrderModel.findById(o._id).lean();
+  assert.equal(row?.refundedFen, 100, '补落账 199-99=100 分');
+  assert.ok((row?.truncatedAt ?? 0) > 0, '权益截断');
+  const e = await entitlementsOf(String(uid));
+  assert.ok(e.memberUntil <= row.truncatedAt, '回放按截断后区间');
+});

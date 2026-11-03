@@ -89,6 +89,8 @@ export interface XpayQueryResult {
   paid: boolean;
   status: number;
   leftFeeFen: number;
+  /** 实付金额（分，order.paid_fee；退款对账用：已退=paid_fee-left_fee） */
+  paidFeeFen: number;
   wxOrderId: string;
   raw: Record<string, unknown>;
 }
@@ -108,6 +110,7 @@ export async function xpayQueryOrder(p: {
     paid: XPAY_PAID_ORDER_STATUSES.has(status),
     status,
     leftFeeFen: Number(order.left_fee ?? order.leftFee ?? 0) || 0,
+    paidFeeFen: Number(order.paid_fee ?? order.paidFee ?? 0) || 0,
     wxOrderId: String(order.order_no ?? order.wx_order_id ?? p.wxOrderId ?? ''),
     raw: data,
   };

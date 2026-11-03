@@ -369,6 +369,31 @@ export async function lazySyncOrders(userId: string, now = Date.now()): Promise<
       }
     }
   }
+
+  // 退款对账兑底（delivered/refunding）：退款推送迟到/丢失时，按 query 的实付/剩余可退
+  // 推导已退金额补落账（applyRefund 自带幂等与截断；差额≤0 即已对齐，零成本跳过）
+  const refundRows = await XpayOrderModel.find({
+    userId: new Types.ObjectId(userId),
+    status: { $in: ['delivered', 'refunding'] },
+    $or: [{ lastQueryAt: 0 }, { lastQueryAt: { $lte: now - QUERY_MIN_INTERVAL_MS } }],
+  }).sort({ lastQueryAt: 1 }).limit(3).lean();
+  for (const row of refundRows) {
+    await XpayOrderModel.updateOne(
+      { _id: row._id },
+      { $set: { lastQueryAt: now, queryAttempts: (row.queryAttempts ?? 0) + 1 } },
+    );
+    try {
+      const r = await xpayQueryOrder({ openid: row.openid, outTradeNo: row.outTradeNo, wxOrderId: row.wxOrderId || undefined });
+      const refundedTotal = Math.max(0, r.paidFeeFen - r.leftFeeFen);
+      const delta = refundedTotal - Number(row.refundedFen ?? 0);
+      if (delta > 0) {
+        console.warn(`[xpay] 退款对账：${row.outTradeNo} 微信侧已退 ${refundedTotal} 分，本地缺记 ${delta} 分，补落账`);
+        await applyRefund({ outTradeNo: row.outTradeNo, refundFeeFen: delta, refundedAt: Date.now() });
+      }
+    } catch (e) {
+      console.warn(`[xpay] 退款对账查单失败（${row.outTradeNo}）：`, (e as Error).message);
+    }
+  }
   return delivered;
 }
 
