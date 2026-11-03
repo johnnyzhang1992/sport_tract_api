@@ -411,7 +411,7 @@ test('boardsettlements：投递索引键序不对（nextAttemptAt 提前）不�
 /**
  * 虚拟支付订单账本（xpayorders，Task 4 / spec §5.2）的**发货幂等**防线：{wxOrderId} unique +
  * partialFilterExpression 限定「非空串」。正面断言（真实库侧 + 声明侧）在
- * test/xpay-order-index.test.ts 的 XO-2/XO-5，这里补谓词族同口径的两条负例（与上面各族的写法一致）。
+ * test/xpay-order-index.test.ts 的 XO-2/XO-5/XO-8，这里补谓词族同口径的三条负例（与上面各族的写法一致）。
  * 为什么「排除空串」必须写进 partial：wxOrderId 未支付时是 `default: ''`——字段在、值是空串，
  * 既不是缺失也不是 null，裸 sparse 挡不住它（同 notifications.dedupeKey 那条 null 的教训）。
  * 空串限定的**认法**是 `$gt: ''` 而不是 `$ne: ''`：dev 库实测（MongoDB 8.0.17）partial 里的 `$ne`
@@ -425,6 +425,13 @@ test('xpayorders 的 wxOrderId 防线：裸 sparse 不算（default "" 会把未
 test('xpayorders 的 partial 缺「非空串」限定（只有 $type）不算（空串进索引→第二笔未支付订单撞键）', () => {
   assert.equal(
     hasUniqueWxOrderIndex([{ key: { wxOrderId: 1 }, unique: true, partialFilterExpression: { wxOrderId: { $type: 'string' } } }]),
+    false,
+  );
+});
+
+test('xpayorders 的 partial 写成 $ne 同样不算防线（Mongo 8 直接拒建该索引＝防线不存在）', () => {
+  assert.equal(
+    hasUniqueWxOrderIndex([{ key: { wxOrderId: 1 }, unique: true, partialFilterExpression: { wxOrderId: { $type: 'string', $ne: '' } } }]),
     false,
   );
 });
