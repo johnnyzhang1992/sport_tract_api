@@ -56,6 +56,8 @@ export async function deliverOrder(p: {
   wxOrderId: string;
   paidAt?: number;
   channel?: string;
+  /** 推送入口必须传 true：明文分支无来源证明，发货前先向微信复核已支付（见 handleXpayNotify） */
+  verifyWithWechat?: boolean;
 }): Promise<NotifyResult> {
   const row = await XpayOrderModel.findOne({ outTradeNo: p.outTradeNo }).lean();
   if (!row) {
@@ -76,7 +78,30 @@ export async function deliverOrder(p: {
       return { ok: true, dropNoRetry: true };
     }
 
-    const now = Number(p.paidAt) > 0 ? Number(p.paidAt) : Date.now();
+    // 推送不可信（兼容模式明文分支没有来源证明，密文也只证明「包出自我们配置的 AESKey」，
+    // 证明不了「这笔支付真发生过」）：发货前必须以微信查单为准。查询只带我方 outTradeNo
+    // + 库内 openid，不把推送带来的 wxOrderId 传给微信——那是攻击者可控字段，不能当定位键。
+    if (p.verifyWithWechat) {
+      let verdict: Awaited<ReturnType<typeof xpayQueryOrder>>;
+      try {
+        verdict = await xpayQueryOrder({ openid: fresh.openid, outTradeNo: fresh.outTradeNo });
+      } catch (e) {
+        // 网络/网关失败：既没证实也没证伪，回非 0 让微信重试（真单稍后重推即可发出去）
+        console.error(`[xpay] 发货复核查单失败（${fresh.outTradeNo}）：`, (e as Error).message);
+        return { ok: false, errcode: 7, errmsg: 'paid-verify query failed' };
+      }
+      if (!verdict.paid) {
+        console.error(`[xpay] 推送声称已支付但微信查单 status=${verdict.status}（${fresh.outTradeNo}）——拒绝发货（疑似伪造推送；真单的懒查单兜底不受影响）`);
+        await XpayOrderModel.updateOne(
+          { _id: row._id },
+          { $set: { lastError: `查单复核未支付（status=${verdict.status}），拒绝发货` } },
+        );
+        return { ok: true, dropNoRetry: true };
+      }
+    }
+
+    // 推送带来的 paid_at 不可信（伪造包可任意填），权益起点不许被 future-date 到未来
+    const now = Math.min(Number(p.paidAt) > 0 ? Number(p.paidAt) : Date.now(), Date.now());
     const user = await UserModel.findById(userId).select('openid').lean();
     if (!user) {
       const attempts = (fresh.deliverAttempts ?? 0) + 1;
@@ -170,6 +195,8 @@ export async function applyRefund(p: {
   refundFeeFen: number;
   refundedAt?: number;
   reason?: string;
+  /** 推送入口必须传 true：落账前先向微信复核「这单确实付过」（见 handleXpayNotify） */
+  verifyWithWechat?: boolean;
 }): Promise<NotifyResult> {
   const filter: Record<string, unknown> = p.outTradeNo ? { outTradeNo: p.outTradeNo } : { wxOrderId: p.wxOrderId };
   const row = await XpayOrderModel.findOne(filter).lean();
@@ -184,6 +211,26 @@ export async function applyRefund(p: {
     if (!fresh) return { ok: true, dropNoRetry: true };
     if (p.refundOrderId && fresh.refundOrderId === p.refundOrderId && (fresh.refundedAt ?? 0) > 0) {
       return { ok: true }; // 重复通知：已经回收过
+    }
+    // 与发货同一条纪律：退款推送同样不可信，落账前以微信查单复核「这单确实付过」。
+    // 只核对支付状态、不再交叉核对退款金额（金额语义与 left_fee 的关系以真单实测定为准，spec §12）——
+    // 伪造最多触发「拒落账」，真退款推送重试即可收敛。
+    if (p.verifyWithWechat) {
+      let verdict: Awaited<ReturnType<typeof xpayQueryOrder>>;
+      try {
+        verdict = await xpayQueryOrder({ openid: fresh.openid, outTradeNo: fresh.outTradeNo, wxOrderId: fresh.wxOrderId || undefined });
+      } catch (e) {
+        console.error(`[xpay] 退款复核查单失败（${fresh.outTradeNo}）：`, (e as Error).message);
+        return { ok: false, errcode: 7, errmsg: 'paid-verify query failed' };
+      }
+      if (!verdict.paid) {
+        console.error(`[xpay] 退款推送但微信查单 status=${verdict.status}（${fresh.outTradeNo}）——拒绝落账（疑似伪造推送）`);
+        await XpayOrderModel.updateOne(
+          { _id: row._id },
+          { $set: { lastError: `退款复核未支付（status=${verdict.status}），拒绝落账` } },
+        );
+        return { ok: true, dropNoRetry: true };
+      }
     }
     if (fee <= 0) {
       await XpayOrderModel.updateOne({ _id: row._id }, { $set: { lastError: `退款通知金额非法：${p.refundFeeFen}` } });
@@ -234,6 +281,10 @@ export async function answerIosRefundQuery(payload: Record<string, unknown>): Pr
 
 /** 推送分流表的实现（pay-notify.routes.ts 注册它） */
 export async function handleXpayNotify(event: string, payload: Record<string, unknown>): Promise<NotifyResult> {
+  // ⚠ 推送入口是唯一不可信的发货/退款触发点：兼容模式的明文分支没有任何来源证明，
+  //   伪造者可对「自己刚建单未支付」的订单推送 deliver_notify 白拿会员。所以两条资金事件都带
+  //   verifyWithWechat，发货/落账前先向微信复核支付状态；代价＝每次推送多一笔 query_order
+  //   （推送量＝支付量，可忽略）。懒查单/管理端路径刚查过单，不带此开关、零额外开销。
   const wp = (payload.WeChatPayInfo ?? {}) as Record<string, unknown>;
   if (event === 'xpay_goods_deliver_notify') {
     const outTradeNo = String(payload.out_trade_no ?? payload.OutTradeNo ?? payload.attach ?? '');
@@ -247,6 +298,7 @@ export async function handleXpayNotify(event: string, payload: Record<string, un
       wxOrderId,
       paidAt: Number(wp.paid_dt ?? wp.PaidTime ?? payload.pay_time ?? 0) || undefined,
       channel: payload.platform === 'ios' ? 'ios' : payload.platform === 'android' ? 'android' : undefined,
+      verifyWithWechat: true,
     });
   }
   if (event === 'xpay_refund_notify') {
@@ -257,6 +309,7 @@ export async function handleXpayNotify(event: string, payload: Record<string, un
       refundFeeFen: Number(payload.refund_fee ?? payload.RefundFee ?? 0),
       refundedAt: Number(payload.refund_succ_time ?? wp.refund_succ_time ?? payload.succ_time ?? 0) || undefined,
       reason: String(payload.reason ?? payload.refund_reason ?? '') || undefined,
+      verifyWithWechat: true,
     });
   }
   if (event === 'xpay_subscribe_ios_refund_query_notify') {

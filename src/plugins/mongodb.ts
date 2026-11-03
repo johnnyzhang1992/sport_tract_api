@@ -3,7 +3,8 @@ import mongoose from 'mongoose';
 import { config } from '../config/index.js';
 import { ActivityModel } from '../models/activity.model.js';
 import { CampaignMemberModel } from '../models/campaign-member.model.js';
-import { hasUniqueInProgressIndex, hasUniqueJoinedIndex } from '../utils/guard-index.js';
+import { XpayOrderModel } from '../models/xpay-order.model.js';
+import { hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasUniqueWxOrderIndex, hasUniqueOutTradeIndex, hasXpayOrderUserReadIndex } from '../utils/guard-index.js';
 
 /**
  * Mongoose 连接插件
@@ -44,6 +45,25 @@ export default fp(
       }
     } catch (err) {
       fastify.log.error({ err }, 'campaignmembers 索引建立失败：重复 joined 的 DB 级兜底不可用，需先收尾存量重复行');
+    }
+
+    // xpayorders 的两条 unique 是资金路径的 DB 级防线（spec §5.2）：wxOrderId partial 非空串＝发货幂等
+    // （它静默消失时同一笔支付能发两次货，资损且不报错），outTradeNo unique＝建单幂等。
+    // {userId,status,periodEnd} 是会员到期回放的读路径。同样显式等建完并核对形状，失败只落 error 不阻塞启动。
+    try {
+      await XpayOrderModel.createIndexes();
+      const xpayIndexes = await XpayOrderModel.collection.indexes();
+      const missing: string[] = [];
+      if (!hasUniqueWxOrderIndex(xpayIndexes)) missing.push('{wxOrderId} unique+partial($type,$gt:\'\')');
+      if (!hasUniqueOutTradeIndex(xpayIndexes)) missing.push('{outTradeNo} unique');
+      if (!hasXpayOrderUserReadIndex(xpayIndexes)) missing.push('{userId,status,periodEnd:-1} 会员回放读路径');
+      if (missing.length) {
+        fastify.log.error(
+          `防线缺失：xpayorders 缺 ${missing.join('、')}——发货幂等/建单幂等的 DB 级兑底不可用，需先收尾存量重复数据`,
+        );
+      }
+    } catch (err) {
+      fastify.log.error({ err }, 'xpayorders 索引建立失败：发货/建单幂等兑底不可用，需先收尾存量重复数据');
     }
 
     // 连接断开后自动重连（mongoose 默认行为），记录状态变化

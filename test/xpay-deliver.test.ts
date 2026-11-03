@@ -64,6 +64,11 @@ after(async () => {
 
 test('DL-1 支付成功推送 → 发货、落区间快照、回 ErrCode 0、发一条定向通知', async () => {
   const o = await mkOrder();
+  // 通知入口发货前要复核查单（推送不可信），夹具返回已支付
+  __setXpayFetcherForTest(async (api) => {
+    assert.equal(api, 'query_order');
+    return { errcode: 0, order: { status: 1, left_fee: 199, order_no: 'wx1' } };
+  });
   const now = Date.now();
   const r = await handleXpayNotify('xpay_goods_deliver_notify', {
     openid: OPENID, out_trade_no: o.outTradeNo, WeChatPayInfo: { MchOrderNo: 'wx1', paid_dt: now },
@@ -238,6 +243,7 @@ test('RF-6 重复退款通知只回收一次（按 refundOrderId 去重）', asy
   const o = await mkOrder({
     status: 'refunding', wxOrderId: 'wxr6', periodStart: start, periodEnd: start + 30 * DAY, refundOrderId: 'rf6', refundedFen: 0,
   });
+  __setXpayFetcherForTest(async () => ({ errcode: 0, order: { status: 1, left_fee: 67 } })); // 通知入口落账前要复核「这单确实付过」
   await handleXpayNotify('xpay_refund_notify', { openid: OPENID, out_trade_no: o.outTradeNo, refund_id: 'rf6', refund_fee: 132, status: 5 });
   const first = await XpayOrderModel.findById(o._id).lean();
   await handleXpayNotify('xpay_refund_notify', { openid: OPENID, out_trade_no: o.outTradeNo, refund_id: 'rf6', refund_fee: 132, status: 5 });
@@ -274,4 +280,57 @@ test('LQ-3 查单超 20 次转 closed 并留 lastError（不再无限骚扰微�
   const row = await XpayOrderModel.findById(o._id).lean();
   assert.equal(row?.status, 'closed');
   assert.match(String(row?.lastError), /ETIMEDOUT|查单 20 次/);
+});
+
+test('DL-7 伪造推送：查单未支付 → 拒绝发货并留痕（明文分支无来源证明的兑底）', async () => {
+  // 攻击面：建单后伪造明文 deliver_notify 白拿会员。防线＝通知入口发货前以微信查单为准。
+  const o = await mkOrder(); // status='created'，从未支付
+  __setXpayFetcherForTest(async (api) => {
+    assert.equal(api, 'query_order');
+    return { errcode: 0, order: { status: 2, left_fee: 199 } }; // 2＝非已支付枚举
+  });
+  const r = await handleXpayNotify('xpay_goods_deliver_notify', {
+    openid: OPENID, out_trade_no: o.outTradeNo, WeChatPayInfo: { MchOrderNo: 'wx_forged' },
+  });
+  assert.equal(r.ok, true, '伪造包重试改变不了结果，吞掉止住 15 次重试');
+  assert.equal(r.dropNoRetry, true);
+  const row = await XpayOrderModel.findById(o._id).lean();
+  assert.equal(row?.status, 'created', '绝不凭推送发货');
+  assert.equal(row?.wxOrderId ?? '', '', '伪造商户单号不能落库');
+  assert.match(String(row?.lastError), /拒绝发货/);
+});
+
+test('DL-8 复核查单确认已支付 → 正常发货（真单不被误伤）', async () => {
+  const o = await mkOrder();
+  __setXpayFetcherForTest(async (api) => {
+    assert.equal(api, 'query_order');
+    return { errcode: 0, order: { status: 1, left_fee: 199 } };
+  });
+  const r = await handleXpayNotify('xpay_goods_deliver_notify', {
+    openid: OPENID, out_trade_no: o.outTradeNo, WeChatPayInfo: { MchOrderNo: 'wx_real' },
+  });
+  assert.equal(r.ok, true);
+  const row = await XpayOrderModel.findById(o._id).lean();
+  assert.equal(row?.status, 'delivered');
+  assert.equal(row?.wxOrderId, 'wx_real');
+});
+
+test('DL-9 复核查单网络失败 → 回非 0 让微信重试（不静默、不吞）', async () => {
+  const o = await mkOrder();
+  __setXpayFetcherForTest(async () => { throw new Error('ETIMEDOUT'); });
+  const r = await deliverOrder({ outTradeNo: o.outTradeNo, wxOrderId: 'wx_x', verifyWithWechat: true });
+  assert.equal(r.ok, false, '无法证实也未证伪时要重试，不能静默成功');
+  assert.equal((await XpayOrderModel.findById(o._id).lean())?.status, 'created');
+});
+
+test('RF-7 伪造退款推送：查单未支付 → 拒绝落账（一分都不动）', async () => {
+  const o = await mkOrder({ status: 'delivered', wxOrderId: 'wxr7', periodStart: Date.now() - DAY, periodEnd: Date.now() + 29 * DAY });
+  __setXpayFetcherForTest(async () => ({ errcode: 0, order: { status: 99, left_fee: 199 } }));
+  const r = await handleXpayNotify('xpay_refund_notify', { openid: OPENID, out_trade_no: o.outTradeNo, refund_id: 'rf7', refund_fee: 199 });
+  assert.equal(r.ok, true);
+  assert.equal(r.dropNoRetry, true);
+  const row = await XpayOrderModel.findById(o._id).lean();
+  assert.equal(row?.refundedFen ?? 0, 0, '伪造退款一分都不能落');
+  assert.equal(row?.refundedAt ?? 0, 0);
+  assert.match(String(row?.lastError), /拒绝落账/);
 });
