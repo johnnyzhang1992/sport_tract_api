@@ -175,6 +175,22 @@ export async function setPaidProductActive(id: string, active: boolean): Promise
 }
 
 /**
+ * 排序的独立入口（2026-11-03 修复轮裁定）。
+ * 为什么要真做而不是只留一句提示：assertPaidProductInput 的 partial 分支会拿「请用 PATCH /sort-order」
+ * 拒掉携带 sortOrder 的 PUT——入口不存在时，这句提示就是把运营指向一个 404，而 Task 13 的后台目录页
+ * 确实要能改排序。与 active 同一条纪律：只碰 sortOrder 这一列，内容改动一律走 PUT。
+ */
+export async function setPaidProductSortOrder(id: string, sortOrder: unknown): Promise<PaidProductDto> {
+  assertObjectIdLike(id, '商品不存在');
+  if (typeof sortOrder !== 'number' || !Number.isInteger(sortOrder) || sortOrder < 0 || sortOrder > 9999) {
+    throw new AppError(400, `排序必须是不大于 9999 的非负整数（收到 ${JSON.stringify(sortOrder)}）`);
+  }
+  const doc = await PaidProductModel.findOneAndUpdate({ _id: id }, { $set: { sortOrder } }, { returnDocument: 'after' }).lean();
+  if (!doc) throw new AppError(404, '商品不存在');
+  return toDto(doc as never);
+}
+
+/**
  * 种子档位（spec §4，MP 后台 2026-11-03 已发布）。
  * $setOnInsert：后台改过的价/文案不会被重跑冲掉——这条与 seedPointItems 同一教训。
  * 三条都高于 iOS 1 元地板价；photoQuota 300 是 D1 默认值，用户改目录即改额度，不改代码。

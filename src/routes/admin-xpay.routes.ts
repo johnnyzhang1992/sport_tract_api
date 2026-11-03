@@ -2,7 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { success } from '../utils/response.js';
 import { adminAuth, adminIdOf } from '../utils/admin-auth.js';
 import {
-  listPaidProductsForAdmin, createPaidProduct, updatePaidProduct, setPaidProductActive,
+  listPaidProductsForAdmin, createPaidProduct, updatePaidProduct,
+  setPaidProductActive, setPaidProductSortOrder,
 } from '../services/paid-products.js';
 import { isMemberPaymentsEnabled, setMemberPaymentsEnabled } from '../services/member-switch.js';
 import { isXpayPayConfigured, isXpayPushConfigured } from '../config/xpay.js';
@@ -27,6 +28,13 @@ export async function adminXpayRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     const body = (request.body ?? {}) as { active?: unknown };
     return success(await setPaidProductActive(id, body.active === true), '已更新');
+  });
+
+  // 排序与上下架同律：PUT 拒绝这两列，各自一条 PATCH（Task 13 的目录页要能改排序）
+  fastify.patch('/products/:id/sort-order', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as { sortOrder?: unknown };
+    return success(await setPaidProductSortOrder(id, body.sortOrder), '已更新');
   });
 
   // 会员开关 + 就绪度自检：运营要能看到「密钥配了没」，否则开关一开就全线报错还没法自证
