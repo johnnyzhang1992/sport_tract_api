@@ -159,7 +159,7 @@ test('OA-5 备注（reason）必填', async () => {
 test('OA-6 refundOrderId 生成后落库，重试复用同值', async () => {
   const seen: string[] = [];
   __setXpayFetcherForTest(async (api, body) => {
-    seen.push(String(body.refund_id));
+    seen.push(String(body.refund_order_id ?? body.refund_id));
     return api === 'refund_order'
       ? { errcode: 0, status: 3 }
       : { errcode: 0, order: { status: 3, left_fee: 199, order_no: "x" } };
