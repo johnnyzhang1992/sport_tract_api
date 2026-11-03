@@ -300,6 +300,28 @@ test('DL-7 伪造推送：查单未支付 → 拒绝发货并留痕（明文分�
   assert.match(String(row?.lastError), /拒绝发货/);
 });
 
+test('DL-10 推送 paid_dt 是秒级时间戳（真单实测）→ 权益起点不落到 1970 年', async () => {
+  const o = await mkOrder();
+  __setXpayFetcherForTest(async (api) => {
+    assert.equal(api, 'query_order');
+    return { errcode: 0, order: { status: 3, left_fee: 199 } };
+  });
+  const paidDtSec = Math.floor(Date.now() / 1000); // 微信 paid_dt/paid_time 是秒
+  const before = Date.now();
+  const r = await handleXpayNotify('xpay_goods_deliver_notify', {
+    openid: OPENID, out_trade_no: o.outTradeNo,
+    WeChatPayInfo: { MchOrderNo: 'wx_sec', paid_dt: paidDtSec },
+  });
+  assert.equal(r.ok, true);
+  const row = await XpayOrderModel.findById(o._id).lean();
+  assert.equal(row?.status, 'delivered');
+  assert.ok(
+    (row?.periodStart ?? 0) >= before - 60_000 && (row?.periodStart ?? 0) <= Date.now(),
+    `periodStart 应是近期时刻，实际 ${row?.periodStart}（秒当毫秒用会落到 1970）`,
+  );
+  assert.equal((row?.periodEnd ?? 0) - (row?.periodStart ?? 0), 30 * DAY);
+});
+
 test('DL-8 复核查单确认已支付 → 正常发货（真单不被误伤）', async () => {
   const o = await mkOrder();
   __setXpayFetcherForTest(async (api) => {

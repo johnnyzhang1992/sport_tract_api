@@ -100,8 +100,12 @@ export async function deliverOrder(p: {
       }
     }
 
-    // 推送带来的 paid_at 不可信（伪造包可任意填），权益起点不许被 future-date 到未来
-    const now = Math.min(Number(p.paidAt) > 0 ? Number(p.paidAt) : Date.now(), Date.now());
+    // 推送带来的 paid_at 不可信（伪造包可任意填），权益起点不许被 future-date 到未来；
+    // 且微信 paid_dt/paid_time 是秒级时间戳（2026-11-03 真单实测 paid_time=1793721038），
+    // 按毫秒用会把权益起点算到 1970 年——阈值 1e12（≈2001-09-09）以下一律视为秒
+    const rawPaidAt = Number(p.paidAt) > 0 ? Number(p.paidAt) : Date.now();
+    const paidAtMs = rawPaidAt < 10_000_000_000 ? rawPaidAt * 1000 : rawPaidAt;
+    const now = Math.min(paidAtMs, Date.now());
     const user = await UserModel.findById(userId).select('openid').lean();
     if (!user) {
       const attempts = (fresh.deliverAttempts ?? 0) + 1;
