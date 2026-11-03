@@ -26,6 +26,7 @@ import {
   hasUniqueInProgressIndex, hasUniqueJoinedIndex, hasExchangeLedgerIndex, hasUniqueDailyQuotaIndex,
   hasNotificationRecipientIndex, hasUniqueBoardSettlementIndex, hasBoardSettlementAdminReadIndex,
   hasBoardTrustedAggregateIndex, hasUniqueNotificationDedupeIndex, hasBoardSettlementNotificationDrainIndex,
+  hasUniqueWxOrderIndex,
 } from '../src/utils/guard-index.js';
 
 before(async () => {
@@ -403,6 +404,27 @@ test('boardsettlements 通知投递索引：声明侧与真实库侧的防线都
 test('boardsettlements：投递索引键序不对（nextAttemptAt 提前）不算防线：等值前缀断了', () => {
   assert.equal(
     hasBoardSettlementNotificationDrainIndex([{ name: 'x', key: { status: 1, channel: 1, nextAttemptAt: 1, notifiedAt: 1 } }]),
+    false,
+  );
+});
+
+/**
+ * 虚拟支付订单账本（xpayorders，Task 4 / spec §5.2）的**发货幂等**防线：{wxOrderId} unique +
+ * partialFilterExpression 限定「非空串」。正面断言（真实库侧 + 声明侧）在
+ * test/xpay-order-index.test.ts 的 XO-2/XO-5，这里补谓词族同口径的两条负例（与上面各族的写法一致）。
+ * 为什么「排除空串」必须写进 partial：wxOrderId 未支付时是 `default: ''`——字段在、值是空串，
+ * 既不是缺失也不是 null，裸 sparse 挡不住它（同 notifications.dedupeKey 那条 null 的教训）。
+ * 空串限定的**认法**是 `$gt: ''` 而不是 `$ne: ''`：dev 库实测（MongoDB 8.0.17）partial 里的 `$ne`
+ * 被服务端判成 `$not` 直接拒建整条索引（code 67 CannotCreateIndex），写 $ne 的声明连索引都建不出来，
+ * 防线不是「弱一点」而是「不存在」；`$gt: ''` 对字符串语义等价且能建成。
+ */
+test('xpayorders 的 wxOrderId 防线：裸 sparse 不算（default "" 会把未支付行判成重复）', () => {
+  assert.equal(hasUniqueWxOrderIndex([{ key: { wxOrderId: 1 }, unique: true, sparse: true }]), false);
+});
+
+test('xpayorders 的 partial 缺「非空串」限定（只有 $type）不算（空串进索引→第二笔未支付订单撞键）', () => {
+  assert.equal(
+    hasUniqueWxOrderIndex([{ key: { wxOrderId: 1 }, unique: true, partialFilterExpression: { wxOrderId: { $type: 'string' } } }]),
     false,
   );
 });

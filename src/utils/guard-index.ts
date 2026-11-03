@@ -172,3 +172,50 @@ export function hasBoardSettlementNotificationDrainIndex(indexes: IndexShape[]):
       && Object.values(key).every((v) => v === 1);
   });
 }
+
+/**
+ * 虚拟支付订单（xpayorders，spec §5.2）的**发货幂等**防线是否真在：
+ * {wxOrderId} unique + partialFilterExpression 限定「非空串」。
+ * 它静默消失时：微信推送未回 ErrCode 0 会重试最多 15 次，同一笔支付能发两次货（资损）且不报错。
+ * partial 而不是裸 sparse：字段 default '' 是「尚未支付」的正常态，sparse 只跳「字段缺失」而空串仍进索引——
+ * 第二笔未支付订单就会撞唯一键，把下单整条路打死。
+ * 非空串这一条只能认 `$gt: ''`，不能认更顺眼的 `$ne: ''`：dev 库（MongoDB 8.0.17）对 partial 里的
+ * `$ne` 直接拒建（code 67 CannotCreateIndex「Expression not supported in partial index: $not」），
+ * 所以库里真在的那条一定是 $gt；只写 `$type:'string'` 也不算（空串是 string，会进索引撞键）。
+ * 认字段组合与 partial 里的 $type + $gt，不认名字（Mongoose 自动生成）。
+ */
+export function hasUniqueWxOrderIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    const p = i.partialFilterExpression?.wxOrderId as { $type?: unknown; $gt?: unknown } | undefined;
+    return Object.keys(key).join(',') === 'wxOrderId' && key.wxOrderId === 1
+      && i.unique === true && p?.$type === 'string' && p.$gt === '';
+  });
+}
+
+/**
+ * 商户下单号防线：{outTradeNo} unique（无 partial——这列每行必有）。
+ * 它静默消失时：并发/重试建单会长出多行同 outTradeNo，端上轮询、退款入参、对账全都对不上一个对象。
+ */
+export function hasUniqueOutTradeIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    return Object.keys(key).join(',') === 'outTradeNo' && key.outTradeNo === 1 && i.unique === true;
+  });
+}
+
+/**
+ * 会员到期回放的用户读路径索引：{userId:1, status:1, periodEnd:-1}（非 unique，但认键序与方向）。
+ * entitlementsOf 的过滤器是 {userId, status:{$in:['delivered','refunding','refunded']}}，
+ * userId 等值 → status（$in 三个等值点）→ periodEnd 倒序收尾（取 max 时免内存排序）。
+ * 它静默消失时：回放不报错但每次判会员都要扫这个人的全部订单，随下单量线性变慢。
+ * 换序（status 打头）或方向写成正序都按「防线不在」处理（索引名是 Mongoose 自动生成的，
+ * 按键组合+方向认，不认名字）。
+ */
+export function hasXpayOrderUserReadIndex(indexes: IndexShape[]): boolean {
+  return indexes.some((i) => {
+    const key = i.key ?? {};
+    return Object.keys(key).join(',') === 'userId,status,periodEnd'
+      && key.userId === 1 && key.status === 1 && key.periodEnd === -1;
+  });
+}
