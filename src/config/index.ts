@@ -46,6 +46,8 @@ export const config = {
   // 榜单奖励灰度开关（spec §6）：默认 false——线上先小流量验一轮结算再放开。
   // 短路点在 settlePeriod/settleDueForUser 入口；回滚＝关掉它（已发的分不回收，台账保留）。
   boardRewardsEnabled: bool(process.env.BOARD_REWARDS_ENABLED, false),
+  // 会员付费总开关的 env 种子值（运行时可被 app_settings.memberPaymentsEnabled 覆盖，见 services/member-switch.ts）
+  memberPaymentsEnabled: bool(process.env.MEMBER_PAYMENTS_ENABLED, false),
   // 配套的发分起点 BOARD_SETTLE_FROM（东八日期串 'YYYY-MM-DD' 或毫秒；缺省＝固定 2026-11-01 00:00 东八区）：
   // **窗口终点 >= 它的周期单元才结算**。缺省是功能上线日、不随启动时刻漂移；开闸时仍应显式钉成实际开闸日
   // （未钉时启动告警）。解析与语义见 config/points.ts 的 parseSettleFrom / warnIfBoardSettleFromUnset。
