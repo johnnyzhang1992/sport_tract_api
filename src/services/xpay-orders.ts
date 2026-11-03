@@ -152,7 +152,8 @@ export async function memberProductsPayload(userId: string, now = Date.now()) {
   const enabled = await isMemberPaymentsEnabled(now);
   const entitlements = await entitlementsOf(userId, now);
   if (!enabled) {
-    return { enabled: false, items: [] as unknown[], entitlements, statusText: memberStatusText(entitlements, now) };
+    // 关闭态也要有一句服务端下发的说明：端上不许自己写「暂未开放」
+    return { enabled: false, items: [] as unknown[], entitlements, statusText: memberStatusText(entitlements, now), notice: MEMBER_CLOSED };
   }
   const items = (await activePaidProducts()).map((i) => ({
     ...i,
@@ -161,5 +162,5 @@ export async function memberProductsPayload(userId: string, now = Date.now()) {
     durationText: MEMBER_PRODUCT_COPY.duration(i.durationDays),
     perkLines: MEMBER_PRODUCT_COPY.perkLines(i.perks.photoQuota),
   }));
-  return { enabled: true, items, entitlements, statusText: memberStatusText(entitlements, now) };
+  return { enabled: true, items, entitlements, statusText: memberStatusText(entitlements, now), notice: '' };
 }

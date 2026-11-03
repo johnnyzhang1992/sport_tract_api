@@ -3,6 +3,7 @@ import { success } from '../utils/response.js';
 import { createMemberOrder, readOrderForUser, memberProductsPayload } from '../services/xpay-orders.js';
 import { entitlementsOf } from '../services/entitlements.js';
 import { scheduleLazySync } from '../services/xpay-deliver.js';
+import { memberEntryHint } from '../config/member-copy.js';
 
 /**
  * 会员（虚拟支付）用户侧接口（spec §6.1）。四个都要登录：
@@ -15,8 +16,11 @@ export async function memberRoutes(fastify: FastifyInstance) {
     return success(await memberProductsPayload(request.user.userId));
   });
 
-  fastify.get('/entitlements', { onRequest: [fastify.authenticate] }, async (request) =>
-    success(await entitlementsOf(request.user.userId)));
+  fastify.get('/entitlements', { onRequest: [fastify.authenticate] }, async (request) => {
+    const e = await entitlementsOf(request.user.userId);
+    // entryHint 给「我的」入口右侧那行（未开通 / 到期日），日期格式由服务端统一
+    return success({ ...e, entryHint: memberEntryHint(e) });
+  });
 
   fastify.post('/order', { onRequest: [fastify.authenticate] }, async (request) => {
     const body = (request.body ?? {}) as { productKey?: unknown; code?: unknown; channel?: unknown };
