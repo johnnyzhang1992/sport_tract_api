@@ -129,6 +129,8 @@ export async function xpayRefundOrder(p: {
   refundFeeFen: number;
   leftFeeFen: number;
   reason: string;
+  /** 退款来源（微信枚举）：1=人工客服发起 2=用户自己发起 3=其他 */
+  reqFrom: '1' | '2' | '3';
 }): Promise<XpayRefundResult> {
   const body: Record<string, unknown> = {
     openid: p.openid,
@@ -137,7 +139,10 @@ export async function xpayRefundOrder(p: {
     refund_fee: p.refundFeeFen,
     // left_fee 必须是最新一次 query_order 的值（spec §2.3）；调用方负责刷新后传进来
     left_fee: p.leftFeeFen,
-    reason: p.reason,
+    // 字段名是 refund_reason 不是 reason、且值只收枚举 0-5；req_from 必填
+    // （2026-11-04 真单实测：发 reason=自由文本/枚举都被 268490002 拒，错误会逐字段推进）
+    refund_reason: p.reason,
+    req_from: p.reqFrom,
   };
   if (p.wxOrderId) body.wx_order_id = p.wxOrderId;
   const data = await fetcher('refund_order', body);

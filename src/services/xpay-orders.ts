@@ -332,6 +332,7 @@ export async function startUserRefund(
     refundFeeFen: finalFee,
     leftFeeFen: left,
     reason: reasonCode,
+    reqFrom: '2', // 用户自己发起
   });
   if (r.failed) {
     await XpayOrderModel.updateOne({ _id: row._id }, { $set: { lastError: `退款失败（微信返回 status ${r.status}）` } });

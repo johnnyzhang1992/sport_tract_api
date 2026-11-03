@@ -167,7 +167,8 @@ test('MF-1 自助退款（真单形状）：day-0 全额、原因枚举入库、
   assert.equal(d.status, 'refunded');
   assert.equal(d.refundFeeFen, 199, 'day-0 剩余 30/30 天＝全额');
   assert.equal(d.refundedFen, 199);
-  assert.equal(refundBodies[0].reason, '1', '发微信的 reason 是枚举码');
+  assert.equal(refundBodies[0].refund_reason, '1', '发微信的 refund_reason 是枚举码');
+  assert.equal(refundBodies[0].req_from, '2', '用户自助退款的 req_from=2');
   const row = await XpayOrderModel.findById(o._id).lean();
   assert.equal(row?.status, 'refunded');
   assert.match(String(row?.refundReason), /^\[产品问题，影响使用或效果不佳\]用着不舒服$/);

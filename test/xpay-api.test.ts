@@ -67,12 +67,12 @@ test('XA-5 refund_order 的字段形状 + refundOrderId 复用同值（重试不
   });
   const r = await xpayRefundOrder({
     openid: 'o1', outTradeNo: 'ST1', wxOrderId: 'wx-1',
-    refundOrderId: 'rf-1', refundFeeFen: 132, leftFeeFen: 199, reason: '客服协商',
+    refundOrderId: 'rf-1', refundFeeFen: 132, leftFeeFen: 199, reason: '1', reqFrom: '1',
   });
   assert.equal(calls[0].api, 'refund_order');
   assert.deepEqual(calls[0].body, {
     openid: 'o1', out_trade_no: 'ST1', refund_id: 'rf-1',
-    refund_fee: 132, left_fee: 199, reason: '客服协商', wx_order_id: 'wx-1',
+    refund_fee: 132, left_fee: 199, refund_reason: '1', req_from: '1', wx_order_id: 'wx-1',
   });
   assert.equal(r.refundOrderId, 'rf-1');
   assert.equal(r.done, true);
@@ -82,14 +82,14 @@ test('XA-6 退款 status 7＝失败，5/8＝完成，其余＝处理中（spec �
   const mk = (status: number) => async () => ({ errcode: 0, refund_id: 'rf-1', status });
   for (const s of XPAY_REFUND_SETTLED_STATUSES) {
     __setXpayFetcherForTest(mk(s));
-    const r = await xpayRefundOrder({ openid: 'o', outTradeNo: 'ST', refundOrderId: 'rf-1', refundFeeFen: 1, leftFeeFen: 1, reason: 'r' });
+    const r = await xpayRefundOrder({ openid: 'o', outTradeNo: 'ST', refundOrderId: 'rf-1', refundFeeFen: 1, leftFeeFen: 1, reason: 'r', reqFrom: '1' });
     assert.equal(r.done, true, `status ${s}`);
     assert.equal(r.failed, false);
   }
   __setXpayFetcherForTest(mk(XPAY_REFUND_FAILED_STATUS));
-  assert.equal((await xpayRefundOrder({ openid: 'o', outTradeNo: 'ST', refundOrderId: 'rf-1', refundFeeFen: 1, leftFeeFen: 1, reason: 'r' })).failed, true);
+  assert.equal((await xpayRefundOrder({ openid: 'o', outTradeNo: 'ST', refundOrderId: 'rf-1', refundFeeFen: 1, leftFeeFen: 1, reason: 'r', reqFrom: '1' })).failed, true);
   __setXpayFetcherForTest(mk(3));
-  const pending = await xpayRefundOrder({ openid: 'o', outTradeNo: 'ST', refundOrderId: 'rf-1', refundFeeFen: 1, leftFeeFen: 1, reason: 'r' });
+  const pending = await xpayRefundOrder({ openid: 'o', outTradeNo: 'ST', refundOrderId: 'rf-1', refundFeeFen: 1, leftFeeFen: 1, reason: 'r', reqFrom: '1' });
   assert.equal(pending.done, false);
   assert.equal(pending.failed, false);
 });
