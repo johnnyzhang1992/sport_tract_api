@@ -21,8 +21,10 @@ import { adsRoutes } from './routes/ads.routes.js';
 import { pointsRoutes } from './routes/points.routes.js';
 import { footprintRecordRoutes } from './routes/footprint-record.routes.js';
 import { adminRoutes } from './routes/admin.routes.js';
+import { adminXpayRoutes } from './routes/admin-xpay.routes.js';
 import { AdminModel, hashPassword } from './models/admin.model.js';
 import { seedPointItems } from './services/points-catalog.js';
+import { seedPaidProducts } from './services/paid-products.js';
 
 export interface BuildAppOptions {
   /** 日志开关（测试传 false；默认 dev 用 pino-pretty，prod 用 JSON） */
@@ -94,6 +96,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(pointsRoutes, { prefix: `${config.apiPrefix}/points` });
   await fastify.register(footprintRecordRoutes, { prefix: `${config.apiPrefix}/footprint-records` });
   await fastify.register(adminRoutes, { prefix: `${config.apiPrefix}/admin` });
+  await fastify.register(adminXpayRoutes, { prefix: `${config.apiPrefix}/admin/xpay` });
 
   // 初始管理员 seed：Admin 集合为空时用环境变量创建
   fastify.addHook('onReady', async () => {
@@ -108,6 +111,9 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
     // 道具目录种子：$setOnInsert，重跑不覆盖后台改动
     const seeded = await seedPointItems();
     fastify.log.info(`道具目录已就绪：${seeded} 条`);
+    // 现金商品目录种子：同一条纪律（$setOnInsert），下单/发货/后台订单页都要靠这三档存在
+    const seededProducts = await seedPaidProducts();
+    fastify.log.info(`现金商品目录已就绪：新增 ${seededProducts} 条`);
   });
 
   // 健康检查（含 MongoDB 状态）

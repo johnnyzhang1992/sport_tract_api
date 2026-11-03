@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 import jsonwebtoken from 'jsonwebtoken';
 import { Types, type PipelineStage } from 'mongoose';
 import { AdminModel, hashPassword, verifyPassword } from '../models/admin.model.js';
@@ -9,6 +9,7 @@ import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
+import { adminAuth, adminIdOf } from '../utils/admin-auth.js';
 import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
 import { escapeRegex } from '../utils/regex.js';
 import { locateRegion } from '../services/region.js';
@@ -153,39 +154,8 @@ function toHourBuckets(rows: Array<{ _id: number; count: number }>) {
   return Array.from({ length: 24 }, (_, hour) => ({ hour, count: byHour.get(hour) ?? 0 }));
 }
 
-/** admin token 校验 */
-async function adminAuth(request: FastifyRequest, reply: FastifyReply) {
-  const token = adminTokenOf(request);
-  if (!token) throw new AppError(401, '缺少管理员凭证');
-  try {
-    const payload = jsonwebtoken.verify(token, config.adminJwtSecret) as { role?: string; id?: string };
-    if (payload.role !== 'admin') throw new AppError(401, '无管理员权限');
-  } catch (e) {
-    if (e instanceof AppError) throw e;
-    throw new AppError(401, '管理员凭证无效或已过期');
-  }
-}
-
-/** 从 authorization 头剥出裸 token（adminAuth 与取管理员身份两处共用同一口径） */
-function adminTokenOf(request: FastifyRequest): string {
-  const auth = request.headers.authorization ?? '';
-  return auth.startsWith('Bearer ') ? auth.slice(7) : '';
-}
-
-/**
- * 当前管理员身份（发放留痕用的 grantedBy）。
- * adminAuth 只验签、不往 request 挂任何东西（也没有 request.admin / request.username），
- * 而 /login 签发的 payload 就是 { role, id, username }——所以在这枚已经过闸的 token 里取 id，
- * 与 PUT /password 取管理员同一口径。username 只作为缺 id 的历史 token 兜底。
- * 路由的 onRequest 已先跑过 adminAuth，这里再验一次不会把无效凭证放到写库之后。
- */
-function adminIdOf(request: FastifyRequest): string {
-  const payload = jsonwebtoken.verify(adminTokenOf(request), config.adminJwtSecret) as {
-    id?: string; username?: string;
-  };
-  return String(payload.id ?? payload.username ?? '');
-}
-
+// adminAuth / adminIdOf 于 2026-11-03 原样搬到 utils/admin-auth.ts 并导出（支付域要共用同一份验签，
+// 复制就是第二个真相）；行为逐字不变，留痕见那个文件头注释。
 export async function adminRoutes(fastify: FastifyInstance) {
   // 管理员登录：用户名 + 密码 → admin token
   fastify.post('/login', async (request) => {
