@@ -9,6 +9,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { UserModel } from '../src/models/user.model.js';
+import { XpayOrderModel } from '../src/models/xpay-order.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { resetExportRate, assertExportRate, EXPORT_RATE_LIMIT } from '../src/services/export.js';
 
@@ -52,6 +53,8 @@ before(async () => {
     const ids = users.map((u) => u._id);
     if (!ids.length) return;
     await ActivityModel.deleteMany({ userId: { $in: ids } });
+    // 多条轨迹打包是会员功能（spec §5.4）：先清掉这些用户的历史订单，否则重跑会撞 outTradeNo 唯一索引
+    await XpayOrderModel.deleteMany({ userId: { $in: ids } });
     await UserModel.deleteMany({ _id: { $in: ids } });
   };
   await purge('exp-');
@@ -68,6 +71,20 @@ before(async () => {
   tokenB = b.accessToken;
   userBId = b.user.id;
   nickB = b.user?.nickname || '';
+
+  // EX5～EX8 测的是打包导出的内容与边界，前提是该用户是会员（闸门本身在 gpx-bundle-member-gate.test.ts 里测）
+  const DAY = 86_400_000;
+  const run = Date.now().toString(36);
+  const grant = (userId: string, openid: string, tag: string) =>
+    XpayOrderModel.create({
+      outTradeNo: `EXP${run}${tag}`.slice(0, 32), wxOrderId: `expwx${run}${tag}`.slice(0, 32),
+      userId, openid, productKey: 'month_card', name: '会员月卡',
+      priceFen: 199, durationDays: 30, status: 'delivered',
+      periodStart: Date.now() - DAY, periodEnd: Date.now() + 30 * DAY,
+      perksSnapshot: { adFree: true, exportBundle: true, photoQuota: 300, subscribeNotice: true },
+    });
+  await grant(userAId, 'exp-user-a', 'a');
+  await grant(userBId, 'exp-user-b', 'b');
 
   const mk = (userId: string, doc: Record<string, unknown>) =>
     ActivityModel.create({

@@ -16,6 +16,8 @@ import {
   reprocessActivity,
 } from '../services/activity.js';
 import { assertActivityForGpx, toGpx } from '../services/gpx.js';
+import { entitlementsOf } from '../services/entitlements.js';
+import { GPX_BUNDLE_MEMBER_REQUIRED } from '../config/member-copy.js';
 import {
   assertExportRate,
   contentDisposition,
@@ -206,6 +208,9 @@ export async function activityRoutes(fastify: FastifyInstance) {
   // 批量导出 GPX zip（ids 或时间范围二选一；与单条导出同一份 toGpx 口径：WGS-84 + 打点航点）
   fastify.get('/export/gpx', { onRequest: [fastify.authenticate] }, async (request, reply) => {
     const q = request.query as { ids?: string; from?: string; to?: string };
+    // 多条轨迹打包＝会员权益（spec §5.4 四处判据之一）。单条 /:id/gpx 不在本轮改动里，仍然免费。
+    const { canExportBundle } = await entitlementsOf(String(request.user.userId));
+    if (!canExportBundle) throw new AppError(403, GPX_BUNDLE_MEMBER_REQUIRED);
     assertExportRate(`gpx:${request.user.userId}`);
     const { archive, done } = await exportGpxZip({
       userId: String(request.user.userId),

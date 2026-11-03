@@ -21,7 +21,7 @@ import { isObjectIdLike } from '../utils/object-id.js';
 import { userKeywordFilter } from '../utils/user-keyword.js';
 import { STATUS_TEXT, cardStatus, type CardStatus } from './points-items.js';
 import { SOURCE_TEXT } from './points-grant.js';
-import { adFreeUntilOf } from './points-cards.js';
+import { entitlementsOf } from './entitlements.js';
 import { getAvatarUrl } from './oss.js';
 import { EXCHANGE_REFUND_TYPE, listPointRecords } from './points-ledger.js';
 import { getSigninState } from './points-signin.js';
@@ -271,7 +271,7 @@ export async function pointsAdminUserDetail(id: unknown): Promise<PointsUserDeta
     pointsOfUser(userId, now),
     PointSigninModel.distinct('dateKey', { userId: user._id }),
     getSigninState(userId, now),
-    adFreeUntilOf(userId),
+    entitlementsOf(userId).then((e) => e.adFreeUntil),
   ]);
   return {
     ...toRow(user, metrics),

@@ -3,7 +3,8 @@ import { getBalance, listPointRecords, settleExpired } from '../services/points-
 import { getSigninState, signIn, useMakeupCard } from '../services/points-signin.js';
 import { getTaskRows, claimTask } from '../services/points-tasks.js';
 import { listActiveItems, exchangeItem, listExchanges } from '../services/points-items.js';
-import { activateCard, adFreeUntilOf, countUnusedCards, listCards } from '../services/points-cards.js';
+import { activateCard, countUnusedCards, listCards } from '../services/points-cards.js';
+import { entitlementsOf } from '../services/entitlements.js';
 import { getSigninCalendar } from '../services/points-calendar.js';
 import { expiringOf, streakPercentileOf } from '../services/points-summary.js';
 import { scheduleLazySettle } from '../services/board-lazy-settle.js';
@@ -42,7 +43,7 @@ export async function pointsRoutes(fastify: FastifyInstance) {
       listActiveItems(),
       getBalance(userId, now),
       // 免广告到期时刻与持卡数都是现推不落字段（spec §5.4），与卡行永远同一口径
-      adFreeUntilOf(userId),
+      entitlementsOf(userId).then((e) => e.adFreeUntil),
       countUnusedCards(userId, now),
       expiringOf(userId, now),
       streakPercentileOf(userId, now),

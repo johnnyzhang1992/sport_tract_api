@@ -1,7 +1,8 @@
 import { Types } from 'mongoose';
 import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
-import { MAX_USER_PHOTOS } from '../config/constants.js';
+import { entitlementsOf } from './entitlements.js';
+import { photoQuotaFullMessage } from '../config/member-copy.js';
 
 /** 带照片的对象：打点是 {photoUrl, photos}，足迹是裸 URL 数组 */
 interface PhotoHolder {
@@ -25,10 +26,16 @@ export function countMarkerPhotos(markers: PhotoHolder[] | undefined | null): nu
   return (markers ?? []).reduce((sum, m) => sum + countPhotos(m), 0);
 }
 
-export async function getPhotoQuota(userId: string): Promise<{ used: number; limit: number; remaining: number }> {
-  const doc = await UserModel.findById(userId).select('photoQuotaUsed').lean();
+export async function getPhotoQuota(
+  userId: string,
+): Promise<{ used: number; limit: number; remaining: number; isMember: boolean }> {
+  // 上限改读权益层（spec §5.4 第 4 处判据）：会员期内是 300，非会员仍是 MAX_USER_PHOTOS
+  const [doc, { photoQuotaLimit, memberActive }] = await Promise.all([
+    UserModel.findById(userId).select('photoQuotaUsed').lean(),
+    entitlementsOf(userId),
+  ]);
   const used = doc?.photoQuotaUsed ?? 0;
-  return { used, limit: MAX_USER_PHOTOS, remaining: Math.max(0, MAX_USER_PHOTOS - used) };
+  return { used, limit: photoQuotaLimit, remaining: Math.max(0, photoQuotaLimit - used), isMember: memberActive };
 }
 
 /**
@@ -46,12 +53,12 @@ export async function settlePhotoQuota(userId: string, before: number, after: nu
   const _id = new Types.ObjectId(userId);
 
   if (delta > 0) {
-    // 条件更新即闸门：过滤器在写入时刻求值，两个并发请求不会同时用掉最后一格额度。
-    // 存量文档可能压根没有这个字段，而 $lte 不匹配缺失值——「缺失当 0」要显式放行。
+    // 上限按写入时刻的权益读数取（会员前后上限不同，不能拿常量）；闸门本身仍是条件更新。
+    const { photoQuotaLimit, memberActive } = await entitlementsOf(userId);
     const ok = await UserModel.findOneAndUpdate(
       {
         _id,
-        $or: [{ photoQuotaUsed: { $lte: MAX_USER_PHOTOS - delta } }, { photoQuotaUsed: { $exists: false } }],
+        $or: [{ photoQuotaUsed: { $lte: photoQuotaLimit - delta } }, { photoQuotaUsed: { $exists: false } }],
       },
       { $inc: { photoQuotaUsed: delta } },
       { new: true, lean: true },
@@ -60,7 +67,7 @@ export async function settlePhotoQuota(userId: string, before: number, after: nu
       .exec();
     if (!ok) {
       const { used } = await getPhotoQuota(userId);
-      throw new AppError(400, `图片额度已满（已用 ${used}/${MAX_USER_PHOTOS} 张），本次需新增 ${delta} 张，请先删除部分照片`);
+      throw new AppError(400, photoQuotaFullMessage(used, photoQuotaLimit, memberActive));
     }
     return;
   }

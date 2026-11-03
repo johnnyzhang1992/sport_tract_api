@@ -4,7 +4,7 @@ import { UserModel } from '../models/user.model.js';
 import { LoginLogModel } from '../models/login-log.model.js';
 import { code2Session } from '../services/wechat.js';
 import { getAvatarUrl } from '../services/oss.js';
-import { adFreeUntilOf } from '../services/points-cards.js';
+import { entitlementsOf } from '../services/entitlements.js';
 import { locateByIp } from '../services/ip-locate.js';
 import { LoginSchema, RefreshSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
@@ -86,7 +86,8 @@ export async function authRoutes(fastify: FastifyInstance) {
     const accessToken = fastify.signAccessToken(userId);
     const refreshToken = fastify.signRefreshToken(userId);
     // 免广告权益到期时刻：端上广告组件靠它决定要不要渲染（每次登录带回来，省一次 summary 请求）
-    const adFreeUntil = await adFreeUntilOf(userId);
+    // 免广告到期时刻现在是权益层的读数（会员与积分卡两条来源已在里面取 max）
+    const { adFreeUntil } = await entitlementsOf(userId);
 
     // openid/sessionKey 为敏感字段，不出接口；头像签名（bucket 私有）
     return success(

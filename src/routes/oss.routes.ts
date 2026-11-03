@@ -3,6 +3,7 @@ import { issueUploadCredential } from '../services/oss.js';
 import { getPhotoQuota } from '../services/photo-quota.js';
 import { AppError } from '../utils/app-error.js';
 import { StsSchema } from '../utils/validators.js';
+import { photoQuotaFullMessage } from '../config/member-copy.js';
 import { success } from '../utils/response.js';
 
 /** OSS 路由：POST /api/oss/credential 签发直传签名凭证（AK 签名，无需 roleArn） */
@@ -15,7 +16,8 @@ export async function ossRoutes(fastify: FastifyInstance) {
     // 真正的闸门在落库处（photo-quota.settlePhotoQuota），这里只是提前一步的提示。
     const quota = await getPhotoQuota(userId);
     if (quota.remaining === 0) {
-      throw new AppError(400, `图片额度已满（已用 ${quota.used}/${quota.limit} 张），请先删除部分照片`);
+      // 文案唯一真值在 config/member-copy（2026-11-03 批准稿 MC-15/15b）：这里不许再写第二份句子
+      throw new AppError(400, photoQuotaFullMessage(quota.used, quota.limit, quota.isMember));
     }
 
     const creds = await issueUploadCredential(userId, dir);
