@@ -13,7 +13,7 @@ import axios from 'axios';
 import { AppError } from '../utils/app-error.js';
 import { callWithRetry } from './wechat-sec.js';
 import { hmacSha256Hex } from './xpay-sign.js';
-import { payConfig } from '../config/xpay.js';
+import { payConfig, xpayConfig } from '../config/xpay.js';
 
 // 官方订单状态枚举（微信开放文档/社区，2026-11-03 真单实测：已支付单 status=3）：
 // 0=初始化 1=创建成功(未支付) 2=已支付待发货 3=发货中 4=已发货 5=已退款 6=已关闭 7=退款失败 8=用户退款完成
@@ -134,15 +134,14 @@ export async function xpayRefundOrder(p: {
 }): Promise<XpayRefundResult> {
   const body: Record<string, unknown> = {
     openid: p.openid,
-    out_trade_no: p.outTradeNo,
-    refund_id: p.refundOrderId,
-    refund_fee: p.refundFeeFen,
-    // left_fee 必须是最新一次 query_order 的值（spec §2.3）；调用方负责刷新后传进来
-    left_fee: p.leftFeeFen,
-    // 字段名是 refund_reason 不是 reason、且值只收枚举 0-5；req_from 必填
-    // （2026-11-04 真单实测：发 reason=自由文本/枚举都被 268490002 拒，错误会逐字段推进）
-    refund_reason: p.reason,
-    req_from: p.reqFrom,
+    order_id: p.outTradeNo, // 与 wx_order_id 二选一（官方文档；out_trade_no/refund_id 会被忽略）
+    refund_order_id: p.refundOrderId, // 8-32 位字母数字 _ -
+    left_fee: p.leftFeeFen, // 最新一次 query_order 的值（spec §2.3）
+    refund_fee: p.refundFeeFen, // (0, left_fee]
+    biz_meta: JSON.stringify({ attach: p.outTradeNo, reason: p.reason }), // 必填，query_order 原样返回
+    refund_reason: p.reason, // 枚举 0-5（不是 reason 字段）
+    req_from: p.reqFrom, // 枚举 1/2/3
+    env: xpayConfig.env,
   };
   if (p.wxOrderId) body.wx_order_id = p.wxOrderId;
   const data = await fetcher('refund_order', body);

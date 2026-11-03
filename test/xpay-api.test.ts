@@ -71,8 +71,9 @@ test('XA-5 refund_order 的字段形状 + refundOrderId 复用同值（重试不
   });
   assert.equal(calls[0].api, 'refund_order');
   assert.deepEqual(calls[0].body, {
-    openid: 'o1', out_trade_no: 'ST1', refund_id: 'rf-1',
-    refund_fee: 132, left_fee: 199, refund_reason: '1', req_from: '1', wx_order_id: 'wx-1',
+    openid: 'o1', order_id: 'ST1', refund_order_id: 'rf-1',
+    refund_fee: 132, left_fee: 199, refund_reason: '1', req_from: '1',
+    biz_meta: JSON.stringify({ attach: 'ST1', reason: '1' }), env: 0, wx_order_id: 'wx-1',
   });
   assert.equal(r.refundOrderId, 'rf-1');
   assert.equal(r.done, true);
