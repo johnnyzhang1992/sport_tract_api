@@ -10,7 +10,7 @@ import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   xpayQueryOrder, xpayRefundOrder, __setXpayFetcherForTest, buildXpayRequest,
-  XPAY_PAID_ORDER_STATUSES, XPAY_REFUND_DONE_STATUS, XPAY_REFUND_FAILED_STATUS,
+  XPAY_PAID_ORDER_STATUSES, XPAY_REFUND_SETTLED_STATUSES, XPAY_REFUND_FAILED_STATUS,
 } from '../src/services/xpay-api.js';
 import { hmacSha256Hex } from '../src/services/xpay-sign.js';
 
@@ -24,28 +24,33 @@ beforeEach(() => {
 test('XA-1 query_order 的请求形状逐字', async () => {
   __setXpayFetcherForTest(async (api, body) => {
     calls.push({ api, body });
-    return { errcode: 0, order: { status: 1, left_fee: 99, order_no: 'wx-1' } };
+    return { errcode: 0, order: { status: 3, left_fee: 99, order_no: 'wx-1' } };
   });
   const r = await xpayQueryOrder({ openid: 'o1', outTradeNo: 'ST1', wxOrderId: 'wx-1' });
   assert.equal(calls[0].api, 'query_order');
-  assert.deepEqual(calls[0].body, { openid: 'o1', out_trade_no: 'ST1', wx_order_id: 'wx-1' });
+  assert.deepEqual(calls[0].body, { openid: 'o1', order_id: 'ST1', wx_order_id: 'wx-1' });
   assert.equal(r.paid, true);
   assert.equal(r.leftFeeFen, 99);
   assert.equal(r.wxOrderId, 'wx-1');
 });
 
-test('XA-2 未知 status 一律按未支付（宁可漏补发货，不虚构权益）', async () => {
-  for (const status of [0, 2, 3, 99, undefined]) {
+test('XA-2 官方枚举之外一律按未支付（宁可漏补发货，不虚构权益）', async () => {
+  for (const status of [0, 1, 6, 99, undefined]) {
     __setXpayFetcherForTest(async () => ({ errcode: 0, order: { status, left_fee: 199 } }));
     const r = await xpayQueryOrder({ openid: 'o1', outTradeNo: 'ST1' });
     assert.equal(r.paid, false, `status=${String(status)} 不该被判成已支付`);
+  }
+  for (const status of [2, 3, 4]) {
+    __setXpayFetcherForTest(async () => ({ errcode: 0, order: { status, left_fee: 199 } }));
+    const r = await xpayQueryOrder({ openid: 'o1', outTradeNo: 'ST1' });
+    assert.equal(r.paid, true, `status=${String(status)}（已支付待发货/发货中/已发货）要判成已支付`);
   }
 });
 
 test('XA-3 XPAY_PAID_ORDER_STATUSES 是「一处可改」的集合，且不含 0（改动它必被这条抓红）', () => {
   assert.ok(XPAY_PAID_ORDER_STATUSES instanceof Set);
   assert.equal(XPAY_PAID_ORDER_STATUSES.has(0), false);
-  assert.deepEqual([...XPAY_PAID_ORDER_STATUSES], [1], 'Task 14 用真单响应核对后把真实取值集合写进来');
+  assert.deepEqual([...XPAY_PAID_ORDER_STATUSES], [2, 3, 4], '官方枚举（2026-11-03 真单实测 status=3）：2 已支付待发货 / 3 发货中 / 4 已发货');
 });
 
 test('XA-4 缺 order 对象时不抛，按未支付且 leftFee 为 0（查单还没结果）', async () => {
@@ -75,7 +80,7 @@ test('XA-5 refund_order 的字段形状 + refundOrderId 复用同值（重试不
 
 test('XA-6 退款 status 7＝失败，5/8＝完成，其余＝处理中（spec §2.3）', async () => {
   const mk = (status: number) => async () => ({ errcode: 0, refund_id: 'rf-1', status });
-  for (const s of XPAY_REFUND_DONE_STATUS) {
+  for (const s of XPAY_REFUND_SETTLED_STATUSES) {
     __setXpayFetcherForTest(mk(s));
     const r = await xpayRefundOrder({ openid: 'o', outTradeNo: 'ST', refundOrderId: 'rf-1', refundFeeFen: 1, leftFeeFen: 1, reason: 'r' });
     assert.equal(r.done, true, `status ${s}`);

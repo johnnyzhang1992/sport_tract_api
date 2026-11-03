@@ -67,7 +67,7 @@ test('DL-1 支付成功推送 → 发货、落区间快照、回 ErrCode 0、发
   // 通知入口发货前要复核查单（推送不可信），夹具返回已支付
   __setXpayFetcherForTest(async (api) => {
     assert.equal(api, 'query_order');
-    return { errcode: 0, order: { status: 1, left_fee: 199, order_no: 'wx1' } };
+    return { errcode: 0, order: { status: 3, left_fee: 199, order_no: "wx1" } };
   });
   const now = Date.now();
   const r = await handleXpayNotify('xpay_goods_deliver_notify', {
@@ -243,7 +243,7 @@ test('RF-6 重复退款通知只回收一次（按 refundOrderId 去重）', asy
   const o = await mkOrder({
     status: 'refunding', wxOrderId: 'wxr6', periodStart: start, periodEnd: start + 30 * DAY, refundOrderId: 'rf6', refundedFen: 0,
   });
-  __setXpayFetcherForTest(async () => ({ errcode: 0, order: { status: 1, left_fee: 67 } })); // 通知入口落账前要复核「这单确实付过」
+  __setXpayFetcherForTest(async () => ({ errcode: 0, order: { status: 3, left_fee: 67 } })); // 通知入口落账前要复核「这单确实付过」
   await handleXpayNotify('xpay_refund_notify', { openid: OPENID, out_trade_no: o.outTradeNo, refund_id: 'rf6', refund_fee: 132, status: 5 });
   const first = await XpayOrderModel.findById(o._id).lean();
   await handleXpayNotify('xpay_refund_notify', { openid: OPENID, out_trade_no: o.outTradeNo, refund_id: 'rf6', refund_fee: 132, status: 5 });
@@ -255,7 +255,7 @@ test('LQ-1 懒查单：查到的已支付单补发货；未知 status 不补（�
   const o = await mkOrder();
   __setXpayFetcherForTest(async (api) => {
     assert.equal(api, 'query_order');
-    return { errcode: 0, order: { status: 1, left_fee: 199, order_no: 'wxlazy' } };
+    return { errcode: 0, order: { status: 3, left_fee: 199, order_no: "wxlazy" } };
   });
   assert.equal(await lazySyncOrders(String(uid), Date.now()), 1);
   assert.equal((await XpayOrderModel.findById(o._id).lean())?.status, 'delivered');
@@ -287,7 +287,7 @@ test('DL-7 伪造推送：查单未支付 → 拒绝发货并留痕（明文分�
   const o = await mkOrder(); // status='created'，从未支付
   __setXpayFetcherForTest(async (api) => {
     assert.equal(api, 'query_order');
-    return { errcode: 0, order: { status: 2, left_fee: 199 } }; // 2＝非已支付枚举
+    return { errcode: 0, order: { status: 1, left_fee: 199 } }; // 1=创建未支付：伪造者手里的单只可能是这个状态
   });
   const r = await handleXpayNotify('xpay_goods_deliver_notify', {
     openid: OPENID, out_trade_no: o.outTradeNo, WeChatPayInfo: { MchOrderNo: 'wx_forged' },
@@ -304,7 +304,7 @@ test('DL-8 复核查单确认已支付 → 正常发货（真单不被误伤）'
   const o = await mkOrder();
   __setXpayFetcherForTest(async (api) => {
     assert.equal(api, 'query_order');
-    return { errcode: 0, order: { status: 1, left_fee: 199 } };
+    return { errcode: 0, order: { status: 3, left_fee: 199 } };
   });
   const r = await handleXpayNotify('xpay_goods_deliver_notify', {
     openid: OPENID, out_trade_no: o.outTradeNo, WeChatPayInfo: { MchOrderNo: 'wx_real' },

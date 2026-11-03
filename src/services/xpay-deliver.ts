@@ -18,7 +18,7 @@ import { XpayOrderModel } from '../models/xpay-order.model.js';
 import { UserModel } from '../models/user.model.js';
 import { createNotification } from './notification.js';
 import { membershipUntilOf } from './entitlements.js';
-import { xpayQueryOrder } from './xpay-api.js';
+import { xpayQueryOrder, XPAY_REFUND_SETTLED_STATUSES } from './xpay-api.js';
 import { isObjectIdLike } from '../utils/object-id.js';
 import { fmtCnDate, MEMBER_DELIVER_NOTICE, IOS_QUERY_EVIDENCE } from '../config/member-copy.js';
 import type { NotifyResult } from '../routes/pay-notify.routes.js';
@@ -223,7 +223,8 @@ export async function applyRefund(p: {
         console.error(`[xpay] 退款复核查单失败（${fresh.outTradeNo}）：`, (e as Error).message);
         return { ok: false, errcode: 7, errmsg: 'paid-verify query failed' };
       }
-      if (!verdict.paid) {
+      if (!verdict.paid && !XPAY_REFUND_SETTLED_STATUSES.has(verdict.status)) {
+        // 已退款（5）/用户退款完成（8）的单，重复/迟到的退款推送也要能落账对齐，不算伪造
         console.error(`[xpay] 退款推送但微信查单 status=${verdict.status}（${fresh.outTradeNo}）——拒绝落账（疑似伪造推送）`);
         await XpayOrderModel.updateOne(
           { _id: row._id },

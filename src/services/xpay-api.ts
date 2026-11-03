@@ -15,8 +15,10 @@ import { callWithRetry } from './wechat-sec.js';
 import { hmacSha256Hex } from './xpay-sign.js';
 import { payConfig } from '../config/xpay.js';
 
-export const XPAY_PAID_ORDER_STATUSES = new Set<number>([1]);
-export const XPAY_REFUND_DONE_STATUS = [5, 8] as const;
+// 官方订单状态枚举（微信开放文档/社区，2026-11-03 真单实测：已支付单 status=3）：
+// 0=初始化 1=创建成功(未支付) 2=已支付待发货 3=发货中 4=已发货 5=已退款 6=已关闭 7=退款失败 8=用户退款完成
+export const XPAY_PAID_ORDER_STATUSES = new Set<number>([2, 3, 4]);
+export const XPAY_REFUND_SETTLED_STATUSES = new Set<number>([5, 8]);
 export const XPAY_REFUND_FAILED_STATUS = 7;
 
 export type XpayFetcher = (api: string, body: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -87,7 +89,7 @@ export async function xpayQueryOrder(p: {
   outTradeNo: string;
   wxOrderId?: string;
 }): Promise<XpayQueryResult> {
-  const body: Record<string, unknown> = { openid: p.openid, out_trade_no: p.outTradeNo };
+  const body: Record<string, unknown> = { openid: p.openid, order_id: p.outTradeNo };
   if (p.wxOrderId) body.wx_order_id = p.wxOrderId;
   const data = await fetcher('query_order', body);
   assertOk('query_order', data);
@@ -133,7 +135,7 @@ export async function xpayRefundOrder(p: {
   assertOk('refund_order', data);
   const status = Number(data.status ?? data.refund_status ?? 0);
   return {
-    done: (XPAY_REFUND_DONE_STATUS as readonly number[]).includes(status),
+    done: XPAY_REFUND_SETTLED_STATUSES.has(status),
     failed: status === XPAY_REFUND_FAILED_STATUS,
     status,
     refundOrderId: String(data.refund_id ?? p.refundOrderId),

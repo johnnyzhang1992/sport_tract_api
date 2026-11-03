@@ -162,7 +162,7 @@ test('OA-6 refundOrderId 生成后落库，重试复用同值', async () => {
     seen.push(String(body.refund_id));
     return api === 'refund_order'
       ? { errcode: 0, status: 3 }
-      : { errcode: 0, order: { status: 1, left_fee: 199, order_no: 'x' } };
+      : { errcode: 0, order: { status: 3, left_fee: 199, order_no: "x" } };
   });
   const o = await mk();
   const first = await app.inject({
@@ -226,7 +226,7 @@ test('OA-10 手动查单查到已支付即补发货（幂等仍生效）', async
   const o = await mk({ status: 'paid', wxOrderId: '', periodStart: 0, periodEnd: 0 });
   __setXpayFetcherForTest(async (_api, body) => ({
     errcode: 0,
-    order: { status: 1, left_fee: 199, order_no: `manual_${String((body as { out_trade_no?: string }).out_trade_no)}` },
+    order: { status: 3, left_fee: 199, order_no: `manual_${String((body as { order_id?: string }).order_id)}` },
   }));
   const res = await app.inject({ method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/query`, headers: H() });
   assert.equal(res.statusCode, 200, res.body);
