@@ -176,6 +176,8 @@ async function purge2() {
   const ids = users.map((u) => u._id);
   if (!ids.length) return;
   await ActivityModel.deleteMany({ userId: { $in: ids } });
+  // 本文件会给测试用户发会员订单（打包导出闸门）；不清掉的话后台「会员订单」页会长期挂着测试单
+  await XpayOrderModel.deleteMany({ userId: { $in: ids } });
   await UserModel.deleteMany({ _id: { $in: ids } });
 }
 

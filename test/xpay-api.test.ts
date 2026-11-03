@@ -9,9 +9,10 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  xpayQueryOrder, xpayRefundOrder, __setXpayFetcherForTest,
+  xpayQueryOrder, xpayRefundOrder, __setXpayFetcherForTest, buildXpayRequest,
   XPAY_PAID_ORDER_STATUSES, XPAY_REFUND_DONE_STATUS, XPAY_REFUND_FAILED_STATUS,
 } from '../src/services/xpay-api.js';
+import { hmacSha256Hex } from '../src/services/xpay-sign.js';
 
 const calls: Array<{ api: string; body: Record<string, unknown> }> = [];
 
@@ -104,4 +105,14 @@ test('XA-7 errcode 非 0 → AppError 且句子含接口名与实际错误码（
 test('XA-8 fetcher 抛网络错时不吞：错误照抛（发货依据不能建立在猜测上）', async () => {
   __setXpayFetcherForTest(async () => { throw new Error('ETIMEDOUT'); });
   await assert.rejects(() => xpayQueryOrder({ openid: 'o', outTradeNo: 'ST' }), /ETIMEDOUT/);
+});
+
+test('XA-9 服务端调 xpay 也必须带 pay_sig：URL 带签名、body 与签名字节一致（268490002 的坑）', () => {
+  const body = '{"openid":"o1","out_trade_no":"ST1"}';
+  const { url, data } = buildXpayRequest('query_order', body, 'AT', 'APPKEY');
+  // uri 带前导斜杠且含 xpay 前缀：实测写 query_order 是 268490003 校验失败
+  const sig = hmacSha256Hex('APPKEY', `/xpay/query_order&${body}`);
+  assert.match(url, /\/xpay\/query_order\?access_token=AT&pay_sig=[0-9a-f]{64}$/);
+  assert.ok(url.includes(sig), 'pay_sig 必须是 HMAC(AppKey, "<api>&<body>")');
+  assert.equal(data, body, '签名的串与实际发送的字节必须完全一致');
 });

@@ -119,6 +119,8 @@ before(async () => {
 after(async () => {
   if (madeRecordIds.length) await FootprintRecordModel.deleteMany({ _id: { $in: madeRecordIds.map((i) => new Types.ObjectId(i)) } });
   if (madeActivityIds.length) await ActivityModel.deleteMany({ _id: { $in: madeActivityIds.map((i) => new Types.ObjectId(i)) } });
+  // 会员订单（PQ18 的 300 张上限用例）也按用户清掉：只在用例末尾删会被中途失败漏掉
+  if (madeUids.length) await XpayOrderModel.deleteMany({ userId: { $in: madeUids.map((i) => new Types.ObjectId(i)) } });
   if (madeUids.length) await UserModel.deleteMany({ _id: { $in: madeUids.map((i) => new Types.ObjectId(i)) } });
   await app.close();
   await mongoose.disconnect().catch(() => {});

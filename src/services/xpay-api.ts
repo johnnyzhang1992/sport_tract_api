@@ -12,6 +12,8 @@
 import axios from 'axios';
 import { AppError } from '../utils/app-error.js';
 import { callWithRetry } from './wechat-sec.js';
+import { hmacSha256Hex } from './xpay-sign.js';
+import { payConfig } from '../config/xpay.js';
 
 export const XPAY_PAID_ORDER_STATUSES = new Set<number>([1]);
 export const XPAY_REFUND_DONE_STATUS = [5, 8] as const;
@@ -19,13 +21,36 @@ export const XPAY_REFUND_FAILED_STATUS = 7;
 
 export type XpayFetcher = (api: string, body: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
+/**
+ * 服务端调 xpay 接口也要签名：`pay_sig = HMAC-SHA256(AppKey, "/xpay/<api>&<post_body>")`，
+ * post_body 必须与真正发出去的字节完全一致（所以这里先序列化一次、再用同一个串签名与发送）。
+ *
+ * 两点都是 2026-11-03 对微信现网实测出来的：
+ * - 漏了 pay_sig → 268490002「签名字段[pay_sig]为空」；
+ * - 被签的 uri 必须是 **带前导斜杠的完整路径 `/xpay/query_order`**（写 `query_order` 或
+ *   `xpay/query_order` 都是 268490003「支付签名校验失败」）。
+ */
+export function buildXpayRequest(
+  api: string,
+  bodyJson: string,
+  accessToken: string,
+  appKey: string,
+): { url: string; data: string } {
+  const paySig = hmacSha256Hex(appKey, `/xpay/${api}&${bodyJson}`);
+  return {
+    url: `https://api.weixin.qq.com/xpay/${api}?access_token=${accessToken}&pay_sig=${paySig}`,
+    data: bodyJson,
+  };
+}
+
 const defaultFetcher: XpayFetcher = async (api, body) => {
+  const bodyJson = JSON.stringify(body);
   const data = await callWithRetry(async (token) => {
-    const res = await axios.post<Record<string, unknown>>(
-      `https://api.weixin.qq.com/xpay/${api}?access_token=${token}`,
-      body,
-      { timeout: 5000 },
-    );
+    const { url, data: payload } = buildXpayRequest(api, bodyJson, token, payConfig().appKey);
+    const res = await axios.post<Record<string, unknown>>(url, payload, {
+      timeout: 5000,
+      headers: { 'Content-Type': 'application/json' },
+    });
     return res.data;
   });
   return data as Record<string, unknown>;
