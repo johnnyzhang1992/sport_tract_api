@@ -19,9 +19,25 @@ export const xpayConfig = {
   env: 0 as const,
 } as const;
 
+/**
+ * 下单侧的两个值（offerId / 现网 AppKey）。与信封那组同一个原因必须经函数取：
+ * `xpayConfig` 在 import 期就固化了 env，测试要靠运行期注入才能既跑下单链路、又不把真密钥写进夹具。
+ */
+let payOverrides: { offerId: string; appKey: string } | null = null;
+
+export function payConfig(): { offerId: string; appKey: string } {
+  return payOverrides ?? { offerId: xpayConfig.offerId, appKey: xpayConfig.appKey };
+}
+
+/** 测试专用：运行期覆盖 offerId/AppKey（传 null 恢复 env 值） */
+export function __setPayConfigForTest(o: { offerId: string; appKey: string } | null): void {
+  payOverrides = o;
+}
+
 /** 下单签名所需的两把钥匙 + offerId 都在位吗（缺任一则付费功能不可用，接口应报「服务未就绪」而不是 500） */
 export function isXpayPayConfigured(): boolean {
-  return Boolean(xpayConfig.offerId && xpayConfig.appKey);
+  const { offerId, appKey } = payConfig();
+  return Boolean(offerId && appKey);
 }
 
 /**

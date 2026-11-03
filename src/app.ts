@@ -22,6 +22,7 @@ import { pointsRoutes } from './routes/points.routes.js';
 import { footprintRecordRoutes } from './routes/footprint-record.routes.js';
 import { adminRoutes } from './routes/admin.routes.js';
 import { payNotifyRoutes } from './routes/pay-notify.routes.js';
+import { memberRoutes } from './routes/member.routes.js';
 import { adminXpayRoutes } from './routes/admin-xpay.routes.js';
 import { AdminModel, hashPassword } from './models/admin.model.js';
 import { seedPointItems } from './services/points-catalog.js';
@@ -99,6 +100,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(adminRoutes, { prefix: `${config.apiPrefix}/admin` });
   // 微信消息推送接收端：公开、无 JWT、不走 success() 封装（应答由该插件自己构造）
   await fastify.register(payNotifyRoutes, { prefix: `${config.apiPrefix}/pay` });
+  await fastify.register(memberRoutes, { prefix: `${config.apiPrefix}/member` });
   await fastify.register(adminXpayRoutes, { prefix: `${config.apiPrefix}/admin/xpay` });
 
   // 初始管理员 seed：Admin 集合为空时用环境变量创建
