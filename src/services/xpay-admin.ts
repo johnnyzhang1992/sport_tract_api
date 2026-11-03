@@ -11,7 +11,7 @@ import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { escapeRegex } from '../utils/regex.js';
 import { bjDateStr, BJ_OFFSET_MS } from '../utils/bj-time.js';
-import { xpayQueryOrder, xpayRefundOrder } from './xpay-api.js';
+import { xpayQueryOrder, xpayRefundOrder, XPAY_REFUND_REASONS } from './xpay-api.js';
 import { suggestRefundFeeFen, deliverOrder, applyRefund } from './xpay-deliver.js';
 
 const DAY_MS = 86_400_000;
@@ -186,7 +186,7 @@ export async function refundPreview(id: string) {
 /** 第二、三步：金额校验（0 < refundFee ≤ leftFee）+ 备注必填 + refundOrderId 复用 */
 export async function startRefund(
   id: string,
-  input: { refundFee?: unknown; reason?: unknown },
+  input: { refundFee?: unknown; reason?: unknown; reasonCode?: unknown },
   adminId: string,
 ): Promise<{ status: string; refundOrderId: string; leftFeeFen: number }> {
   assertObjectIdLike(id, '订单不存在');
@@ -197,6 +197,15 @@ export async function startRefund(
   const reason = String(input.reason ?? '').trim();
   if (!reason) throw new AppError(400, '退款备注必填（会写进订单留痕，方便日后与用户核对）');
   if (reason.length > 100) throw new AppError(400, `退款备注不能超过 100 字（当前 ${reason.length} 字）`);
+  // 微信 refund_order 的 reason 只收枚举（2026-11-04 真单实测 268490002）；备注只进我们的库、不发微信
+  const reasonCode = String(input.reasonCode ?? '').trim();
+  const knownReason = XPAY_REFUND_REASONS.find((r) => r.code === reasonCode);
+  if (!knownReason) {
+    throw new AppError(
+      400,
+      `退款原因必须是枚举值（收到 ${JSON.stringify(input.reasonCode)}，可选：${XPAY_REFUND_REASONS.map((r) => `${r.code}=${r.label}`).join('；')}）`,
+    );
+  }
 
   const age = Date.now() - new Date(row.createdAt as never).getTime();
   if (age > XPAY_REFUND_WINDOW_MS) {
@@ -232,7 +241,7 @@ export async function startRefund(
     refundOrderId,
     refundFeeFen: fee,
     leftFeeFen: left,
-    reason,
+    reason: reasonCode,
   });
   if (r.failed) {
     await XpayOrderModel.updateOne({ _id: row._id }, { $set: { lastError: `退款失败（微信返回 status ${r.status}）` } });
@@ -242,7 +251,7 @@ export async function startRefund(
     { _id: row._id },
     { $set: { status: 'refunding', refundReason: reason, lastQueryAt: Date.now() } },
   );
-  console.warn(`[xpay] 发起退款 ${row.outTradeNo} ${fee} 分（admin=${adminId}，备注=${reason}）→ refunding`);
+  console.warn(`[xpay] 发起退款 ${row.outTradeNo} ${fee} 分（admin=${adminId}，原因=${reasonCode}，备注=${reason}）→ refunding`);
   if (r.done) {
     // 极少见：启动即完成。复用 Task 9 的回收路径，别让状态卡在 refunding，也不在运营侧另写一份落账
     await applyRefund({ outTradeNo: row.outTradeNo, refundFeeFen: fee, refundOrderId: r.refundOrderId });

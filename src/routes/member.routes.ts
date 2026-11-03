@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { success } from '../utils/response.js';
-import { createMemberOrder, readOrderForUser, memberProductsPayload } from '../services/xpay-orders.js';
+import { createMemberOrder, readOrderForUser, memberProductsPayload, listOrdersForUser, repayOrder, cancelOrder, startUserRefund } from '../services/xpay-orders.js';
 import { entitlementsOf } from '../services/entitlements.js';
 import { scheduleLazySync } from '../services/xpay-deliver.js';
 import { memberEntryHint } from '../config/member-copy.js';
@@ -36,5 +36,27 @@ export async function memberRoutes(fastify: FastifyInstance) {
   fastify.get('/order/:outTradeNo', { onRequest: [fastify.authenticate] }, async (request) => {
     const { outTradeNo } = request.params as { outTradeNo: string };
     return success(await readOrderForUser(request.user.userId, outTradeNo));
+  });
+
+  // ===== 我的订单（2026-11-04）：全状态列表 / 待支付继续支付与取消 / 已生效自助退款 =====
+  fastify.get('/orders', { onRequest: [fastify.authenticate] }, async (request) => {
+    return success(await listOrdersForUser(request.user.userId));
+  });
+
+  fastify.post('/order/:outTradeNo/repay', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { outTradeNo } = request.params as { outTradeNo: string };
+    const body = (request.body ?? {}) as { code?: unknown };
+    return success(await repayOrder(request.user.userId, outTradeNo, body.code), '支付参数已就绪');
+  });
+
+  fastify.post('/order/:outTradeNo/cancel', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { outTradeNo } = request.params as { outTradeNo: string };
+    return success(await cancelOrder(request.user.userId, outTradeNo), '订单已取消');
+  });
+
+  fastify.post('/order/:outTradeNo/refund', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { outTradeNo } = request.params as { outTradeNo: string };
+    const body = (request.body ?? {}) as { reasonCode?: unknown; note?: unknown };
+    return success(await startUserRefund(request.user.userId, outTradeNo, body), '退款已发起');
   });
 }

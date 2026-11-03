@@ -17,9 +17,12 @@ import { activePaidProducts, paidProductOf } from './paid-products.js';
 import { entitlementsOf, type Entitlements } from './entitlements.js';
 import { isMemberPaymentsEnabled } from './member-switch.js';
 import { xpayConfig, isXpayPayConfigured, payConfig } from '../config/xpay.js';
+import { xpayQueryOrder, xpayRefundOrder, XPAY_REFUND_REASONS } from './xpay-api.js';
+import { applyRefund, suggestRefundFeeFen } from './xpay-deliver.js';
+import { BJ_OFFSET_MS } from '../utils/bj-time.js';
 import {
   MEMBER_CLOSED, ORDER_SESSION_EXPIRED, ORDER_IDENTITY_MISMATCH, ORDER_PRODUCT_UNAVAILABLE,
-  MEMBER_PRODUCT_COPY, memberStatusText,
+  MEMBER_PRODUCT_COPY, memberStatusText, MEMBER_ORDERS_NOTICE, fmtCnDate,
 } from '../config/member-copy.js';
 
 /**
@@ -145,6 +148,213 @@ export async function readOrderForUser(userId: string, outTradeNo: string): Prom
     base.entitlements = await entitlementsOf(String(userId));
   }
   return base;
+}
+
+// ===== 我的订单：列表 / 继续支付 / 取消 / 自助退款（2026-11-04）=====
+
+/** 用户自助退款可选的原因（微信枚举去掉「0 暂无描述」——用户侧必须选个真实原因） */
+const USER_REFUNDABLE_REASONS = XPAY_REFUND_REASONS.filter((r) => r.code !== '0');
+
+const ORDER_STATUS_TEXT: Record<string, string> = {
+  created: '待支付',
+  paid: '已支付·待发货',
+  delivered: '已生效',
+  refunding: '退款中',
+  refunded: '已退款',
+  closed: '已关闭',
+};
+
+/** 东八区「YYYY-MM-DD HH:mm」：与 admin 侧同一口径，运营/用户看的取数时刻用 */
+function bjDateTimeText(ms: number): string {
+  return new Date(ms + BJ_OFFSET_MS).toISOString().slice(0, 16).replace('T', ' ');
+}
+
+export interface MemberOrderRowDto {
+  outTradeNo: string;
+  status: string;
+  statusText: string;
+  name: string;
+  priceFen: number;
+  refundedFen: number;
+  periodText: string;
+  createdAtText: string;
+  canPay: boolean;
+  canCancel: boolean;
+  canRefund: boolean;
+}
+
+/** 我的订单（仅本人，最多 20 条）：动作旗标由服务端裁定，端上只按旗标渲染按钮 */
+export async function listOrdersForUser(
+  userId: string,
+  _now = Date.now(),
+): Promise<{ items: MemberOrderRowDto[]; notice: string }> {
+  const rows = await XpayOrderModel.find({ userId: new Types.ObjectId(String(userId)) })
+    .sort({ createdAt: -1 })
+    .limit(20)
+    .lean();
+  const items = rows.map((r) => {
+    const refunded = Number(r.refundedFen ?? 0);
+    const price = Number(r.priceFen ?? 0);
+    return {
+      outTradeNo: r.outTradeNo,
+      status: r.status,
+      statusText: ORDER_STATUS_TEXT[r.status] ?? r.status,
+      name: r.name,
+      priceFen: price,
+      refundedFen: refunded,
+      periodText: r.periodStart > 0 ? `${fmtCnDate(r.periodStart)} ~ ${fmtCnDate(r.periodEnd)}` : '',
+      createdAtText: bjDateTimeText(new Date(r.createdAt as never).getTime()),
+      canPay: r.status === 'created',
+      canCancel: r.status === 'created',
+      // iOS 订单由用户在 Apple 侧退款（与管理端同一政策），自助仅 Android
+      canRefund: (r.status === 'delivered' || r.status === 'refunding')
+        && price - refunded > 0 && r.channel !== 'ios',
+    };
+  });
+  return { items, notice: MEMBER_ORDERS_NOTICE };
+}
+
+/** 取消待支付订单：本地置 closed 即可（未支付单微信侧不会发货，若收到推送会因陌生单被丢） */
+export async function cancelOrder(
+  userId: string,
+  outTradeNo: unknown,
+): Promise<{ outTradeNo: string; status: 'closed' }> {
+  const raw = String(outTradeNo ?? '');
+  if (!OUT_TRADE_NO_RE.test(raw)) throw new AppError(404, '订单不存在');
+  if (!isObjectIdLike(userId)) throw new AppError(401, '请先登录');
+  const row = await XpayOrderModel.findOne({ outTradeNo: raw, userId: new Types.ObjectId(String(userId)) }).lean();
+  if (!row) throw new AppError(404, '订单不存在');
+  if (row.status !== 'created') throw new AppError(400, '只有待支付订单可以取消');
+  await XpayOrderModel.updateOne({ _id: row._id, status: 'created' }, { $set: { status: 'closed' } });
+  return { outTradeNo: row.outTradeNo, status: 'closed' };
+}
+
+/** 继续支付：复用原 outTradeNo 重签支付参数（session_key 用完即弃，所以每次都要新取的 code） */
+export async function repayOrder(
+  userId: string,
+  outTradeNo: unknown,
+  code: unknown,
+): Promise<MemberOrderDto> {
+  if (!(await isMemberPaymentsEnabled())) throw new AppError(403, MEMBER_CLOSED);
+  if (!isXpayPayConfigured()) throw new AppError(503, MEMBER_CLOSED);
+  const raw = String(outTradeNo ?? '');
+  if (!OUT_TRADE_NO_RE.test(raw)) throw new AppError(404, '订单不存在');
+  const codeStr = String(code ?? '').trim();
+  if (!codeStr) throw new AppError(400, ORDER_SESSION_EXPIRED);
+  if (!isObjectIdLike(userId)) throw new AppError(401, '请先登录');
+  const user = await UserModel.findById(userId).select('openid').lean();
+  if (!user?.openid) throw new AppError(401, '请先登录');
+  const row = await XpayOrderModel.findOne({ outTradeNo: raw, userId: new Types.ObjectId(String(userId)) }).lean();
+  if (!row) throw new AppError(404, '订单不存在');
+  if (row.status !== 'created') throw new AppError(400, '只有待支付订单可以继续支付');
+  const session = await code2Session(codeStr);
+  if (session.openid !== user.openid) throw new AppError(400, ORDER_IDENTITY_MISMATCH);
+  const { offerId, appKey } = payConfig();
+  const attach = row.attach || row.outTradeNo;
+  const payData = buildPayParams(
+    {
+      offerId,
+      buyQuantity: 1,
+      env: xpayConfig.env,
+      currencyType: 'CNY',
+      productId: row.productKey,
+      goodsPrice: row.priceFen,
+      outTradeNo: row.outTradeNo,
+      attach,
+    },
+    appKey,
+    session.sessionKey,
+  );
+  return {
+    outTradeNo: row.outTradeNo,
+    status: row.status,
+    mode: 'short_series_goods',
+    buyQuantity: 1,
+    env: xpayConfig.env,
+    priceFen: row.priceFen,
+    name: row.name,
+    durationDays: row.durationDays,
+    payData,
+  };
+}
+
+/**
+ * 用户自助退款：金额按剩余天数折算、服务端算定（不可自选，防「用满再全退」）；
+ * 原因必选（微信枚举 1-5），备注可选只进订单留痕。iOS 单走 Apple，不在此通道。
+ */
+export async function startUserRefund(
+  userId: string,
+  outTradeNo: unknown,
+  input: { reasonCode?: unknown; note?: unknown },
+): Promise<{ status: string; refundOrderId: string; refundFeeFen: number; refundedFen: number; entitlements: Entitlements }> {
+  if (!(await isMemberPaymentsEnabled())) throw new AppError(403, MEMBER_CLOSED);
+  if (!isXpayPayConfigured()) throw new AppError(503, MEMBER_CLOSED);
+  const raw = String(outTradeNo ?? '');
+  if (!OUT_TRADE_NO_RE.test(raw)) throw new AppError(404, '订单不存在');
+  if (!isObjectIdLike(userId)) throw new AppError(401, '请先登录');
+  const row = await XpayOrderModel.findOne({ outTradeNo: raw, userId: new Types.ObjectId(String(userId)) }).lean();
+  if (!row) throw new AppError(404, '订单不存在');
+  if (row.channel === 'ios') throw new AppError(403, 'iOS 购买的订单请在 App Store 里申请退款');
+  if (row.status !== 'delivered' && row.status !== 'refunding') {
+    throw new AppError(400, '仅已生效的会员订单支持自助退款');
+  }
+  const price = Number(row.priceFen ?? 0);
+  const already = Number(row.refundedFen ?? 0);
+  if (price - already <= 0) throw new AppError(400, '该订单已全额退款');
+
+  const reasonCode = String(input.reasonCode ?? '').trim();
+  const knownReason = XPAY_REFUND_REASONS.find((r) => r.code === reasonCode && r.code !== '0');
+  if (!knownReason) {
+    throw new AppError(400, `请选择退款原因（可选：${USER_REFUNDABLE_REASONS.map((r) => r.label).join('；')}）`);
+  }
+  const note = String(input.note ?? '').trim();
+  if (note.length > 100) throw new AppError(400, `退款说明不能超过 100 字（当前 ${note.length} 字）`);
+
+  // 金额基线＝实时微信侧剩余可退（提交前现查，不拿库里旧值猜），再按剩余天数折算
+  const fresh = await xpayQueryOrder({ openid: row.openid, outTradeNo: row.outTradeNo, wxOrderId: row.wxOrderId || undefined });
+  const left = Math.max(0, Math.min(Number(fresh.leftFeeFen) || 0, price - already));
+  if (left <= 0) throw new AppError(400, '该订单在微信侧已没有可退金额');
+  const fee = row.periodStart > 0
+    ? suggestRefundFeeFen({ leftFeeFen: left, periodStart: row.periodStart, periodEnd: row.periodEnd })
+    : left; // 未生效的顺延单：一天没消费，全额退
+  const finalFee = Math.max(1, Math.min(fee, left));
+
+  // refundOrderId 复用纪律与 admin 路径一致（微信要求重试同值）
+  const refundOrderId = row.refundOrderId
+    || `R${Date.now().toString(36).toUpperCase()}${randomBytes(2).toString('hex').toUpperCase()}`;
+  if (!row.refundOrderId) await XpayOrderModel.updateOne({ _id: row._id }, { $set: { refundOrderId } });
+
+  const r = await xpayRefundOrder({
+    openid: row.openid,
+    outTradeNo: row.outTradeNo,
+    wxOrderId: row.wxOrderId || undefined,
+    refundOrderId,
+    refundFeeFen: finalFee,
+    leftFeeFen: left,
+    reason: reasonCode,
+  });
+  if (r.failed) {
+    await XpayOrderModel.updateOne({ _id: row._id }, { $set: { lastError: `退款失败（微信返回 status ${r.status}）` } });
+    throw new AppError(502, `微信退款失败（status ${r.status}），未受理，请稍后重试`);
+  }
+  const refundReason = `[${knownReason.label}]${note}`;
+  await XpayOrderModel.updateOne(
+    { _id: row._id },
+    { $set: { status: 'refunding', refundReason, lastQueryAt: Date.now() } },
+  );
+  console.warn(`[xpay] 用户发起退款 ${row.outTradeNo} ${finalFee} 分（user=${userId}，原因=${reasonCode}${note ? `，说明=${note}` : ''}）→ refunding`);
+  if (r.done) {
+    // 极少见：受理即完成。复用 applyRefund 的截断与幂等
+    await applyRefund({ outTradeNo: row.outTradeNo, refundFeeFen: finalFee, refundOrderId: r.refundOrderId });
+  }
+  const after = await XpayOrderModel.findById(row._id).lean();
+  return {
+    status: r.done ? 'refunded' : 'refunding',
+    refundOrderId: r.refundOrderId,
+    refundFeeFen: finalFee,
+    refundedFen: Number(after?.refundedFen ?? 0),
+    entitlements: await entitlementsOf(String(userId)),
+  };
 }
 
 /** 会员页数据（文案服务端下发：spec §6.1，端上不自算日均也不拼句） */

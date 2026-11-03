@@ -20,6 +20,15 @@ import { payConfig } from '../config/xpay.js';
 export const XPAY_PAID_ORDER_STATUSES = new Set<number>([2, 3, 4]);
 export const XPAY_REFUND_SETTLED_STATUSES = new Set<number>([5, 8]);
 export const XPAY_REFUND_FAILED_STATUS = 7;
+/** refund_order 的 reason 只收枚举字符串（2026-11-04 真单实测：自由文本被 268490002 拒收） */
+export const XPAY_REFUND_REASONS = [
+  { code: '0', label: '暂无描述' },
+  { code: '1', label: '产品问题，影响使用或效果不佳' },
+  { code: '2', label: '售后问题，无法满足需求' },
+  { code: '3', label: '意愿问题，用户主动退款' },
+  { code: '4', label: '价格问题' },
+  { code: '5', label: '其他原因' },
+] as const;
 
 export type XpayFetcher = (api: string, body: Record<string, unknown>) => Promise<Record<string, unknown>>;
 

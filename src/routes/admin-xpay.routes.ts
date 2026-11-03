@@ -61,7 +61,7 @@ export async function adminXpayRoutes(fastify: FastifyInstance) {
 
   fastify.post('/orders/:id/refund', { onRequest: [adminAuth] }, async (request) => {
     const { id } = request.params as { id: string };
-    const body = (request.body ?? {}) as { refundFee?: unknown; reason?: unknown };
+    const body = (request.body ?? {}) as { refundFee?: unknown; reason?: unknown; reasonCode?: unknown };
     return success(await startRefund(id, body, adminIdOf(request)), '退款已发起');
   });
 

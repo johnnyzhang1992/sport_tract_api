@@ -126,7 +126,7 @@ test('OA-4 refundFee 越界 → 400，句子含对象 + 实际值 + 上限', asy
   for (const refundFee of [0, -5, 100, 99999]) {
     const res = await app.inject({
       method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
-      headers: H(), payload: { refundFee, reason: '测试' },
+      headers: H(), payload: { reasonCode: '5', refundFee, reason: '测试' },
     });
     assert.equal(res.statusCode, 400, `${refundFee}: ${res.body}`);
     assert.match(res.json().message, /99/, `要含上限：${res.json().message}`);
@@ -138,7 +138,7 @@ test('OA-4b 可退额度超过 5 分钟未刷新 → 拒绝（不许拿旧值猜
   const o = await mk({ leftFeeFen: 199, leftFeeAt: Date.now() - LEFT_FEE_FRESH_MS - 1000 });
   const res = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
-    headers: H(), payload: { refundFee: 100, reason: '测试' },
+    headers: H(), payload: { reasonCode: '5', refundFee: 100, reason: '测试' },
   });
   assert.equal(res.statusCode, 400);
   assert.match(res.json().message, /重新预览/);
@@ -149,7 +149,7 @@ test('OA-5 备注（reason）必填', async () => {
   for (const reason of [undefined, '', '   ']) {
     const res = await app.inject({
       method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
-      headers: H(), payload: { refundFee: 100, reason },
+      headers: H(), payload: { reasonCode: '5', refundFee: 100, reason },
     });
     assert.equal(res.statusCode, 400);
     assert.match(res.json().message, /备注/);
@@ -167,7 +167,7 @@ test('OA-6 refundOrderId 生成后落库，重试复用同值', async () => {
   const o = await mk();
   const first = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
-    headers: H(), payload: { refundFee: 100, reason: '客服协商' },
+    headers: H(), payload: { reasonCode: '5', refundFee: 100, reason: '客服协商' },
   });
   assert.equal(first.statusCode, 200, first.body);
   const id1 = first.json().data.refundOrderId as string;
@@ -175,7 +175,7 @@ test('OA-6 refundOrderId 生成后落库，重试复用同值', async () => {
   assert.equal((await XpayOrderModel.findById(o._id).lean())?.status, 'refunding');
   const second = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
-    headers: H(), payload: { refundFee: 50, reason: '重试' },
+    headers: H(), payload: { reasonCode: '5', refundFee: 50, reason: '重试' },
   });
   assert.equal(second.json().data.refundOrderId, id1, '重试必须复用同一退款单号');
   assert.equal(seen.filter((s) => s === id1).length, 2);
@@ -185,7 +185,7 @@ test('OA-7 iOS 渠道退款按钮禁用：403 且说明由用户在 App Store �
   const o = await mk({ channel: 'ios' });
   const res = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
-    headers: H(), payload: { refundFee: 100, reason: '测试' },
+    headers: H(), payload: { reasonCode: '5', refundFee: 100, reason: '测试' },
   });
   assert.equal(res.statusCode, 403);
   assert.match(res.json().message, /App Store/);
@@ -199,7 +199,7 @@ test('OA-8 超过支付后 365 天窗口 → 拒绝发起（提前给明确原�
   await XpayOrderModel.collection.updateOne({ _id: o._id }, { $set: { createdAt: new Date(Date.now() - 400 * DAY) } });
   const res = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
-    headers: H(), payload: { refundFee: 100, reason: '测试' },
+    headers: H(), payload: { reasonCode: '5', refundFee: 100, reason: '测试' },
   });
   assert.equal(res.statusCode, 400);
   assert.match(res.json().message, /365/);
@@ -234,4 +234,22 @@ test('OA-10 手动查单查到已支付即补发货（幂等仍生效）', async
   const row = await XpayOrderModel.findById(o._id).lean();
   assert.equal(row?.status, 'delivered');
   assert.ok((row?.periodEnd ?? 0) > (row?.periodStart ?? 0));
+});
+
+test('OA-11 退款原因必须是微信枚举（自由文本被 268490002 拒收的教训）', async () => {
+  const o = await mk();
+  for (const bad of [undefined, '', '客服协商', '0'.repeat(3)]) {
+    const res = await app.inject({
+      method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
+      headers: H(), payload: { refundFee: 100, reason: '测试', reasonCode: bad },
+    });
+    assert.equal(res.statusCode, 400, `reasonCode=${String(bad)}: ${res.body}`);
+    assert.match(res.json().message, /退款原因必须是枚举值/);
+    assert.match(res.json().message, /5=其他原因/, '要带可选清单（对象+可选值）');
+  }
+  const ok = await app.inject({
+    method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
+    headers: H(), payload: { refundFee: 100, reason: '测试', reasonCode: '1' },
+  });
+  assert.ok([200, 502].includes(ok.statusCode), `合法枚举要能走到微信调用：${ok.body}`);
 });
