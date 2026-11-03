@@ -6,6 +6,10 @@ import {
   setPaidProductActive, setPaidProductSortOrder,
 } from '../services/paid-products.js';
 import { isMemberPaymentsEnabled, setMemberPaymentsEnabled } from '../services/member-switch.js';
+import {
+  listXpayOrders, getXpayOrderDetail, refundPreview, startRefund, manualQuery,
+  type XpayOrderListQuery,
+} from '../services/xpay-admin.js';
 import { isXpayPayConfigured, isXpayPushConfigured } from '../config/xpay.js';
 
 /**
@@ -35,6 +39,35 @@ export async function adminXpayRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     const body = (request.body ?? {}) as { sortOrder?: unknown };
     return success(await setPaidProductSortOrder(id, body.sortOrder), '已更新');
+  });
+
+  // ==================== 订单 ====================
+
+  fastify.get('/orders', { onRequest: [adminAuth] }, async (request) => {
+    const q = request.query as XpayOrderListQuery;
+    return success(await listXpayOrders(q));
+  });
+
+  fastify.get('/orders/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await getXpayOrderDetail(id));
+  });
+
+  // 三步退款：第一步单独成接口，让「刷新额度」这件事在 UI 上有明确的一次点击
+  fastify.post('/orders/:id/refund-preview', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await refundPreview(id));
+  });
+
+  fastify.post('/orders/:id/refund', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as { refundFee?: unknown; reason?: unknown };
+    return success(await startRefund(id, body, adminIdOf(request)), '退款已发起');
+  });
+
+  fastify.post('/orders/:id/query', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await manualQuery(id));
   });
 
   // 会员开关 + 就绪度自检：运营要能看到「密钥配了没」，否则开关一开就全线报错还没法自证
