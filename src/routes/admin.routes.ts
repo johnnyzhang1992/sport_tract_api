@@ -676,10 +676,13 @@ export async function adminRoutes(fastify: FastifyInstance) {
 
   // 用户列表（含每人轨迹数；支持昵称搜索 + 创建时间/最后登录排序）
   fastify.get('/users', { onRequest: [adminAuth] }, async (request) => {
-    const { page = '1', pageSize = '20', keyword, sortBy, order } = request.query as { page?: string; pageSize?: string; keyword?: string; sortBy?: string; order?: string };
+    const { page = '1', pageSize = '20', keyword, role, sortBy, order } = request.query as { page?: string; pageSize?: string; keyword?: string; role?: string; sortBy?: string; order?: string };
     const p = Math.max(1, Number(page) || 1);
     const ps = Math.min(100, Number(pageSize) || 20);
     const filter: Record<string, unknown> = {};
+    if (role === 'admin' || role === 'user') {
+      filter.role = role; // 白名单外的值当没传：不筛选时返回空列表会误导成「没有这类用户」
+    }
     if (keyword && String(keyword).trim()) {
       // 转义后按字面量搜：元字符不当通配，非法正则也不会让 Mongo 抛错（与足迹搜索同一口径）
       const kw = { $regex: escapeRegex(String(keyword).trim()), $options: 'i' };
