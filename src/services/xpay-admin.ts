@@ -106,14 +106,10 @@ export async function listXpayOrders(q: XpayOrderListQuery = {}) {
   const { page, pageSize } = normalizePage(q);
   const filter: Record<string, unknown> = {};
   if (q.status !== undefined && String(q.status) !== '') {
-    // 支持逗号分隔多状态（如 delivered,refunding）；每个值都单独校验，坏值整句 400
-    const parts = String(q.status).split(',').map((s) => s.trim()).filter(Boolean);
-    for (const s of parts) {
-      if (!(XPAY_ORDER_STATUS as readonly string[]).includes(s)) {
-        throw new AppError(400, `订单状态不合法（收到 "${s}"；可用：${XPAY_ORDER_STATUS.join('、')}）`);
-      }
+    if (!(XPAY_ORDER_STATUS as readonly string[]).includes(String(q.status))) {
+      throw new AppError(400, `订单状态不合法（收到 "${String(q.status)}"；可用：${XPAY_ORDER_STATUS.join('、')}）`);
     }
-    filter.status = parts.length === 1 ? parts[0] : { $in: parts };
+    filter.status = q.status;
   }
   if (q.channel !== undefined && String(q.channel) !== '') {
     if (!(XPAY_CHANNELS as readonly string[]).includes(String(q.channel))) {

@@ -384,8 +384,9 @@ export async function memberProductsPayload(userId: string, now = Date.now()) {
   const entitlements = await entitlementsOf(userId, now);
   if (!enabled) {
     // 关闭态也要有一句服务端下发的说明：端上不许自己写「暂未开放」
-    return { enabled: false, items: [] as unknown[], entitlements, statusText: memberStatusText(entitlements, now), notice: MEMBER_CLOSED };
+    return { enabled: false, items: [] as unknown[], entitlements, statusText: memberStatusText(entitlements, now), notice: MEMBER_CLOSED, operator: false };
   }
+  const operator = (String((await UserModel.findById(userId).select({ role: 1 }).lean())?.role ?? 'user')) === 'admin';
   const items = (await activePaidProducts()).map((i) => ({
     ...i,
     priceText: MEMBER_PRODUCT_COPY.price(i.priceFen),
@@ -393,5 +394,5 @@ export async function memberProductsPayload(userId: string, now = Date.now()) {
     durationText: MEMBER_PRODUCT_COPY.duration(i.durationDays),
     perkLines: MEMBER_PRODUCT_COPY.perkLines(i.perks.photoQuota),
   }));
-  return { enabled: true, items, entitlements, statusText: memberStatusText(entitlements, now), notice: '' };
+  return { enabled: true, items, entitlements, statusText: memberStatusText(entitlements, now), notice: '', operator };
 }
