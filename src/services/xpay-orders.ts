@@ -206,9 +206,9 @@ export async function listOrdersForUser(
       createdAtText: bjDateTimeText(new Date(r.createdAt as never).getTime()),
       canPay: r.status === 'created',
       canCancel: r.status === 'created',
-      // iOS/Android 一致：已生效且还有可退金额就给自助退款入口
+      // iOS 订单由用户在 Apple 侧退款（微信 690000020：开发者不可对 iOS 单发起退款），自助仅 Android
       canRefund: (r.status === 'delivered' || r.status === 'refunding')
-        && price - refunded > 0,
+        && price - refunded > 0 && r.channel !== 'ios',
     };
   });
   return { items, notice: MEMBER_ORDERS_NOTICE };
@@ -294,6 +294,9 @@ export async function startUserRefund(
   if (!isObjectIdLike(userId)) throw new AppError(401, '请先登录');
   const row = await XpayOrderModel.findOne({ outTradeNo: raw, userId: new Types.ObjectId(String(userId)) }).lean();
   if (!row) throw new AppError(404, '订单不存在');
+  // 微信 690000020 实测：iOS（IAP）订单不支持开发者发起退款，用户只能在 App Store 申请；
+  // Apple 通过后由退款推送/对账兑底（LQ-4）自动同步账本
+  if (row.channel === 'ios') throw new AppError(403, 'iOS 购买的订单请在 App Store 里申请退款');
   if (row.status !== 'delivered' && row.status !== 'refunding') {
     throw new AppError(400, '仅已生效的会员订单支持自助退款');
   }
