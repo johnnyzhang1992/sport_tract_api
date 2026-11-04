@@ -13,7 +13,7 @@ import {
 import { scheduleLazySettle } from '../services/board-lazy-settle.js';
 import { collectSection } from '../utils/section.js';
 import { success } from '../utils/response.js';
-import { publicProfileByUid } from '../services/public-profile.js';
+import { publicProfileByUid, assertProfileQuota } from '../services/public-profile.js';
 
 /** 统计路由：/api/stats（决策 F18/F19） */
 export async function statsRoutes(fastify: FastifyInstance) {
@@ -52,6 +52,8 @@ export async function statsRoutes(fastify: FastifyInstance) {
 
   // 榜单用户公开资料：点击排行榜用户列时拉取（白名单字段 + 累计八项）
   fastify.get('/profile/:uid', async (request) => {
+    // 先限流再校验/查库：非法 UID 的扫描请求同样计数
+    assertProfileQuota(request.ip);
     const uid = Number((request.params as { uid?: string }).uid);
     if (!Number.isInteger(uid) || uid <= 0) throw new AppError(400, 'UID 不合法');
     const profile = await publicProfileByUid(uid);

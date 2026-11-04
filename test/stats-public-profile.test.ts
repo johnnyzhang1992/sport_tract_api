@@ -5,6 +5,7 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { XpayOrderModel } from '../src/models/xpay-order.model.js';
+import { assertProfileQuota, resetProfileRateForTest, PROFILE_RATE_LIMIT } from '../src/services/public-profile.js';
 
 /**
  * 榜单用户公开资料：点击排行榜用户列的半屏数据源。
@@ -19,6 +20,7 @@ const PROV = '公开资料测试省';
 let userId = '';
 
 before(async () => {
+  resetProfileRateForTest();
   app = await buildApp({ logger: false });
   await app.ready();
   const old = await UserModel.find({ openid: new RegExp(`^${PREFIX}`) }).select('_id').lean();
@@ -113,4 +115,29 @@ test('PPROF3 榜单行带公开 uid（用于点开资料）', async () => {
   assert.equal(res.statusCode, 200, res.body);
   const top = res.json().data.top as Array<{ uid: number }>;
   assert.equal(top[0]?.uid, UID);
+});
+
+
+test('PPROF4 限流：同一 IP 每分钟上限，超限 429，下个窗口恢复', () => {
+  resetProfileRateForTest();
+  const now = Date.now();
+  for (let i = 0; i < PROFILE_RATE_LIMIT; i += 1) assertProfileQuota('9.9.9.9', now);
+  assert.throws(
+    () => assertProfileQuota('9.9.9.9', now),
+    (e: unknown) => (e as { statusCode?: number }).statusCode === 429,
+  );
+  assert.doesNotThrow(() => assertProfileQuota('9.9.9.9', now + 60_000), '下一分钟窗口恢复');
+  resetProfileRateForTest();
+});
+
+test('PPROF5 路由层：非法 UID 也计数，超限直接 429（先限流再校验）', async () => {
+  resetProfileRateForTest();
+  for (let i = 0; i < PROFILE_RATE_LIMIT; i += 1) {
+    const res = await app.inject({ method: 'GET', url: `${API}/profile/abc` });
+    assert.equal(res.statusCode, 400, `第 ${i + 1} 次应仍是参数错误`);
+  }
+  const blocked = await app.inject({ method: 'GET', url: `${API}/profile/abc` });
+  assert.equal(blocked.statusCode, 429);
+  assert.match(blocked.json().message || '', /过于频繁/);
+  resetProfileRateForTest();
 });

@@ -8,6 +8,7 @@ import { overview } from './stats.js';
 import { footprint } from './footprint.js';
 import { activeMemberUserIds } from './entitlements.js';
 import { getAvatarUrl, getMediumUrl } from './oss.js';
+import { AppError } from '../utils/app-error.js';
 
 export interface PublicProfile {
   uid: number;
@@ -65,4 +66,28 @@ export async function publicProfileByUid(uid: number): Promise<PublicProfile | n
       cityCount: fp.cityCount || 0,
     },
   };
+}
+
+
+// ==================== 公开资料限流（按来源 IP，30 次/分钟） ====================
+// 公开接口、会被榜单点击触发；overview + footprint 都是聚合查询，必须限频防刷。
+export const PROFILE_RATE_WINDOW_MS = 60_000;
+export const PROFILE_RATE_LIMIT = 30;
+const profileRate = new Map<string, number[]>();
+
+/** 当前窗口内计数，超过上限抛 429（now 可注入便于测试） */
+export function assertProfileQuota(ip: string, now: number = Date.now()): void {
+  const key = ip || 'unknown';
+  if (profileRate.size > 10_000) profileRate.clear(); // 粗暴防漏：窗口内命中才保留，上限有界
+  const hits = (profileRate.get(key) ?? []).filter((t) => now - t < PROFILE_RATE_WINDOW_MS);
+  if (hits.length >= PROFILE_RATE_LIMIT) {
+    throw new AppError(429, '请求过于频繁，请稍后再试');
+  }
+  hits.push(now);
+  profileRate.set(key, hits);
+}
+
+/** 测试专用：清空频控窗口 */
+export function resetProfileRateForTest(): void {
+  profileRate.clear();
 }
