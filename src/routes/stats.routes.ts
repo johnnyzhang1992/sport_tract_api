@@ -13,6 +13,7 @@ import {
 import { scheduleLazySettle } from '../services/board-lazy-settle.js';
 import { collectSection } from '../utils/section.js';
 import { success } from '../utils/response.js';
+import { publicProfileByUid } from '../services/public-profile.js';
 
 /** 统计路由：/api/stats（决策 F18/F19） */
 export async function statsRoutes(fastify: FastifyInstance) {
@@ -47,6 +48,15 @@ export async function statsRoutes(fastify: FastifyInstance) {
   fastify.get('/best', { onRequest: [fastify.authenticate] }, async (request) => {
     const result = await bestRecords(request.user.userId);
     return success(result);
+  });
+
+  // 榜单用户公开资料：点击排行榜用户列时拉取（白名单字段 + 累计八项）
+  fastify.get('/profile/:uid', async (request) => {
+    const uid = Number((request.params as { uid?: string }).uid);
+    if (!Number.isInteger(uid) || uid <= 0) throw new AppError(400, 'UID 不合法');
+    const profile = await publicProfileByUid(uid);
+    if (!profile) throw new AppError(404, '用户不存在');
+    return success(profile);
   });
 
   // 平台分位：累计距离超越全站用户占比（统计页「超越全站 XX%」）

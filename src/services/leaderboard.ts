@@ -52,6 +52,8 @@ export interface RankRow {
   durationSec: number;
   /** 加权平均配速（秒/公里）= Σduration ÷ Σdistance，取整；无可信距离时为 null */
   paceSecPerKm: number | null;
+  /** 公开 UID（榜单用户点开资料用；不是 openid） */
+  uid: number;
   /** 此刻是否为付费会员（头像徽标用；不含积分免广告卡） */
   memberActive: boolean;
   /** 用户 id（仅管理端 includeUserId 时下发，用户端不暴露） */
@@ -308,12 +310,13 @@ export async function leaderboard(
     ...bestDocs.map((b) => String(b.doc.userId)),
   ]);
   const users = await UserModel.find({ _id: { $in: [...involvedIds] } })
-    .select({ nickname: 1, gender: 1, avatarUrl: 1, avatarPreset: 1 })
+    .select({ uid: 1, nickname: 1, gender: 1, avatarUrl: 1, avatarPreset: 1 })
     .lean();
   const infoById = new Map(
     users.map((u) => [
       String(u._id),
       {
+        uid: Number(u.uid) || 0,
         nickname: u.nickname || '',
         gender: u.gender ?? 0,
         avatarUrl: u.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
@@ -331,6 +334,7 @@ export async function leaderboard(
     const durationSec = Math.round(r.duration || 0);
     return {
       rank,
+      uid: (info && info.uid) || 0,
       name: (info && info.nickname) || '运动用户',
       gender: (info && info.gender) || 0,
       avatarUrl: (info && info.avatarUrl) || '',
