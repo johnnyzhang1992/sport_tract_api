@@ -202,7 +202,7 @@ test('DS-2b 管理员有授权：站内 + 微信同时发，字段完整，发�
   assert.equal(sends.length, 1);
   assert.equal(sends[0].openid, ADMIN_OPENID);
   assert.equal(sends[0].templateId, DAILY_REPORT_TEMPLATE_ID);
-  assert.equal(sends[0].page, '/pages/notification-list/notification-list');
+  assert.equal(sends[0].page, '/pages/operator/operator', '点击应落到数据概览页');
   assert.ok(r.stats);
   assert.equal(sends[0].data.time21.value, '2026年11月3日');
   assert.equal(sends[0].data.thing29.value, '迹路者');

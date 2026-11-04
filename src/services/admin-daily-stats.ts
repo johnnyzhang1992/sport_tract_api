@@ -199,7 +199,10 @@ async function sendDailyReportWechat(
     const r = await sender({
       openid,
       templateId: DAILY_REPORT_TEMPLATE_ID,
-      page: '/pages/notification-list/notification-list',
+      // 点击落地页＝数据概览（运营者的日报，点进去看数）。
+      // ⚠️ 该页面需随下一个正式版发布：正式版尚无此页时，微信会拒绝发送（errcode 非零），
+      //    我们的实现失败不消耗授权额度，新版发布后自动恢复推送并正常消耗。
+      page: '/pages/operator/operator',
       miniprogramState: miniprogramState(),
       data: buildDailyStatsSubscribeData(stats, dayStart),
     });
