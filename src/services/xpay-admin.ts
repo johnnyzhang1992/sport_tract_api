@@ -148,12 +148,6 @@ export async function refundPreview(id: string) {
     truncateToText: bjDateStr(Date.now()),
     channel: row.channel ?? '',
   };
-  if (row.channel === 'ios') {
-    return {
-      ...base, leftFeeFen: 0, suggestFeeFen: 0, canRefund: false,
-      reason: 'iOS 订单由用户在 App Store 申请退款，开发者无法主动退（spec §2.3）',
-    };
-  }
   if (row.status === 'closed') {
     return { ...base, leftFeeFen: 0, suggestFeeFen: 0, canRefund: false, reason: '订单已超时关闭，没有可退金额' };
   }
@@ -192,7 +186,6 @@ export async function startRefund(
   assertObjectIdLike(id, '订单不存在');
   const row = await XpayOrderModel.findById(id).lean();
   if (!row) throw new AppError(404, '订单不存在');
-  if (row.channel === 'ios') throw new AppError(403, 'iOS 订单由用户在 App Store 申请退款，开发者侧无法主动退');
 
   const reason = String(input.reason ?? '').trim();
   if (!reason) throw new AppError(400, '退款备注必填（会写进订单留痕，方便日后与用户核对）');

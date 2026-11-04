@@ -6,7 +6,7 @@
  * OA-4 refundFee 越界（0 / 负 / > leftFee）→ 400，句子含实际值与上限；
  * OA-5 备注必填；
  * OA-6 refundOrderId 生成后落库、重试复用同值；
- * OA-7 iOS 渠道禁用退款（403 + 由用户在 App Store 申请）；
+ * OA-7 iOS 渠道与管理端同链路可退（req_from=1 人工客服）；预览不再按渠道拦；
  * OA-8 超过 365 天窗口拒绝发起；
  * OA-9 列表过滤 + keyword 转义；
  * OA-10 手动查单查到已支付即补发货。
@@ -181,16 +181,25 @@ test('OA-6 refundOrderId 生成后落库，重试复用同值', async () => {
   assert.equal(seen.filter((s) => s === id1).length, 2);
 });
 
-test('OA-7 iOS 渠道退款按钮禁用：403 且说明由用户在 App Store 申请', async () => {
-  const o = await mk({ channel: 'ios' });
+test('OA-7 iOS 渠道与管理端同链路可退：预览不再拦、退款 req_from=1', async () => {
+  const o = await mk({ channel: 'ios', status: 'delivered', priceFen: 199, leftFeeFen: 199, leftFeeAt: Date.now() });
+  const bodies: Array<Record<string, unknown>> = [];
+  __setXpayFetcherForTest(async (api, body) => {
+    if (api === 'query_order') return { errcode: 0, order: { status: 3, left_fee: 199 } };
+    bodies.push(body as Record<string, unknown>);
+    return { errcode: 0, refund_id: 'rf-ios', status: 3 };
+  });
+  const p = await app.inject({ method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund-preview`, headers: H() });
+  assert.equal(p.statusCode, 200, p.body);
+  assert.equal(p.json().data.canRefund, true, 'iOS 不再按渠道拦预览');
   const res = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
     headers: H(), payload: { reasonCode: '5', refundFee: 100, reason: '测试' },
   });
-  assert.equal(res.statusCode, 403);
-  assert.match(res.json().message, /App Store/);
-  const p = await app.inject({ method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund-preview`, headers: H() });
-  assert.equal(p.json().data.canRefund, false);
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().data.status, 'refunding');
+  assert.equal(bodies[0].refund_reason, '5');
+  assert.equal(bodies[0].req_from, '1', '管理端人工客服发起');
 });
 
 test('OA-8 超过支付后 365 天窗口 → 拒绝发起（提前给明确原因）', async () => {

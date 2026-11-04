@@ -206,9 +206,9 @@ export async function listOrdersForUser(
       createdAtText: bjDateTimeText(new Date(r.createdAt as never).getTime()),
       canPay: r.status === 'created',
       canCancel: r.status === 'created',
-      // iOS 订单由用户在 Apple 侧退款（与管理端同一政策），自助仅 Android
+      // iOS/Android 一致：已生效且还有可退金额就给自助退款入口
       canRefund: (r.status === 'delivered' || r.status === 'refunding')
-        && price - refunded > 0 && r.channel !== 'ios',
+        && price - refunded > 0,
     };
   });
   return { items, notice: MEMBER_ORDERS_NOTICE };
@@ -280,7 +280,7 @@ export async function repayOrder(
 
 /**
  * 用户自助退款：金额按剩余天数折算、服务端算定（不可自选，防「用满再全退」）；
- * 原因必选（微信枚举 1-5），备注可选只进订单留痕。iOS 单走 Apple，不在此通道。
+ * 原因必选（微信枚举 1-5），备注可选只进订单留痕。iOS 单与 Android 走同一条自助退款链路。
  */
 export async function startUserRefund(
   userId: string,
@@ -294,7 +294,6 @@ export async function startUserRefund(
   if (!isObjectIdLike(userId)) throw new AppError(401, '请先登录');
   const row = await XpayOrderModel.findOne({ outTradeNo: raw, userId: new Types.ObjectId(String(userId)) }).lean();
   if (!row) throw new AppError(404, '订单不存在');
-  if (row.channel === 'ios') throw new AppError(403, 'iOS 购买的订单请在 App Store 里申请退款');
   if (row.status !== 'delivered' && row.status !== 'refunding') {
     throw new AppError(400, '仅已生效的会员订单支持自助退款');
   }

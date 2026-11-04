@@ -88,7 +88,7 @@ after(async () => {
 
 const auth = (t: string) => ({ authorization: `Bearer ${t}` });
 
-test('ML-1 列表：只回自己的单；动作旗标按状态/渠道裁定', async () => {
+test('ML-1 列表：只回自己的单；动作旗标按状态裁定', async () => {
   const mine = await mkRow(); // created
   const droid = await mkDelivered(); // android 已生效
   const iphone = await mkDelivered({ channel: 'ios' }); // ios 已生效
@@ -104,7 +104,7 @@ test('ML-1 列表：只回自己的单；动作旗标按状态/渠道裁定', as
   assert.equal(a.canPay, true); assert.equal(a.canCancel, true); assert.equal(a.canRefund, false);
   assert.equal(a.statusText, '待支付');
   assert.equal(byId(droid.outTradeNo).canRefund, true, 'android 已生效可自助退');
-  assert.equal(byId(iphone.outTradeNo).canRefund, false, 'ios 单不给自助退旗标');
+  assert.equal(byId(iphone.outTradeNo).canRefund, true, 'ios 单同样可自助退');
   assert.ok(items.every((i: { notice?: string }) => !i.notice), 'notice 在列表外层');
   assert.match(res.json().data.notice, /剩余天数/);
 });
@@ -176,7 +176,26 @@ test('MF-1 自助退款（真单形状）：day-0 全额、原因枚举入库、
   assert.ok(e.memberUntil <= Date.now(), '全额退款后会员立即截断');
 });
 
-test('MF-2 闸门：别人的单 404；created 不可退；ios 403；原因/说明校验', async () => {
+test('MF-1b iOS 订单同样可自助退款：走同一条微信退款链路', async () => {
+  const o = await mkDelivered({ channel: 'ios', periodStart: Date.now() - 3600_000 });
+  const refundBodies: Array<Record<string, unknown>> = [];
+  __setXpayFetcherForTest(async (api, body) => {
+    if (api === 'query_order') return { errcode: 0, order: { status: 3, left_fee: 199 } };
+    refundBodies.push(body as Record<string, unknown>);
+    return { errcode: 0, refund_id: 'rfIOS', status: 5 };
+  });
+  const res = await app.inject({
+    method: 'POST', url: `${config.apiPrefix}/member/order/${o.outTradeNo}/refund`,
+    headers: auth(alice), payload: { reasonCode: '1' },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().data.status, 'refunded');
+  assert.equal(refundBodies[0].req_from, '2', 'iOS 自助退款同样 req_from=2');
+  const row = await XpayOrderModel.findById(o._id).lean();
+  assert.equal(row?.status, 'refunded');
+});
+
+test('MF-2 闸门：别人的单 404；created 不可退；原因/说明校验', async () => {
   const bobRow = await mkRow({}, BOB);
   const alien = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/member/order/${bobRow.outTradeNo}/refund`,
@@ -191,7 +210,9 @@ test('MF-2 闸门：别人的单 404；created 不可退；ios 403；原因/说�
   });
   assert.equal((await bad({ reasonCode: '1' }, created.outTradeNo)).statusCode, 400, '仅已生效可退');
   const iosRow = await mkDelivered({ channel: 'ios' });
-  assert.equal((await bad({ reasonCode: '1' }, iosRow.outTradeNo)).statusCode, 403);
+  const iosNoReason = await bad({}, iosRow.outTradeNo);
+  assert.equal(iosNoReason.statusCode, 400, 'iOS 单不再按渠道拦');
+  assert.match(iosNoReason.json().message, /请选择退款原因/, '照样走到原因校验');
   const live = await mkDelivered();
   const noReason = await bad({}, live.outTradeNo);
   assert.equal(noReason.statusCode, 400);
