@@ -10,6 +10,7 @@ import { AppError } from '../utils/app-error.js';
 import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM, DRIFT_SCORE_PB_GATE } from '../config/constants.js';
 import type { ActivityType } from '../config/constants.js';
 import { getAvatarUrl } from './oss.js';
+import { activeMemberUserIds } from './entitlements.js';
 import { bjIsoWeekStart, bjMonthStart, bjYearStart } from '../utils/bj-time.js';
 
 export interface RegionProvince {
@@ -51,6 +52,8 @@ export interface RankRow {
   durationSec: number;
   /** 加权平均配速（秒/公里）= Σduration ÷ Σdistance，取整；无可信距离时为 null */
   paceSecPerKm: number | null;
+  /** 此刻是否为付费会员（头像徽标用；不含积分免广告卡） */
+  memberActive: boolean;
   /** 用户 id（仅管理端 includeUserId 时下发，用户端不暴露） */
   userId?: string;
 }
@@ -69,6 +72,8 @@ export interface BestRow {
   gender: number;
   avatarUrl: string;
   avatarPreset: string;
+  /** 此刻是否为付费会员（头像徽标用） */
+  memberActive: boolean;
 }
 
 /** 各运动类型的本榜最佳指标（顺序即展示顺序；所有类型都有距离/时长，耐力类加专项指标） */
@@ -316,6 +321,7 @@ export async function leaderboard(
       },
     ]),
   );
+  const memberIds = await activeMemberUserIds([...involvedIds]);
 
   const toRow = (
     r: { _id: unknown; distance: number; count: number; duration: number },
@@ -334,6 +340,7 @@ export async function leaderboard(
       durationSec,
       // 按合计距离加权，不是逐条配速平均；缺距离或时长就没可信配速（前端显示「—」）
       paceSecPerKm: r.distance > 0 && durationSec > 0 ? Math.round(durationSec / (r.distance / 1000)) : null,
+      memberActive: memberIds.has(String(r._id)),
       ...(includeUserId ? { userId: String(r._id) } : {}),
     };
   };
@@ -351,6 +358,7 @@ export async function leaderboard(
       gender: (info && info.gender) || 0,
       avatarUrl: (info && info.avatarUrl) || '',
       avatarPreset: (info && info.avatarPreset) || '',
+      memberActive: memberIds.has(String(doc.userId)),
     };
   });
 

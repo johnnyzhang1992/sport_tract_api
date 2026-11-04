@@ -46,7 +46,7 @@ const xpayOrderSchema = new Schema({
   },
 
   status: { type: String, enum: XPAY_ORDER_STATUS, default: 'created' },
-  /** 秒级时间戳区间；未发货前 0（0＝还没排进会员链） */
+  /** 毫秒级时间戳区间（Date.now() 口径）；未发货前 0（0＝还没排进会员链） */
   periodStart: { type: Number, default: 0 },
   periodEnd: { type: Number, default: 0 },
 

@@ -37,7 +37,7 @@ export interface Entitlements {
   canSubscribeNotice: boolean;
 }
 
-function effectiveEnd(r: MembershipRow): number {
+function effectiveEnd(r: Pick<MembershipRow, 'periodStart' | 'periodEnd' | 'truncatedAt'>): number {
   if (r.periodEnd <= 0 || r.periodStart <= 0) return 0;
   if (r.truncatedAt <= 0) return r.periodEnd;
   // 退款受理时刻不晚于起点＝这笔从未生效就被退掉：一天都不给。
@@ -143,4 +143,40 @@ export async function membershipUntilOf(userId: string): Promise<number> {
   if (!isObjectIdLike(userId)) return 0;
   const rows = await safe('会员订单', () => orderRows(new Types.ObjectId(userId)), [] as MembershipRow[]);
   return replayMembership(rows);
+}
+
+/**
+ * 批量判定「此刻是付费会员」的用户集合（榜单头像徽标用）。
+ * 只认会员订单（含退款截断），不含积分免广告卡——徽标语义是「会员」，不是「免广告」。
+ */
+export async function activeMemberUserIds(
+  userIds: Array<string | Types.ObjectId>,
+  now = Date.now(),
+): Promise<Set<string>> {
+  const ids = [...new Set(userIds.map(String))].filter(isObjectIdLike).map((id) => new Types.ObjectId(id));
+  if (!ids.length) return new Set();
+  const rows = await safe(
+    '会员订单批量',
+    async () => {
+      const docs = await XpayOrderModel.find({
+        userId: { $in: ids },
+        status: { $in: [...MEMBER_COUNTING_STATUS] },
+      })
+        .select({ userId: 1, periodStart: 1, periodEnd: 1, truncatedAt: 1 })
+        .lean();
+      return docs.map((r) => ({
+        userId: String(r.userId),
+        periodStart: Number(r.periodStart) || 0,
+        periodEnd: Number(r.periodEnd) || 0,
+        truncatedAt: Number(r.truncatedAt) || 0,
+      }));
+    },
+    [] as Array<{ userId: string; periodStart: number; periodEnd: number; truncatedAt: number }>,
+  );
+  const out = new Set<string>();
+  for (const r of rows) {
+    // periodStart 为 0＝还没排进会员链（未发货），不参与
+    if (r.periodStart > 0 && r.periodStart <= now && effectiveEnd(r) > now) out.add(r.userId);
+  }
+  return out;
 }
