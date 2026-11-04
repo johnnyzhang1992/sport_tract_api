@@ -378,5 +378,5 @@ test('FEE-1 手续费扣除：≤180 天不扣；超期按 1% 四舍五入；上
   assert.equal(feeDeductionFen(now - 179 * DAY, 199, now), 0);
   assert.equal(feeDeductionFen(now - 181 * DAY, 199, now), 2, '199×1%＝1.99 → 四舍五入 2 分');
   assert.equal(feeDeductionFen(now - 400 * DAY, 100, now), 1, '100×1%＝1 分');
-  assert.equal(feeDeductionFen(now - 400 * DAY, 1, now), 1, '小额退款扣除额不超过退款额本身');
+  assert.equal(feeDeductionFen(now - 400 * DAY, 1, now), 0, '四舍五入不足 1 分则不扣（退款额本身不为负）');
 });
