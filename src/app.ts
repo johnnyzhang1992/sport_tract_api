@@ -26,6 +26,7 @@ import { memberRoutes } from './routes/member.routes.js';
 import { setNotifyHandler } from './routes/pay-notify.routes.js';
 import { handleXpayNotify } from './services/xpay-deliver.js';
 import { adminXpayRoutes } from './routes/admin-xpay.routes.js';
+import { operatorRoutes } from './routes/operator.routes.js';
 import { AdminModel, hashPassword } from './models/admin.model.js';
 import { seedPointItems } from './services/points-catalog.js';
 import { seedPaidProducts } from './services/paid-products.js';
@@ -106,6 +107,8 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   // 回调的业务实现挂到信封路由上（信封只负责验签/解密/应答形态）
   setNotifyHandler(handleXpayNotify);
   await fastify.register(adminXpayRoutes, { prefix: `${config.apiPrefix}/admin/xpay` });
+  // 运营者接口（role=admin 的微信用户）：用户 JWT + 实时查库校验角色
+  await fastify.register(operatorRoutes, { prefix: `${config.apiPrefix}/operator` });
 
   // 初始管理员 seed：Admin 集合为空时用环境变量创建
   fastify.addHook('onReady', async () => {

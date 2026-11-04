@@ -402,9 +402,9 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
-  // 手动触发「昨日数据统计」站内通知（幂等；联调/补发用）
+  // 手动触发「昨日数据统计」站内通知 + 订阅消息（幂等；联调/补发用，绕过 09:00–12:00 时间窗）
   fastify.post('/daily-stats/run', { onRequest: [adminAuth] }, async () =>
-    success(await runAdminDailyStats(), '已执行'));
+    success(await runAdminDailyStats(Date.now(), { force: true }), '已执行'));
 
   // 用户趋势：注册用户量 + 登录 UV/PV（range=week|month|year，按东八区分桶补零）
   fastify.get('/user-trend', { onRequest: [adminAuth] }, async (request) => {

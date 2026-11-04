@@ -30,6 +30,7 @@ export async function userRoutes(fastify: FastifyInstance) {
       weightKg: user.weightKg,
       heightCm: user.heightCm,
       profileCompleted: user.profileCompleted ?? false,
+      role: user.role ?? 'user', // 站内角色（admin=运营者，小程序据此显示运营中心入口）
       settings: user.settings,
       createdAt: user.createdAt,
     });

@@ -15,12 +15,18 @@ import { NotificationModel } from '../src/models/notification.model.js';
 import { PointSigninModel } from '../src/models/point.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
+import { SubscribeGrantModel } from '../src/models/subscribe-grant.model.js';
+import { SubscribeMessageLogModel } from '../src/models/subscribe-message-log.model.js';
 import { bjToday0 } from '../src/utils/bj-time.js';
 import {
-  collectDailyStats, buildDailyStatsContent, runAdminDailyStats,
-  bjMonthDay, dailyStatsDedupeKey,
+  collectDailyStats, buildDailyStatsContent, buildDailyStatsSubscribeContent,
+  buildDailyStatsSubscribeData, isDailyReportSendTime,
+  runAdminDailyStats, bjMonthDay, dailyStatsDedupeKey,
+  DAILY_REPORT_TEMPLATE_ID, DAILY_REPORT_TEMPLATE_KEY,
+  recordDailyReportGrant, __setAdminDailyStatsSenderForTest,
 } from '../src/services/admin-daily-stats.js';
 import { bjYmd } from '../src/services/member-reminder.js';
+import { listMessageSubscriptions, grantMessageSubscription } from '../src/services/subscriptions.js';
 
 let app: FastifyInstance;
 const RUN = Date.now().toString(36);
@@ -36,6 +42,9 @@ const DAY_START = bjToday0(NOW) - DAY; // 2026-11-03 00:00 +08
 let adminUid = '';
 let normalUid = '';
 let adminToken = '';
+let sends: Array<{ openid: string; templateId: string; page?: string; data: Record<string, { value: string }> }> = [];
+let sendResult = { errcode: 0, errmsg: 'ok' };
+let sendThrows = false;
 
 async function login(openid: string) {
   const res = await app.inject({
@@ -98,9 +107,19 @@ beforeEach(async () => {
   await ActivityModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
   await PointSigninModel.deleteMany({ dateKey: bjYmd(DAY_START) });
   await NotificationModel.deleteMany({ dedupeKey: /^adminDailyStats:/ });
+  await SubscribeGrantModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
+  await SubscribeMessageLogModel.deleteMany({ templateKey: DAILY_REPORT_TEMPLATE_KEY });
   await UserModel.deleteMany({ openid: NEW_OPENID });
   await UserModel.updateOne({ _id: adminUid }, { $set: { role: 'admin' } });
   await UserModel.updateOne({ _id: normalUid }, { $set: { role: 'user' } });
+  sends = [];
+  sendResult = { errcode: 0, errmsg: 'ok' };
+  sendThrows = false;
+  __setAdminDailyStatsSenderForTest(async (input) => {
+    if (sendThrows) throw new Error('ETIMEDOUT');
+    sends.push(input as never);
+    return sendResult;
+  });
 });
 
 after(async () => {
@@ -108,8 +127,11 @@ after(async () => {
   await ActivityModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
   await PointSigninModel.deleteMany({ dateKey: bjYmd(DAY_START) });
   await NotificationModel.deleteMany({ dedupeKey: /^adminDailyStats:/ });
+  await SubscribeGrantModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
+  await SubscribeMessageLogModel.deleteMany({ templateKey: DAILY_REPORT_TEMPLATE_KEY });
   await UserModel.deleteMany({ openid: { $in: [ADMIN_OPENID, USER_OPENID, NEW_OPENID] } });
   await AdminModel.deleteMany({ username: ADMIN_USER });
+  __setAdminDailyStatsSenderForTest(null);
   await app.close();
   await mongoose.disconnect().catch(() => {});
 });
@@ -127,6 +149,26 @@ test('DS-1 口径：UV/PV、轨迹创建/完成、签到人数、新增用户 + 
   assert.equal(bjMonthDay(DAY_START), '11月3日');
   const text = buildDailyStatsContent(s);
   assert.match(text, /^访问人数：\d+ 人\n访问次数：\d+ 次\n轨迹创建：\d+ 条\n轨迹完成：\d+ 条\n签到人数：\d+ 人\n新增用户：\d+ 人$/);
+
+  // 订阅消息短字段：轨迹{完成}/{全部}签到{签到}新增{新增}
+  const sample = {
+    date: DAY_START, uv: 50, pv: 123,
+    tracksCreated: 2, tracksFinished: 1, signinUsers: 2, newUsers: 1,
+  };
+  assert.equal(buildDailyStatsSubscribeContent(sample), '轨迹1/2签到2新增1');
+  assert.ok(buildDailyStatsSubscribeContent(sample).length <= 20);
+  const big = { ...sample, tracksCreated: 9999, tracksFinished: 9999, signinUsers: 9999, newUsers: 9999 };
+  assert.equal(buildDailyStatsSubscribeContent(big), '轨9999/9999签9999新9999', '四位数字退短标签');
+  assert.equal(buildDailyStatsSubscribeContent(big).length, 20);
+  const wan = { ...sample, tracksCreated: 10000, tracksFinished: 10000, signinUsers: 10000, newUsers: 10000 };
+  assert.equal(buildDailyStatsSubscribeContent(wan), '轨迹1万/1万签到1万新增1万');
+
+  const data = buildDailyStatsSubscribeData(sample, DAY_START);
+  assert.equal(data.time21.value, '2026年11月3日');
+  assert.equal(data.thing29.value, '迹路者');
+  assert.equal(data.number22.value, '50');
+  assert.equal(data.number4.value, '123');
+  assert.equal(data.thing1.value, '轨迹1/2签到2新增1');
 });
 
 test('DS-2 只投给管理员：定向通知、content 装全部指标、重复跑不重发', async () => {
@@ -148,6 +190,99 @@ test('DS-2 只投给管理员：定向通知、content 装全部指标、重复�
   const again = await runAdminDailyStats(NOW);
   assert.equal(again.sent, 0);
   assert.ok(again.skipped >= 1);
+  assert.equal(r.wechatSent, 0, '没有每日报告授权就不发微信');
+  assert.equal(sends.length, 0);
+});
+
+test('DS-2b 管理员有授权：站内 + 微信同时发，字段完整，发完消耗额度', async () => {
+  await seedDay();
+  await recordDailyReportGrant(adminUid, 'message_center');
+  const r = await runAdminDailyStats(NOW);
+  assert.equal(r.wechatSent, 1);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].openid, ADMIN_OPENID);
+  assert.equal(sends[0].templateId, DAILY_REPORT_TEMPLATE_ID);
+  assert.equal(sends[0].page, '/pages/notification-list/notification-list');
+  assert.ok(r.stats);
+  assert.equal(sends[0].data.time21.value, '2026年11月3日');
+  assert.equal(sends[0].data.thing29.value, '迹路者');
+  assert.equal(sends[0].data.number22.value, String(r.stats!.uv));
+  assert.equal(sends[0].data.number4.value, String(r.stats!.pv));
+  assert.equal(sends[0].data.thing1.value, buildDailyStatsSubscribeContent(r.stats!));
+  assert.ok(sends[0].data.thing1.value.length <= 20);
+
+  const grant = await SubscribeGrantModel.findOne({
+    userId: adminUid, templateKey: DAILY_REPORT_TEMPLATE_KEY,
+  }).lean();
+  assert.equal(grant?.status, 'consumed');
+  const log = await SubscribeMessageLogModel.findOne({
+    userId: adminUid, templateKey: DAILY_REPORT_TEMPLATE_KEY,
+  }).lean();
+  assert.equal(log?.status, 'sent');
+  assert.ok(await NotificationModel.exists({ dedupeKey: dailyStatsDedupeKey(DAY_START, adminUid) }), '站内报告仍在');
+
+  const again = await runAdminDailyStats(NOW);
+  assert.equal(again.wechatSent, 0);
+  assert.equal(sends.length, 1, '同一天同管理员只发一条');
+});
+
+test('DS-2c 43101：额度作废、记失败；站内报告仍生成', async () => {
+  await seedDay();
+  await recordDailyReportGrant(adminUid, 'message_center');
+  sendResult = { errcode: 43101, errmsg: 'user refuse' };
+  const r = await runAdminDailyStats(NOW);
+  assert.equal(r.wechatFailed, 1);
+  assert.equal(r.wechatSent, 0);
+  const grant = await SubscribeGrantModel.findOne({
+    userId: adminUid, templateKey: DAILY_REPORT_TEMPLATE_KEY,
+  }).lean();
+  assert.equal(grant?.status, 'invalid');
+  assert.equal(grant?.invalidReason, '43101');
+  const log = await SubscribeMessageLogModel.findOne({
+    userId: adminUid, templateKey: DAILY_REPORT_TEMPLATE_KEY,
+  }).lean();
+  assert.equal(log?.status, 'failed');
+  assert.equal(log?.errcode, 43101);
+  assert.ok(await NotificationModel.exists({ dedupeKey: dailyStatsDedupeKey(DAY_START, adminUid) }));
+});
+
+test('DS-5 发送时间：09:00–12:00 才发微信；force 可手动补', async () => {
+  assert.equal(isDailyReportSendTime(Date.UTC(2026, 10, 4, 0, 59)), false, '08:59 不发');
+  assert.equal(isDailyReportSendTime(NOW), true, '10:00 发');
+  assert.equal(isDailyReportSendTime(Date.UTC(2026, 10, 4, 6, 0)), false, '14:00 不发');
+
+  await seedDay();
+  await recordDailyReportGrant(adminUid, 'message_center');
+  const late = Date.UTC(2026, 10, 4, 6, 0, 0);
+  const skipped = await runAdminDailyStats(late);
+  assert.equal(skipped.wechatSent, 0);
+  assert.equal(sends.length, 0);
+  assert.ok(skipped.sent >= 1, '站内报告不受微信时间窗影响');
+
+  const forced = await runAdminDailyStats(late, { force: true });
+  assert.equal(forced.wechatSent, 1);
+  assert.equal(sends.length, 1);
+});
+
+test('DS-6 每日报告只给管理员：列表出现、普通用户不可订阅', async () => {
+  const adminList = await listMessageSubscriptions(adminUid);
+  const daily = adminList.items.find((i) => i.key === DAILY_REPORT_TEMPLATE_KEY);
+  assert.ok(daily, '管理员能看到每日数据报告');
+  assert.equal(daily?.label, '每日数据报告');
+  assert.equal(daily?.description, '每天 09:00 推送昨日数据');
+  assert.equal(daily?.templateId, DAILY_REPORT_TEMPLATE_ID);
+  assert.equal(daily?.subscribed, false);
+
+  const normalList = await listMessageSubscriptions(normalUid);
+  assert.ok(!normalList.items.some((i) => i.key === DAILY_REPORT_TEMPLATE_KEY), '普通用户看不到');
+  await assert.rejects(
+    () => grantMessageSubscription(normalUid, DAILY_REPORT_TEMPLATE_KEY, 'message_center'),
+    /仅管理员/,
+  );
+
+  await grantMessageSubscription(adminUid, DAILY_REPORT_TEMPLATE_KEY, 'message_center');
+  const after = await listMessageSubscriptions(adminUid);
+  assert.equal(after.items.find((i) => i.key === DAILY_REPORT_TEMPLATE_KEY)?.subscribed, true);
 });
 
 test('DS-3 角色接口：普通用户→管理员可切换；非法角色 400；列表回 role', async () => {
@@ -179,30 +314,42 @@ test('DS-3 角色接口：普通用户→管理员可切换；非法角色 400�
 });
 
 test('DS-3b 最后一名管理员保护：降级仅存 admin → 400 且角色不变；再提一名后可降', async () => {
-  // 只保留 normalUid 一个管理员（清全表角色：历史运行残留的 admin 会干扰「仅存一人」断言；
-  // User.role 不被其他用例消费，放开到全量是安全的）
-  await UserModel.updateMany({}, { $set: { role: 'user' } });
-  await UserModel.updateOne({ _id: normalUid }, { $set: { role: 'admin' } });
+  // 共享 dev 库里可能有真实管理员（例如本机 UID1004）：临时降级，测试结束必须在 finally 还原，
+  // 不能像早期那样直接 updateMany({}) 把全平台角色永久清成 user。
+  const priorAdmins = await UserModel.find({ role: 'admin' }).select({ _id: 1 }).lean();
+  const priorIds = priorAdmins.map((a) => a._id);
+  try {
+    await UserModel.updateMany({ role: 'admin' }, { $set: { role: 'user' } });
+    await UserModel.updateOne({ _id: normalUid }, { $set: { role: 'admin' } });
 
-  const deny = await app.inject({
-    method: 'PATCH', url: `${config.apiPrefix}/admin/users/${normalUid}/role`,
-    headers: { authorization: `Bearer ${adminToken}` }, payload: { role: 'user' },
-  });
-  assert.equal(deny.statusCode, 400, deny.body);
-  assert.match(deny.json().message, /至少保留一名管理员/);
-  assert.equal((await UserModel.findById(normalUid).lean())?.role, 'admin', '角色未被改动');
+    const deny = await app.inject({
+      method: 'PATCH', url: `${config.apiPrefix}/admin/users/${normalUid}/role`,
+      headers: { authorization: `Bearer ${adminToken}` }, payload: { role: 'user' },
+    });
+    assert.equal(deny.statusCode, 400, deny.body);
+    assert.match(deny.json().message, /至少保留一名管理员/);
+    assert.equal((await UserModel.findById(normalUid).lean())?.role, 'admin', '角色未被改动');
 
-  // 提一名新管理员后，原管理员即可降级
-  const promote = await app.inject({
-    method: 'PATCH', url: `${config.apiPrefix}/admin/users/${adminUid}/role`,
-    headers: { authorization: `Bearer ${adminToken}` }, payload: { role: 'admin' },
-  });
-  assert.equal(promote.statusCode, 200, promote.body);
-  const back = await app.inject({
-    method: 'PATCH', url: `${config.apiPrefix}/admin/users/${normalUid}/role`,
-    headers: { authorization: `Bearer ${adminToken}` }, payload: { role: 'user' },
-  });
-  assert.equal(back.statusCode, 200, back.body);
+    // 提一名新管理员后，原管理员即可降级
+    const promote = await app.inject({
+      method: 'PATCH', url: `${config.apiPrefix}/admin/users/${adminUid}/role`,
+      headers: { authorization: `Bearer ${adminToken}` }, payload: { role: 'admin' },
+    });
+    assert.equal(promote.statusCode, 200, promote.body);
+    const back = await app.inject({
+      method: 'PATCH', url: `${config.apiPrefix}/admin/users/${normalUid}/role`,
+      headers: { authorization: `Bearer ${adminToken}` }, payload: { role: 'user' },
+    });
+    assert.equal(back.statusCode, 200, back.body);
+  } finally {
+    await UserModel.updateMany({ _id: { $in: priorIds } }, { $set: { role: 'admin' } });
+    if (!priorIds.some((id) => String(id) === normalUid)) {
+      await UserModel.updateOne({ _id: normalUid }, { $set: { role: 'user' } });
+    }
+    if (!priorIds.some((id) => String(id) === adminUid)) {
+      await UserModel.updateOne({ _id: adminUid }, { $set: { role: 'user' } });
+    }
+  }
 });
 
 test('DS-4 管理端手动跑一轮：返回投递数并生成通知', async () => {

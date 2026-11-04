@@ -1,5 +1,7 @@
+import { Types } from 'mongoose';
 import { AppError } from '../utils/app-error.js';
 import { isObjectIdLike } from '../utils/object-id.js';
+import { UserModel } from '../models/user.model.js';
 import {
   getReminderSettings,
   hasReminderGrant,
@@ -12,6 +14,12 @@ import {
   recordWeeklySportsGrant,
   WEEKLY_SPORTS_TEMPLATE_KEY,
 } from './weekly-sports-reminder.js';
+import {
+  DAILY_REPORT_TEMPLATE_ID,
+  DAILY_REPORT_TEMPLATE_KEY,
+  hasDailyReportGrant,
+  recordDailyReportGrant,
+} from './admin-daily-stats.js';
 
 export interface MessageSubscriptionItem {
   key: string;
@@ -56,6 +64,17 @@ export async function listMessageSubscriptions(userId: string): Promise<{ items:
       subscribed: await hasWeeklySportsGrant(userId),
     });
   }
+  // 每日数据报告只给管理员；普通用户不展示也不可订阅
+  const user = await UserModel.findById(new Types.ObjectId(userId)).select({ role: 1 }).lean();
+  if (user?.role === 'admin') {
+    items.push({
+      key: DAILY_REPORT_TEMPLATE_KEY,
+      label: '每日数据报告',
+      description: '每天 09:00 推送昨日数据',
+      templateId: DAILY_REPORT_TEMPLATE_ID,
+      subscribed: await hasDailyReportGrant(userId),
+    });
+  }
   return { items };
 }
 
@@ -74,6 +93,11 @@ export async function grantMessageSubscription(
     const settings = await getWeeklySportsSettings();
     if (!settings.enabled) throw new AppError(403, '每周运动数据提醒暂未开放');
     return recordWeeklySportsGrant(userId, String(scene ?? ''));
+  }
+  if (templateKey === DAILY_REPORT_TEMPLATE_KEY) {
+    const user = await UserModel.findById(new Types.ObjectId(userId)).select({ role: 1 }).lean();
+    if (user?.role !== 'admin') throw new AppError(403, '仅管理员可订阅');
+    return recordDailyReportGrant(userId, String(scene ?? ''));
   }
   throw new AppError(400, '订阅类型不存在');
 }
