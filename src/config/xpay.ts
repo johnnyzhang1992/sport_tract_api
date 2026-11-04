@@ -17,6 +17,11 @@ export const xpayConfig = {
   pushAesKey: process.env.WX_PUSH_AES_KEY ?? '',
   /** 固定 0＝现网（spec §7.1） */
   env: 0 as const,
+  /** 退款手续费扣除费率（百分比）：仅支付超过 180 天的退款扣除（官方：超期平台不退手续费）；0＝关闭 */
+  feeRatePercent: (() => {
+    const n = Number.parseInt(process.env.XPAY_FEE_RATE_PERCENT ?? '', 10);
+    return Number.isFinite(n) ? n : 1;
+  })(),
 } as const;
 
 /**

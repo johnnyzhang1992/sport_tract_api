@@ -88,7 +88,7 @@ after(async () => {
 
 const auth = (t: string) => ({ authorization: `Bearer ${t}` });
 
-test('ML-1 列表：只回自己的单；动作旗标按状态裁定', async () => {
+test('ML-1 列表：只回自己的单；动作旗标按状态/渠道裁定', async () => {
   const mine = await mkRow(); // created
   const droid = await mkDelivered(); // android 已生效
   const iphone = await mkDelivered({ channel: 'ios' }); // ios 已生效
@@ -104,7 +104,7 @@ test('ML-1 列表：只回自己的单；动作旗标按状态裁定', async () 
   assert.equal(a.canPay, true); assert.equal(a.canCancel, true); assert.equal(a.canRefund, false);
   assert.equal(a.statusText, '待支付');
   assert.equal(byId(droid.outTradeNo).canRefund, true, 'android 已生效可自助退');
-  assert.equal(byId(iphone.outTradeNo).canRefund, true, 'ios 单同样可自助退');
+  assert.equal(byId(iphone.outTradeNo).canRefund, false, 'ios 单不给自助退旗标（690000020：走 App Store）');
   assert.ok(items.every((i: { notice?: string }) => !i.notice), 'notice 在列表外层');
   assert.match(res.json().data.notice, /剩余天数/);
 });
@@ -176,26 +176,7 @@ test('MF-1 自助退款（真单形状）：day-0 全额、原因枚举入库、
   assert.ok(e.memberUntil <= Date.now(), '全额退款后会员立即截断');
 });
 
-test('MF-1b iOS 订单同样可自助退款：走同一条微信退款链路', async () => {
-  const o = await mkDelivered({ channel: 'ios', periodStart: Date.now() - 3600_000 });
-  const refundBodies: Array<Record<string, unknown>> = [];
-  __setXpayFetcherForTest(async (api, body) => {
-    if (api === 'query_order') return { errcode: 0, order: { status: 3, left_fee: 199 } };
-    refundBodies.push(body as Record<string, unknown>);
-    return { errcode: 0, refund_id: 'rfIOS', status: 5 };
-  });
-  const res = await app.inject({
-    method: 'POST', url: `${config.apiPrefix}/member/order/${o.outTradeNo}/refund`,
-    headers: auth(alice), payload: { reasonCode: '1' },
-  });
-  assert.equal(res.statusCode, 200, res.body);
-  assert.equal(res.json().data.status, 'refunded');
-  assert.equal(refundBodies[0].req_from, '2', 'iOS 自助退款同样 req_from=2');
-  const row = await XpayOrderModel.findById(o._id).lean();
-  assert.equal(row?.status, 'refunded');
-});
-
-test('MF-2 闸门：别人的单 404；created 不可退；原因/说明校验', async () => {
+test('MF-2 闸门：别人的单 404；created 不可退；iOS 403 走 App Store；原因/说明校验', async () => {
   const bobRow = await mkRow({}, BOB);
   const alien = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/member/order/${bobRow.outTradeNo}/refund`,
@@ -210,9 +191,9 @@ test('MF-2 闸门：别人的单 404；created 不可退；原因/说明校验',
   });
   assert.equal((await bad({ reasonCode: '1' }, created.outTradeNo)).statusCode, 400, '仅已生效可退');
   const iosRow = await mkDelivered({ channel: 'ios' });
-  const iosNoReason = await bad({}, iosRow.outTradeNo);
-  assert.equal(iosNoReason.statusCode, 400, 'iOS 单不再按渠道拦');
-  assert.match(iosNoReason.json().message, /请选择退款原因/, '照样走到原因校验');
+  const iosRes = await bad({ reasonCode: '1' }, iosRow.outTradeNo);
+  assert.equal(iosRes.statusCode, 403, 'iOS 单拦下：690000020 开发者不可发起退款');
+  assert.match(iosRes.json().message, /App Store/);
   const live = await mkDelivered();
   const noReason = await bad({}, live.outTradeNo);
   assert.equal(noReason.statusCode, 400);
@@ -221,6 +202,32 @@ test('MF-2 闸门：别人的单 404；created 不可退；原因/说明校验',
   assert.equal(zero.statusCode, 400, '「暂无描述」不给用户选');
   const long = await bad({ reasonCode: '1', note: '字'.repeat(101) }, live.outTradeNo);
   assert.equal(long.statusCode, 400);
+});
+
+test('MF-4 支付超 180 天（未超 365 窗口）的自助退款：金额扣除手续费后发起（费率 1%）', async () => {
+  const refundBodies: Array<Record<string, unknown>> = [];
+  const o = await mkDelivered({ periodStart: Date.now() - 3600_000 });
+  // 把 createdAt 推到 400 天前（原生驱动绕过 timestamps 只读）
+  await XpayOrderModel.collection.updateOne({ _id: o._id }, { $set: { createdAt: new Date(Date.now() - 300 * DAY) } });
+  __setXpayFetcherForTest(async (api, body) => {
+    if (api === 'query_order') return { errcode: 0, order: { status: 3, left_fee: 199 } };
+    // refund_order：记录实发字段供断言
+    refundBodies.push(body as Record<string, unknown>);
+    return { errcode: 0, refund_id: 'rfOld', status: 3 }; // 受理处理中
+  });
+  const res = await app.inject({
+    method: 'POST', url: `${config.apiPrefix}/member/order/${o.outTradeNo}/refund`,
+    headers: auth(alice), payload: { reasonCode: '3', note: '' },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().data.refundFeeFen, 197, '199 − round(199×1%)=2 ＝ 197');
+  assert.equal(refundBodies[0]?.refund_fee, 197, '发微信的 refund_fee 是扣除后金额');
+  assert.match(res.json().message ?? '', /退款/);
+});
+
+test('MF-5 订单页 notice 下发手续费规则（服务端文案，端上不拼）', async () => {
+  const res = await app.inject({ method: 'GET', url: `${config.apiPrefix}/member/orders`, headers: auth(alice) });
+  assert.match(res.json().data.notice, /手续费/);
 });
 
 test('MF-3 退款中重试：refundOrderId 复用同值（微信要求重试同单号）', async () => {

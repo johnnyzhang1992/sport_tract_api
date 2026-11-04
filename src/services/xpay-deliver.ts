@@ -19,6 +19,7 @@ import { UserModel } from '../models/user.model.js';
 import { createNotification } from './notification.js';
 import { membershipUntilOf } from './entitlements.js';
 import { xpayQueryOrder, XPAY_REFUND_SETTLED_STATUSES } from './xpay-api.js';
+import { xpayConfig } from '../config/xpay.js';
 import { isObjectIdLike } from '../utils/object-id.js';
 import { fmtCnDate, MEMBER_DELIVER_NOTICE, IOS_QUERY_EVIDENCE } from '../config/member-copy.js';
 import type { NotifyResult } from '../routes/pay-notify.routes.js';
@@ -28,6 +29,21 @@ const QUERY_MIN_INTERVAL_MS = 60_000;
 const QUERY_MAX_ATTEMPTS = 20;
 const DELIVER_RETRY_ALERT_AT = 5;
 const REFUND_COUNT_ALERT_AT = 5;
+
+/** 支付 180 天内退款平台退还手续费；超过 180 天不退（官方文档，费率 Android 1%/iOS 12%） */
+export const XPAY_FEE_KEEP_WINDOW_MS = 180 * DAY_MS;
+
+/**
+ * 超过 180 天的退款：平台不退手续费，手续费由我们承担 → 从退款金额中扣除。
+ * 费率取 xpayConfig.feeRatePercent（env XPAY_FEE_RATE_PERCENT，默认 1%、0＝关闭）；
+ * 扣除额四舍五入到分，且不超过退款金额本身。
+ */
+export function feeDeductionFen(createdAtMs: number, refundAmountFen: number, now = Date.now()): number {
+  const ratePct = xpayConfig.feeRatePercent;
+  if (ratePct <= 0 || refundAmountFen <= 0) return 0;
+  if (now - createdAtMs <= XPAY_FEE_KEEP_WINDOW_MS) return 0;
+  return Math.min(refundAmountFen, Math.round((refundAmountFen * ratePct) / 100));
+}
 
 /** 按用户串行（同用户的多笔发货排队，不重叠） */
 const chains = new Map<string, Promise<void>>();

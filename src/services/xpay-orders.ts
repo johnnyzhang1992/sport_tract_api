@@ -18,7 +18,8 @@ import { entitlementsOf, type Entitlements } from './entitlements.js';
 import { isMemberPaymentsEnabled } from './member-switch.js';
 import { xpayConfig, isXpayPayConfigured, payConfig } from '../config/xpay.js';
 import { xpayQueryOrder, xpayRefundOrder, XPAY_REFUND_REASONS } from './xpay-api.js';
-import { applyRefund, suggestRefundFeeFen } from './xpay-deliver.js';
+import { applyRefund, suggestRefundFeeFen, feeDeductionFen } from './xpay-deliver.js';
+import { XPAY_REFUND_WINDOW_MS } from './xpay-admin.js';
 import { BJ_OFFSET_MS } from '../utils/bj-time.js';
 import {
   MEMBER_CLOSED, ORDER_SESSION_EXPIRED, ORDER_IDENTITY_MISMATCH, ORDER_PRODUCT_UNAVAILABLE,
@@ -304,6 +305,12 @@ export async function startUserRefund(
   const already = Number(row.refundedFen ?? 0);
   if (price - already <= 0) throw new AppError(400, '该订单已全额退款');
 
+  // 退款窗口与管理端同一口径（微信侧 365 天）：超窗口的单 refund_order 本身就发不出去，提前给明确原因
+  const orderAge = Date.now() - new Date(row.createdAt as never).getTime();
+  if (orderAge > XPAY_REFUND_WINDOW_MS) {
+    throw new AppError(400, `该订单已超过支付后 365 天的退款窗口（已 ${Math.floor(orderAge / 86_400_000)} 天），无法自助退款`);
+  }
+
   const reasonCode = String(input.reasonCode ?? '').trim();
   const knownReason = XPAY_REFUND_REASONS.find((r) => r.code === reasonCode && r.code !== '0');
   if (!knownReason) {
@@ -320,6 +327,12 @@ export async function startUserRefund(
     ? suggestRefundFeeFen({ leftFeeFen: left, periodStart: row.periodStart, periodEnd: row.periodEnd })
     : left; // 未生效的顺延单：一天没消费，全额退
   const finalFee = Math.max(1, Math.min(fee, left));
+  // 支付超过 180 天的退款：平台不退手续费（官方），从用户退款金额中扣除我们承担的部分
+  const deduct = feeDeductionFen(new Date(row.createdAt as never).getTime(), finalFee, Date.now());
+  const payable = finalFee - deduct;
+  if (payable <= 0) {
+    throw new AppError(400, `按规则扣除支付手续费（${deduct} 分）后已无可退金额，无法发起退款`);
+  }
 
   // refundOrderId 复用纪律与 admin 路径一致（微信要求重试同值）
   const refundOrderId = row.refundOrderId
@@ -331,7 +344,7 @@ export async function startUserRefund(
     outTradeNo: row.outTradeNo,
     wxOrderId: row.wxOrderId || undefined,
     refundOrderId,
-    refundFeeFen: finalFee,
+    refundFeeFen: payable,
     leftFeeFen: left,
     reason: reasonCode,
     reqFrom: '2', // 用户自己发起
@@ -348,13 +361,13 @@ export async function startUserRefund(
   console.warn(`[xpay] 用户发起退款 ${row.outTradeNo} ${finalFee} 分（user=${userId}，原因=${reasonCode}${note ? `，说明=${note}` : ''}）→ refunding`);
   if (r.done) {
     // 极少见：受理即完成。复用 applyRefund 的截断与幂等
-    await applyRefund({ outTradeNo: row.outTradeNo, refundFeeFen: finalFee, refundOrderId: r.refundOrderId });
+    await applyRefund({ outTradeNo: row.outTradeNo, refundFeeFen: payable, refundOrderId: r.refundOrderId });
   }
   const after = await XpayOrderModel.findById(row._id).lean();
   return {
     status: r.done ? 'refunded' : 'refunding',
     refundOrderId: r.refundOrderId,
-    refundFeeFen: finalFee,
+    refundFeeFen: payable,
     refundedFen: Number(after?.refundedFen ?? 0),
     entitlements: await entitlementsOf(String(userId)),
   };

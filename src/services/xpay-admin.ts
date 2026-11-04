@@ -12,7 +12,8 @@ import { assertObjectIdLike } from '../utils/object-id.js';
 import { escapeRegex } from '../utils/regex.js';
 import { bjDateStr, BJ_OFFSET_MS } from '../utils/bj-time.js';
 import { xpayQueryOrder, xpayRefundOrder, XPAY_REFUND_REASONS } from './xpay-api.js';
-import { suggestRefundFeeFen, deliverOrder, applyRefund } from './xpay-deliver.js';
+import { xpayConfig } from '../config/xpay.js';
+import { suggestRefundFeeFen, deliverOrder, applyRefund, feeDeductionFen } from './xpay-deliver.js';
 
 const DAY_MS = 86_400_000;
 /** 微信退款窗口＝支付后 365 天（spec §2.3） */
@@ -175,10 +176,14 @@ export async function refundPreview(id: string) {
   if (leftFeeFen <= 0) {
     return { ...base, leftFeeFen: 0, suggestFeeFen: 0, canRefund: false, reason: '微信侧剩余可退金额为 0（可能已全额退款）' };
   }
+  const suggest = suggestRefundFeeFen({ leftFeeFen, periodStart: row.periodStart, periodEnd: row.periodEnd });
+  const createdAtMs = new Date(row.createdAt as never).getTime();
+  const deduct = feeDeductionFen(createdAtMs, suggest);
   return {
     ...base,
     leftFeeFen,
-    suggestFeeFen: suggestRefundFeeFen({ leftFeeFen, periodStart: row.periodStart, periodEnd: row.periodEnd }),
+    suggestFeeFen: Math.max(1, suggest - deduct),
+    ...(deduct > 0 ? { feeNote: `支付已超 180 天：平台不退手续费，建议值已扣除 ${deduct} 分（费率 ${xpayConfig.feeRatePercent}%）` } : {}),
     canRefund: true,
   };
 }

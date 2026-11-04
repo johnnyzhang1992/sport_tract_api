@@ -80,7 +80,7 @@ export const MEMBER_DELIVER_NOTICE = {
  * iOS 退款问询的 evidence 文本（spec §7.4）。这不是用户可见文案，是发给 Apple/微信的说明，
  * 但要求具体：写清实际使用天数与总天数。
  */
-export const MEMBER_ORDERS_NOTICE = '退款金额按剩余天数折算，以提交时微信侧额度为准；退款后权益立即截断至退款时刻';
+export const MEMBER_ORDERS_NOTICE = '退款金额按剩余天数折算，以提交时微信侧额度为准；退款后权益立即截断至退款时刻；支付超过 180 天的退款将扣除支付手续费';
 
 export const IOS_QUERY_EVIDENCE = {
   notFound: '未查到该订单，建议退款',

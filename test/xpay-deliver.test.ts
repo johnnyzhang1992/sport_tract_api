@@ -16,7 +16,7 @@ import { XpayOrderModel } from '../src/models/xpay-order.model.js';
 import { UserModel } from '../src/models/user.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
 import {
-  handleXpayNotify, deliverOrder, applyRefund, answerIosRefundQuery, lazySyncOrders, suggestRefundFeeFen,
+  handleXpayNotify, deliverOrder, applyRefund, answerIosRefundQuery, lazySyncOrders, suggestRefundFeeFen, feeDeductionFen,
 } from '../src/services/xpay-deliver.js';
 import { __setEntitlementFetchersForTest, entitlementsOf } from '../src/services/entitlements.js';
 import { __setXpayFetcherForTest } from '../src/services/xpay-api.js';
@@ -370,4 +370,13 @@ test('LQ-4 退款对账：delivered 单微信侧已退而本地缺记 → 按差
   assert.ok((row?.truncatedAt ?? 0) > 0, '权益截断');
   const e = await entitlementsOf(String(uid));
   assert.ok(e.memberUntil <= row.truncatedAt, '回放按截断后区间');
+});
+
+test('FEE-1 手续费扣除：≤180 天不扣；超期按 1% 四舍五入；上限不超过退款额', () => {
+  const now = Date.now();
+  assert.equal(feeDeductionFen(now - 180 * DAY, 199, now), 0, '恰好 180 天不扣（规则是超过）');
+  assert.equal(feeDeductionFen(now - 179 * DAY, 199, now), 0);
+  assert.equal(feeDeductionFen(now - 181 * DAY, 199, now), 2, '199×1%＝1.99 → 四舍五入 2 分');
+  assert.equal(feeDeductionFen(now - 400 * DAY, 100, now), 1, '100×1%＝1 分');
+  assert.equal(feeDeductionFen(now - 400 * DAY, 1, now), 1, '小额退款扣除额不超过退款额本身');
 });

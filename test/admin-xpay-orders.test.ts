@@ -6,7 +6,7 @@
  * OA-4 refundFee 越界（0 / 负 / > leftFee）→ 400，句子含实际值与上限；
  * OA-5 备注必填；
  * OA-6 refundOrderId 生成后落库、重试复用同值；
- * OA-7 iOS 渠道与管理端同链路可退（req_from=1 人工客服）；预览不再按渠道拦；
+ * OA-7 iOS 渠道禁用退款（690000020：用户走 App Store 申请，开发者不可发起）；
  * OA-8 超过 365 天窗口拒绝发起；
  * OA-9 列表过滤 + keyword 转义；
  * OA-10 手动查单查到已支付即补发货。
@@ -181,25 +181,17 @@ test('OA-6 refundOrderId 生成后落库，重试复用同值', async () => {
   assert.equal(seen.filter((s) => s === id1).length, 2);
 });
 
-test('OA-7 iOS 渠道与管理端同链路可退：预览不再拦、退款 req_from=1', async () => {
-  const o = await mk({ channel: 'ios', status: 'delivered', priceFen: 199, leftFeeFen: 199, leftFeeAt: Date.now() });
-  const bodies: Array<Record<string, unknown>> = [];
-  __setXpayFetcherForTest(async (api, body) => {
-    if (api === 'query_order') return { errcode: 0, order: { status: 3, left_fee: 199 } };
-    bodies.push(body as Record<string, unknown>);
-    return { errcode: 0, refund_id: 'rf-ios', status: 3 };
-  });
-  const p = await app.inject({ method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund-preview`, headers: H() });
-  assert.equal(p.statusCode, 200, p.body);
-  assert.equal(p.json().data.canRefund, true, 'iOS 不再按渠道拦预览');
+test('OA-7 iOS 渠道禁用退款：403（690000020 用户走 App Store）、预览 canRefund=false', async () => {
+  const o = await mk({ channel: 'ios' });
   const res = await app.inject({
     method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund`,
     headers: H(), payload: { reasonCode: '5', refundFee: 100, reason: '测试' },
   });
-  assert.equal(res.statusCode, 200, res.body);
-  assert.equal(res.json().data.status, 'refunding');
-  assert.equal(bodies[0].refund_reason, '5');
-  assert.equal(bodies[0].req_from, '1', '管理端人工客服发起');
+  assert.equal(res.statusCode, 403);
+  assert.match(res.json().message, /App Store/);
+  assert.match(res.json().message, /690000020/, '要带上真单实测的错误码依据');
+  const p = await app.inject({ method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund-preview`, headers: H() });
+  assert.equal(p.json().data.canRefund, false);
 });
 
 test('OA-8 超过支付后 365 天窗口 → 拒绝发起（提前给明确原因）', async () => {
@@ -229,6 +221,18 @@ test('OA-9 列表过滤 + keyword 转义（畸形串不许打挂查询）', asyn
   // 未转义时这是一个非法正则（会抛 SyntaxError 变成 500）；转义后只是一个搜不到的普通串
   const weird = await listXpayOrders({ keyword: 'a(', page: 1, pageSize: 50 });
   assert.equal(mine(weird), 0, '括号必须被转义，不能当正则元字符');
+});
+
+test('OA-6b 支付超 180 天（未超 365 窗口）：预览建议值扣手续费并带 feeNote', async () => {
+  const o = await mk({ status: 'delivered', leftFeeFen: 199, leftFeeAt: Date.now() });
+  __setXpayFetcherForTest(async () => ({ errcode: 0, order: { status: 3, left_fee: 199 } }));
+  await XpayOrderModel.collection.updateOne({ _id: o._id }, { $set: { createdAt: new Date(Date.now() - 300 * DAY) } });
+  const res = await app.inject({ method: 'POST', url: `${config.apiPrefix}/admin/xpay/orders/${o._id}/refund-preview`, headers: H() });
+  assert.equal(res.statusCode, 200, res.body);
+  // mk 默认周期＝已用 10 天/剩 20 天：折算 floor(199×20/30)=132；再扣 1% 手续费 round(1.32)=1 → 131
+  assert.equal(res.json().data.suggestFeeFen, 131, '折算后再扣手续费');
+  assert.match(res.json().data.feeNote ?? '', /180 天/);
+  assert.match(res.json().data.feeNote ?? '', /已扣除 1 分/);
 });
 
 test('OA-10 手动查单查到已支付即补发货（幂等仍生效）', async () => {
