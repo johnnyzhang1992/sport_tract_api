@@ -61,6 +61,7 @@ export const UpdateMeSchema = z
         defaultType: z.string().optional(),
         highAccuracy: z.boolean().optional(),
         showBodyData: z.boolean().optional(),
+        showSportData: z.boolean().optional(), // 资料卡累计运动数据展示开关
         kmAnnounce: z.boolean().optional(), // 记录中整公里震动+横幅播报开关
       })
       .optional(),

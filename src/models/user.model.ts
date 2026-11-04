@@ -19,6 +19,7 @@ const userSchema = new Schema(
       defaultType: { type: String, default: 'walking' },
       highAccuracy: { type: Boolean, default: true },
       showBodyData: { type: Boolean, default: true }, // 个人中心是否展示身高体重
+      showSportData: { type: Boolean, default: true }, // 他人点开资料卡时是否展示累计运动数据
       kmAnnounce: { type: Boolean, default: true }, // 记录中整公里震动+横幅播报
     },
     avatarPreset: { type: String, default: '' }, // 默认头像预设 key（assets/avatars/default-N，avatarUrl 为空时生效）

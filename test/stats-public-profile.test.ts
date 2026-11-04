@@ -16,6 +16,7 @@ let app: FastifyInstance;
 const NOW = Date.now();
 const PREFIX = 'openid:public-profile';
 const UID = 990777;
+const HIDDEN_UID = 990778;
 const PROV = '公开资料测试省';
 let userId = '';
 
@@ -52,6 +53,10 @@ before(async () => {
     startTime: NOW - 2 * 86400000, endTime: NOW - 2 * 86400000 + 900000,
     duration: 900, distance: 3000, elevationGain: 0, calories: 0, trackPoints: [], markers: [],
   });
+  await UserModel.create({
+    openid: `${PREFIX}-hidden`, uid: HIDDEN_UID, nickname: '隐藏乙',
+    settings: { showSportData: false },
+  });
   await XpayOrderModel.create({
     outTradeNo: 'PUBLICPROFILE1', wxOrderId: 'PUBLICPROFILE1',
     userId: u._id, openid: u.openid, productKey: 'month_card', name: '会员月卡',
@@ -82,6 +87,7 @@ test('PPROF1 公开资料：白名单字段 + 累计八项，不含私密字段'
   assert.equal(d.nickname, '公开甲');
   assert.ok(d.joinDays >= 10, '加入天数按 createdAt 计算');
   assert.equal(d.memberActive, true);
+  assert.equal(d.showSportData, true);
   assert.equal(d.total.count, 2);
   assert.equal(d.total.distance, 8000);
   assert.equal(d.total.typeCount, 2, '运动类型数 = finished 类型去重');
@@ -92,7 +98,7 @@ test('PPROF1 公开资料：白名单字段 + 累计八项，不含私密字段'
   assert.ok(d.avatarLargeUrl, '头像大图 URL 要下发（预览用）');
   assert.deepEqual(
     Object.keys(d).sort(),
-    ['avatarLargeUrl', 'avatarPreset', 'avatarUrl', 'footprint', 'joinDays', 'memberActive', 'nickname', 'total', 'uid'].sort(),
+    ['avatarLargeUrl', 'avatarPreset', 'avatarUrl', 'footprint', 'joinDays', 'memberActive', 'nickname', 'showSportData', 'total', 'uid'].sort(),
     '顶层字段必须严格是白名单',
   );
   for (const secret of ['openid', 'settings', 'heightCm', 'weightKg', 'userId']) {
@@ -140,4 +146,16 @@ test('PPROF5 路由层：非法 UID 也计数，超限直接 429（先限流再�
   assert.equal(blocked.statusCode, 429);
   assert.match(blocked.json().message || '', /过于频繁/);
   resetProfileRateForTest();
+});
+
+
+test('PPROF6 关闭展示：身份照常返回，累计八项整体置空', async () => {
+  const res = await app.inject({ method: 'GET', url: `${API}/profile/${HIDDEN_UID}` });
+  assert.equal(res.statusCode, 200, res.body);
+  const d = res.json().data;
+  assert.equal(d.uid, HIDDEN_UID);
+  assert.equal(d.nickname, '隐藏乙');
+  assert.equal(d.showSportData, false);
+  assert.equal(d.total, null);
+  assert.equal(d.footprint, null);
 });
