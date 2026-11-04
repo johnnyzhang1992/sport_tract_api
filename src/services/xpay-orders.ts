@@ -23,7 +23,7 @@ import { XPAY_REFUND_WINDOW_MS } from './xpay-admin.js';
 import { BJ_OFFSET_MS } from '../utils/bj-time.js';
 import {
   MEMBER_CLOSED, ORDER_SESSION_EXPIRED, ORDER_IDENTITY_MISMATCH, ORDER_PRODUCT_UNAVAILABLE,
-  MEMBER_PRODUCT_COPY, memberStatusText, MEMBER_ORDERS_NOTICE, MEMBER_IOS_REFUND_HINT, fmtCnDate,
+  MEMBER_PRODUCT_COPY, memberStatusText, MEMBER_ORDERS_NOTICE, MEMBER_IOS_REFUND_HINT, MEMBER_IOS_REFUND_GUIDE, fmtCnDate,
 } from '../config/member-copy.js';
 
 /**
@@ -213,6 +213,8 @@ export async function listOrdersForUser(
       // iOS 单不显示退款按钮，但下发一行指引（用户侧只有 App Store 一条合法退款路径）
       refundHint: r.channel === 'ios' && (r.status === 'delivered' || r.status === 'refunding')
         ? MEMBER_IOS_REFUND_HINT : '',
+      refundGuide: r.channel === 'ios' && (r.status === 'delivered' || r.status === 'refunding')
+        ? MEMBER_IOS_REFUND_GUIDE : [],
     };
   });
   return { items, notice: MEMBER_ORDERS_NOTICE };

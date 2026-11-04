@@ -82,6 +82,14 @@ export const MEMBER_DELIVER_NOTICE = {
  */
 export const MEMBER_IOS_REFUND_HINT = 'iOS 退款请在 App Store 申请，通过后自动同步到这里';
 
+/** iOS 订单的退款流程指引（用户点开「退款流程」展示；步骤性事实以 Apple/微信官方口径为准） */
+export const MEMBER_IOS_REFUND_GUIDE = [
+  '1. 在 App Store 提交申请：设置 → 顶部 Apple ID → 媒体与购买项目 → 账户 → 购买记录 → 选中订单 → 请求退款（也可在 reportaproblem.apple.com 操作）',
+  '2. Apple 会向我们问询：只按你的实际使用情况回复建议（未使用或刚用 1 天内会建议同意，使用超过 1 天会如实说明）',
+  '3. 是否退款最终由 Apple 决定：通过后退款原路退回（一般 1-3 个工作日），会员权益立即终止；未通过则订单不受影响',
+  '4. 结果在 App Store 申请页查看；退款成功后，本页订单状态会自动更新为「已退款」',
+];
+
 export const MEMBER_ORDERS_NOTICE = '退款金额按剩余天数折算，以提交时微信侧额度为准；退款后权益立即截断至退款时刻；支付超过 180 天的退款将扣除支付手续费';
 
 export const IOS_QUERY_EVIDENCE = {
