@@ -84,7 +84,7 @@ export const MEMBER_IOS_REFUND_HINT = 'iOS 退款请在 App Store 申请，通�
 
 /** iOS 订单的退款流程指引（用户点开「退款流程」展示；步骤性事实以 Apple/微信官方口径为准） */
 export const MEMBER_IOS_REFUND_GUIDE = [
-  '1. 在 App Store 提交申请：设置 → 顶部 Apple ID → 媒体与购买项目 → 账户 → 购买记录 → 选中订单 → 请求退款（也可在 reportaproblem.apple.com 操作）',
+  '1. 在 App Store 提交申请：设置 → 顶部 Apple ID → 媒体与购买项目 → 账户 → 购买记录 → 选中本订单，入口可能是「请求退款」或「报告问题」（点击跳转 reportaproblem.apple.com 网站），选择订单与退款理由、按提示填写资料后提交',
   '2. Apple 会向我们问询：只按你的实际使用情况回复建议（未使用或刚用 1 天内会建议同意，使用超过 1 天会如实说明）',
   '3. 是否退款最终由 Apple 决定：通过后退款原路退回（一般 1-3 个工作日），会员权益立即终止；未通过则订单不受影响',
   '4. 结果在 App Store 申请页查看；退款成功后，本页订单状态会自动更新为「已退款」',
