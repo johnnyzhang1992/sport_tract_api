@@ -7,12 +7,14 @@ import { UserModel } from '../models/user.model.js';
 import { overview } from './stats.js';
 import { footprint } from './footprint.js';
 import { activeMemberUserIds } from './entitlements.js';
-import { getAvatarUrl } from './oss.js';
+import { getAvatarUrl, getMediumUrl } from './oss.js';
 
 export interface PublicProfile {
   uid: number;
   nickname: string;
   avatarUrl: string;
+  /** 头像大图（800px 档，点开头像预览用） */
+  avatarLargeUrl: string;
   avatarPreset: string;
   joinDays: number;
   memberActive: boolean;
@@ -46,6 +48,7 @@ export async function publicProfileByUid(uid: number): Promise<PublicProfile | n
     uid: Number(user.uid) || 0,
     nickname: user.nickname || '运动用户',
     avatarUrl: user.avatarUrl ? getAvatarUrl(user.avatarUrl) : '',
+    avatarLargeUrl: user.avatarUrl ? getMediumUrl(user.avatarUrl) : '',
     avatarPreset: user.avatarPreset || '',
     joinDays: createdAt > 0 ? Math.max(1, Math.ceil((Date.now() - createdAt) / 86400000)) : 0,
     memberActive: memberIds.has(id),
