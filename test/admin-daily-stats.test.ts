@@ -359,5 +359,8 @@ test('DS-4 管理端手动跑一轮：返回投递数并生成通知', async () 
   });
   assert.equal(r.statusCode, 200, r.body);
   assert.ok(r.json().data.sent >= 1);
-  assert.ok(await NotificationModel.exists({ dedupeKey: dailyStatsDedupeKey(DAY_START, adminUid) }));
+  // 预期 dedupeKey 用响应回传的真实 dayStart 推导：路由内部用真实当前时间，
+  // 跨天边界（本地时间过了午夜）时与固定 NOW 的 DAY_START 不再相等——按响应动态断言
+  const dedupe = dailyStatsDedupeKey(r.json().data.date, adminUid);
+  assert.ok(await NotificationModel.exists({ dedupeKey: dedupe }));
 });
