@@ -181,7 +181,7 @@ async function purge2() {
   await UserModel.deleteMany({ _id: { $in: ids } });
 }
 
-test('EX1 用户端汇总 CSV：BOM+CRLF、十列口径、三类时长独立、只含本人 finished', async () => {
+test('EX1 用户端汇总 CSV：BOM+CRLF、十一列口径（首列轨迹ID）、三类时长独立、只含本人 finished', async () => {
   const res = await app.inject({
     method: 'GET', url: `${API}/activities/export/summary`,
     headers: { authorization: `Bearer ${tokenA}` },
@@ -192,10 +192,11 @@ test('EX1 用户端汇总 CSV：BOM+CRLF、十列口径、三类时长独立、�
   assert.ok(body.startsWith('\uFEFF'), 'UTF-8 BOM 开头（Excel 中文兼容）');
   assert.ok(body.includes('\r\n'), 'CRLF 换行');
   const lines = body.slice(1).trimEnd().split('\r\n');
-  assert.equal(lines[0], '昵称,运动类型,开始时间,结束时间,运动时长,手动暂停,静止暂停,乘车时长,运动距离(公里),坐标点数量');
+  assert.equal(lines[0], '轨迹ID,昵称,运动类型,开始时间,结束时间,运动时长,手动暂停,静止暂停,乘车时长,运动距离(公里),坐标点数量');
   assert.equal(lines.length, 4, `本人 finished 共 3 行：${lines.length}`);
   assert.ok(body.includes('2026-10-25 08:00:00'), '开始时间走东八区');
   const runLine = lines.find((l) => l.includes('2026-10-25 08:00:00'))!;
+  assert.ok(runLine.startsWith(`${aRunning},`), '首列是完整轨迹 ID，可与 GPX 文件名关联');
   assert.ok(runLine.includes(',跑步,'), '类型出中文标签');
   assert.ok(runLine.includes(',01:00:00,'), `运动时长 3600s：${runLine}`);
   assert.ok(runLine.includes(',00:02:00,00:01:00,00:00:30,'), '手动/静止/乘车三列独立');
@@ -260,8 +261,10 @@ test('EX5 批量 GPX zip：PK 魔数、单条条目、README 坐标系说明', a
     assert.ok(gpx && readme, `条目齐全：${entries.join(',')}`);
     assert.ok(gpx!.startsWith('2026-10-25_'), '文件名以开始日期开头');
     assert.ok(gpx!.includes('跑步'), '文件名含类型中文');
+    assert.ok(gpx!.includes(aRunning), '文件名带完整轨迹 ID（不再截前 12 位）');
     const gpxBody = fs.readFileSync(path.join(dir, gpx!), 'utf8');
     assert.ok(gpxBody.includes('<trkpt'), '有轨迹点');
+    assert.ok(gpxBody.includes(`轨迹ID：${aRunning}`), 'GPX metadata 里带轨迹 ID');
     assert.ok(gpxBody.includes('2026-10-25T'), '时间已换算绝对 ISO');
     assert.ok(!gpxBody.includes('oss.example.com'), '照片 URL 不进 GPX');
     const readmeBody = fs.readFileSync(path.join(dir, readme!), 'utf8');
@@ -307,6 +310,36 @@ test('EX8 超上限 101 条 400', async () => {
   });
   assert.equal(res.statusCode, 400);
   assert.ok(res.body.includes('100'));
+});
+
+test('EX13 GPX 类型/时间筛选：type=running 只导跑步行；未知类型 400', async () => {
+  const one = await app.inject({
+    method: 'GET', url: `${API}/activities/export/gpx?type=running`,
+    headers: { authorization: `Bearer ${tokenA}` },
+  });
+  assert.equal(one.statusCode, 200, one.body);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'export-type-'));
+  try {
+    const zipPath = path.join(dir, 'out.zip');
+    fs.writeFileSync(zipPath, one.rawPayload);
+    await execFileP('unzip', ['-o', zipPath, '-d', dir]);
+    const gpxFiles = fs.readdirSync(dir).filter((f) => f.endsWith('.gpx'));
+    assert.equal(gpxFiles.length, 1, '只打包跑步那一条');
+    assert.ok(gpxFiles[0].includes(aRunning));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const bad = await app.inject({
+    method: 'GET', url: `${API}/activities/export/gpx?type=flying`,
+    headers: { authorization: `Bearer ${tokenA}` },
+  });
+  assert.equal(bad.statusCode, 400);
+  const byTime = await app.inject({
+    method: 'GET', url: `${API}/activities/export/gpx?from=${T_RUN + 1}`,
+    headers: { authorization: `Bearer ${tokenA}` },
+  });
+  assert.equal(byTime.statusCode, 200, byTime.body);
+  assert.ok(byTime.rawPayload.length > 0, '时间范围同样可打包');
 });
 
 test('EX9 频控：同 key 窗口内超 5 次 429（临时解除测试豁免验证分支）', async () => {

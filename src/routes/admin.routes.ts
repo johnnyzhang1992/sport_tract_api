@@ -4,6 +4,7 @@ import { Types, type PipelineStage } from 'mongoose';
 import { AdminModel, hashPassword, verifyPassword } from '../models/admin.model.js';
 import { UserModel } from '../models/user.model.js';
 import { LoginLogModel } from '../models/login-log.model.js';
+import { runAdminDailyStats } from '../services/admin-daily-stats.js';
 import { ActivityModel } from '../models/activity.model.js';
 import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import { config } from '../config/index.js';
@@ -401,6 +402,10 @@ export async function adminRoutes(fastify: FastifyInstance) {
     });
   });
 
+  // 手动触发「昨日数据统计」站内通知（幂等；联调/补发用）
+  fastify.post('/daily-stats/run', { onRequest: [adminAuth] }, async () =>
+    success(await runAdminDailyStats(), '已执行'));
+
   // 用户趋势：注册用户量 + 登录 UV/PV（range=week|month|year，按东八区分桶补零）
   fastify.get('/user-trend', { onRequest: [adminAuth] }, async (request) => {
     const raw = String((request.query as { range?: string }).range || 'week');
@@ -727,6 +732,7 @@ export async function adminRoutes(fastify: FastifyInstance) {
           lastLoginAt: u.lastLoginAt ?? u.createdAt,
           activityCount: uc?.count ?? 0, // 全部轨迹数
           finishedCount: uc?.finished ?? 0, // 已完成轨迹数
+          role: u.role ?? 'user', // 站内角色：admin 才会收到每日数据统计通知
           note: u.note ?? '', // 管理员备注（仅管理端可见）
           lastLoginIp: log?.ip ?? '',
           // 定位失败的历史脏值（"0"/"内网IP"/空）统一显示“未知”
@@ -745,6 +751,39 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const nicknameBackfilled = await backfillEmptyNicknames();
     const remaining = await UserModel.countDocuments({ uid: { $exists: false } });
     return success({ uidBackfilled, nicknameBackfilled, remaining });
+  });
+
+  // 设置用户角色（默认普通用户；管理员才接收每日数据统计通知）
+  fastify.patch('/users/:id/role', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    assertObjectIdLike(id, '用户不存在');
+    const body = (request.body ?? {}) as { role?: unknown };
+    const role = String(body.role ?? '');
+    if (role !== 'user' && role !== 'admin') throw new AppError(400, '角色只能是 user 或 admin');
+    const user = await UserModel.findById(id).select({ role: 1 }).lean();
+    if (!user) throw new AppError(404, '用户不存在');
+    const current = String(user.role ?? 'user');
+    if (current === role) return success({ id, role }, '角色未变化');
+
+    const demoting = current === 'admin' && role === 'user';
+    if (demoting) {
+      // 快路径预检：绝大多数请求在这里拿到明确 400
+      const admins = await UserModel.countDocuments({ role: 'admin' });
+      if (admins <= 1) throw new AppError(400, '至少保留一名管理员');
+      // 竞态保护：条件更新只降 admin 态的行；两个并发降级把最后的管理员挤掉时，
+      // 事后校验发现 admin=0 的一方回滚并 400（并发另一方同样回滚，终态一致）
+      const updated = await UserModel.updateOne({ _id: id, role: 'admin' }, { $set: { role: 'user' } });
+      if (updated.modifiedCount !== 1) throw new AppError(409, '角色已被其他操作修改，请刷新后重试');
+      const adminsLeft = await UserModel.countDocuments({ role: 'admin' });
+      if (adminsLeft === 0) {
+        await UserModel.updateOne({ _id: id }, { $set: { role: 'admin' } });
+        throw new AppError(400, '至少保留一名管理员');
+      }
+    } else {
+      await UserModel.updateOne({ _id: id }, { $set: { role } });
+    }
+    console.warn(`[admin] 用户角色 → ${role}（user=${id}，admin=${adminIdOf(request)}）`);
+    return success({ id, role }, '角色已更新');
   });
 
   // 设置用户备注（仅管理后台可见/编辑）

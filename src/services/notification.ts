@@ -5,9 +5,34 @@ import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
 
+export const NOTIFICATION_CATEGORIES = ['system', 'member', 'reward'] as const;
+export type NotificationCategory = (typeof NOTIFICATION_CATEGORIES)[number];
+
+const CATEGORY_LABELS: Record<NotificationCategory, string> = {
+  system: '系统通知',
+  member: '会员服务',
+  reward: '榜单奖励',
+};
+const CATEGORY_ORDER: NotificationCategory[] = ['system', 'member', 'reward'];
+
+/** 历史行（字段缺失/null）一律归入系统通知，不能让分类筛选把它漏掉 */
+export function notificationCategoryOf(raw: unknown): NotificationCategory {
+  return raw === 'member' || raw === 'reward' ? raw : 'system';
+}
+
+export function notificationCategoryLabel(raw: unknown): string {
+  return CATEGORY_LABELS[notificationCategoryOf(raw)];
+}
+
 export interface NotificationSummaryItem {
   id: string;
   title: string;
+}
+
+export interface NotificationListQuery {
+  category?: string;
+  q?: string;
+  unreadOnly?: boolean;
 }
 
 /**
@@ -26,7 +51,7 @@ function recipientFilter(userId?: string): Record<string, unknown> {
 async function publishedRows(userId?: string) {
   return NotificationModel.find({ published: true, ...recipientFilter(userId) })
     .sort({ publishedAt: -1 })
-    .select({ title: 1, content: 1, publishedAt: 1, userId: 1 })
+    .select({ title: 1, content: 1, category: 1, publishedAt: 1, userId: 1 })
     .lean();
 }
 
@@ -91,19 +116,57 @@ export async function notificationSummary(userId?: string) {
   };
 }
 
-/** 历史列表：可见范围（广播+定向给我的）全量，倒序；游客 read 一律 false、unreadCount=0 */
-export async function listNotifications(userId?: string) {
+/**
+ * 历史列表：可见范围（广播+定向给我的）全量，倒序；游客 read 一律 false、unreadCount=0。
+ * 2026-11-04 消息中心：category / q / unread 三个筛选都在服务端收口；分类计数只列有数据的分类。
+ */
+export async function listNotifications(userId?: string, query: NotificationListQuery = {}) {
+  const category = normalizeCategoryFilter(query.category);
+  const q = String(query.q ?? '').trim().toLowerCase();
+  if (q.length > 50) throw new AppError(400, '搜索关键词不能超过 50 字');
+
   const rows = await publishedRows(userId);
   const { unreadRows, isUnread } = await unreadState(userId, rows);
+
+  const items = rows.filter((r) => {
+    if (category && notificationCategoryOf(r.category) !== category) return false;
+    if (q && !`${r.title}\n${r.content}`.toLowerCase().includes(q)) return false;
+    // 游客没有已读概念：忽略「只看未读」，避免把一条都不返回
+    if (query.unreadOnly && userId && !isUnread(r)) return false;
+    return true;
+  });
+
+  const categories = CATEGORY_ORDER.flatMap((key) => {
+    const catRows = rows.filter((r) => notificationCategoryOf(r.category) === key);
+    if (catRows.length === 0) return [];
+    return [{
+      key,
+      label: CATEGORY_LABELS[key],
+      unreadCount: userId ? catRows.filter(isUnread).length : 0,
+    }];
+  });
+
   return {
-    items: rows.map((r) => ({
+    items: items.map((r) => ({
       id: String(r._id),
       title: r.title,
+      category: notificationCategoryOf(r.category),
+      categoryText: notificationCategoryLabel(r.category),
       publishedAt: r.publishedAt ?? 0,
       read: userId ? !isUnread(r) : false,
     })),
     unreadCount: userId ? unreadRows.length : 0,
+    total: items.length,
+    categories,
   };
+}
+
+function normalizeCategoryFilter(raw: unknown): NotificationCategory | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  if ((NOTIFICATION_CATEGORIES as readonly string[]).includes(String(raw))) {
+    return String(raw) as NotificationCategory;
+  }
+  throw new AppError(400, '消息分类不合法');
 }
 
 /** 详情：仅已发布且对我可见（广播或收件人是我）可读；读接口不写已读。
@@ -116,6 +179,8 @@ export async function getNotificationDetail(id: string, userId?: string) {
     id: String(row._id),
     title: row.title,
     content: row.content,
+    category: notificationCategoryOf(row.category),
+    categoryText: notificationCategoryLabel(row.category),
     publishedAt: row.publishedAt ?? 0,
   };
 }
@@ -173,6 +238,8 @@ export interface AdminNotification {
   id: string;
   title: string;
   content: string;
+  category: NotificationCategory;
+  categoryText: string;
   published: boolean;
   publishedAt: number | null;
   /** 定向收件人；null＝广播。后台列表只回广播行，此字段恒 null（保留供单条 DTO 透明） */
@@ -184,6 +251,7 @@ export interface AdminNotification {
 export type NotificationInput = {
   title?: unknown;
   content?: unknown;
+  category?: unknown;
   published?: unknown;
   /** 定向收件人（24 位 hex）；null/缺省＝广播 */
   userId?: unknown;
@@ -194,6 +262,8 @@ function toAdminNotification(r: Record<string, unknown> & { _id: unknown }): Adm
     id: String(r._id),
     title: String(r.title || ''),
     content: String(r.content || ''),
+    category: notificationCategoryOf(r.category),
+    categoryText: notificationCategoryLabel(r.category),
     published: Boolean(r.published),
     publishedAt: (r.publishedAt as number | null) ?? null,
     userId: r.userId ? String(r.userId) : null,
@@ -215,6 +285,12 @@ function validateInput(input: NotificationInput, { partial }: { partial: boolean
     if (!content) throw new AppError(400, '正文不能为空');
     if (content.length > 5000) throw new AppError(400, '正文不能超过 5000 字');
     out.content = content;
+  }
+  if (input.category !== undefined) {
+    if (!(NOTIFICATION_CATEGORIES as readonly string[]).includes(String(input.category))) {
+      throw new AppError(400, '消息分类不合法（system/member/reward）');
+    }
+    out.category = String(input.category);
   }
   if (input.published !== undefined) out.published = Boolean(input.published);
   // 收件人（userId）是**收件人**不是操作人，且只在创建时写：

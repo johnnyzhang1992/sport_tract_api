@@ -56,11 +56,13 @@ export function toGpx(doc: Record<string, any>): string {
 
   const startTime = doc.startTime ? new Date(doc.startTime).toISOString() : '';
   const name = `${doc.type ?? 'activity'} ${startTime}`;
+  const trackId = doc._id == null ? '' : String(doc._id);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="sport-track" xmlns="http://www.topografix.com/GPX/1/1">
   <metadata>
     <name>${escape(name)}</name>
+    <desc>${trackId ? `轨迹ID：${escape(trackId)}` : ''}</desc>
     <time>${startTime}</time>
   </metadata>
 ${wpts}

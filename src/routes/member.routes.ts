@@ -4,6 +4,8 @@ import { createMemberOrder, readOrderForUser, memberProductsPayload, listOrdersF
 import { entitlementsOf } from '../services/entitlements.js';
 import { scheduleLazySync } from '../services/xpay-deliver.js';
 import { memberEntryHint } from '../config/member-copy.js';
+import { getReminderSettings, hasReminderGrant, recordReminderGrant } from '../services/member-reminder.js';
+import { AppError } from '../utils/app-error.js';
 
 /**
  * 会员（虚拟支付）用户侧接口（spec §6.1）。四个都要登录：
@@ -52,6 +54,24 @@ export async function memberRoutes(fastify: FastifyInstance) {
   fastify.post('/order/:outTradeNo/cancel', { onRequest: [fastify.authenticate] }, async (request) => {
     const { outTradeNo } = request.params as { outTradeNo: string };
     return success(await cancelOrder(request.user.userId, outTradeNo), '订单已取消');
+  });
+
+  // ===== 会员到期提醒（一次性订阅）：模板 ID 与开关由服务端下发，端上不写死 =====
+  fastify.get('/reminder', { onRequest: [fastify.authenticate] }, async (request) => {
+    const s = await getReminderSettings();
+    return success({
+      enabled: s.enabled,
+      templateId: s.enabled ? s.templateId : '',
+      daysBefore: s.daysBefore,
+      subscribed: await hasReminderGrant(request.user.userId),
+    });
+  });
+
+  fastify.post('/reminder/grant', { onRequest: [fastify.authenticate] }, async (request) => {
+    const body = (request.body ?? {}) as { scene?: unknown };
+    const s = await getReminderSettings();
+    if (!s.enabled) throw new AppError(403, '到期提醒暂未开放');
+    return success(await recordReminderGrant(request.user.userId, String(body.scene ?? '')), '已开启到期提醒');
   });
 
   fastify.post('/order/:outTradeNo/refund', { onRequest: [fastify.authenticate] }, async (request) => {

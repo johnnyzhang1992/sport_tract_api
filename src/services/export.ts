@@ -88,7 +88,7 @@ export function contentDisposition(ascii: string, utf8: string): string {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(utf8)}`;
 }
 
-const CSV_HEADER = '昵称,运动类型,开始时间,结束时间,运动时长,手动暂停,静止暂停,乘车时长,运动距离(公里),坐标点数量';
+const CSV_HEADER = '轨迹ID,昵称,运动类型,开始时间,结束时间,运动时长,手动暂停,静止暂停,乘车时长,运动距离(公里),坐标点数量';
 
 type SummaryOpts = {
   /** 用户端传本人 id；管理端按参数（可缺省 = 全部用户） */
@@ -139,6 +139,7 @@ export async function exportSummaryCsv(opts: SummaryOpts): Promise<Readable> {
         { $sort: { startTime: -1, _id: 1 } },
         {
           $project: {
+            _id: 1,
             userId: 1, type: 1, startTime: 1, endTime: 1, duration: 1,
             pausedMs: 1, standstillMs: 1, vehicleMs: 1, distance: 1,
             pointCount: { $size: { $ifNull: ['$trackPoints', []] } },
@@ -158,6 +159,7 @@ export async function exportSummaryCsv(opts: SummaryOpts): Promise<Readable> {
       }
       for (const r of rows) {
         const line = [
+          String(r._id),
           nickCache.get(String(r.userId)) ?? '',
           typeLabel(r.type),
           bjDateTime(r.startTime),
@@ -189,7 +191,7 @@ function readmeBody(count: number): string {
     '坐标系：WGS-84 —— 与 Strava / 两步路 / Google Earth 等通用工具兼容。',
     '注意：微信/高德地图使用 GCJ-02 坐标，把 GPX 直接加载到高德底图上位置会偏移数百米，属正常现象。',
     '',
-    '文件命名：开始日期_运动类型_轨迹ID',
+    '文件命名：开始日期_运动类型_轨迹ID（与运动记录 CSV 的「轨迹ID」列一致，可据此关联两份导出）',
     '内容：轨迹点（经纬度 / 海拔 / 时间）；轨迹打点以航点（wpt）保留名称与地址文本。',
     '不含：运动照片。',
     '',
@@ -205,14 +207,19 @@ export async function exportGpxZip(opts: {
   ids?: string[];
   from?: number;
   to?: number;
+  type?: string;
   cap?: number;
 }): Promise<{ archive: Archiver; done: Promise<void>; count: number }> {
   const cap = opts.cap ?? EXPORT_GPX_MAX_ITEMS;
+  if (opts.type && !(ACTIVITY_TYPES as readonly string[]).includes(opts.type)) {
+    throw new AppError(400, '无效的运动类型');
+  }
   const filter: Record<string, unknown> = {
     status: 'finished',
     userId: Types.ObjectId.isValid(opts.userId) ? new Types.ObjectId(opts.userId) : opts.userId,
     'trackPoints.0': { $exists: true },
   };
+  if (opts.type) filter.type = opts.type;
   if (opts.ids) {
     const ids = [...new Set(opts.ids.map((s) => s.trim()).filter(Boolean))];
     if (ids.some((id) => !Types.ObjectId.isValid(id))) throw new AppError(400, '轨迹 ID 无效');
@@ -220,12 +227,14 @@ export async function exportGpxZip(opts: {
     if (!ids.length) throw new AppError(400, '请先选择要导出的轨迹');
     filter._id = { $in: ids.map((id) => new Types.ObjectId(id)) };
   } else {
-    if (!opts.from && !opts.to) throw new AppError(400, '请指定轨迹 ID 或时间范围');
-    const range: Record<string, unknown> = {};
-    if (opts.from) range.$gte = opts.from;
-    if (opts.to) range.$lte = opts.to;
-    if (opts.from && opts.to && opts.to <= opts.from) throw new AppError(400, '时间范围无效');
-    filter.startTime = range;
+    if (!opts.from && !opts.to && !opts.type) throw new AppError(400, '请指定轨迹 ID、时间范围或运动类型');
+    if (opts.from || opts.to) {
+      const range: Record<string, unknown> = {};
+      if (opts.from) range.$gte = opts.from;
+      if (opts.to) range.$lte = opts.to;
+      if (opts.from && opts.to && opts.to <= opts.from) throw new AppError(400, '时间范围无效');
+      filter.startTime = range;
+    }
   }
 
   const total = await ActivityModel.countDocuments(filter);
@@ -241,7 +250,7 @@ export async function exportGpxZip(opts: {
         .limit(ZIP_BATCH)
         .lean();
       for (const doc of docs) {
-        const name = `${bjDateTime(doc.startTime).slice(0, 10)}_${typeLabel(String(doc.type))}_${String(doc._id).slice(0, 12)}.gpx`;
+        const name = `${bjDateTime(doc.startTime).slice(0, 10)}_${typeLabel(String(doc.type))}_${String(doc._id)}.gpx`;
         archive.append(toGpx(doc), { name });
       }
     }

@@ -83,6 +83,7 @@ test('DL-1 支付成功推送 → 发货、落区间快照、回 ErrCode 0、发
   const n = await NotificationModel.find({ userId: uid, dedupeKey: { $regex: '^xpay_deliver:' } }).lean();
   assert.equal(n.length, 1);
   assert.equal(n[0].published, true, '定向通知要已发布，否则用户看不见');
+  assert.equal(n[0].category, 'member', '会员到账通知要进「会员服务」分类');
   assert.match(String(n[0].content), /会员月卡已生效/, '通知正文用批准稿 MC-16');
 });
 

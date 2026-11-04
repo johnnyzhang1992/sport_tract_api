@@ -207,7 +207,7 @@ export async function activityRoutes(fastify: FastifyInstance) {
 
   // 批量导出 GPX zip（ids 或时间范围二选一；与单条导出同一份 toGpx 口径：WGS-84 + 打点航点）
   fastify.get('/export/gpx', { onRequest: [fastify.authenticate] }, async (request, reply) => {
-    const q = request.query as { ids?: string; from?: string; to?: string };
+    const q = request.query as { ids?: string; from?: string; to?: string; type?: string };
     // 多条轨迹打包＝会员权益（spec §5.4 四处判据之一）。单条 /:id/gpx 不在本轮改动里，仍然免费。
     const { canExportBundle } = await entitlementsOf(String(request.user.userId));
     if (!canExportBundle) throw new AppError(403, GPX_BUNDLE_MEMBER_REQUIRED);
@@ -217,6 +217,7 @@ export async function activityRoutes(fastify: FastifyInstance) {
       ids: q.ids ? q.ids.split(',') : undefined,
       from: q.from ? Number(q.from) : undefined,
       to: q.to ? Number(q.to) : undefined,
+      type: q.type || undefined,
     });
     reply.header('Content-Type', 'application/zip');
     reply.header('Content-Disposition', contentDisposition(`track-export-${exportStamp()}.zip`, `轨迹导出_${exportStamp()}.zip`));

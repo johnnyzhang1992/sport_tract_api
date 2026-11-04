@@ -764,6 +764,7 @@ async function notifyReward(
   try {
     await notify({
       userId: r.userId,
+      category: 'reward',
       published: true,
       title: CREDIT_NOTIFICATION_TITLE,
       content: creditNotificationContent({ type: r.type, period, periodKey, rank: r.rank, points: r.points }),
@@ -937,6 +938,7 @@ export async function deliverPendingBoardNotifications(
     try {
       await notify({
         userId: String(row.userId),
+        category: 'reward',
         published: true,
         title: creditSide ? CREDIT_NOTIFICATION_TITLE : REVOKE_NOTIFICATION_TITLE,
         content,
@@ -1576,7 +1578,7 @@ export async function revokeBoardSettlement(
   let notified = false;
   try {
     const n = await notify(
-      { userId, published: true, title: REVOKE_NOTIFICATION_TITLE, content },
+      { userId, category: 'reward', published: true, title: REVOKE_NOTIFICATION_TITLE, content },
       boardNotificationDedupeKey('revoke', { type: row.type, period: row.period, periodKey: row.periodKey, userId }),
     );
     notification = { id: n.id, title: n.title, content: n.content };

@@ -1286,6 +1286,7 @@ test('SP-1 周榜结算：发分流水 type=board_reward、idemKey 带周期、�
   const notes = await NotificationModel.find({ userId: cyc[0] }).lean();
   assert.equal(notes.length, 1, '每人一条，不许重发');
   assert.equal(notes[0].title, '榜单积分奖励到账');
+  assert.equal(notes[0].category, 'reward', '榜单奖励通知要进「榜单奖励」分类');
   assert.equal(notes[0].content, '恭喜获得「骑行·周榜」第 1 名奖励 +50 积分（2026/12/07 至 2026/12/13 这一周）。');
   assert.equal(notes[0].published, true);
   // 不占每日上限：当天就这一笔，全额入账
@@ -2464,6 +2465,7 @@ test('NB-6（I-1a 撤回侧）撤回即时通知盖戳丢失：补投按去重�
   assert.equal(res.status, 'revoked');
   assert.equal(await NotificationModel.countDocuments({ userId: u, title: '榜单积分奖励调整' }), 1);
   const notes = await NotificationModel.find({ userId: u }).lean();
+  assert.equal(notes[0].category, 'reward', '撤回通知同样归「榜单奖励」');
   assert.equal(notes[0].dedupeKey, `board:revoke:cycling:week:${U31}:${u}`, '撤回即时通知也要带去重键');
 
   // 盖戳丢失（revokeNotifiedAt 退回 null）→ 补投只允许「识别为已发送」，不许第二条

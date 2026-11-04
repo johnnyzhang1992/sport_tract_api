@@ -175,6 +175,7 @@ export async function deliverOrder(p: {
       await createNotification({
         title: MEMBER_DELIVER_NOTICE.title,
         content: MEMBER_DELIVER_NOTICE.content(fresh.name, fmtCnDate(periodEnd)),
+        category: 'member',
         published: true,
         userId,
       }, `xpay_deliver:${p.wxOrderId || p.outTradeNo}`);

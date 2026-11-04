@@ -6,6 +6,12 @@ import {
   setPaidProductActive, setPaidProductSortOrder,
 } from '../services/paid-products.js';
 import { isMemberPaymentsEnabled, setMemberPaymentsEnabled } from '../services/member-switch.js';
+import { getReminderSettings, setReminderSettings, runMemberExpiryReminders } from '../services/member-reminder.js';
+import {
+  getWeeklySportsSettings,
+  setWeeklySportsSettings,
+  runWeeklySportsReminders,
+} from '../services/weekly-sports-reminder.js';
 import {
   listXpayOrders, getXpayOrderDetail, refundPreview, startRefund, manualQuery,
   type XpayOrderListQuery,
@@ -69,6 +75,34 @@ export async function adminXpayRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     return success(await manualQuery(id));
   });
+
+  // 会员到期提醒（一次性订阅）设置：开关 / 模板 ID / 提前天数
+  fastify.get('/reminder-settings', { onRequest: [adminAuth] }, async () =>
+    success(await getReminderSettings()));
+
+  fastify.put('/reminder-settings', { onRequest: [adminAuth] }, async (request) => {
+    const next = await setReminderSettings(request.body);
+    console.warn(`[member-reminder] 设置更新 → enabled=${next.enabled} days=${next.daysBefore}（admin=${adminIdOf(request)}）`);
+    return success(next, '已保存');
+  });
+
+  // 手动跑一轮（幂等；联调/补发用）
+  fastify.post('/reminder-settings/run', { onRequest: [adminAuth] }, async () =>
+    success(await runMemberExpiryReminders(), '已执行'));
+
+  // 每周运动数据提醒（一次性订阅）：开关 / 模板 ID；发送时间固定周一 09:00
+  fastify.get('/weekly-sports-settings', { onRequest: [adminAuth] }, async () =>
+    success(await getWeeklySportsSettings()));
+
+  fastify.put('/weekly-sports-settings', { onRequest: [adminAuth] }, async (request) => {
+    const next = await setWeeklySportsSettings(request.body);
+    console.warn(`[weekly-sports] 设置更新 → enabled=${next.enabled}（admin=${adminIdOf(request)}）`);
+    return success(next, '已保存');
+  });
+
+  // 手动跑一轮：绕过周一 09:00 的时间闸门，联调/补发用；同周幂等
+  fastify.post('/weekly-sports-settings/run', { onRequest: [adminAuth] }, async () =>
+    success(await runWeeklySportsReminders(Date.now(), { force: true }), '已执行'));
 
   // 会员开关 + 就绪度自检：运营要能看到「密钥配了没」，否则开关一开就全线报错还没法自证
   fastify.get('/member-switch', { onRequest: [adminAuth] }, async () =>

@@ -6,6 +6,8 @@ const { Schema, model, models } = mongoose;
 const userSchema = new Schema(
   {
     openid: { type: String, required: true, unique: true, index: true },
+    /** 站内角色：admin 才能收到每日数据统计通知；存量缺省按普通用户 */
+    role: { type: String, enum: ['user', 'admin'], default: 'user', index: true },
     uid: { type: Number, sparse: true, unique: true }, // 用户唯一编号（1000 起；sparse 兼容存量用户迁移补号）
     nickname: { type: String, default: '' },
     avatarUrl: { type: String, default: '' },
