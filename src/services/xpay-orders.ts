@@ -23,7 +23,7 @@ import { XPAY_REFUND_WINDOW_MS } from './xpay-admin.js';
 import { BJ_OFFSET_MS } from '../utils/bj-time.js';
 import {
   MEMBER_CLOSED, ORDER_SESSION_EXPIRED, ORDER_IDENTITY_MISMATCH, ORDER_PRODUCT_UNAVAILABLE,
-  MEMBER_PRODUCT_COPY, memberStatusText, MEMBER_ORDERS_NOTICE, fmtCnDate,
+  MEMBER_PRODUCT_COPY, memberStatusText, MEMBER_ORDERS_NOTICE, MEMBER_IOS_REFUND_HINT, fmtCnDate,
 } from '../config/member-copy.js';
 
 /**
@@ -210,6 +210,9 @@ export async function listOrdersForUser(
       // iOS 订单由用户在 Apple 侧退款（微信 690000020：开发者不可对 iOS 单发起退款），自助仅 Android
       canRefund: (r.status === 'delivered' || r.status === 'refunding')
         && price - refunded > 0 && r.channel !== 'ios',
+      // iOS 单不显示退款按钮，但下发一行指引（用户侧只有 App Store 一条合法退款路径）
+      refundHint: r.channel === 'ios' && (r.status === 'delivered' || r.status === 'refunding')
+        ? MEMBER_IOS_REFUND_HINT : '',
     };
   });
   return { items, notice: MEMBER_ORDERS_NOTICE };

@@ -105,6 +105,8 @@ test('ML-1 列表：只回自己的单；动作旗标按状态/渠道裁定', as
   assert.equal(a.statusText, '待支付');
   assert.equal(byId(droid.outTradeNo).canRefund, true, 'android 已生效可自助退');
   assert.equal(byId(iphone.outTradeNo).canRefund, false, 'ios 单不给自助退旗标（690000020：走 App Store）');
+  assert.match(byId(iphone.outTradeNo).refundHint ?? '', /App Store/, 'iOS 行下发退款指引');
+  assert.equal(byId(droid.outTradeNo).refundHint ?? '', '', '可自退的 android 行不需要指引');
   assert.ok(items.every((i: { notice?: string }) => !i.notice), 'notice 在列表外层');
   assert.match(res.json().data.notice, /剩余天数/);
 });
