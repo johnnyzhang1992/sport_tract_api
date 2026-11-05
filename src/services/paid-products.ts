@@ -193,22 +193,22 @@ export async function setPaidProductSortOrder(id: string, sortOrder: unknown): P
 /**
  * 种子档位（spec §4，MP 后台 2026-11-03 已发布）。
  * $setOnInsert：后台改过的价/文案不会被重跑冲掉——这条与 seedPointItems 同一教训。
- * 三条都高于 iOS 1 元地板价；photoQuota 300 是 D1 默认值，用户改目录即改额度，不改代码。
+ * 三条都高于 iOS 1 元地板价；photoQuota 200 是 D1 默认值（2026-11-05 从 300 下调），用户改目录即改额度，不改代码。
  */
 const SEED = [
   {
     key: 'month_card', name: '会员月卡', subtitle: '30 天', priceFen: 199, durationDays: 30, sortOrder: 1,
-    perks: { adFree: true, exportBundle: true, photoQuota: 300, subscribeNotice: true },
+    perks: { adFree: true, exportBundle: true, photoQuota: 200, subscribeNotice: true },
     notes: ['MP 后台道具价 1.99 元', '改价要同步 MP 后台（spec §2.4）'],
   },
   {
     key: 'season_card', name: '会员季卡', subtitle: '90 天', priceFen: 499, durationDays: 90, sortOrder: 2,
-    perks: { adFree: true, exportBundle: true, photoQuota: 300, subscribeNotice: true },
+    perks: { adFree: true, exportBundle: true, photoQuota: 200, subscribeNotice: true },
     notes: ['MP 后台道具价 4.99 元', '改价要同步 MP 后台（spec §2.4）'],
   },
   {
     key: 'year_card', name: '会员年卡', subtitle: '365 天', priceFen: 1699, durationDays: 365, sortOrder: 3,
-    perks: { adFree: true, exportBundle: true, photoQuota: 300, subscribeNotice: true },
+    perks: { adFree: true, exportBundle: true, photoQuota: 200, subscribeNotice: true },
     notes: ['MP 后台道具价 16.99 元', '改价要同步 MP 后台（spec §2.4）'],
   },
 ];

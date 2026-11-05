@@ -48,7 +48,8 @@ export const MAX_TRACK_POINTS = 20_000;
  * 每用户累计照片上限（轨迹打点 + 足迹合计）。额度存在 user.photoQuotaUsed，
  * 落库时按「新集合 − 旧集合」的差结算，所以 used 恒等于库里存着的 URL 颗数。
  */
-export const MAX_USER_PHOTOS = 100;
+/** 普通用户照片上限（2026-11-05 调整：100 → 50） */
+export const MAX_USER_PHOTOS = 50;
 
 /**
  * 有效运动最小距离（米）：finish/惰性清理重算距离低于该值视为无效运动

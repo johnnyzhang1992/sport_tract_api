@@ -9,7 +9,8 @@
 import { BJ_OFFSET_MS } from '../utils/bj-time.js';
 
 /** 会员期间的照片上限（D1 拍板 300；商品目录里的 perks.photoQuota 才是每档实际值，这里只用于文案） */
-export const MEMBER_PHOTO_QUOTA = 300;
+/** 会员照片上限（2026-11-05 调整：300 → 200；一次升级永久保留，见 photo-quota.resolvePhotoQuotaLimit） */
+export const MEMBER_PHOTO_QUOTA = 200;
 
 /** MC-14：非会员请求多条轨迹打包 */
 export const GPX_BUNDLE_MEMBER_REQUIRED = '多条轨迹打包导出需要开通会员';

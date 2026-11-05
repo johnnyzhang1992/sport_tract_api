@@ -21,7 +21,8 @@ import { PointCardModel, PointRecordModel, PointAccountModel, PointLotModel, Poi
 import { XpayOrderModel } from '../src/models/xpay-order.model.js';
 import { config } from '../src/config/index.js';
 import { deleteMyPhotos, listMyPhotos } from '../src/services/photo-manager.js';
-import { photoQuotaFullMessage } from '../src/config/member-copy.js';
+import { photoQuotaFullMessage, MEMBER_PHOTO_QUOTA } from '../src/config/member-copy.js';
+import { MAX_USER_PHOTOS } from '../src/config/constants.js';
 
 const RUN = Date.now().toString(36);
 const OWNER_OPENID = `pm_owner_${RUN}`;
@@ -101,7 +102,7 @@ test('PM-1 总览：只含自己的照片，按来源分组，读数带 over', a
   const all = res.groups.flatMap((g) => g.photos.map((p) => p.url));
   assert.ok(all.every((u) => !u.includes(`${RUN}-9`)), '别人的照片不能出现');
   assert.equal(res.used, 3);
-  assert.equal(res.limit, 100);
+  assert.equal(res.limit, MAX_USER_PHOTOS, '普通用户基础额度');
   assert.equal(res.over, 0);
 });
 
@@ -154,28 +155,28 @@ test('PM-5 幂等：重复删同一批 URL 不报错、不二次扣减', async (
 });
 
 test('PM-6 满额文案：升级长期有效、指引去「照片管理」删旧的；无「回落」说法', () => {
-  const memberFull = photoQuotaFullMessage(300, 300, true);
+  const memberFull = photoQuotaFullMessage(MEMBER_PHOTO_QUOTA, MEMBER_PHOTO_QUOTA, true);
   assert.match(memberFull, /已是上限/);
   assert.match(memberFull, /照片管理/);
   assert.ok(!memberFull.includes('回落'), '额度一次升级永久保留，不应出现回落文案');
 
-  const freeFull = photoQuotaFullMessage(100, 100, false);
-  assert.match(freeFull, /开通会员可提升到 300 张/);
+  const freeFull = photoQuotaFullMessage(MAX_USER_PHOTOS, MAX_USER_PHOTOS, false);
+  assert.match(freeFull, new RegExp(`开通会员可提升到 ${MEMBER_PHOTO_QUOTA} 张`));
   assert.match(freeFull, /长期有效/);
 
   // 超额只可能是脏数据：仍要给出可执行的删除建议
-  const over = photoQuotaFullMessage(320, 300, true);
+  const over = photoQuotaFullMessage(MEMBER_PHOTO_QUOTA + 20, MEMBER_PHOTO_QUOTA, true);
   assert.match(over, /超出 20 张/);
   assert.match(over, /删除 20 张以上/);
 });
 
-test('PM-7 额度一次升级永久保留：会员拿过 300 后过期，上限仍是 300（不回落）', async () => {
+test('PM-7 额度一次升级永久保留：会员拿过会员额度后过期，上限仍保持（不回落）', async () => {
   const openid = `pm_hw_${RUN}`;
   const uid = await mkUser(openid);
   const { resolvePhotoQuotaLimit, getPhotoQuota } = await import('../src/services/photo-quota.js');
 
   // 1) 未开通会员：基础 100
-  assert.equal((await resolvePhotoQuotaLimit(uid)).limit, 100);
+  assert.equal((await resolvePhotoQuotaLimit(uid)).limit, MAX_USER_PHOTOS);
 
   // 2) 造一笔「已生效」的会员订单（300 张权益）→ 上限升到 300 并落高水位
   const now = Date.now();
@@ -187,7 +188,7 @@ test('PM-7 额度一次升级永久保留：会员拿过 300 后过期，上限�
     name: '会员月卡',
     priceFen: 199,
     durationDays: 30,
-    perksSnapshot: { adFree: true, exportBundle: true, photoQuota: 300, subscribeNotice: true },
+    perksSnapshot: { adFree: true, exportBundle: true, photoQuota: MEMBER_PHOTO_QUOTA, subscribeNotice: true },
     status: 'delivered',
     wxOrderId: `wxhw${RUN}`.slice(0, 20),
     periodStart: now - 1000,
@@ -195,8 +196,8 @@ test('PM-7 额度一次升级永久保留：会员拿过 300 后过期，上限�
     attach: '',
     channel: 'android',
   });
-  assert.equal((await resolvePhotoQuotaLimit(uid)).limit, 300, '会员期内升到 300');
-  assert.equal((await UserModel.findById(uid).lean())?.photoQuotaLimit, 300, '高水位已落库');
+  assert.equal((await resolvePhotoQuotaLimit(uid)).limit, MEMBER_PHOTO_QUOTA, '会员期内升到会员额度');
+  assert.equal((await UserModel.findById(uid).lean())?.photoQuotaLimit, MEMBER_PHOTO_QUOTA, '高水位已落库');
 
   // 3) 会员到期（把区间改到过去）→ 上限**不回落**，仍是 300
   await XpayOrderModel.updateOne(
@@ -204,14 +205,14 @@ test('PM-7 额度一次升级永久保留：会员拿过 300 后过期，上限�
     { $set: { periodStart: now - 60 * DAY, periodEnd: now - 30 * DAY } },
   );
   const after = await resolvePhotoQuotaLimit(uid);
-  assert.equal(after.limit, 300, '会员到期不回落（一次升级永久保留）');
+  assert.equal(after.limit, MEMBER_PHOTO_QUOTA, '会员到期不回落（一次升级永久保留）');
   assert.equal(after.isMember, false, '此时确实已不是会员');
-  assert.equal((await getPhotoQuota(uid)).limit, 300);
+  assert.equal((await getPhotoQuota(uid)).limit, MEMBER_PHOTO_QUOTA);
 
   // 4) 已用 250 张：过期后仍可继续上传到 300（不会因过期被卡在 100）
-  await UserModel.updateOne({ _id: uid }, { $set: { photoQuotaUsed: 250 } });
+  await UserModel.updateOne({ _id: uid }, { $set: { photoQuotaUsed: MEMBER_PHOTO_QUOTA - 10 } });
   const q = await getPhotoQuota(uid);
-  assert.equal(q.remaining, 50);
+  assert.equal(q.remaining, 10);
 
   await UserModel.deleteOne({ openid });
 });

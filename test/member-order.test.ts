@@ -21,6 +21,7 @@ import { __setEntitlementFetchersForTest } from '../src/services/entitlements.js
 import { seedPaidProducts } from '../src/services/paid-products.js';
 import { __setPayConfigForTest } from '../src/config/xpay.js';
 import { AppSettingModel } from '../src/models/app-setting.model.js';
+import { MEMBER_PHOTO_QUOTA } from '../src/config/member-copy.js';
 import {
   MEMBER_CLOSED, ORDER_IDENTITY_MISMATCH, ORDER_PRODUCT_UNAVAILABLE, ORDER_SESSION_EXPIRED,
 } from '../src/config/member-copy.js';
@@ -187,7 +188,7 @@ test('MO-8 GET /member/products：三档齐全、价格/日均/权益行由服�
   assert.equal(d.items[0].priceText, '1.99 元');
   assert.equal(d.items[0].perDayText, '约 0.07 元/天');
   assert.equal(d.items[2].perDayText, '约 0.05 元/天');
-  assert.deepEqual(d.items[0].perkLines, ['免广告', '多条轨迹打包导出 GPX', '照片额度 300 张', '订阅消息提醒']);
+  assert.deepEqual(d.items[0].perkLines, ['免广告', '多条轨迹打包导出 GPX', `照片额度 ${MEMBER_PHOTO_QUOTA} 张`, '订阅消息提醒']);
   assert.equal(typeof d.entitlements.memberUntil, 'number');
   assert.equal(d.statusText, '', '从没开通过的用户没有状态行');
 });
@@ -217,6 +218,6 @@ test('MO-10 建单时把目录的 name/priceFen/durationDays/perks 快照进订�
   assert.equal(row?.priceFen, 1699);
   assert.equal(row?.name, '会员年卡');
   assert.equal(row?.durationDays, 365);
-  assert.equal(row?.perksSnapshot.photoQuota, 300);
+  assert.equal(row?.perksSnapshot.photoQuota, MEMBER_PHOTO_QUOTA);
   await PaidProductModel.updateOne({ key: 'year_card' }, { $set: { priceFen: 1699, name: '会员年卡', durationDays: 365 } });
 });

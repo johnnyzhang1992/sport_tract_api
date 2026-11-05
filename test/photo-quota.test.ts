@@ -8,6 +8,7 @@ import { ActivityModel } from '../src/models/activity.model.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
 import { config } from '../src/config/index.js';
 import { MAX_USER_PHOTOS } from '../src/config/constants.js';
+import { MEMBER_PHOTO_QUOTA } from '../src/config/member-copy.js';
 import { XpayOrderModel } from '../src/models/xpay-order.model.js';
 
 /**
@@ -141,10 +142,10 @@ test('PQ2 剩余额度 1 张时存 2 张：400、文案含已用/上限（批准
 
   assert.equal(res.statusCode, 400, res.body);
   const msg = res.json().message as string;
-  // 文案 2026-11-03 逐条批准（MC-15）：已用/上限 + 开通会员可提升到 300 + 删除出路。
+  // 文案 2026-11-05 定稿：已用/上限 + 开通会员可提升到会员额度（升级后长期有效）+ 删除出路。
   // 「本次需新增 N 张」不在批准稿里，所以这里不再断言它——改文案要用户重新批。
   assert.match(msg, new RegExp(`已用 ${MAX_USER_PHOTOS - 1}/${MAX_USER_PHOTOS} 张`), `提示要含已用/上限，实际「${msg}」`);
-  assert.match(msg, /开通会员可提升到 300 张/, `提示要含会员额度，实际「${msg}」`);
+  assert.match(msg, new RegExp(`开通会员可提升到 ${MEMBER_PHOTO_QUOTA} 张`), `提示要含会员额度，实际「${msg}」`);
   assert.match(msg, /照片管理/, `提示要含删除出路（指向「照片管理」页），实际「${msg}」`);
   assert.equal(await FootprintRecordModel.countDocuments({ title: '额度PQ2' }), 0, '被拒不能留下半成品');
   assert.equal(await usedOf(uid), MAX_USER_PHOTOS - 1, '结算失败不能把额度扣掉');
@@ -347,7 +348,7 @@ test('PQ17 空串占位不算一张', async () => {
   assert.equal(await usedOf(uid), 0, '未拍照时端上提交的是空串，占额度就是冤枉的');
 });
 
-test('PQ18 会员期内上限改读权益层：已用 100 张仍可签发（300 上限），用满 300 时报会员版文案', async () => {
+test('PQ18 会员期内上限改读权益层：已用基础额度仍可签发（会员上限），用满时报会员版文案', async () => {
   const { token, uid } = await freshUser('pq18');
   await setUsed(uid, MAX_USER_PHOTOS);
   const DAY = 86_400_000;
@@ -356,17 +357,18 @@ test('PQ18 会员期内上限改读权益层：已用 100 张仍可签发（300 
     userId: new Types.ObjectId(uid), openid: `pq18_${uid}`, productKey: 'month_card', name: '会员月卡',
     priceFen: 199, durationDays: 30, status: 'delivered',
     periodStart: Date.now() - DAY, periodEnd: Date.now() + DAY,
-    perksSnapshot: { adFree: true, exportBundle: true, photoQuota: 300, subscribeNotice: true },
+    perksSnapshot: { adFree: true, exportBundle: true, photoQuota: MEMBER_PHOTO_QUOTA, subscribeNotice: true },
   });
 
   const ok = await req('POST', '/oss/credential', token, { dir: 'footprint' });
-  assert.equal(ok.statusCode, 200, `会员不该被 100 张卡住：${ok.body}`);
-  assert.equal(ok.json().data.photoQuotaRemaining, 200, '300 − 已用 100');
+  assert.equal(ok.statusCode, 200, `会员不该被基础额度卡住：${ok.body}`);
+  assert.equal(ok.json().data.photoQuotaRemaining, MEMBER_PHOTO_QUOTA - MAX_USER_PHOTOS,
+    `会员上限 ${MEMBER_PHOTO_QUOTA} − 已用 ${MAX_USER_PHOTOS}`);
 
-  await setUsed(uid, 300);
+  await setUsed(uid, MEMBER_PHOTO_QUOTA);
   const full = await req('POST', '/oss/credential', token, { dir: 'footprint' });
   assert.equal(full.statusCode, 400, full.body);
-  assert.match(full.json().message, /已用 300\/300 张，已是上限/, `会员满额要用会员版文案，实际「${full.json().message}」`);
+  assert.match(full.json().message, new RegExp(`已用 ${MEMBER_PHOTO_QUOTA}/${MEMBER_PHOTO_QUOTA} 张，已是上限`), `会员满额要用会员版文案，实际「${full.json().message}」`);
   await XpayOrderModel.deleteMany({ userId: new Types.ObjectId(uid) });
 });
 
