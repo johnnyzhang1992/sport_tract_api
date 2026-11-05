@@ -295,11 +295,22 @@ test('EX7 无轨迹点的活动不进 zip（404 提示）；无 ids/范围 400',
     headers: { authorization: `Bearer ${tokenA}` },
   });
   assert.equal(r1.statusCode, 404);
+  // 不给任何筛选＝「全部记录 + 全部类型」（2026-11-05 修复：原先这里是 400）
   const r2 = await app.inject({
     method: 'GET', url: `${API}/activities/export/gpx`,
     headers: { authorization: `Bearer ${tokenA}` },
   });
-  assert.equal(r2.statusCode, 400);
+  assert.equal(r2.statusCode, 200, r2.body);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'export-all-'));
+  try {
+    const zipPath = path.join(dir, 'all.zip');
+    fs.writeFileSync(zipPath, r2.rawPayload);
+    await execFileP('unzip', ['-o', zipPath, '-d', dir]);
+    const gpx = fs.readdirSync(dir).filter((f) => f.endsWith('.gpx'));
+    assert.ok(gpx.length >= 2, `全部记录应打包本夹具的所有轨迹，实际 ${gpx.length} 个`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('EX8 超上限 101 条 400', async () => {

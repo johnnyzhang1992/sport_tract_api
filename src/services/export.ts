@@ -227,7 +227,9 @@ export async function exportGpxZip(opts: {
     if (!ids.length) throw new AppError(400, '请先选择要导出的轨迹');
     filter._id = { $in: ids.map((id) => new Types.ObjectId(id)) };
   } else {
-    if (!opts.from && !opts.to && !opts.type) throw new AppError(400, '请指定轨迹 ID、时间范围或运动类型');
+    // 「全部记录 + 全部类型」是合法选择（2026-11-05）：导出页的时间档默认就有「全部」，
+    // 之前这里硬性要求 from/to/type 之一，用户选「全部/全部」必然 400。
+    // 安全性由下面的**单次上限**兜住：超限给出可执行建议，而不是拦下「全部」这个档位。
     if (opts.from || opts.to) {
       const range: Record<string, unknown> = {};
       if (opts.from) range.$gte = opts.from;
@@ -239,7 +241,9 @@ export async function exportGpxZip(opts: {
 
   const total = await ActivityModel.countDocuments(filter);
   if (total === 0) throw new AppError(404, '选中的轨迹没有可导出的坐标明细');
-  if (total > cap) throw new AppError(400, `共 ${total} 条，超出单次导出上限 ${cap} 条，请缩小范围`);
+  if (total > cap) {
+    throw new AppError(400, `共 ${total} 条，超出单次导出上限 ${cap} 条，请缩小时间范围，或按运动类型分批导出`);
+  }
 
   const archive = new ZipArchive({ zlib: { level: 9 } });
   const done = (async () => {
