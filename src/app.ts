@@ -27,6 +27,7 @@ import { setNotifyHandler } from './routes/pay-notify.routes.js';
 import { handleXpayNotify } from './services/xpay-deliver.js';
 import { adminXpayRoutes } from './routes/admin-xpay.routes.js';
 import { operatorRoutes } from './routes/operator.routes.js';
+import { photoRoutes } from './routes/photo.routes.js';
 import { AdminModel, hashPassword } from './models/admin.model.js';
 import { seedPointItems } from './services/points-catalog.js';
 import { seedPaidProducts } from './services/paid-products.js';
@@ -109,6 +110,8 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   await fastify.register(adminXpayRoutes, { prefix: `${config.apiPrefix}/admin/xpay` });
   // 运营者接口（role=admin 的微信用户）：用户 JWT + 实时查库校验角色
   await fastify.register(operatorRoutes, { prefix: `${config.apiPrefix}/operator` });
+  // 照片管理：我的照片总览 + 批量删除（额度超额时的唯一可操作入口）
+  await fastify.register(photoRoutes, { prefix: `${config.apiPrefix}/photos` });
 
   // 初始管理员 seed：Admin 集合为空时用环境变量创建
   fastify.addHook('onReady', async () => {

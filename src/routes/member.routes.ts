@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { success } from '../utils/response.js';
 import { createMemberOrder, readOrderForUser, memberProductsPayload, listOrdersForUser, repayOrder, cancelOrder, startUserRefund } from '../services/xpay-orders.js';
 import { entitlementsOf } from '../services/entitlements.js';
+import { getPhotoQuota } from '../services/photo-quota.js';
 import { scheduleLazySync } from '../services/xpay-deliver.js';
 import { memberEntryHint } from '../config/member-copy.js';
 import { getReminderSettings, hasReminderGrant, recordReminderGrant } from '../services/member-reminder.js';
@@ -19,9 +20,16 @@ export async function memberRoutes(fastify: FastifyInstance) {
   });
 
   fastify.get('/entitlements', { onRequest: [fastify.authenticate] }, async (request) => {
-    const e = await entitlementsOf(request.user.userId);
-    // entryHint 给「我的」入口右侧那行（未开通 / 到期日），日期格式由服务端统一
-    return success({ ...e, entryHint: memberEntryHint(e) });
+    const userId = request.user.userId;
+    const [e, quota] = await Promise.all([entitlementsOf(userId), getPhotoQuota(userId)]);
+    // entryHint 给「我的」入口右侧那行（未开通 / 到期日），日期格式由服务端统一。
+    // photoQuota（2026-11-05）：额度用量在设置页与会员页各展示一处，读者是同一份读数
+    // （used 恒等于「库里存着的照片颗数」，limit 随会员状态变化）。
+    return success({
+      ...e,
+      entryHint: memberEntryHint(e),
+      photoQuota: { used: quota.used, limit: quota.limit, remaining: quota.remaining },
+    });
   });
 
   fastify.post('/order', { onRequest: [fastify.authenticate] }, async (request) => {

@@ -31,6 +31,12 @@ const userSchema = new Schema(
     footprintDirty: { type: Boolean, default: true },
     // 已占用的照片额度（轨迹打点 + 足迹合计）；存量用户可能没这个字段，读时按 0 算
     photoQuotaUsed: { type: Number, default: 0 },
+    /**
+     * 照片额度的**历史最高值**（高水位）。产品裁定 2026-11-05：
+     * 开通会员拿到的 300 张是一次性升级，会员到期**不回落到 100**——这里存拿到过的最大值，
+     * 真实上限 = max(100, 本字段, 当前会员权益给的额度)。只在升高时用 $max 写入。
+     */
+    photoQuotaLimit: { type: Number, default: 0 },
   },
   { timestamps: true },
 );

@@ -2,6 +2,7 @@ import { Types } from 'mongoose';
 import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { entitlementsOf } from './entitlements.js';
+import { MAX_USER_PHOTOS } from '../config/constants.js';
 import { photoQuotaFullMessage } from '../config/member-copy.js';
 
 /** 带照片的对象：打点是 {photoUrl, photos}，足迹是裸 URL 数组 */
@@ -26,16 +27,46 @@ export function countMarkerPhotos(markers: PhotoHolder[] | undefined | null): nu
   return (markers ?? []).reduce((sum, m) => sum + countPhotos(m), 0);
 }
 
+/**
+ * 照片上限的唯一解析出口（2026-11-05 产品裁定「一次升级、永久保留」）：
+ *   真实上限 = max(基础 100, 历史最高 photoQuotaLimit, 当前会员权益给的额度)
+ * 会员期内首次拿到 300 时把高水位落到 User.photoQuotaLimit（只升不降，$max 原子写），
+ * 之后即使会员到期也仍是 300——用户不需要为「额度回落」删照片，满额时删旧的即可。
+ * 所有读写额度的路径（凭证签发、落库结算、页面展示）都必须走这里，不许各自读权益层。
+ */
+export async function resolvePhotoQuotaLimit(
+  userId: string,
+): Promise<{ limit: number; isMember: boolean }> {
+  const [doc, e] = await Promise.all([
+    UserModel.findById(userId).select({ photoQuotaLimit: 1 }).lean(),
+    entitlementsOf(userId),
+  ]);
+  const stored = Number(doc?.photoQuotaLimit ?? 0) || 0;
+  const limit = Math.max(MAX_USER_PHOTOS, stored, e.photoQuotaLimit);
+  if (limit > stored) {
+    // 只升不降：$max 是原子且幂等，并发请求里谁先谁后都收敛到同一个高水位
+    await UserModel.updateOne(
+      { _id: new Types.ObjectId(userId) },
+      { $max: { photoQuotaLimit: limit } },
+    ).catch(() => {});
+  }
+  return { limit, isMember: e.memberActive };
+}
+
 export async function getPhotoQuota(
   userId: string,
 ): Promise<{ used: number; limit: number; remaining: number; isMember: boolean }> {
-  // 上限改读权益层（spec §5.4 第 4 处判据）：会员期内是 300，非会员仍是 MAX_USER_PHOTOS
-  const [doc, { photoQuotaLimit, memberActive }] = await Promise.all([
+  const [doc, resolved] = await Promise.all([
     UserModel.findById(userId).select('photoQuotaUsed').lean(),
-    entitlementsOf(userId),
+    resolvePhotoQuotaLimit(userId),
   ]);
   const used = doc?.photoQuotaUsed ?? 0;
-  return { used, limit: photoQuotaLimit, remaining: Math.max(0, photoQuotaLimit - used), isMember: memberActive };
+  return {
+    used,
+    limit: resolved.limit,
+    remaining: Math.max(0, resolved.limit - used),
+    isMember: resolved.isMember,
+  };
 }
 
 /**
@@ -54,7 +85,7 @@ export async function settlePhotoQuota(userId: string, before: number, after: nu
 
   if (delta > 0) {
     // 上限按写入时刻的权益读数取（会员前后上限不同，不能拿常量）；闸门本身仍是条件更新。
-    const { photoQuotaLimit, memberActive } = await entitlementsOf(userId);
+    const { limit: photoQuotaLimit, isMember: memberActive } = await resolvePhotoQuotaLimit(userId);
     const ok = await UserModel.findOneAndUpdate(
       {
         _id,

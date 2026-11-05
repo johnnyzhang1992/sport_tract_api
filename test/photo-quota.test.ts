@@ -145,7 +145,7 @@ test('PQ2 剩余额度 1 张时存 2 张：400、文案含已用/上限（批准
   // 「本次需新增 N 张」不在批准稿里，所以这里不再断言它——改文案要用户重新批。
   assert.match(msg, new RegExp(`已用 ${MAX_USER_PHOTOS - 1}/${MAX_USER_PHOTOS} 张`), `提示要含已用/上限，实际「${msg}」`);
   assert.match(msg, /开通会员可提升到 300 张/, `提示要含会员额度，实际「${msg}」`);
-  assert.match(msg, /或删除部分照片后继续上传/, `提示要含删除出路，实际「${msg}」`);
+  assert.match(msg, /照片管理/, `提示要含删除出路（指向「照片管理」页），实际「${msg}」`);
   assert.equal(await FootprintRecordModel.countDocuments({ title: '额度PQ2' }), 0, '被拒不能留下半成品');
   assert.equal(await usedOf(uid), MAX_USER_PHOTOS - 1, '结算失败不能把额度扣掉');
 });
@@ -366,7 +366,7 @@ test('PQ18 会员期内上限改读权益层：已用 100 张仍可签发（300 
   await setUsed(uid, 300);
   const full = await req('POST', '/oss/credential', token, { dir: 'footprint' });
   assert.equal(full.statusCode, 400, full.body);
-  assert.match(full.json().message, /已用 300\/300 张，已是会员上限/, `会员满额要用会员版文案，实际「${full.json().message}」`);
+  assert.match(full.json().message, /已用 300\/300 张，已是上限/, `会员满额要用会员版文案，实际「${full.json().message}」`);
   await XpayOrderModel.deleteMany({ userId: new Types.ObjectId(uid) });
 });
 

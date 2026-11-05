@@ -14,11 +14,21 @@ export const MEMBER_PHOTO_QUOTA = 300;
 /** MC-14：非会员请求多条轨迹打包 */
 export const GPX_BUNDLE_MEMBER_REQUIRED = '多条轨迹打包导出需要开通会员';
 
-/** MC-15 / MC-15b：照片额度已满（会员与非会员是两句：对会员说「开通会员」是废话） */
+/**
+ * 照片额度已满的文案（2026-11-05 定稿）。
+ *
+ * 额度规则是**一次升级、永久保留**：开通会员拿到的 300 张不会因为会员到期回落到 100，
+ * 所以这里没有「回落」这类句子——满额时唯一的出路就是删旧的（或还没升级过的人去开通会员）。
+ * used > limit 只可能是历史脏数据（正常路径不可能出现），仍给一句可执行的兜底。
+ */
 export function photoQuotaFullMessage(used: number, limit: number, isMember: boolean): string {
+  if (used > limit) {
+    const over = used - limit;
+    return `照片额度已超出（已用 ${used}/${limit} 张，超出 ${over} 张），删除 ${over} 张以上照片后继续上传`;
+  }
   return isMember
-    ? `照片额度已满（已用 ${used}/${limit} 张，已是会员上限），删除部分照片后继续上传`
-    : `照片额度已满（已用 ${used}/${limit} 张），开通会员可提升到 ${MEMBER_PHOTO_QUOTA} 张，或删除部分照片后继续上传`;
+    ? `照片额度已满（已用 ${used}/${limit} 张，已是上限），到「照片管理」删除部分旧照片后继续上传`
+    : `照片额度已满（已用 ${used}/${limit} 张），开通会员可提升到 ${MEMBER_PHOTO_QUOTA} 张（升级后长期有效），或到「照片管理」删除部分旧照片后继续上传`;
 }
 
 /** 中文日期（与批准稿里的示例同形：2026年12月3日） */
