@@ -19,6 +19,7 @@ import { isMemberPaymentsEnabled } from './member-switch.js';
 import { xpayConfig, isXpayPayConfigured, payConfig } from '../config/xpay.js';
 import { xpayQueryOrder, xpayRefundOrder, XPAY_REFUND_REASONS } from './xpay-api.js';
 import { applyRefund, suggestRefundFeeFen, feeDeductionFen } from './xpay-deliver.js';
+import { getPhotoQuota } from './photo-quota.js';
 import { XPAY_REFUND_WINDOW_MS } from './xpay-admin.js';
 import { BJ_OFFSET_MS } from '../utils/bj-time.js';
 import {
@@ -384,9 +385,13 @@ export async function memberProductsPayload(userId: string, now = Date.now()) {
   const entitlements = await entitlementsOf(userId, now);
   // 运营者旗标与付费开关解耦：关闸时运营者的「数据概览」入口仍在
   const operator = (String((await UserModel.findById(userId).select({ role: 1 }).lean())?.role ?? 'user')) === 'admin';
+  // 照片额度用量（2026-11-05）：会员页要在权益区展示实时读数，随本响应一起给，
+  // 端上不必再打第二个接口（一个请求拿全，也避免两处读数可能不一致的窗口）。
+  const quota = await getPhotoQuota(userId, entitlements);
+  const photoQuota = { used: quota.used, limit: quota.limit, remaining: quota.remaining };
   if (!enabled) {
     // 关闭态也要有一句服务端下发的说明：端上不许自己写「暂未开放」
-    return { enabled: false, items: [] as unknown[], entitlements, statusText: memberStatusText(entitlements, now), notice: MEMBER_CLOSED, operator };
+    return { enabled: false, items: [] as unknown[], entitlements, statusText: memberStatusText(entitlements, now), notice: MEMBER_CLOSED, operator, photoQuota };
   }
   const items = (await activePaidProducts()).map((i) => ({
     ...i,
@@ -395,5 +400,5 @@ export async function memberProductsPayload(userId: string, now = Date.now()) {
     durationText: MEMBER_PRODUCT_COPY.duration(i.durationDays),
     perkLines: MEMBER_PRODUCT_COPY.perkLines(i.perks.photoQuota),
   }));
-  return { enabled: true, items, entitlements, statusText: memberStatusText(entitlements, now), notice: '', operator };
+  return { enabled: true, items, entitlements, statusText: memberStatusText(entitlements, now), notice: '', operator, photoQuota };
 }

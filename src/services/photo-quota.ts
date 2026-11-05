@@ -36,10 +36,12 @@ export function countMarkerPhotos(markers: PhotoHolder[] | undefined | null): nu
  */
 export async function resolvePhotoQuotaLimit(
   userId: string,
+  /** 调用方已经算过权益时传进来，省一次读库（规则本身仍只在这里实现） */
+  precomputed?: { photoQuotaLimit: number; memberActive: boolean },
 ): Promise<{ limit: number; isMember: boolean }> {
   const [doc, e] = await Promise.all([
     UserModel.findById(userId).select({ photoQuotaLimit: 1 }).lean(),
-    entitlementsOf(userId),
+    precomputed ?? entitlementsOf(userId),
   ]);
   const stored = Number(doc?.photoQuotaLimit ?? 0) || 0;
   const limit = Math.max(MAX_USER_PHOTOS, stored, e.photoQuotaLimit);
@@ -55,10 +57,11 @@ export async function resolvePhotoQuotaLimit(
 
 export async function getPhotoQuota(
   userId: string,
+  precomputed?: { photoQuotaLimit: number; memberActive: boolean },
 ): Promise<{ used: number; limit: number; remaining: number; isMember: boolean }> {
   const [doc, resolved] = await Promise.all([
     UserModel.findById(userId).select('photoQuotaUsed').lean(),
-    resolvePhotoQuotaLimit(userId),
+    resolvePhotoQuotaLimit(userId, precomputed),
   ]);
   const used = doc?.photoQuotaUsed ?? 0;
   return {
