@@ -170,12 +170,12 @@ test('WS-2b 非发送时间整轮跳过；后台 force 可手动补跑', async (
   await mkActivity({ startTime: at(3, 8, 0) });
 
   const beforeNine = at(9, 8, 0);
-  const skipped = await runWeeklySportsReminders(beforeNine);
+  const skipped = await runWeeklySportsReminders(beforeNine, { onlyUserIds: [uid] });
   assert.equal(skipped.sent, 0);
   assert.equal(sends.length, 0);
   assert.equal(await hasWeeklySportsGrant(uid), true);
 
-  const forced = await runWeeklySportsReminders(beforeNine, { force: true });
+  const forced = await runWeeklySportsReminders(beforeNine, { force: true, onlyUserIds: [uid] });
   assert.equal(forced.sent, 1, 'force 绕过时间闸门');
   assert.equal(sends.length, 1);
 });
@@ -186,7 +186,7 @@ test('WS-3 有额度有数据：发一条、消耗额度、同周不重发', asy
   await mkActivity({ type: 'running', distance: 5000, startTime: at(3, 8, 0) });
   await mkActivity({ type: 'cycling', distance: 12000, duration: 2400, startTime: at(8, 10, 0) });
 
-  const r = await runWeeklySportsReminders(NOW);
+  const r = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.deepEqual({ sent: r.sent, noData: r.noData, failed: r.failed, skipped: r.skipped }, {
     sent: 1, noData: 0, failed: 0, skipped: 0,
   });
@@ -209,7 +209,7 @@ test('WS-3 有额度有数据：发一条、消耗额度、同周不重发', asy
   assert.equal(log?.status, 'sent');
 
   // 同周重跑：额度已消耗，不在扫描名单；不重发
-  const again = await runWeeklySportsReminders(NOW);
+  const again = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(again.sent, 0);
   assert.equal(sends.length, 1, '同周只发一条');
 
@@ -218,7 +218,7 @@ test('WS-3 有额度有数据：发一条、消耗额度、同周不重发', asy
     { userId: new mongoose.Types.ObjectId(uid), templateKey: WEEKLY_SPORTS_TEMPLATE_KEY },
     { $set: { status: 'granted' } },
   );
-  const dedupe = await runWeeklySportsReminders(NOW);
+  const dedupe = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(dedupe.skipped, 1, '同周占位挡住重复投递');
   assert.equal(sends.length, 1);
 });
@@ -228,7 +228,7 @@ test('WS-4 上周无运动：不发、不消耗额度；没有额度的人不在
   await recordWeeklySportsGrant(uid, 'message_center');
   // 只有本周运动，上周为空
   await mkActivity({ startTime: at(9, 8, 0) });
-  const r = await runWeeklySportsReminders(NOW);
+  const r = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(r.sent, 0);
   assert.equal(r.noData, 1);
   assert.equal(sends.length, 0);
@@ -239,7 +239,7 @@ test('WS-4 上周无运动：不发、不消耗额度；没有额度的人不在
   await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(uid) });
   await mkActivity({ startTime: at(3, 8, 0) });
   await SubscribeGrantModel.deleteMany({ userId: new mongoose.Types.ObjectId(uid) });
-  const noGrant = await runWeeklySportsReminders(NOW);
+  const noGrant = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(noGrant.sent, 0);
   assert.equal(sends.length, 0);
 });
@@ -250,7 +250,7 @@ test('WS-5 43101：额度作废、记失败；同周不重试', async () => {
   await mkActivity({ startTime: at(3, 8, 0) });
   sendResult = { errcode: 43101, errmsg: 'user refuse' };
 
-  const r = await runWeeklySportsReminders(NOW);
+  const r = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(r.failed, 1);
   assert.equal(r.sent, 0);
   const grant = await SubscribeGrantModel.findOne({
@@ -264,7 +264,7 @@ test('WS-5 43101：额度作废、记失败；同周不重试', async () => {
   assert.equal(log?.status, 'failed');
   assert.equal(log?.errcode, 43101);
 
-  const again = await runWeeklySportsReminders(NOW);
+  const again = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(again.sent, 0);
   assert.equal(sends.length, 1, '43101 是终态，同周不重试');
 });
@@ -275,13 +275,13 @@ test('WS-6 网络失败：删占位，下一轮可重试；额度不消耗', asy
   await mkActivity({ startTime: at(3, 8, 0) });
   sendThrows = true;
 
-  const first = await runWeeklySportsReminders(NOW);
+  const first = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(first.failed, 1);
   assert.equal(await hasWeeklySportsGrant(uid), true, '失败不消耗额度');
   assert.equal(await SubscribeMessageLogModel.countDocuments({}), 0, '网络失败删掉 sending 占位');
 
   sendThrows = false;
-  const second = await runWeeklySportsReminders(NOW);
+  const second = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(second.sent, 1, '下一轮重试成功');
 });
 

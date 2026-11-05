@@ -982,6 +982,138 @@ export async function deliverPendingBoardNotifications(
  * - 失败路径（裁定 1）：release 删 pending 让重试重领；绝不把失败写成 skipped（那是门槛缓存语义）。
  * - 单条 reward 失败只影响该条（catch 住），整批不中断——一次 pass 里 24 条奖励，一条炸不能带走其余人。
  */
+/* ==========================================================================
+ * 上榜通知（2026-11-05 产品裁定）：周榜/月榜的前 N 名各发一条「你上榜了」。
+ *
+ * 三条口径：
+ * 1. **前 10 名**（与 leaderboard 展示的默认条数一致），并列全含（与发分的并列口径一致）；
+ * 2. **与发分开关解耦**：关闸时没人收到到账通知，前 3 名也要发；开闸时前 3 名/被撤回者
+ *    已有到账（撤回）通知，上榜通知把他们排除——同一件事不发两条；
+ *    判定依据是**台账里真有 credited/revoked 行**（真的发过通知），不是只看开关：某个榜没过
+ *    参与人数门槛时没人拿到奖励，那个榜的前 3 名照常收上榜通知；
+ * 3. **每人每周期一条汇总**（一个人可能同时在多个榜上榜，不能按榜轰炸），年榜不发。
+ *
+ * 幂等：Notification.dedupeKey 的唯一索引（一个周期单元 + 一个人 = 一条），
+ * createNotification 撞键时返回既有行，所以重复 pass / 并发 pass 都不会重发。
+ * ========================================================================== */
+
+/** 上榜名次口径：与 leaderboard 展示的默认条数一致（榜单上看得到的人才收到通知） */
+export const ON_THE_LIST_TOP_N = 10;
+/** 只对周榜/月榜发上榜通知（年榜不发：产品明确只要周/月） */
+export const ON_THE_LIST_PERIODS: readonly BoardPeriod[] = ['week', 'month'];
+export const ON_THE_LIST_TITLE = '榜单上榜通知';
+
+export function boardOnTheListDedupeKey(
+  period: BoardPeriod,
+  periodKey: string,
+  userId: string,
+): string {
+  return `board:onthelist:${period}:${periodKey}:${userId}`;
+}
+
+/** 一条上榜记录：哪个榜、第几名 */
+export interface OnTheListEntry {
+  type: string;
+  rank: number;
+}
+
+/**
+ * 每榜前 N 名（含并列）→ 按用户汇总。纯函数：不碰库、不碰时钟。
+ * 与 planOneBoard 的并列口径一致：距离相等即同名次、并全部收下（即便因此超过 N 条）。
+ */
+export function planOnTheList(
+  boards: ReadonlyArray<{ type: string; rows: BoardCandidate[] }>,
+  topN = ON_THE_LIST_TOP_N,
+): Map<string, OnTheListEntry[]> {
+  const out = new Map<string, OnTheListEntry[]>();
+  for (const board of boards) {
+    const sorted = [...board.rows].sort((a, b) => b.distance - a.distance);
+    let i = 0;
+    while (i < sorted.length && i < topN) {
+      const rank = i + 1;
+      const tied = [sorted[i]];
+      for (let j = i + 1; j < sorted.length && sorted[j].distance === tied[0].distance; j += 1) {
+        tied.push(sorted[j]);
+      }
+      for (const t of tied) {
+        const list = out.get(t.userId) ?? [];
+        list.push({ type: board.type, rank });
+        out.set(t.userId, list);
+      }
+      i += tied.length;
+    }
+  }
+  return out;
+}
+
+/** 上榜通知正文：按「最高名次 + 全部上榜项」写一句，不按榜拆条 */
+export function onTheListContent(
+  period: BoardPeriod,
+  periodKey: string,
+  entries: OnTheListEntry[],
+): string {
+  const label = boardLabel(period, periodKey);
+  const periodLabel = PERIOD_LABEL[period];
+  const parts = entries.map((e) => `${TYPE_LABEL[e.type] ?? e.type}·${periodLabel}第 ${e.rank} 名`);
+  const best = [...entries].sort((a, b) => a.rank - b.rank)[0];
+  if (entries.length === 1) return `你在「${parts[0]}」上榜（${label}），继续加油！`;
+  return `你在 ${entries.length} 个${periodLabel}上榜（${label}）：${parts.join('、')}。`
+    + `最高 ${TYPE_LABEL[best.type] ?? best.type}·${periodLabel}第 ${best.rank} 名。`;
+}
+
+/**
+ * 给一个周期单元发上榜通知。**不看 BOARD_REWARDS 开关**（见上方口径 2），
+ * 但沿用结算的两道时间闸门：周期没结束不发、早于 settleFrom 的历史单元不发。
+ * 永不抛错：通知只是结算的顺带动作，炸了留给下一次进页面重试（幂等键兜住重发）。
+ */
+export async function notifyOnTheListOfBoards(
+  period: BoardPeriod,
+  periodKey: string,
+  endMs: number,
+  now = Date.now(),
+  deps: SettleDeps = {},
+): Promise<{ notified: number }> {
+  if (!ON_THE_LIST_PERIODS.includes(period)) return { notified: 0 };
+  const boundaryMs = settleBoundaryMs(period, periodKey);
+  if (now < boundaryMs) return { notified: 0 }; // 周期还没结束
+  if (boundaryMs < BOARD_REWARDS.settleFrom) return { notified: 0 }; // 上线前的单元不发（与发分同口径）
+  const startMs = periodStartMsFromKey(period, periodKey);
+  const boards: Array<{ type: string; rows: BoardCandidate[] }> = [];
+  for (const type of ACTIVITY_TYPES) {
+    const rows = await trustedBoardRows(type, startMs, endMs);
+    // 参与人数门槛与发分同口径：两三个人的榜不值得发「你上榜了」
+    if (rows.length <= BOARD_REWARDS.minParticipants) continue;
+    boards.push({ type, rows });
+  }
+  if (!boards.length) return { notified: 0 };
+  const recipients = planOnTheList(boards);
+  if (!recipients.size) return { notified: 0 };
+  // 台账里真有 credited/revoked 行的＝已发过到账（撤回）通知，不再发上榜通知
+  const rewarded = new Set<string>(
+    (await BoardSettlementModel.find({ period, periodKey, status: { $in: ['credited', 'revoked'] } })
+      .select({ userId: 1 })
+      .lean()).map((r) => String(r.userId)),
+  );
+  const notify = deps.notify ?? createNotification;
+  let notified = 0;
+  for (const [userId, entries] of recipients) {
+    if (rewarded.has(userId)) continue;
+    try {
+      await notify({
+        userId,
+        category: 'reward',
+        published: true,
+        title: ON_THE_LIST_TITLE,
+        content: onTheListContent(period, periodKey, entries),
+      }, boardOnTheListDedupeKey(period, periodKey, userId));
+      notified += 1;
+    } catch (e) {
+      console.error('[points-board] 上榜通知发送失败（下次进页面重试，幂等键兜住重发）', { userId, period, periodKey }, e);
+    }
+  }
+  return { notified };
+}
+
 export async function settlePeriod(
   period: BoardPeriod,
   periodKey: string,
@@ -1153,14 +1285,25 @@ export async function settlePeriod(
  * 返回 void：调用方不需要（也不该）拿结算结果做用户可见判断。
  */
 export async function settleDueForUser(userId: string, now: number = Date.now()): Promise<void> {
-  if (!(await isBoardRewardsEnabled())) return; // C5：开关关闭连查询都不做（SP-4）
+  // C5：发分开关关着时不做结算（连聚合都不做）。
+  // 但**上榜通知与这个开关解耦**（关闸时没人收到到账通知，前 3 名也要发上榜通知），
+  // 所以这里不再直接 return，只把“发分”这一步跳过；上榜通知照常走下面的单元循环。
+  const rewardsEnabled = await isBoardRewardsEnabled();
   try {
     const units = await computeSettleUnits(userId, now);
     for (const u of units) {
+      if (rewardsEnabled) {
+        try {
+          await settlePeriod(u.period, u.periodKey, u.endMs, now);
+        } catch (e) {
+          console.error('[points-board] 懒结算单元失败（下后进页面重试）', { userId, period: u.period, periodKey: u.periodKey }, e);
+        }
+      }
+      // 上榜通知：发分开关关着也要发（见 notifyOnTheListOfBoards 的口径 2）
       try {
-        await settlePeriod(u.period, u.periodKey, u.endMs, now);
+        await notifyOnTheListOfBoards(u.period, u.periodKey, u.endMs, now);
       } catch (e) {
-        console.error('[points-board] 懒结算单元失败（下后进页面重试）', { userId, period: u.period, periodKey: u.periodKey }, e);
+        console.error('[points-board] 上榜通知单元失败（下后进页面重试）', { userId, period: u.period, periodKey: u.periodKey }, e);
       }
     }
   } catch (e) {

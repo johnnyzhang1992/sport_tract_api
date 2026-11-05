@@ -209,7 +209,16 @@ export interface WeeklySportsRunResult {
  */
 export async function runWeeklySportsReminders(
   now = Date.now(),
-  opts: { force?: boolean } = {},
+  opts: {
+    force?: boolean;
+    /**
+     * **仅测试用**：把扫描范围收窄到给定用户（与 `__setXSenderForTest` 同一类测试缝）。
+     * 存在的理由：共享 dev 库上真实用户也会持有有效授权行，测试断言「本夹具发了 1 条、
+     * 其余 0 条」时会被真实用户的行污染成 noData/多发送——测试不该要求独占全局集合。
+     * 生产调用方一律不传（undefined＝扫全量）。
+     */
+    onlyUserIds?: string[];
+  } = {},
 ): Promise<WeeklySportsRunResult> {
   const result: WeeklySportsRunResult = { sent: 0, noData: 0, skipped: 0, failed: 0 };
   const settings = await getWeeklySportsSettings(now);
@@ -218,10 +227,15 @@ export async function runWeeklySportsReminders(
 
   const { weekStart, weekEnd } = weeklyWindow(now);
   const weekKey = bjIsoWeekLabel(weekStart);
-  const grants = await SubscribeGrantModel.find({
+  const grantFilter: Record<string, unknown> = {
     templateKey: WEEKLY_SPORTS_TEMPLATE_KEY,
     status: 'granted',
-  }).sort({ grantedAt: 1 }).select({ _id: 1, userId: 1 }).lean();
+  };
+  if (opts.onlyUserIds?.length) {
+    grantFilter.userId = { $in: opts.onlyUserIds.map((id) => new Types.ObjectId(id)) };
+  }
+  const grants = await SubscribeGrantModel.find(grantFilter)
+    .sort({ grantedAt: 1 }).select({ _id: 1, userId: 1 }).lean();
   if (grants.length === 0) return result;
 
   // 每用户只消费最早的一条额度
