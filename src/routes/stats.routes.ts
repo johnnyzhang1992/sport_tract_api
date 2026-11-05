@@ -120,16 +120,18 @@ export async function statsRoutes(fastify: FastifyInstance) {
   // 运动榜：按 运动类型 > 省份 排行（周期 week/month/year/all；TOP10 昵称完整展示 + 当前用户真实排名）
   // 可选鉴权（2026-10-26）：游客可看榜单（me 为 null，前端不渲染"我的排名"卡）
   fastify.get('/leaderboard', { onRequest: [fastify.authenticateOptional] }, async (request) => {
-    const query = request.query as { type?: string; province?: string; period?: string };
+    const query = request.query as { type?: string; province?: string; period?: string; periodKey?: string };
     const userId = request.user ? request.user.userId : null;
     // 懒结算后台触发（Task 9 / spec §4.2）：游客绝不触发（替谁结算都不成立）；
     // 只递 userId+时刻，query 里的 period 不参与调度——结算单元由 settleDueForUser 自己派生。
     if (userId) scheduleLazySettle(userId);
+    // periodKey（可选）：看历史周期（2026-11-05）。不给＝包含当前时刻的那一期。
     const result = await leaderboard(
       userId,
       query.type || 'running',
       query.province || '全国',
       (query.period || 'all') as 'week' | 'month' | 'year' | 'all',
+      { periodKey: query.periodKey },
     );
     return success(result);
   });
@@ -138,11 +140,11 @@ export async function statsRoutes(fastify: FastifyInstance) {
   // 可选鉴权（2026-10-26）：游客可看（与榜单本体同口径）
   fastify.get('/leaderboard-type-counts', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     // chips 排序与当前周期一致：period 缺省 week（榜单默认也是周榜）
-    const query = request.query as { period?: string };
+    const query = request.query as { period?: string; periodKey?: string };
     const period = (['week', 'month', 'year', 'all'] as const).includes((query.period ?? '') as never)
       ? (query.period as 'week' | 'month' | 'year' | 'all')
       : 'week';
-    return success(await leaderboardTypeCounts(period));
+    return success(await leaderboardTypeCounts(period, { periodKey: query.periodKey }));
   });
 
   // 运动榜：当前用户各类型榜名次一览（单次聚合；首页摘要按 周榜→月榜→年榜→总榜 回退取最优展示）

@@ -1306,14 +1306,14 @@ export async function adminRoutes(fastify: FastifyInstance) {
   // 运动榜（管理端）：与用户端 /stats/leaderboard 同口径；TOP N（默认 20）
   // 管理端不下发"我的排名"，行数据带 userId 供跳转用户详情
   fastify.get('/leaderboard', { onRequest: [adminAuth] }, async (request) => {
-    const q = request.query as { type?: string; province?: string; period?: string; limit?: string };
+    const q = request.query as { type?: string; province?: string; period?: string; limit?: string; periodKey?: string };
     const limit = Math.min(50, Math.max(1, Number(q.limit) || 20));
     const result = await leaderboard(
       null,
       q.type || 'walking',
       q.province || '全国',
       (q.period || 'all') as 'week' | 'month' | 'year' | 'all',
-      { limit, includeUserId: true },
+      { limit, includeUserId: true, periodKey: q.periodKey },
     );
     return success(result);
   });

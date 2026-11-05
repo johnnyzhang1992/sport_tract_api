@@ -11,7 +11,7 @@ import { ACTIVITY_TYPES, MIN_PLAUSIBLE_PACE_SEC_PER_KM, DRIFT_SCORE_PB_GATE } fr
 import type { ActivityType } from '../config/constants.js';
 import { getAvatarUrl } from './oss.js';
 import { activeMemberUserIds } from './entitlements.js';
-import { bjIsoWeekStart, bjMonthStart, bjYearStart } from '../utils/bj-time.js';
+import { bjDateStr, bjIsoWeekStart, bjMonthStart, bjYearStart } from '../utils/bj-time.js';
 
 export interface RegionProvince {
   name: string;
@@ -118,6 +118,11 @@ export interface LeaderboardResult {
   me: RankRow | null;
   /** 本榜最佳：当前 类型/省份/周期 筛选下的单项纪录（按类型的指标集） */
   best: BestRow[];
+  /** 当前展示的期（all 为 null）。历史周期入口新增（2026-11-05） */
+  window: PeriodWindow | null;
+  /** 翻页键：上一期恒有，下一期在未来时为 null */
+  prevPeriodKey: string | null;
+  nextPeriodKey: string | null;
 }
 
 const LEADERBOARD_PERIODS = ['week', 'month', 'year', 'all'] as const;
@@ -130,6 +135,102 @@ export function periodStartMs(period: LeaderboardPeriod, now = new Date()): numb
   if (period === 'week') return bjIsoWeekStart(ms);
   if (period === 'month') return bjMonthStart(ms);
   return bjYearStart(ms);
+}
+
+/**
+ * 周期窗口（2026-11-05 新增：榜单支持看历史周期）。
+ * 一个「期」= [startMs, endMs) 的东八区自然区间，periodKey 沿用积分榜单那套规范：
+ * week=`周一的日期`（YYYY-MM-DD）、month=`YYYY-MM`、year=`YYYY`；all 无窗口（null）。
+ */
+export interface PeriodWindow {
+  periodKey: string;
+  startMs: number;
+  endMs: number;
+  /** 给用户看的区间文案：周=「2026/10/27 至 11/02」，月=「2026年10月」，年=「2026年」 */
+  text: string;
+}
+
+const DAY_MS = 86_400_000;
+
+const BJ_MS = 8 * 3600_000;
+function bjMid(y: number, m: number, d: number): number {
+  return Date.UTC(y, m - 1, d) - BJ_MS;
+}
+
+function bjParts(ms: number): { y: number; m: number; d: number } {
+  const d = new Date(ms + BJ_MS);
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate() };
+}
+
+/** 某周期在「包含 anchorMs 的那一期」的窗口 */
+export function periodWindowOf(period: LeaderboardPeriod, anchorMs = Date.now()): PeriodWindow | null {
+  if (period === 'all') return null;
+  const startMs = periodStartMs(period, new Date(anchorMs)) as number;
+  return windowFromStart(period, startMs);
+}
+
+function windowFromStart(period: Exclude<LeaderboardPeriod, 'all'>, startMs: number): PeriodWindow {
+  if (period === 'week') {
+    const endMs = startMs + 7 * DAY_MS;
+    const s = bjParts(startMs);
+    const e = bjParts(endMs - DAY_MS); // 最后一天（含）
+    const md = (p: { m: number; d: number }) => `${String(p.m).padStart(2, '0')}/${String(p.d).padStart(2, '0')}`;
+    return {
+      periodKey: bjDateStr(startMs),
+      startMs,
+      endMs,
+      text: s.y === e.y ? `${s.y}/${md(s)} 至 ${md(e)}` : `${s.y}/${md(s)} 至 ${e.y}/${md(e)}`,
+    };
+  }
+  if (period === 'month') {
+    const p = bjParts(startMs);
+    const endMs = bjMid(p.y, p.m + 1, 1);
+    return { periodKey: `${p.y}-${String(p.m).padStart(2, '0')}`, startMs, endMs, text: `${p.y}年${p.m}月` };
+  }
+  const p = bjParts(startMs);
+  return { periodKey: String(p.y), startMs, endMs: bjMid(p.y + 1, 1, 1), text: `${p.y}年` };
+}
+
+/**
+ * 用 periodKey 反解窗口（历史周期入口）。非法形态一律 400——
+ * 与「外来 id 藏进 404」口径不同：这里是用户手填/前端算错的查询参数，给明确原因更好排障。
+ */
+export function periodWindowFromKey(period: LeaderboardPeriod, periodKey: string): PeriodWindow | null {
+  if (period === 'all') return null;
+  const key = String(periodKey || '').trim();
+  if (!key) return null; // 空＝当前期，由调用方回落
+  if (period === 'week') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) throw new AppError(400, `周榜周期键应为 YYYY-MM-DD（收到「${key}」）`);
+    const start = bjMid(Number(key.slice(0, 4)), Number(key.slice(5, 7)), Number(key.slice(8, 10)));
+    if (bjDateStr(start) !== key) throw new AppError(400, `周榜周期键不是合法日期（收到「${key}」）`);
+    if (bjIsoWeekStart(start) !== start) throw new AppError(400, `周榜周期键必须是周一（收到「${key}」）`);
+    return windowFromStart('week', start);
+  }
+  if (period === 'month') {
+    const m = /^(\d{4})-(\d{2})$/.exec(key);
+    if (!m) throw new AppError(400, `月榜周期键应为 YYYY-MM（收到「${key}」）`);
+    const month = Number(m[2]);
+    if (month < 1 || month > 12) throw new AppError(400, `月榜周期键月份非法（收到「${key}」）`);
+    return windowFromStart('month', bjMid(Number(m[1]), month, 1));
+  }
+  if (!/^\d{4}$/.test(key)) throw new AppError(400, `年榜周期键应为 YYYY（收到「${key}」）`);
+  return windowFromStart('year', bjMid(Number(key), 1, 1));
+}
+
+/** 相邻期（供前端「上一期 / 下一期」翻页）；下一期在未来时返回 null */
+export function adjacentPeriodKeys(
+  period: LeaderboardPeriod,
+  win: PeriodWindow | null,
+  now = Date.now(),
+): { prevPeriodKey: string | null; nextPeriodKey: string | null } {
+  if (!win) return { prevPeriodKey: null, nextPeriodKey: null };
+  const prev = periodWindowOf(period, win.startMs - 1);
+  const next = periodWindowOf(period, win.endMs); // endMs 属于下一期
+  const nextInFuture = win.endMs > now; // 本期都还没结束 ⇒ 没有下一期
+  return {
+    prevPeriodKey: prev ? prev.periodKey : null,
+    nextPeriodKey: nextInFuture ? null : (next ? next.periodKey : null),
+  };
 }
 
 /** 全平台点亮统计（60s 内存缓存：聚合只读历史，短窗口内允许略旧） */
@@ -190,10 +291,14 @@ export interface TypeCount {
  * chips 排序必须与当前选中的周期一致——周榜下按周数据排，总榜下按全量排；
  * 零填充全部类型，前端才能区分「真没人玩」和「接口没返回这项」
  */
-export async function leaderboardTypeCounts(period: LeaderboardPeriod = 'all'): Promise<{ types: TypeCount[]; period: LeaderboardPeriod }> {
-  const startMs = periodStartMs(period);
+export async function leaderboardTypeCounts(
+  period: LeaderboardPeriod = 'all',
+  opts: { periodKey?: string; now?: number } = {},
+): Promise<{ types: TypeCount[]; period: LeaderboardPeriod; window: PeriodWindow | null }> {
+  const now = opts.now ?? Date.now();
+  const win = opts.periodKey ? periodWindowFromKey(period, opts.periodKey) : periodWindowOf(period, now);
   const match: Record<string, unknown> = { status: 'finished', type: { $in: [...ACTIVITY_TYPES] } };
-  if (startMs != null) match.startTime = { $gte: startMs };
+  if (win) match.startTime = { $gte: win.startMs, $lt: win.endMs };
   const rows = await ActivityModel.aggregate<{ _id: string; n: number }>([
     { $match: match },
     { $group: { _id: '$type', n: { $sum: 1 } } },
@@ -202,6 +307,7 @@ export async function leaderboardTypeCounts(period: LeaderboardPeriod = 'all'): 
   return {
     types: ACTIVITY_TYPES.map((type) => ({ type, count: map.get(type) ?? 0 })),
     period,
+    window: win,
   };
 }
 
@@ -211,9 +317,9 @@ export async function leaderboard(
   type: string,
   province = '全国',
   period: LeaderboardPeriod = 'all',
-  opts: { limit?: number; includeUserId?: boolean } = {},
+  opts: { limit?: number; includeUserId?: boolean; periodKey?: string; now?: number } = {},
 ): Promise<LeaderboardResult> {
-  const { limit = 10, includeUserId = false } = opts;
+  const { limit = 10, includeUserId = false, periodKey, now = Date.now() } = opts;
   if (!ACTIVITY_TYPES.includes(type as never)) {
     throw new AppError(400, '运动类型不合法');
   }
@@ -221,10 +327,15 @@ export async function leaderboard(
     throw new AppError(400, '榜单周期不合法');
   }
 
+  // 历史周期（2026-11-05）：periodKey 给了就按那一期算，不给就是包含当前时刻的那一期。
+  // 窗口必须**两端都夹住**（$gte + $lt）——只夹起点会让「过去的周榜」把后面的数据算进来。
+  const win = periodKey
+    ? periodWindowFromKey(period, periodKey)
+    : periodWindowOf(period, now);
+
   const match: Record<string, unknown> = { status: 'finished', type };
   if (province && province !== '全国') match.provinces = province; // 命中多键索引 { userId, provinces }
-  const startMs = periodStartMs(period);
-  if (startMs !== null) match.startTime = { $gte: startMs };
+  if (win) match.startTime = { $gte: win.startMs, $lt: win.endMs };
 
   // 全量分组后内存排序：同时拿到 TOP N 和当前用户名次（量级小，无需 $rank）
   const rows = await ActivityModel.aggregate<{
@@ -366,6 +477,7 @@ export async function leaderboard(
     };
   });
 
+  const adjacent = adjacentPeriodKeys(period, win, now);
   return {
     type,
     province: province || '全国',
@@ -374,6 +486,9 @@ export async function leaderboard(
     top: topRows.map((r, i) => toRow(r, i + 1)),
     me: meRow ? toRow(meRow, myIdx + 1) : null,
     best,
+    window: win,
+    prevPeriodKey: adjacent.prevPeriodKey,
+    nextPeriodKey: adjacent.nextPeriodKey,
   };
 }
 
