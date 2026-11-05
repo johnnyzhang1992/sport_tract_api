@@ -107,11 +107,22 @@ export async function listMyPhotos(userId: string): Promise<MyPhotosResult> {
     });
   }
 
+  // 计数权威性（2026-11-05）：photoQuotaUsed 是「该用户库里存着的照片颗数」的缓存，
+  // 历史数据（额度功能上线前的老轨迹/足迹）没走过结算，counter 会偏低——这里以**文档实际张数**
+  // 为准，并把 counter 顺手校准（只在这一处做修复，写路径仍然走 settlePhotoQuota）。
+  const actual = groups.reduce((n, g) => n + g.photos.length, 0);
+  let used = quota.used;
+  if (actual !== used) {
+    await UserModel.updateOne({ _id: uid }, { $set: { photoQuotaUsed: actual } });
+    console.warn(`[photos] 额度计数校准：${used} → ${actual}（user=${userId}）`);
+    used = actual;
+  }
+
   return {
-    used: quota.used,
+    used,
     limit: quota.limit,
-    remaining: quota.remaining,
-    over: Math.max(0, quota.used - quota.limit),
+    remaining: Math.max(0, quota.limit - used),
+    over: Math.max(0, used - quota.limit),
     isMember: quota.isMember,
     groups,
   };
