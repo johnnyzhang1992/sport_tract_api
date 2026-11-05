@@ -275,6 +275,7 @@ test('NC6 消息订阅：状态来自本地额度台账；已消耗就不算已�
     assert.equal(first.items[0].label, '会员到期提醒');
     assert.equal(first.items[0].templateId, MEMBER_EXPIRY_TEMPLATE_ID);
     assert.equal(first.items[0].subscribed, false);
+    assert.equal(first.items[0].subscribeType, '一次性订阅', '消息类型标注（工具类目仅一次性模板）');
     assert.match(first.items[0].description, /3 天/);
 
     const grant = await postWith(me.token, '/notifications/subscriptions/grant', {

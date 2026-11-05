@@ -25,6 +25,8 @@ export interface MessageSubscriptionItem {
   key: string;
   label: string;
   description: string;
+  /** 消息类型：一次性订阅 / 长期订阅（工具类目仅能申请一次性；长期仅政务/医疗等公共服务类目开放） */
+  subscribeType: string;
   templateId: string;
   /** 会员到期提醒用；其它模板不返回 */
   daysBefore?: number;
@@ -50,6 +52,7 @@ export async function listMessageSubscriptions(userId: string): Promise<{ items:
       key: MEMBER_EXPIRY_TEMPLATE_KEY,
       label: '会员到期提醒',
       description: `会员到期前 ${memberSettings.daysBefore} 天提醒你续费`,
+      subscribeType: '一次性订阅',
       templateId: memberSettings.templateId,
       daysBefore: memberSettings.daysBefore,
       subscribed: await hasReminderGrant(userId),
@@ -60,6 +63,7 @@ export async function listMessageSubscriptions(userId: string): Promise<{ items:
       key: WEEKLY_SPORTS_TEMPLATE_KEY,
       label: '每周运动数据',
       description: '每周一 09:00 汇总上周运动数据',
+      subscribeType: '一次性订阅',
       templateId: weeklySettings.templateId,
       subscribed: await hasWeeklySportsGrant(userId),
     });
@@ -71,6 +75,7 @@ export async function listMessageSubscriptions(userId: string): Promise<{ items:
       key: DAILY_REPORT_TEMPLATE_KEY,
       label: '每日数据报告',
       description: '每天 09:00 推送昨日数据',
+      subscribeType: '一次性订阅',
       templateId: DAILY_REPORT_TEMPLATE_ID,
       subscribed: await hasDailyReportGrant(userId),
     });
