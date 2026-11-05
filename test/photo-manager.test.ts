@@ -216,3 +216,25 @@ test('PM-7 额度一次升级永久保留：会员拿过会员额度后过期，
 
   await UserModel.deleteOne({ openid });
 });
+
+test('PM-8 同一张图挂在两处：删一处会保留 OSS 文件（引用守卫），两处都删才彻底清理', async () => {
+  await ActivityModel.deleteMany({ userId: new Types.ObjectId(ownerId) });
+  await FootprintRecordModel.deleteMany({ userId: new Types.ObjectId(ownerId) });
+  const shared = PHOTO(51);
+  const a = await mkActivity(ownerId, [], [[shared]]);
+  const f = await mkFootprint(ownerId, [shared]); // 同一张图也挂在足迹上
+  await UserModel.updateOne({ _id: ownerId }, { $set: { photoQuotaUsed: 2 } });
+
+  // 删轨迹这一份：DB 里轨迹已无这张图，但足迹仍引用 → 守卫判定「文件不可删」
+  const r1 = await deleteMyPhotos(ownerId, [{ kind: 'activity', id: String(a._id), urls: [shared] }]);
+  assert.equal(r1.deleted, 1);
+  const afterAct = await ActivityModel.findById(a._id).lean();
+  const actPhotos = ((afterAct?.markers ?? []) as Array<{ photos: string[] }>).flatMap((m) => m.photos);
+  assert.deepEqual(actPhotos, [], '轨迹侧照片已删');
+  assert.deepEqual(((await FootprintRecordModel.findById(f._id).lean())?.photos ?? []) as string[], [shared], '足迹侧仍保留');
+
+  // 再删足迹那一份：此时无任何文档引用，OSS 清理才会执行（测试环境 OSS 未配置时静默跳过）
+  const r2 = await deleteMyPhotos(ownerId, [{ kind: 'footprint', id: String(f._id), urls: [shared] }]);
+  assert.equal(r2.deleted, 1);
+  assert.deepEqual(((await FootprintRecordModel.findById(f._id).lean())?.photos ?? []) as string[], []);
+});

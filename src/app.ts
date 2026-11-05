@@ -23,6 +23,7 @@ import { footprintRecordRoutes } from './routes/footprint-record.routes.js';
 import { adminRoutes } from './routes/admin.routes.js';
 import { payNotifyRoutes } from './routes/pay-notify.routes.js';
 import { memberRoutes } from './routes/member.routes.js';
+import { werunRoutes } from './routes/werun.routes.js';
 import { setNotifyHandler } from './routes/pay-notify.routes.js';
 import { handleXpayNotify } from './services/xpay-deliver.js';
 import { adminXpayRoutes } from './routes/admin-xpay.routes.js';
@@ -105,6 +106,8 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
   // 微信消息推送接收端：公开、无 JWT、不走 success() 封装（应答由该插件自己构造）
   await fastify.register(payNotifyRoutes, { prefix: `${config.apiPrefix}/pay` });
   await fastify.register(memberRoutes, { prefix: `${config.apiPrefix}/member` });
+  // 微信运动步数：客户端取 WeRun 加密数据转发上来，服务端现换 session_key 解密落库
+  await fastify.register(werunRoutes, { prefix: `${config.apiPrefix}/werun` });
   // 回调的业务实现挂到信封路由上（信封只负责验签/解密/应答形态）
   setNotifyHandler(handleXpayNotify);
   await fastify.register(adminXpayRoutes, { prefix: `${config.apiPrefix}/admin/xpay` });

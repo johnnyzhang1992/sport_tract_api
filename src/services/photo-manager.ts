@@ -128,6 +128,37 @@ export async function listMyPhotos(userId: string): Promise<MyPhotosResult> {
   };
 }
 
+/**
+ * 删除 OSS 前的引用守卫（2026-11-05）：同一张图可能被多条记录引用（重复挂载、用户把它
+ * 复制到另一条轨迹/足迹），只按「本次删掉的那份」删 OSS 会把仍在用的图打成破图。
+ * 这里跨两个集合再查一遍：仍被任何文档引用的 URL 不删文件（DB 行已按用户意图删除）。
+ * 用一次 $in 查询 + 内存过滤，不按 URL 逐条查。
+ */
+async function pruneStillReferenced(urls: string[]): Promise<string[]> {
+  if (!urls.length) return [];
+  const candidates = [...new Set(urls.map((u) => cleanUrl(u)).filter(Boolean))];
+  if (!candidates.length) return [];
+  const [actRefs, fpRefs] = await Promise.all([
+    ActivityModel.find({
+      $or: [
+        { 'markers.photos': { $in: candidates } },
+        { 'markers.photoUrl': { $in: candidates } },
+      ],
+    }).select({ markers: 1 }).lean(),
+    FootprintRecordModel.find({ photos: { $in: candidates } }).select({ photos: 1 }).lean(),
+  ]);
+  const stillUsed = new Set<string>();
+  for (const a of actRefs) {
+    for (const m of ((a.markers ?? []) as Array<{ photos?: string[]; photoUrl?: string }>)) {
+      for (const u of markerPhotos(m)) stillUsed.add(cleanUrl(u));
+    }
+  }
+  for (const f of fpRefs) {
+    for (const u of ((f.photos ?? []) as string[])) if (u) stillUsed.add(cleanUrl(u));
+  }
+  return candidates.filter((u) => !stillUsed.has(u));
+}
+
 export interface DeletePhotosResult {
   deleted: number;
   used: number;
@@ -204,8 +235,18 @@ export async function deleteMyPhotos(userId: string, refs: PhotoRef[]): Promise<
     await settlePhotoQuota(userId, own.length, keep.length);
   }
 
-  // OSS 文件清理失败不阻塞：库里已不再引用，重传同名文件也不会命中旧对象
-  if (staleOss.length) await deleteOssObjects(staleOss).catch(() => {});
+  // OSS 文件清理：先过引用守卫（别把仍被引用的图删掉），失败不阻塞主流程
+  if (staleOss.length) {
+    const removable = await pruneStillReferenced(staleOss).catch(() => [] as string[]);
+    const skipped = staleOss.length - removable.length;
+    if (skipped > 0) console.warn(`[photos] ${skipped} 张仍被其它记录引用，保留 OSS 文件（user=${userId}）`);
+    if (removable.length) {
+      await deleteOssObjects(removable).catch((e) => {
+        // 文件可能残留成孤儿对象；库里已不引用，不影响功能，留给运维按日志清理
+        console.error('[photos] OSS 文件删除失败（库已删，对象残留）', { user: userId, urls: removable.length }, e);
+      });
+    }
+  }
 
   const quota = await getPhotoQuota(userId);
   // 兜平：删除路径已把 used 回补，这里只读不写（避免二次扣减）

@@ -17,6 +17,18 @@ export const RefreshSchema = z.object({
 });
 
 /**
+ * 微信运动步数同步：encryptedData/iv 是 wx.getWeRunData 原样转发（Base64 文本），
+ * code 用于服务端现换 session_key 解密（用完即弃，同 xpay 下单时序）。
+ * 长度给上限：31 天的 stepInfoList 解密后不足 2KB，Base64 约 3KB，给 8KB 已远超余量——
+ * 防止把接口当自由文本存储滥用。
+ */
+export const WeRunSyncSchema = z.object({
+  code: z.string().min(1, '缺少微信登录 code').max(128),
+  encryptedData: z.string().min(1, '缺少加密数据').max(8192),
+  iv: z.string().min(1, '缺少加密向量').max(64),
+});
+
+/**
  * 图片类地址只允许 http/https。
  *
  * 为什么不能只靠 `z.string().url()`：它底层就是 `new URL()`，而 `javascript:` / `data:`

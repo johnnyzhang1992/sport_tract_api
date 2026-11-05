@@ -21,16 +21,19 @@ export async function code2Session(code: string): Promise<Code2SessionResult> {
     if (!config.isDev) {
       throw new AppError(500, 'WX_MOCK_LOGIN 仅允许在开发环境开启');
     }
+    // session_key 按真实口径给 base64：真实值是 Base64_Decode 后 16 字节的 AES key，
+    // mock 给定长 base64（'0123456789abcdef' 的编码）才能让 werun 解密在测试里跑通加解密回环
+    const mockSessionKey = 'MDEyMzQ1Njc4OWFiY2RlZg==';
     // 不同 code 映射不同 openid，便于测试多账号
     // code 形如 "openid:自定义" 时直接透传自定义 openid——测试可用独立命名空间，
     // 避免被其他测试文件的全局 mock_openid_ 清理误伤（并行跑时互相删用户）
     if (code.startsWith('openid:')) {
-      return { openid: code.slice('openid:'.length), sessionKey: 'mock-session-key' };
+      return { openid: code.slice('openid:'.length), sessionKey: mockSessionKey };
     }
     const hash = [...code].reduce((acc, c) => acc + c.charCodeAt(0), 0);
     return {
       openid: `mock_openid_${(hash % 10000).toString().padStart(4, '0')}`,
-      sessionKey: 'mock-session-key',
+      sessionKey: mockSessionKey,
     };
   }
 
