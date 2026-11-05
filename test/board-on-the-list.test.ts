@@ -143,17 +143,25 @@ test('OL-1 planOnTheList：前 N 名 + 并列全含 + 跨榜按用户汇总', ()
   ], '一个人上多个榜要合并到同一条');
 });
 
-test('OL-2 onTheListContent：单项一句、多项汇总并点出最高名次', () => {
+test('OL-2 onTheListContent：多行分块、逐榜一行、名次好的排前面', () => {
   const one = onTheListContent('week', WEEK_KEY, [{ type: 'running', rank: 3 }]);
-  assert.match(one, /跑步·周榜第 3 名/);
-  assert.match(one, /2024\/|2031\//, '带周期说明');
+  const oneLines = one.split('\n');
+  assert.equal(oneLines[0], '你在「跑步·周榜 第 3 名」上榜');
+  assert.equal(oneLines[1], '', '结论与周期之间留空行');
+  assert.match(one, /^统计周期：/m);
+  assert.match(one, /继续加油/);
 
   const many = onTheListContent('month', MONTH_KEY, [
     { type: 'running', rank: 5 },
     { type: 'cycling', rank: 2 },
   ]);
-  assert.match(many, /2 个月榜上榜/);
-  assert.match(many, /最高 骑行·月榜第 2 名/);
+  const lines = many.split('\n');
+  assert.equal(lines[0], '你在 2 个月榜上榜');
+  assert.equal(lines[1], '', '空行分隔');
+  assert.equal(lines[2], '· 骑行·月榜 第 2 名', '名次好的排前面');
+  assert.equal(lines[3], '· 跑步·月榜 第 5 名');
+  assert.ok(lines.includes('最高名次：骑行·月榜 第 2 名'));
+  assert.equal(many.includes('。最高'), false, '不再是一段到底的长句');
 });
 
 /* ------------------------------ 端到端 ------------------------------ */

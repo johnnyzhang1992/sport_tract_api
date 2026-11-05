@@ -73,7 +73,8 @@ export function memberEntryHint(e: { memberActive: boolean; memberUntil: number 
 /** MC-16：会员到账的定向通知 */
 export const MEMBER_DELIVER_NOTICE = {
   title: '会员已开通',
-  content: (productName: string, untilText: string) => `${productName}已生效，有效期至 ${untilText}`,
+  // 多行：结论一行、有效期一行（详情页 white-space: pre-wrap 原样渲染换行）
+  content: (productName: string, untilText: string) => `${productName}已生效\n有效期至：${untilText}\n感谢支持，尽情运动吧！`,
 };
 
 /**

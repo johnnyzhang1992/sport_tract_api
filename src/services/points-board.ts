@@ -1046,7 +1046,11 @@ export function planOnTheList(
   return out;
 }
 
-/** 上榜通知正文：按「最高名次 + 全部上榜项」写一句，不按榜拆条 */
+/**
+ * 上榜通知正文：**多行分块**（通知详情页 white-space: pre-wrap 会原样渲染换行）。
+ * 一段到底的句子在手机上读起来很挤（2026-11-05 反馈），所以拆成
+ * 「一句结论 / 空行 / 逐榜一行 / 空行 / 周期 / 加油」四段，一眼能扫完。
+ */
 export function onTheListContent(
   period: BoardPeriod,
   periodKey: string,
@@ -1054,11 +1058,26 @@ export function onTheListContent(
 ): string {
   const label = boardLabel(period, periodKey);
   const periodLabel = PERIOD_LABEL[period];
-  const parts = entries.map((e) => `${TYPE_LABEL[e.type] ?? e.type}·${periodLabel}第 ${e.rank} 名`);
-  const best = [...entries].sort((a, b) => a.rank - b.rank)[0];
-  if (entries.length === 1) return `你在「${parts[0]}」上榜（${label}），继续加油！`;
-  return `你在 ${entries.length} 个${periodLabel}上榜（${label}）：${parts.join('、')}。`
-    + `最高 ${TYPE_LABEL[best.type] ?? best.type}·${periodLabel}第 ${best.rank} 名。`;
+  const lineOf = (e: OnTheListEntry) => `${TYPE_LABEL[e.type] ?? e.type}·${periodLabel} 第 ${e.rank} 名`;
+  // 名次好的排前面：用户最关心的是自己最好那一项
+  const sorted = [...entries].sort((a, b) => a.rank - b.rank);
+  if (sorted.length === 1) {
+    return [
+      `你在「${lineOf(sorted[0])}」上榜`,
+      '',
+      `统计周期：${label}`,
+      '继续加油，下期继续冲榜！',
+    ].join('\n');
+  }
+  return [
+    `你在 ${sorted.length} 个${periodLabel}上榜`,
+    '',
+    ...sorted.map((e) => `· ${lineOf(e)}`),
+    '',
+    `统计周期：${label}`,
+    `最高名次：${lineOf(sorted[0])}`,
+    '继续加油，下期继续冲榜！',
+  ].join('\n');
 }
 
 /**
