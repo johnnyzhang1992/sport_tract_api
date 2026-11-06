@@ -51,9 +51,10 @@ export function decryptWeRunData(encryptedData: string, iv: string, sessionKey: 
   }
 }
 
-/** 东八区 YYYY-MM-DD：微信 timestamp 是北京时区当天零点，用 UTC+8 偏移取日期（与端上 bjDate 同口径） */
-export function werunDateOf(timestamp: number): string {
-  return new Date((timestamp + 8 * 3600) * 1000).toISOString().slice(0, 10);
+/** 东八区 YYYY-MM-DD：微信 timestamp 是北京时区当天零点，用 UTC+8 偏移取日期（与端上 bjDate 同口径）。
+ *  入参是「秒」（微信步数时间戳口径）——毫秒时间戳别用这个，会被乘成几万年外 */
+export function werunDateOf(timestampSeconds: number): string {
+  return new Date((timestampSeconds + 8 * 3600) * 1000).toISOString().slice(0, 10);
 }
 
 /**

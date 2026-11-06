@@ -20,6 +20,8 @@ const werunDaySchema = new Schema(
 // 唯一索引兜底并发双写；userId 单列索引服务「某用户全部步数」查询
 werunDaySchema.index({ userId: 1, date: 1 }, { unique: true });
 werunDaySchema.index({ userId: 1, date: -1 });
+// 步数榜按「日期区间」聚合（不带 userId 等值），上面两条 {userId,date} 帮不上忙
+werunDaySchema.index({ date: 1, userId: 1 });
 
 export type WerunDay = { userId: unknown; date: string; step: number; syncedAt: number };
 

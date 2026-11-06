@@ -3,6 +3,7 @@ import { UserModel } from '../models/user.model.js';
 import { WerunDayModel } from '../models/werun-day.model.js';
 import { code2Session } from '../services/wechat.js';
 import { assertWatermarkTrustworthy, decryptWeRunData, sanitizeStepInfoList } from '../services/werun.js';
+import { werunBoard, werunBoardProvinces } from '../services/werun-board.js';
 import { WeRunSyncSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
@@ -41,5 +42,23 @@ export async function werunRoutes(fastify: FastifyInstance) {
     );
 
     return success({ syncedDays: days.length, days });
+  });
+
+  // 步数排行榜：day/week/month/year 四周期，全国/按省（用户最近登录省份），TOP50 + 我的真实排名。
+  // 可选鉴权：游客可看榜单（me 为 null，前端不渲染「我的排名」卡）——与运动榜 2026-10-26 口径一致。
+  fastify.get('/board', { onRequest: [fastify.authenticateOptional] }, async (request) => {
+    const query = request.query as { period?: string; periodKey?: string; province?: string };
+    const userId = request.user ? request.user.userId : null;
+    return success(
+      await werunBoard(userId, query.period || 'day', {
+        province: query.province || '全国',
+        periodKey: query.periodKey,
+      }),
+    );
+  });
+
+  // 省份选择器数据：有登录记录的省份（人数降序），前端拼「全国」在首位
+  fastify.get('/board-provinces', { onRequest: [fastify.authenticateOptional] }, async () => {
+    return success(await werunBoardProvinces());
   });
 }
