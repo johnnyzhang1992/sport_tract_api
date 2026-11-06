@@ -63,6 +63,8 @@ export interface MemberStats {
   count: number;
   distance: number;
   duration: number;
+  /** 步数PK口径：活动窗口内微信步数合计；普通运动PK为 0 */
+  step?: number;
 }
 
 /**

@@ -25,6 +25,12 @@ import {
   type MemberStats,
   excludedCountForMembers,
 } from './campaign-stats.js';
+import {
+  stepStatsForMembers,
+  stepStreakForUser,
+  dailyStepRowsForMembers,
+  memberDayStepComparison,
+} from './campaign-steps.js';
 import { assertObjectIdLike } from '../utils/object-id.js';
 import { getAvatarUrl } from './oss.js';
 import { bjDateStr, bjDayStart, bjToday0 } from '../utils/bj-time.js';
@@ -57,6 +63,8 @@ export interface MemberRow {
   count: number;
   distance: number;
   duration: number;
+  /** 步数PK口径：活动窗口内微信步数合计；普通运动PK为 0 */
+  step?: number;
   /** 被 driftScore 门禁排除的轨迹条数（数据保留但不计入活动；0/缺省不展示）。
    *  没有它用户会困惑「我明明跑了 21 公里，活动里怎么只算 12」。 */
   excludedCount?: number;
@@ -66,6 +74,8 @@ export interface CampaignDetailDto {
   title: string;
   description: string;
   visibility: 'public' | 'private';
+  kind: 'activity' | 'steps';
+  stepAuxEnabled: boolean;
   allowedTypes: string[];
   memberLimit: number | null;
   startAt: number;
@@ -212,13 +222,17 @@ export async function createCampaign(
     assertTextAllowed([sec]);
   }
 
+  const kind = input.kind ?? 'activity';
+  const stepAuxEnabled = kind === 'activity' && input.stepAuxEnabled === true;
   const [campaign] = await CampaignModel.create([
     {
       creatorId: ocid,
       title: input.title,
       description: input.description,
       visibility: input.visibility,
-      allowedTypes: input.allowedTypes,
+      kind,
+      stepAuxEnabled,
+      allowedTypes: kind === 'steps' ? [] : input.allowedTypes,
       memberLimit: input.memberLimit,
       startAt,
       endAt,
@@ -270,9 +284,13 @@ export async function updateCampaign(
   }
 
   const set: Record<string, unknown> = {};
+  if (c.kind === 'steps' && (input.allowedTypes !== undefined || input.stepAuxEnabled !== undefined)) {
+    throw new AppError(400, '步数PK不区分运动类型，也不使用步数辅助开关');
+  }
   if (input.title !== undefined) set.title = input.title;
   if (input.description !== undefined) set.description = input.description;
   if (input.visibility !== undefined) set.visibility = input.visibility;
+  if (input.stepAuxEnabled !== undefined) set.stepAuxEnabled = input.stepAuxEnabled === true;
   if (input.allowedTypes !== undefined) set.allowedTypes = input.allowedTypes;
   if (input.endDate !== undefined) {
     const endAt = bjDayStart(Date.parse(`${input.endDate}T00:00:00+08:00`)) + DAY_MS;
@@ -386,17 +404,29 @@ export async function listCampaigns(
       const key = String(c._id);
       const members = facets.members.get(key) ?? [];
       const segs = await loadSegments(key);
-      const stats = await statsForMembers(
-        c,
-        segs,
-        members.map((m) => m.userId),
-      );
+      const uids = members.map((m) => m.userId);
+      const isSteps = c.kind === 'steps';
+      let stats: Map<string, MemberStats>;
+      if (isSteps) {
+        const stepMap = await stepStatsForMembers(c, segs, uids);
+        stats = new Map(uids.map((uid) => {
+          const s = stepMap.get(uid);
+          return [uid, { ...emptyStats(), step: s?.step ?? 0, count: s?.days ?? 0 }];
+        }));
+      } else {
+        stats = await statsForMembers(c, segs, uids);
+      }
       const rankOf = (m: { userId: string; joinedAt: number | null }) => ({
         distance: stats.get(m.userId)?.distance ?? 0,
+        step: stats.get(m.userId)?.step ?? 0,
         joinedAt: m.joinedAt,
       });
       const topUids = [...members]
-        .sort((a, b) => byDistanceThenJoin(rankOf(a), rankOf(b)))
+        .sort((a, b) =>
+          isSteps
+            ? (rankOf(b).step - rankOf(a).step || (a.joinedAt ?? 0) - (b.joinedAt ?? 0))
+            : byDistanceThenJoin(rankOf(a), rankOf(b)),
+        )
         .slice(0, 3)
         .map((m) => m.userId);
       return { c, key, stats, topUids };
@@ -442,6 +472,10 @@ function byDistanceThenJoin(
 
 /** 类型筛选：必须是合法运动类型，且落在活动白名单内（白名单为空 = 不限） */
 function assertCampaignType(c: CampaignDoc, type?: string) {
+  if (c.kind === 'steps') {
+    if (type) throw new AppError(400, '步数PK不区分运动类型');
+    return;
+  }
   if (!type) return;
   if (!(ACTIVITY_TYPES as readonly string[]).includes(type)) {
     throw new AppError(400, '运动类型不合法');
@@ -490,6 +524,8 @@ function cardDto(
     id: String(c._id),
     title: c.title,
     visibility: c.visibility,
+    kind: c.kind ?? 'activity',
+    stepAuxEnabled: c.kind !== 'steps' && c.stepAuxEnabled === true,
     startAt: c.startAt,
     endAt: c.endAt,
     status: effectiveStatus(c),
@@ -517,6 +553,8 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
     title: c.title,
     description: c.description,
     visibility: c.visibility,
+    kind: c.kind ?? 'activity',
+    stepAuxEnabled: c.kind !== 'steps' && c.stepAuxEnabled === true,
     allowedTypes: c.allowedTypes,
     memberLimit: c.memberLimit ?? null,
     startAt: c.startAt,
@@ -551,9 +589,19 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
     .select('nickname avatarUrl avatarPreset gender')
     .lean();
   const uMap = new Map(users.map((u) => [String(u._id), u]));
-  const stats = await statsForMembers(c, segs, uids);
-  // 被 driftScore 门禁排除的条数（成员面板「N 条未计入」说明的数据来源）
-  const excluded = await excludedCountForMembers(c, uids);
+  const isSteps = c.kind === 'steps';
+  let stats: Map<string, MemberStats>;
+  if (isSteps) {
+    const stepMap = await stepStatsForMembers(c, segs, uids);
+    stats = new Map(uids.map((uid) => {
+      const s = stepMap.get(uid);
+      return [uid, { ...emptyStats(), step: s?.step ?? 0, count: s?.days ?? 0 }];
+    }));
+  } else {
+    stats = await statsForMembers(c, segs, uids);
+  }
+  // 被 driftScore 门禁排除的条数（仅普通运动PK；步数PK没有轨迹口径）
+  const excluded = isSteps ? new Map<string, number>() : await excludedCountForMembers(c, uids);
 
   const memberList: MemberRow[] = members.map((m) => {
     const u = uMap.get(String(m.userId));
@@ -573,17 +621,27 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
       count: a.count + m.count,
       distance: a.distance + m.distance,
       duration: a.duration + m.duration,
+      ...(isSteps ? { step: (a.step ?? 0) + (m.step ?? 0) } : {}),
     }),
     emptyStats(),
   );
-  // 底部悬浮面板（仅本人）：次数 / 连续运动天数 / 距离 / 时长 + 我的位置（距离口径）
+  // 底部悬浮面板（仅本人）：普通PK按距离，步数PK按步数
   const myStats = stats.get(viewerId) ?? emptyStats();
-  const streak = await streakForUser(c, segs.get(viewerId) ?? [], viewerId);
-  const ranked = [...memberList].sort(byDistanceThenJoin);
+  const streak = isSteps
+    ? await stepStreakForUser(c, segs.get(viewerId) ?? [], viewerId)
+    : await streakForUser(c, segs.get(viewerId) ?? [], viewerId);
+  const ranked = isSteps
+    ? [...memberList].sort(
+      (x, y) => (y.step ?? 0) - (x.step ?? 0) || (x.joinedAt ?? 0) - (y.joinedAt ?? 0),
+    )
+    : [...memberList].sort(byDistanceThenJoin);
   const myIdx = ranked.findIndex((m) => m.userId === viewerId);
-  const leaderDistance = ranked[0]?.distance ?? 0;
+  const valueOf = (m: MemberRow) => (isSteps ? m.step ?? 0 : m.distance);
+  const leaderValue = ranked[0] ? valueOf(ranked[0]) : 0;
+  const myValue = valueOf({ ...myStats, userId: viewerId, role: '', name: '', avatarUrl: '', avatarPreset: '', joinedAt: null });
   // 上一名＝排在我前面的那一位；我第一（或查不到自己）时没有上一名，给 0 与 gapToLeader 同口径
-  const prevDistance = myIdx > 0 ? ranked[myIdx - 1].distance : myStats.distance;
+  const prevValue = myIdx > 0 ? valueOf(ranked[myIdx - 1]) : myValue;
+  const totalValue = isSteps ? totals.step ?? 0 : totals.distance;
   return {
     ...base,
     canJoin,
@@ -594,9 +652,9 @@ export async function getCampaignDetail(id: string, viewerId: string): Promise<C
       streak,
       rank: myIdx >= 0 ? myIdx + 1 : ranked.length,
       members: ranked.length,
-      gapToLeader: Math.max(0, leaderDistance - myStats.distance),
-      gapToPrev: Math.max(0, prevDistance - myStats.distance),
-      share: totals.distance > 0 ? myStats.distance / totals.distance : 0,
+      gapToLeader: Math.max(0, leaderValue - myValue),
+      gapToPrev: Math.max(0, prevValue - myValue),
+      share: totalValue > 0 ? myValue / totalValue : 0,
     },
   };
 }
@@ -829,11 +887,13 @@ export interface LeaderRow {
   distance: number;
   count: number;
   duration: number;
-  /** 当前排序指标的值（距离米 / 次数 / 时长秒） */
+  /** 步数PK口径：窗口内微信步数合计 */
+  step?: number;
+  /** 当前排序指标的值（距离米 / 次数 / 时长秒 / 步数） */
   value: number;
 }
 
-export type LeaderMetric = 'distance' | 'count' | 'duration';
+export type LeaderMetric = 'distance' | 'count' | 'duration' | 'step';
 
 export interface LeaderboardMy {
   rank: number;
@@ -878,26 +938,41 @@ export async function campaignLeaderboard(
   const c = await loadCampaignOr404(id);
   await assertJoinedMember(c._id, viewerId, '只有活动成员可以查看排行榜');
   assertCampaignType(c, query.type);
-  const metric: LeaderMetric = query.metric ?? 'distance';
+  const isSteps = c.kind === 'steps';
+  const metric: LeaderMetric = isSteps ? 'step' : query.metric ?? 'distance';
 
   const members = await CampaignMemberModel.find({ campaignId: c._id, state: 'joined' })
     .select('userId joinedAt')
     .lean();
   const uids = members.map((m) => String(m.userId));
-  const stats = await statsForMembers(c, await loadSegments(String(c._id)), uids, query.type);
+  const segs = await loadSegments(String(c._id));
+  let stats: Map<string, MemberStats>;
+  if (isSteps) {
+    const stepMap = await stepStatsForMembers(c, segs, uids);
+    stats = new Map(uids.map((uid) => {
+      const s = stepMap.get(uid);
+      return [uid, { ...emptyStats(), step: s?.step ?? 0, count: s?.days ?? 0 }];
+    }));
+  } else {
+    stats = await statsForMembers(c, segs, uids, query.type);
+  }
   const valueOf = (s: MemberStats) =>
-    metric === 'count' ? s.count : metric === 'duration' ? s.duration : s.distance;
+    isSteps
+      ? s.step ?? 0
+      : metric === 'count' ? s.count : metric === 'duration' ? s.duration : s.distance;
 
-  // 指标优先，平手退回距离→加入时间（列表卡片头像的同一条排序）
+  // 指标优先，平手退回距离/步数→加入时间（列表卡片头像的同一条排序）
   const ranked = [...members].sort((x, y) => {
     const xs = stats.get(String(x.userId))!;
     const ys = stats.get(String(y.userId))!;
     return (
       valueOf(ys) - valueOf(xs) ||
-      byDistanceThenJoin(
-        { distance: xs.distance, joinedAt: x.joinedAt ?? null },
-        { distance: ys.distance, joinedAt: y.joinedAt ?? null },
-      )
+      (isSteps
+        ? (x.joinedAt ?? 0) - (y.joinedAt ?? 0)
+        : byDistanceThenJoin(
+          { distance: xs.distance, joinedAt: x.joinedAt ?? null },
+          { distance: ys.distance, joinedAt: y.joinedAt ?? null },
+        ))
     );
   });
 
@@ -932,6 +1007,7 @@ export async function campaignLeaderboard(
         distance: s.distance,
         count: s.count,
         duration: s.duration,
+        ...(isSteps ? { step: s.step ?? 0 } : {}),
         value: valueOf(s),
       };
     }),
@@ -968,7 +1044,7 @@ export interface TrendSeries {
 }
 
 export interface CampaignTrendDto {
-  metric: 'distance';
+  metric: 'distance' | 'step';
   /** 分档：person＝前三名 + 我（缺省，老端形状不变）；type＝全队每个运动类型一条线 */
   by: 'person' | 'type';
   /** 日期桶粒度：跨度 ≤31 天按日，否则按周（周桶标签＝该周首日） */
@@ -1020,6 +1096,38 @@ export async function campaignTrend(
     if (dayIdx < 0 || dayIdx >= dayCount) return -1;
     return bucket === 'week' ? Math.floor(dayIdx / 7) : dayIdx;
   };
+
+  if (c.kind === 'steps') {
+    const stepMap = await stepStatsForMembers(c, segs, uids);
+    const ranked = [...members].sort((x, y) => {
+      const xs = stepMap.get(String(x.userId))?.step ?? 0;
+      const ys = stepMap.get(String(y.userId))?.step ?? 0;
+      return ys - xs || (x.joinedAt ?? 0) - (y.joinedAt ?? 0);
+    });
+    const picked = ranked.slice(0, 3).map((m) => String(m.userId));
+    if (uids.includes(viewerId) && !picked.includes(viewerId)) picked.push(viewerId);
+    const users = await UserModel.find({ _id: { $in: picked } }).select('nickname').lean();
+    const nameMap = new Map(users.map((u) => [String(u._id), u.nickname]));
+    const series: TrendSeries[] = picked.map((uid) => ({
+      userId: uid,
+      name: nameMap.get(uid) || '微信用户',
+      isMe: uid === viewerId,
+      values: labels.map(() => 0),
+    }));
+    if (bucketCount === 0 || picked.length === 0) {
+      return { metric: 'step', by: 'person', bucket, labels, series };
+    }
+    const idxByUid = new Map(picked.map((uid, i) => [uid, i]));
+    for (const r of await dailyStepRowsForMembers(c, segs, picked)) {
+      const i = idxByUid.get(r.userId);
+      if (i === undefined) continue;
+      const b = bucketOf(r.date);
+      if (b < 0) continue;
+      series[i].values[b] += r.step;
+    }
+    for (const s of series) s.values = cumsum(s.values);
+    return { metric: 'step', by: 'person', bucket, labels, series };
+  }
 
   if (by === 'type') {
     const acc = new Map<string, number[]>();
@@ -1143,6 +1251,25 @@ export async function memberDetail(
     elevationGain: d.elevationGain ?? 0,
   }));
   return { stats, items, total, page: query.page, pageSize: query.pageSize };
+}
+
+/** 成员按天步数对比（成员半屏「按天对比」Tab） */
+export async function campaignMemberDaySteps(
+  id: string,
+  viewerId: string,
+  targetUid: string,
+  query: { page: number; pageSize: number },
+) {
+  const c = await loadCampaignOr404(id);
+  await assertJoinedMember(c._id, viewerId, '只有活动成员可以查看成员明细');
+  assertObjectIdLike(targetUid, '成员不存在');
+  const uid = String(new mongoose.Types.ObjectId(targetUid));
+  if (c.kind === 'activity' && !c.stepAuxEnabled) {
+    throw new AppError(400, '该活动未开启微信步数辅助');
+  }
+  const segs = await loadSegments(String(c._id));
+  if (!segs.has(uid)) throw new AppError(404, '成员不存在');
+  return memberDayStepComparison(c, segs.get(uid)!, uid, query);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

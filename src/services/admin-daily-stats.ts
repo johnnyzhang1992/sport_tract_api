@@ -9,6 +9,7 @@ import { SubscribeMessageLogModel } from '../models/subscribe-message-log.model.
 import { createNotification } from './notification.js';
 import { sendSubscribeMessage, type SubscribeSendResult } from './subscribe-message.js';
 import { bjYmd } from './member-reminder.js';
+import { bjDateStr } from '../utils/bj-time.js';
 import { bjToday0, BJ_OFFSET_MS } from '../utils/bj-time.js';
 import { fmtCnDate } from '../config/member-copy.js';
 import { AppError } from '../utils/app-error.js';
@@ -51,7 +52,9 @@ export async function collectDailyStats(dayStart: number): Promise<DailyStats> {
     LoginLogModel.countDocuments({ createdAt: { $gte: from, $lt: to } }),
     ActivityModel.countDocuments({ createdAt: { $gte: from, $lt: to } }),
     ActivityModel.countDocuments({ status: 'finished', endTime: { $gte: dayStart, $lt: dayEnd } }),
-    PointSigninModel.distinct('userId', { dateKey: bjYmd(dayStart) }),
+    // ⚠ dateKey 必须用 bjDateStr（'2026-11-06'）——那是 points-signin 落库时的格式；
+    // 早先这里用了 bjYmd（'20261106'，无分隔），格式不一致导致签到人数恒为 0（2026-11-05 修复）。
+    PointSigninModel.distinct('userId', { dateKey: bjDateStr(dayStart) }),
     UserModel.countDocuments({ createdAt: { $gte: from, $lt: to } }),
   ]);
   return {

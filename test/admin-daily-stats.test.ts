@@ -26,6 +26,8 @@ import {
   recordDailyReportGrant, __setAdminDailyStatsSenderForTest,
 } from '../src/services/admin-daily-stats.js';
 import { bjYmd } from '../src/services/member-reminder.js';
+import { bjDateStr } from '../src/utils/bj-time.js';
+import { signIn } from '../src/services/points-signin.js';
 import { listMessageSubscriptions, grantMessageSubscription } from '../src/services/subscriptions.js';
 
 let app: FastifyInstance;
@@ -92,10 +94,11 @@ async function seedDay() {
     { userId: normalUid, type: 'running', status: 'finished', startTime: DAY_START + 4000_000, endTime: DAY_START + 5000_000, createdAt: at, updatedAt: at },
     { userId: normalUid, type: 'walking', status: 'finished', startTime: NOW - 3600_000, endTime: NOW - 1800_000, createdAt: new Date(NOW - 3600_000), updatedAt: new Date(NOW - 1800_000) },
   ]);
-  await PointSigninModel.create([
-    { userId: adminUid, dateKey: bjYmd(DAY_START), streakDay: 1, points: 5, source: 'sign', createdAt: DAY_START + 1000 },
-    { userId: normalUid, dateKey: bjYmd(DAY_START), streakDay: 1, points: 5, source: 'sign', createdAt: DAY_START + 2000 },
-  ]);
+  // 用**真实签到服务**落两行：dateKey 的格式由服务自己决定。
+  // 这里曾经手搓过 dateKey（bjYmd 无分隔），正好把「查询用错格式」的 bug 固化进测试，
+  // 导致线上签到人数恒为 0 而用例一直绿（2026-11-05 教训）。
+  await signIn(adminUid, DAY_START + 10 * 3600_000);
+  await signIn(normalUid, DAY_START + 11 * 3600_000);
   await UserModel.create({
     openid: NEW_OPENID, nickname: '新用户', uid: 900000 + Math.floor(Math.random() * 90000),
     createdAt: new Date(DAY_START + 5000_000), updatedAt: new Date(DAY_START + 5000_000),
@@ -105,7 +108,7 @@ async function seedDay() {
 beforeEach(async () => {
   await LoginLogModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
   await ActivityModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
-  await PointSigninModel.deleteMany({ dateKey: bjYmd(DAY_START) });
+  await PointSigninModel.deleteMany({ dateKey: { $in: [bjDateStr(DAY_START), bjYmd(DAY_START)] } });
   await NotificationModel.deleteMany({ dedupeKey: /^adminDailyStats:/ });
   await SubscribeGrantModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
   await SubscribeMessageLogModel.deleteMany({ templateKey: DAILY_REPORT_TEMPLATE_KEY });
@@ -125,7 +128,7 @@ beforeEach(async () => {
 after(async () => {
   await LoginLogModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
   await ActivityModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
-  await PointSigninModel.deleteMany({ dateKey: bjYmd(DAY_START) });
+  await PointSigninModel.deleteMany({ dateKey: { $in: [bjDateStr(DAY_START), bjYmd(DAY_START)] } });
   await NotificationModel.deleteMany({ dedupeKey: /^adminDailyStats:/ });
   await SubscribeGrantModel.deleteMany({ userId: { $in: [adminUid, normalUid] } });
   await SubscribeMessageLogModel.deleteMany({ templateKey: DAILY_REPORT_TEMPLATE_KEY });

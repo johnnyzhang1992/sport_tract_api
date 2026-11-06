@@ -75,6 +75,7 @@ export const UpdateMeSchema = z
         showBodyData: z.boolean().optional(),
         showSportData: z.boolean().optional(), // 资料卡累计运动数据展示开关
         kmAnnounce: z.boolean().optional(), // 记录中整公里震动+横幅播报开关
+        dailyStepSync: z.boolean().optional(), // 每天进入小程序同步微信步数
       })
       .optional(),
   })
@@ -312,6 +313,8 @@ export const CreateCampaignSchema = z
     title: z.string().trim().min(1, '标题不能为空').max(30, '标题最多 30 字'),
     description: z.string().trim().max(120, '描述最多 120 字').default(''),
     visibility: z.enum(['public', 'private']),
+    kind: z.enum(['activity', 'steps']).optional(),
+    stepAuxEnabled: z.boolean().optional(),
     allowedTypes: z.array(z.enum(ACTIVITY_TYPE_VALUES)).max(8).default([]),
     // 默认 100：兜住「整段不带 memberLimit」的调用方（端上已预填 100，但接口不该靠调用方自觉）。
     // 显式 null 仍是「不限」——zod 的 default 只在 undefined 时生效，端上「清空＝不限制」的明确意图不会被吃掉。
@@ -319,7 +322,11 @@ export const CreateCampaignSchema = z
     startDate: campaignDateField('startDate', '开始日期'),
     endDate: campaignDateField('endDate', '结束日期'),
   })
-  .refine((v) => v.endDate >= v.startDate, { message: '结束日期不能早于开始日期', path: ['endDate'] });
+  .refine((v) => v.endDate >= v.startDate, { message: '结束日期不能早于开始日期', path: ['endDate'] })
+  .refine((v) => v.kind !== 'steps' || v.allowedTypes.length === 0, {
+    message: '步数PK不区分运动类型，allowedTypes 必须为空',
+    path: ['allowedTypes'],
+  });
 
 /**
  * 发起人编辑活动（PUT /campaigns/:id）。
@@ -337,13 +344,14 @@ export const UpdateCampaignSchema = z
     title: z.string().trim().min(1, '标题不能为空').max(30, '标题最多 30 字').optional(),
     description: z.string().trim().max(120, '描述最多 120 字').optional(),
     visibility: z.enum(['public', 'private']).optional(),
+    stepAuxEnabled: z.boolean().optional(),
     allowedTypes: z.array(z.enum(ACTIVITY_TYPE_VALUES)).max(8).optional(),
     memberLimit: z.number().int().positive().max(500, '人数上限最多 500').nullable().optional(),
     endDate: campaignDateField('endDate', '结束日期').optional(),
   })
   .strict()
   .refine((v) => Object.values(v).some((x) => x !== undefined), {
-    message: '没有任何要修改的字段（标题 / 描述 / 可见性 / 运动类型 / 人数上限 / 结束日期至少一项）',
+    message: '没有任何要修改的字段（标题 / 描述 / 可见性 / 步数辅助 / 运动类型 / 人数上限 / 结束日期至少一项）',
   });
 
 export const ListCampaignQuery = z.object({

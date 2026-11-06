@@ -16,6 +16,7 @@ import {
   campaignLeaderboard,
   campaignTrend,
   memberDetail,
+  campaignMemberDaySteps,
   listPending,
   approveMember,
   rejectMember,
@@ -123,6 +124,12 @@ export async function campaignRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     const query = TrendQuery.parse(request.query);
     return success(await campaignTrend(id, request.user.userId, query));
+  });
+
+  fastify.get('/:id/members/:uid/steps', auth, async (request) => {
+    const { id, uid } = request.params as { id: string; uid: string };
+    const query = PageQuery.parse(request.query);
+    return success(await campaignMemberDaySteps(id, request.user.userId, uid, query));
   });
 
   fastify.get('/:id/members/:uid', auth, async (request) => {

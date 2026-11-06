@@ -23,6 +23,7 @@ const userSchema = new Schema(
       showBodyData: { type: Boolean, default: true }, // 个人中心是否展示身高体重
       showSportData: { type: Boolean, default: true }, // 他人点开资料卡时是否展示累计运动数据
       kmAnnounce: { type: Boolean, default: true }, // 记录中整公里震动+横幅播报
+      dailyStepSync: { type: Boolean, default: true }, // 每天进入小程序时同步微信步数；关闭后仅活动页按需同步
     },
     avatarPreset: { type: String, default: '' }, // 默认头像预设 key（assets/avatars/default-N，avatarUrl 为空时生效）
     note: { type: String, default: '', maxlength: 200 }, // 管理员备注（仅管理后台可见/编辑）
