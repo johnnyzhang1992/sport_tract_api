@@ -182,3 +182,14 @@ test('WS-4 参数与鉴权：非法 range 400，未登录 401', async () => {
   assert.equal(noAuth.statusCode, 401);
   assert.match(noAuth.json().message, /登录/);
 });
+
+test('WS-7 深翻页闸门：skip 超上限直接 400（range=all 的 total 会随年限增长）', async () => {
+  // 页 251 × 每页 20 = skip 5000 → 恰好等于上限，放行
+  const edge = await get('/days?range=all&page=251&pageSize=20');
+  assert.equal(edge.statusCode, 200, edge.body);
+  // 再多一页就拒：不让服务端替调用方空转几十万行
+  const deep = await get('/days?range=all&page=252&pageSize=20');
+  assert.equal(deep.statusCode, 400);
+  assert.match(deep.json().message, /翻页过深/);
+  assert.match(deep.json().message, /5000/);
+});

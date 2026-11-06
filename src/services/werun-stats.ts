@@ -1,12 +1,21 @@
 import { Types } from 'mongoose';
 import { WerunDayModel } from '../models/werun-day.model.js';
 import { bjDateStr } from '../utils/bj-time.js';
+import { AppError } from '../utils/app-error.js';
 
 /** 个人步数统计可选窗口（自然日，含今天） */
 export const WERUN_STATS_RANGES = [7, 30, 180, 365] as const;
 export type WerunStatsRange = (typeof WERUN_STATS_RANGES)[number];
 
 const DAY_MS = 86_400_000;
+
+/**
+ * 明细分页的最大 skip（行数）。range=all 的 total 会随使用年限增长，
+ * `skip((page-1)*pageSize)` 传个 page=100000 就是一次几十万行的空转——
+ * 超过这个量直接 400 让调用方缩小范围，而不是让服务端替它数跳过。
+ * 5000 行 ÷ 默认 20 条/页 = 250 页，远超正常翻动深度。
+ */
+export const WERUN_DAYS_MAX_SKIP = 5000;
 
 export interface WerunStatsOverview {
   totalStep: number;
@@ -230,6 +239,13 @@ export async function werunDayList(
   pageSize: number,
   now = Date.now(),
 ): Promise<WerunDayListResult> {
+  const skip = (page - 1) * pageSize;
+  if (skip > WERUN_DAYS_MAX_SKIP) {
+    throw new AppError(
+      400,
+      `翻页过深（第 ${page} 页，需跳过 ${skip} 行，上限 ${WERUN_DAYS_MAX_SKIP} 行）：请改用时间档或缩小范围`,
+    );
+  }
   const filter: Record<string, unknown> = { userId: new Types.ObjectId(userId) };
   let startDate = '';
   let endDate = '';
@@ -244,7 +260,7 @@ export async function werunDayList(
     WerunDayModel.find(filter)
       .select({ date: 1, step: 1 })
       .sort({ date: -1 })
-      .skip((page - 1) * pageSize)
+      .skip(skip)
       .limit(pageSize)
       .lean(),
   ]);
