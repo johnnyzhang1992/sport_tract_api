@@ -1,12 +1,34 @@
 import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
 import { UserModel } from '../models/user.model.js';
 import { WerunDayModel } from '../models/werun-day.model.js';
 import { code2Session } from '../services/wechat.js';
 import { assertWatermarkTrustworthy, decryptWeRunData, sanitizeStepInfoList } from '../services/werun.js';
 import { werunBoard, werunBoardProvinces } from '../services/werun-board.js';
+import { WERUN_STATS_RANGES, werunStats, werunDayList, type WerunStatsRange } from '../services/werun-stats.js';
+import { exportWerunCsv } from '../services/werun-export.js';
+import { werunReport } from '../services/werun-report.js';
+import { assertExportRate, contentDisposition, exportStamp, EXPORT_CSV_MAX_ROWS } from '../services/export.js';
 import { WeRunSyncSchema } from '../utils/validators.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
+
+const StatsRange = z.coerce
+  .number()
+  .int()
+  .refine((v) => WERUN_STATS_RANGES.some((r) => r === v), 'range 仅支持 7 / 30 / 180 / 365');
+
+const StatsQuery = z.object({
+  range: StatsRange,
+  /** 1 = 额外下发前一个同长度窗口，供趋势变化卡对比 */
+  compare: z.coerce.number().int().min(0).max(1).optional(),
+});
+
+const DaysQuery = z.object({
+  range: StatsRange,
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().positive().max(100).default(20),
+});
 
 /**
  * 微信运动步数（决策：session_key 用完即弃，同 xpay 下单时序）
@@ -60,5 +82,45 @@ export async function werunRoutes(fastify: FastifyInstance) {
   // 省份选择器数据：有登录记录的省份（人数降序），前端拼「全国」在首位
   fastify.get('/board-provinces', { onRequest: [fastify.authenticateOptional] }, async () => {
     return success(await werunBoardProvinces());
+  });
+
+  // 个人步数统计：概况 + 趋势（7/30 按日、180 按周、365 按月；缺失日补 0）
+  fastify.get('/stats', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { range, compare } = StatsQuery.parse(request.query);
+    return success(await werunStats(request.user.userId, range as WerunStatsRange, Date.now(), compare === 1));
+  });
+
+  // 每日步数明细：只列有同步记录的天，按日期倒序分页
+  fastify.get('/days', { onRequest: [fastify.authenticate] }, async (request) => {
+    const { range, page, pageSize } = DaysQuery.parse(request.query);
+    return success(await werunDayList(request.user.userId, range as WerunStatsRange, page, pageSize));
+  });
+
+  // 报告页步数聚合：from/to 与 /overview 同口径 [from, to)，不传 = 全部时间
+  fastify.get('/report', { onRequest: [fastify.authenticate] }, async (request) => {
+    const q = request.query as { from?: string; to?: string };
+    return success(
+      await werunReport(
+        request.user.userId,
+        q.from ? Number(q.from) : undefined,
+        q.to ? Number(q.to) : undefined,
+      ),
+    );
+  });
+
+  // 步数 CSV：与运动记录导出同款范围参数（from/to 为 ms，换算成东八区自然日）
+  fastify.get('/export/csv', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const q = request.query as { from?: string; to?: string };
+    assertExportRate(`werun-export:${request.user.userId}`);
+    const csv = await exportWerunCsv({
+      userId: String(request.user.userId),
+      from: q.from ? Number(q.from) : undefined,
+      to: q.to ? Number(q.to) : undefined,
+      cap: EXPORT_CSV_MAX_ROWS,
+    });
+    const stamp = exportStamp();
+    reply.header('Content-Type', 'text/csv; charset=utf-8');
+    reply.header('Content-Disposition', contentDisposition(`werun-steps-${stamp}.csv`, `微信步数_${stamp}.csv`));
+    return reply.send(csv);
   });
 }
