@@ -25,7 +25,7 @@ interface StatsData {
   prevOverview?: { totalStep: number; avgStep: number; bestDate: string; bestStep: number; syncedDays: number; startDate: string; endDate: string };
 }
 interface DayItem { date: string; step: number }
-interface DaysData { total: number; items: DayItem[]; hasMore: boolean }
+interface DaysData { total: number; items: DayItem[]; hasMore: boolean; startDate: string; endDate: string }
 
 /** 东八区今天 − n 天，YYYY-MM-DD */
 function bjDateAgo(n: number): string {
@@ -153,6 +153,24 @@ test('WS-5 compare=1：下发紧邻的前一个同长度窗口，供趋势变化
 
   const plain = (await get('/stats?range=30')).json().data as StatsData;
   assert.equal(plain.prevOverview, undefined, '不传 compare 不多算一个窗口');
+});
+
+test('WS-6 明细 range=all：不限窗口、倒序分页，包含一年外记录', async () => {
+  const all = (await get('/days?range=all&page=1&pageSize=100')).json().data as DaysData;
+  assert.equal(all.total, 7, '7 条同步记录全部纳入，含 400 天前');
+  assert.deepEqual(all.items.map((x) => x.step), [1000, 2000, 3000, 4000, 5000, 6000, 7000]);
+  assert.equal(all.startDate, bjDateAgo(400), '首尾按数据实际范围');
+  assert.equal(all.endDate, bjDateAgo(0));
+
+  const p1 = (await get('/days?range=all&page=1&pageSize=2')).json().data as DaysData;
+  assert.deepEqual(p1.items.map((x) => x.step), [1000, 2000]);
+  assert.equal(p1.hasMore, true);
+  // 起止日期描述的是**整个数据集**，不随 pageSize/页码变
+  assert.equal(p1.startDate, all.startDate, '换 pageSize 也不能改 startDate');
+  assert.equal(p1.endDate, all.endDate, '换 pageSize 也不能改 endDate');
+  const p4 = (await get('/days?range=all&page=4&pageSize=2')).json().data as DaysData;
+  assert.deepEqual(p4.items.map((x) => x.step), [7000]);
+  assert.equal(p4.hasMore, false);
 });
 
 test('WS-4 参数与鉴权：非法 range 400，未登录 401', async () => {

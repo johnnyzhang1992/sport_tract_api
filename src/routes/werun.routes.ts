@@ -24,8 +24,11 @@ const StatsQuery = z.object({
   compare: z.coerce.number().int().min(0).max(1).optional(),
 });
 
+/** 明细：固定窗口或 all（全部同步记录，不跟时间档走） */
+const DaysRange = z.union([StatsRange, z.literal('all')]);
+
 const DaysQuery = z.object({
-  range: StatsRange,
+  range: DaysRange,
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(20),
 });
@@ -90,10 +93,10 @@ export async function werunRoutes(fastify: FastifyInstance) {
     return success(await werunStats(request.user.userId, range as WerunStatsRange, Date.now(), compare === 1));
   });
 
-  // 每日步数明细：只列有同步记录的天，按日期倒序分页
+  // 每日步数明细：只列有同步记录的天，按日期倒序分页；range=all 为全部记录
   fastify.get('/days', { onRequest: [fastify.authenticate] }, async (request) => {
     const { range, page, pageSize } = DaysQuery.parse(request.query);
-    return success(await werunDayList(request.user.userId, range as WerunStatsRange, page, pageSize));
+    return success(await werunDayList(request.user.userId, range as WerunStatsRange | 'all', page, pageSize));
   });
 
   // 报告页步数聚合：from/to 与 /overview 同口径 [from, to)，不传 = 全部时间

@@ -48,7 +48,8 @@ export interface WerunDayRow {
 }
 
 export interface WerunDayListResult {
-  range: WerunStatsRange;
+  /** 'all' = 全部同步记录（明细页不跟时间档走） */
+  range: WerunStatsRange | 'all';
   startDate: string;
   endDate: string;
   items: WerunDayRow[];
@@ -221,19 +222,23 @@ export async function werunStats(
   return result;
 }
 
-/** 每日明细分页：按日期倒序，只返回有同步记录的天 */
+/** 每日明细分页：按日期倒序，只返回有同步记录的天；range='all' 不限日期 */
 export async function werunDayList(
   userId: string,
-  range: WerunStatsRange,
+  range: WerunStatsRange | 'all',
   page: number,
   pageSize: number,
   now = Date.now(),
 ): Promise<WerunDayListResult> {
-  const { startDate, endDate } = werunRangeWindow(range, now);
-  const filter = {
-    userId: new Types.ObjectId(userId),
-    date: { $gte: startDate, $lte: endDate },
-  };
+  const filter: Record<string, unknown> = { userId: new Types.ObjectId(userId) };
+  let startDate = '';
+  let endDate = '';
+  if (range !== 'all') {
+    const window = werunRangeWindow(range, now);
+    startDate = window.startDate;
+    endDate = window.endDate;
+    filter.date = { $gte: startDate, $lte: endDate };
+  }
   const [total, rows] = await Promise.all([
     WerunDayModel.countDocuments(filter),
     WerunDayModel.find(filter)
@@ -243,6 +248,17 @@ export async function werunDayList(
       .limit(pageSize)
       .lean(),
   ]);
+  if (range === 'all') {
+    // 全量档的起止日期＝**整个数据集**的首尾，不是当前页的首尾——否则同一个请求换个
+    // pageSize 返回的 startDate/endDate 就变了，调用方没法把它当「数据范围」用。
+    // 两条走 {userId,date} 索引的极轻查询（只取日期、各 limit 1）。
+    const [first, last] = await Promise.all([
+      WerunDayModel.findOne(filter).select({ date: 1 }).sort({ date: 1 }).lean(),
+      WerunDayModel.findOne(filter).select({ date: 1 }).sort({ date: -1 }).lean(),
+    ]);
+    startDate = first?.date ? String(first.date) : '';
+    endDate = last?.date ? String(last.date) : '';
+  }
   return {
     range,
     startDate,
