@@ -15,6 +15,9 @@ export const MEMBER_PHOTO_QUOTA = 200;
 /** MC-14：非会员请求多条轨迹打包 */
 export const GPX_BUNDLE_MEMBER_REQUIRED = '多条轨迹打包导出需要开通会员';
 
+/** 照片打包导出（2026-11-06 新增）：与 GPX 打包同一权益口径（打包导出＝会员专属），文案句式沿用 MC-14 */
+export const PHOTOS_BUNDLE_MEMBER_REQUIRED = '照片打包导出需要开通会员';
+
 /**
  * 照片额度已满的文案（2026-11-05 定稿）。
  *

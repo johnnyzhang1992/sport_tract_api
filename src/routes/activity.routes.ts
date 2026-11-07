@@ -22,11 +22,13 @@ import {
   assertExportRate,
   contentDisposition,
   exportGpxZip,
+  exportPhotosZip,
   exportStamp,
   exportSummaryCsv,
   EXPORT_CSV_MAX_ROWS,
 } from '../services/export.js';
 import { ActivityModel } from '../models/activity.model.js';
+import { PHOTOS_BUNDLE_MEMBER_REQUIRED } from '../config/member-copy.js';
 import { deleteOssObjects, getSignedUrl, getThumbUrl } from '../services/oss.js';
 import { importActivity } from '../services/import.js';
 import { z } from 'zod';
@@ -223,6 +225,25 @@ export async function activityRoutes(fastify: FastifyInstance) {
     reply.header('Content-Disposition', contentDisposition(`track-export-${exportStamp()}.zip`, `轨迹导出_${exportStamp()}.zip`));
     reply.send(archive);
     await done; // 打包完成后才落 handler：流中途出错交给 Fastify 断连，结束前的校验已全部前置
+    return reply;
+  });
+
+  // 照片打包 zip（2026-11-06）：轨迹打点 + 足迹 两个来源，逐张 OSS 原图下载进包。
+  // 打包导出＝会员权益（与 GPX 打包同一口径），时间范围与 GPX 同款 from/to（ms）。
+  fastify.get('/export/photos', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const q = request.query as { from?: string; to?: string };
+    const { canExportBundle } = await entitlementsOf(String(request.user.userId));
+    if (!canExportBundle) throw new AppError(403, PHOTOS_BUNDLE_MEMBER_REQUIRED);
+    assertExportRate(`photos:${request.user.userId}`);
+    const { archive, done } = await exportPhotosZip({
+      userId: String(request.user.userId),
+      from: q.from ? Number(q.from) : undefined,
+      to: q.to ? Number(q.to) : undefined,
+    });
+    reply.header('Content-Type', 'application/zip');
+    reply.header('Content-Disposition', contentDisposition(`photos-export-${exportStamp()}.zip`, `照片导出_${exportStamp()}.zip`));
+    reply.send(archive);
+    await done;
     return reply;
   });
 

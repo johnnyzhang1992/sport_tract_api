@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
+import { contentDisposition, exportFootprintCsv, exportStamp, EXPORT_CSV_MAX_ROWS, assertExportRate } from '../services/export.js';
 import {
   CreateFootprintRecordSchema,
   FootprintGeoQuery,
@@ -29,6 +30,23 @@ export async function footprintRecordRoutes(fastify: FastifyInstance) {
     const input = CreateFootprintRecordSchema.parse(request.body);
     const record = await createFootprint(request.user.userId, input);
     return success({ record }, '足迹已创建');
+  });
+
+  // 足迹 CSV 导出（2026-11-06）：本人全部足迹一行一条；from/to 与活动导出同一口径（ms 时间窗），
+  // visitDate 按 [from, to] 换算成东八区自然日区间比较
+  fastify.get('/export/csv', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const q = request.query as { from?: string; to?: string };
+    assertExportRate(`footprint-export:${request.user.userId}`);
+    const stream = await exportFootprintCsv({
+      userId: String(request.user.userId),
+      from: q.from ? Number(q.from) : undefined,
+      to: q.to ? Number(q.to) : undefined,
+      cap: EXPORT_CSV_MAX_ROWS,
+    });
+    reply.header('Content-Type', 'text/csv; charset=utf-8');
+    reply.header('Content-Disposition', contentDisposition(`footprints-${exportStamp()}.csv`, `足迹记录_${exportStamp()}.csv`));
+    reply.send(stream);
+    return reply;
   });
 
   fastify.get('/', { onRequest: [fastify.authenticate] }, async (request) => {

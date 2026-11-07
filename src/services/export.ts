@@ -1,12 +1,16 @@
 import { PassThrough, Readable } from 'node:stream';
 import { ZipArchive, type Archiver } from 'archiver';
+import axios from 'axios';
 import { Types } from 'mongoose';
 import { AppError } from '../utils/app-error.js';
 import { ACTIVITY_TYPES, ACTIVITY_TYPE_META } from '../config/constants.js';
 import { BJ_OFFSET_MS } from '../utils/bj-time.js';
+import { footprintCategoryLabel } from '../utils/footprint-category.js';
 import { toGpx } from './gpx.js';
 import { ActivityModel } from '../models/activity.model.js';
+import { FootprintRecordModel } from '../models/footprint-record.model.js';
 import { UserModel } from '../models/user.model.js';
+import { getSignedUrl } from './oss.js';
 
 /**
  * 运动数据导出（2026-11-01）：
@@ -262,4 +266,193 @@ export async function exportGpxZip(opts: {
     await archive.finalize();
   })();
   return { archive, done, count: total };
+}
+
+/* ───────────────────────── 足迹 CSV（2026-11-06） ───────────────────────── */
+
+const FOOTPRINT_CSV_HEADER =
+  '足迹ID,到访日期,标题,分类,地点,详细地址,省份,城市,同行人,描述,图片数,经度,纬度';
+
+/** 毫秒时间戳 → 东八区 YYYY-MM-DD（visitDate 是自然日字符串，字典序即时间序） */
+function bjDate(ms: number): string {
+  return new Date(ms + BJ_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+type FootprintCsvOpts = {
+  userId: string;
+  /** 与活动导出同一口径的 ms 时间窗；visitDate 按 [from, to] 换算成自然日区间 */
+  from?: number;
+  to?: number;
+  cap: number;
+};
+
+/**
+ * 足迹 CSV 流：本人全部足迹（描述全文在列）。行量小（个人足迹量级），
+ * 一次查全即可，不需要像活动汇总那样分批投影。
+ */
+export async function exportFootprintCsv(opts: FootprintCsvOpts): Promise<Readable> {
+  const filter: Record<string, unknown> = { userId: new Types.ObjectId(opts.userId) };
+  const range: Record<string, unknown> = {};
+  if (opts.from) range.$gte = bjDate(opts.from);
+  if (opts.to) range.$lte = bjDate(opts.to);
+  if (opts.from && opts.to && opts.to <= opts.from) throw new AppError(400, '时间范围无效');
+  if (Object.keys(range).length) filter.visitDate = range;
+
+  const total = await FootprintRecordModel.countDocuments(filter);
+  if (total === 0) throw new AppError(404, '没有符合条件的足迹记录');
+  if (total > opts.cap) {
+    throw new AppError(400, `共 ${total} 条，超出单次导出上限 ${opts.cap} 条，请缩小时间范围`);
+  }
+
+  const pass = new PassThrough();
+  const pump = async () => {
+    pass.write(`\uFEFF${FOOTPRINT_CSV_HEADER}\r\n`);
+    const rows = await FootprintRecordModel.find(filter).sort({ visitDate: -1, _id: 1 }).lean();
+    for (const r of rows) {
+      const line = [
+        String(r._id),
+        r.visitDate,
+        r.title,
+        footprintCategoryLabel(r.category || ''),
+        r.location?.name || '',
+        r.location?.address || '',
+        r.location?.province || '',
+        r.location?.city || '',
+        (r.people || []).join('、'),
+        r.description || '',
+        (r.photos || []).length,
+        r.location?.longitude ?? '',
+        r.location?.latitude ?? '',
+      ]
+        .map(csvEscape)
+        .join(',');
+      if (!pass.write(`${line}\r\n`)) await new Promise<void>((resolve) => pass.once('drain', resolve));
+    }
+    pass.end();
+  };
+  void pump().catch((e) => pass.destroy(e));
+  return pass;
+}
+
+/* ───────────────────────── 照片打包 zip（2026-11-06） ───────────────────────── */
+
+/** 照片打包上限（张）：原图走 OSS 出网，单包太大既慢又烧流量；超出提示分批 */
+export const EXPORT_PHOTOS_MAX_ITEMS = 200;
+
+/** OSS 对象单张下载上限（10MB）：防脏数据里的巨型对象拖死导出 */
+const PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+
+function photosReadme(stats: { activities: number; footprints: number; ok: number; failed: string[]; total: number }): string {
+  const lines = [
+    '小迹一下 · 照片导出',
+    `导出时间：${bjDateTime(Date.now())}（东八区）`,
+    `照片总数：${stats.total} 张（成功打包 ${stats.ok} 张）`,
+    `来源：轨迹打点 ${stats.activities} 条 · 足迹 ${stats.footprints} 条`,
+    '',
+    '目录结构：轨迹/开始日期_类型_轨迹ID/photo-N.jpg；足迹/到访日期_足迹ID/photo-N.jpg',
+    '轨迹ID 与「运动记录 CSV」的轨迹ID 列一致，可据此关联。',
+  ];
+  if (stats.failed.length) {
+    lines.push('', `以下 ${stats.failed.length} 张对象已不存在或下载失败，未包含在包内：`, ...stats.failed);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 照片打包 zip 流：轨迹打点 photos（含旧字段 photoUrl 兜底）+ 足迹 photos 两个来源。
+ * 逐张从 OSS 原图下载后 append 进归档（signed URL + axios，10MB 单张上限）；
+ * 单张失败不炸整包——记录进「导出说明.txt」（历史脏数据：库里挂着、对象已删很常见）。
+ */
+export async function exportPhotosZip(opts: {
+  userId: string;
+  from?: number;
+  to?: number;
+  cap?: number;
+}): Promise<{ archive: Archiver; done: Promise<void>; count: number }> {
+  const cap = opts.cap ?? EXPORT_PHOTOS_MAX_ITEMS;
+  const uid = Types.ObjectId.isValid(opts.userId) ? new Types.ObjectId(opts.userId) : opts.userId;
+  const dateRange: Record<string, unknown> = {};
+  if (opts.from) dateRange.$gte = bjDate(opts.from);
+  if (opts.to) dateRange.$lte = bjDate(opts.to);
+
+  // 轨迹：与 GPX 同款范围（startTime ms）；足迹：visitDate 自然日区间
+  const actFilter: Record<string, unknown> = { status: 'finished', userId: uid, 'markers.0': { $exists: true } };
+  if (opts.from || opts.to) {
+    const range: Record<string, unknown> = {};
+    if (opts.from) range.$gte = opts.from;
+    if (opts.to) range.$lte = opts.to;
+    if (opts.from && opts.to && opts.to <= opts.from) throw new AppError(400, '时间范围无效');
+    actFilter.startTime = range;
+  }
+  const fpFilter: Record<string, unknown> = { userId: uid };
+  if (Object.keys(dateRange).length) fpFilter.visitDate = dateRange;
+
+  const [activities, footprints] = await Promise.all([
+    ActivityModel.find(actFilter).select('type startTime markers').sort({ startTime: -1, _id: 1 }).lean(),
+    FootprintRecordModel.find(fpFilter).select('visitDate photos').sort({ visitDate: -1, _id: 1 }).lean(),
+  ]);
+
+  // 先盘点总数再动 OSS：超限直接 400，别让用户等了半天才报错
+  type PhotoEntry = { url: string; name: string };
+  const entries: PhotoEntry[] = [];
+  for (const doc of activities) {
+    const dir = `轨迹/${bjDateTime(Number(doc.startTime)).slice(0, 10)}_${typeLabel(String(doc.type))}_${String(doc._id)}`;
+    let n = 0;
+    for (const m of doc.markers ?? []) {
+      const urls = [...(m.photos || []), ...(m.photoUrl ? [m.photoUrl] : [])];
+      for (const url of new Set(urls.map((u: string) => String(u).split('?')[0]))) {
+        if (!url) continue;
+        n += 1;
+        const ext = url.toLowerCase().endsWith('.png') ? '.png' : '.jpg';
+        entries.push({ url, name: `${dir}/photo-${n}${ext}` });
+      }
+    }
+  }
+  for (const fp of footprints) {
+    let n = 0;
+    for (const url of new Set<string>((fp.photos || []).map((u: string) => String(u).split('?')[0]))) {
+      if (!url) continue;
+      n += 1;
+      const ext = url.toLowerCase().endsWith('.png') ? '.png' : '.jpg';
+      entries.push({ url, name: `足迹/${fp.visitDate}_${String(fp._id)}/photo-${n}${ext}` });
+    }
+  }
+  if (entries.length === 0) throw new AppError(404, '选中的范围没有可导出的照片');
+  if (entries.length > cap) {
+    throw new AppError(400, `共 ${entries.length} 张照片，超出单次打包上限 ${cap} 张，请缩小时间范围分批导出`);
+  }
+
+  const archive = new ZipArchive({ zlib: { level: 6 } }); // 图片已压缩，zlib 再高只烧 CPU 不省体积
+  const failed: string[] = [];
+  const done = (async () => {
+    for (const entry of entries) {
+      try {
+        // 原图（不带图片处理参数）：导出要保真；第三方域名（非本桶）原样返回也能拉。
+        // **流式 append**（2026-11-06 优化）：原先 responseType:'arraybuffer' 把每张整块读进内存
+        // 再 append，200 张 × 单张上限 10MB 的理论峰值能到 2G —— 2G 内存的机器扛不住。
+        // 改成流式后内存与张数脱钩；且 axios 在**收到响应头**时就会 reject（404/超时），
+        // 所以「坏对象」依旧在 append 之前被识别、照旧进 failed 清单（本次失败语义不变）。
+        const res = await axios.get(getSignedUrl(entry.url, 600), {
+          responseType: 'stream',
+          timeout: 20000,
+          maxContentLength: PHOTO_MAX_BYTES,
+        });
+        archive.append(res.data as unknown as Readable, { name: entry.name });
+      } catch {
+        failed.push(entry.name); // 单张失败不炸整包，说明.txt 里交代
+      }
+    }
+    archive.append(
+      photosReadme({
+        activities: activities.length,
+        footprints: footprints.length,
+        ok: entries.length - failed.length,
+        failed,
+        total: entries.length,
+      }),
+      { name: '导出说明.txt' },
+    );
+    await archive.finalize();
+  })();
+  return { archive, done, count: entries.length };
 }

@@ -135,6 +135,14 @@ export const IMAGE_PROCESS = {
 let cachedClient: OSS | null = null;
 
 /**
+ * 签名量化窗口（秒）。OSS signatureUrl 按「当前秒 + expires」算绝对过期，
+ * 若每次现算，同一张图每次请求的 Expires/Signature 都不同 → URL 变 → 端上图片缓存
+ * 永远不命中、每次 onShow 重拉整屏重载闪烁。把绝对过期时刻量化到窗口边界后，
+ * 窗口内同一 key+档位的 URL 逐字相同（缓存可命中）；最坏剩余有效期仍 ≥ expiresSec。
+ */
+export const OSS_SIGN_WINDOW_SECONDS = 900;
+
+/**
  * 签发访问 URL
  * @param process x-oss-process 图片处理参数（缩略图/头像/中图）；不传即原图
  * 非本桶地址（微信头像等）原样返回，签名逻辑不接管第三方域名。
@@ -146,7 +154,12 @@ export function getSignedUrl(url: string, expiresSec = 86400, process?: string):
   const { region, bucket, accessKeyId, accessKeySecret } = config.oss;
   // 一次详情要签十几条，client 建一次复用（构造里有凭证解析，别按张数重复付）
   cachedClient ??= new OSS({ region, accessKeyId, accessKeySecret, bucket, secure: true });
-  return cachedClient.signatureUrl(key, { expires: expiresSec, method: 'GET', ...(process ? { process } : {}) });
+  // signatureUrl 内部用 now+expires 反推绝对过期；传入「目标绝对过期 - now」使 Expires 在窗口内恒定
+  const nowSec = Math.floor(Date.now() / 1000);
+  const bucketStart = Math.floor(nowSec / OSS_SIGN_WINDOW_SECONDS) * OSS_SIGN_WINDOW_SECONDS;
+  const targetExp = bucketStart + OSS_SIGN_WINDOW_SECONDS + expiresSec;
+  const relative = Math.max(1, targetExp - nowSec);
+  return cachedClient.signatureUrl(key, { expires: relative, method: 'GET', ...(process ? { process } : {}) });
 }
 
 export const getThumbUrl = (url: string) => getSignedUrl(url, 86400, IMAGE_PROCESS.thumb);
