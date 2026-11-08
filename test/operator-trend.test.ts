@@ -1,7 +1,7 @@
 /**
  * 运营者趋势接口（2026-11-08）：GET /operator/stats/trend?range&granularity。
  * 口径：东八区；新增用户=users.createdAt、PV=登录日志数、UV=桶内去重 userId（周桶重新去重）、
- * 轨迹=activities.createdAt（同 summary 卡）。窗口含今天；空桶补 0；周桶周一始。
+ * 轨迹新增=activities.createdAt（同 summary「新增轨迹」）、轨迹完成=status finished 且 endTime（同「轨迹完成」）。窗口含今天；空桶补 0；周桶周一始。
  * 组合约束：week 仅 day；halfyear 仅 week；month 两者。非法 400 带实际值。
  * 运行：WX_MOCK_LOGIN=true node --import tsx --test --test-concurrency=1 test/operator-trend.test.ts
  */
@@ -94,6 +94,7 @@ async function delta(range: 'week' | 'month' | 'halfyear', gran: 'day' | 'week' 
       pv: b.pv - (p?.pv ?? 0),
       newUsers: b.newUsers - (p?.newUsers ?? 0),
       tracksCreated: b.tracksCreated - (p?.tracksCreated ?? 0),
+      tracksFinished: b.tracksFinished - (p?.tracksFinished ?? 0),
     };
   });
   return { granularity: after.granularity, buckets };
@@ -128,7 +129,7 @@ test('OT-1 闸门与入参：401/403；非法 range/granularity/组合 400 带�
   assert.match(halfDay.json().message, /180/);
 });
 
-test('OT-2 week/day：7 桶补零；UV 去重 PV 计数；newUsers/轨迹按 createdAt 归桶', async () => {
+test('OT-2 week/day：7 桶补零；UV 去重 PV 计数；轨迹新增按创建、完成按结束时间归桶', async () => {
   const dayX = D0 - 2 * DAY;
   const d = await delta('week', 'day', async () => {
     await log(opId, dayX + 10 * 3600_000);
@@ -140,7 +141,14 @@ test('OT-2 week/day：7 桶补零；UV 去重 PV 计数；newUsers/轨迹按 cre
       { $set: { createdAt: new Date(dayX + 8 * 3600_000) } },
     );
     await ActivityModel.insertMany(
-      [{ userId: opId, type: 'running', status: 'finished', startTime: dayX + 9 * 3600_000, createdAt: new Date(dayX + 9 * 3600_000) }],
+      [
+        // 3 天前创建、今天完成：新增归创建日，完成归今天
+        { userId: opId, type: 'running', status: 'finished', startTime: dayX - 3 * DAY, endTime: dayX + 9 * 3600_000, createdAt: new Date(dayX - 3 * DAY) },
+        // 进行中：算新增、不算完成
+        { userId: opId, type: 'walking', status: 'in_progress', startTime: dayX + 10 * 3600_000, createdAt: new Date(dayX + 10 * 3600_000) },
+        // 今天创建、昨天完成：完成归昨天
+        { userId: normId, type: 'hiking', status: 'finished', startTime: dayX + 8 * 3600_000, endTime: D0 - DAY + 9 * 3600_000, createdAt: new Date(dayX + 8 * 3600_000) },
+      ],
       { timestamps: false },
     );
   });
@@ -149,15 +157,21 @@ test('OT-2 week/day：7 桶补零；UV 去重 PV 计数；newUsers/轨迹按 cre
   consecutive(d.buckets.map((b) => b.key), DAY);
   const x = d.buckets.find((b) => b.key === bjDateStr(dayX));
   assert.deepEqual(
-    { uv: x?.uv, pv: x?.pv, newUsers: x?.newUsers, tracksCreated: x?.tracksCreated },
-    { uv: 2, pv: 3, newUsers: 1, tracksCreated: 1 },
+    { uv: x?.uv, pv: x?.pv, newUsers: x?.newUsers, tracksCreated: x?.tracksCreated, tracksFinished: x?.tracksFinished },
+    { uv: 2, pv: 3, newUsers: 1, tracksCreated: 2, tracksFinished: 1 },
   );
   const y = d.buckets.find((b) => b.key === bjDateStr(D0 - DAY));
   assert.equal(y?.uv, 1);
   assert.equal(y?.pv, 1);
+  assert.equal(y?.tracksCreated, 0, '昨天创建的那条已计入今天');
+  assert.equal(y?.tracksFinished, 1, '昨天完成的进昨天桶');
+  const z = d.buckets.find((b) => b.key === bjDateStr(dayX - 3 * DAY));
+  assert.equal(z?.tracksCreated, 1, '3 天前创建的归创建日');
+  assert.equal(z?.tracksFinished, 0);
+  const hit = new Set([bjDateStr(dayX), bjDateStr(D0 - DAY), bjDateStr(dayX - 3 * DAY)]);
   for (const b of d.buckets) {
-    if (b.key !== bjDateStr(dayX) && b.key !== bjDateStr(D0 - DAY)) {
-      assert.deepEqual([b.uv, b.pv, b.newUsers, b.tracksCreated], [0, 0, 0, 0], `夹具只落在两天 ${b.key}`);
+    if (!hit.has(b.key)) {
+      assert.deepEqual([b.uv, b.pv, b.newUsers, b.tracksCreated, b.tracksFinished], [0, 0, 0, 0, 0], `夹具只落在三天 ${b.key}`);
     }
     assert.match(b.label, /^\d{1,2}\/\d{1,2}$/, '标签 M/D');
   }

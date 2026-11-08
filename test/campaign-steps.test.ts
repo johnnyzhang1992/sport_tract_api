@@ -159,23 +159,65 @@ test('CS-3 按天对比：匹配 / 步数偏少 / 仅步数 / 未同步', async 
   assert.equal(r.summary.step, 10000);
 });
 
-test('CS-4 步数PK详情/排行/趋势：按步数而不是轨迹', async () => {
-  await addSteps(creatorId, [['2026-11-06', 8000]]);
-  await addSteps(memberId, [['2026-11-03', 3000], ['2026-11-04', 4000], ['2026-11-05', 5000]]);
+/** 相对今天偏移的东八区日期串（YYYY-MM-DD） */
+function bjDateOffset(days: number): string {
+  return new Date(Date.now() + 8 * 3600_000 + days * DAY).toISOString().slice(0, 10);
+}
 
-  const detail = await getCampaignDetail(stepCampaign, creatorId);
+/**
+ * 自建一个「近期已结束」的步数PK（窗口 today-10 ~ today-4）。
+ * 为什么必须用相对日期：贡献窗口只到 `min(活动结束, now) - 1`（今天天然不计入），
+ * 而创建者的加入时刻=创建时刻（=now）——夹具一旦把窗口写死在某个固定周，跨过那天后
+ * 创建者的贡献日就整个落在窗口外，步数静默变 0（CS-4 从 2026-11-06 起一直是红的）。
+ */
+async function makeRecentStepsCampaign(): Promise<{ id: string; d: { a: string; b: string; c: string } }> {
+  const created = await createCampaign(creatorId, {
+    title: `步数PK相对窗口-${RUN}`,
+    description: '',
+    visibility: 'public',
+    kind: 'steps',
+    allowedTypes: [],
+    memberLimit: 10,
+    startDate: bjDateOffset(-10),
+    endDate: bjDateOffset(-4),
+  }, async () => ({ risky: false }));
+  extraCampaigns.push(created.id);
+  await CampaignMemberModel.create({
+    campaignId: new mongoose.Types.ObjectId(created.id),
+    userId: memberId,
+    role: 'member',
+    state: 'joined',
+    joinedAt: at(bjDateOffset(-9), 10),
+    leftAt: null,
+  });
+  // createCampaign 给创建者写的 member 行 joinedAt=now（=今天），而贡献窗口只到「昨天」——
+  // 他的贡献日集合会恒为空。这里把加入时刻前移到窗口起点（等价于「开赛前就已报名」），
+  // 否则「创建者也有步数贡献」这条断言在结构上永远不可能成立。
+  await CampaignMemberModel.updateOne(
+    { campaignId: new mongoose.Types.ObjectId(created.id), userId: creatorId },
+    { $set: { joinedAt: at(bjDateOffset(-10), 9) } },
+  );
+  return { id: created.id, d: { a: bjDateOffset(-8), b: bjDateOffset(-7), c: bjDateOffset(-6) } };
+}
+
+test('CS-4 步数PK详情/排行/趋势：按步数而不是轨迹', async () => {
+  const { id, d } = await makeRecentStepsCampaign();
+  await addSteps(creatorId, [[d.b, 8000]]);
+  await addSteps(memberId, [[d.a, 3000], [d.b, 4000], [d.c, 5000]]);
+
+  const detail = await getCampaignDetail(id, creatorId);
   assert.equal(detail.kind, 'steps');
   assert.equal(detail.totals?.step, 20000);
   assert.equal(detail.myPanel?.step, 8000);
   assert.equal(detail.members?.find((m) => m.userId === memberId)?.step, 12000);
 
-  const board = await campaignLeaderboard(stepCampaign, creatorId, { page: 1, pageSize: 20 });
+  const board = await campaignLeaderboard(id, creatorId, { page: 1, pageSize: 20 });
   assert.equal(board.metric, 'step');
   assert.equal(board.rows[0].userId, memberId, '成员 12000 > 创建者 8000');
   assert.equal(board.rows[0].step, 12000);
   assert.equal(board.my.rank, 2);
 
-  const trend = await campaignTrend(stepCampaign, creatorId, {});
+  const trend = await campaignTrend(id, creatorId, {});
   assert.equal(trend.metric, 'step');
   assert.ok(trend.labels.length > 0);
   assert.equal(
@@ -213,8 +255,16 @@ test('CS-6 入参闸门：步数PK 不接受运动类型/辅助开关；设置�
 
   assert.equal(UpdateCampaignSchema.safeParse({ kind: 'activity' }).success, false, 'kind 不可编辑');
   assert.equal(UpdateCampaignSchema.safeParse({ stepAuxEnabled: true }).success, true);
+  // 用「进行中」的自建步数PK：共享夹具的窗口写死在固定周，过期后这里会先报「活动已结束」，
+  // 断言就测不到「步数PK不区分运动类型」这条真正的闸门（2026-11-08 踩到）。
+  const ongoing = await createCampaign(creatorId, {
+    title: `步数PK进行中-${RUN}`, description: '', visibility: 'public',
+    kind: 'steps', allowedTypes: [], memberLimit: 10,
+    startDate: bjDateOffset(-1), endDate: bjDateOffset(3),
+  }, async () => ({ risky: false }));
+  extraCampaigns.push(ongoing.id);
   await assert.rejects(
-    () => updateCampaign(stepCampaign, creatorId, { stepAuxEnabled: true }),
+    () => updateCampaign(ongoing.id, creatorId, { stepAuxEnabled: true }),
     /步数PK不区分运动类型/,
   );
 

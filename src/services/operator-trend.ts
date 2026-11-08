@@ -16,6 +16,7 @@ export interface TrendBucket {
   uv: number;
   pv: number;
   tracksCreated: number;
+  tracksFinished: number;
 }
 
 export function defaultGranularity(range: TrendRange): TrendGranularity {
@@ -60,20 +61,23 @@ function windowOf(range: TrendRange, g: TrendGranularity, now: number): { from: 
   return { from, to, starts };
 }
 
-function truncExpr(g: TrendGranularity) {
+function truncExpr(g: TrendGranularity, field = 'createdAt') {
+  // $toDate：endTime 是毫秒 number（activity.model），$dateTrunc 只收日期类型；Date 字段上是无操作
+  const date = { $toDate: `$${field}` };
   return g === 'week'
-    ? { $dateTrunc: { date: '$createdAt', unit: 'week', timezone: '+08:00', startOfWeek: 'Monday' } }
-    : { $dateTrunc: { date: '$createdAt', unit: 'day', timezone: '+08:00' } };
+    ? { $dateTrunc: { date, unit: 'week', timezone: '+08:00', startOfWeek: 'Monday' } }
+    : { $dateTrunc: { date, unit: 'day', timezone: '+08:00' } };
 }
 
-const keyExpr = (g: TrendGranularity) => ({
-  $dateToString: { format: '%Y-%m-%d', date: truncExpr(g), timezone: '+08:00' },
+const keyExpr = (g: TrendGranularity, field = 'createdAt') => ({
+  $dateToString: { format: '%Y-%m-%d', date: truncExpr(g, field), timezone: '+08:00' },
 });
 
 /**
- * 运营者趋势：整窗一次聚合/表（$dateTrunc 东八区桶），空桶补 0。
+ * 运营者趋势：整窗一次性聚合/表（$dateTrunc 东八区桶），空桶补 0。
  * UV=桶内去重 userId（周桶重新去重，≠逐日相加）；PV=登录日志数；
- * newUsers=users.createdAt；tracksCreated=activities.createdAt（同 summary 卡口径）。
+ * newUsers=users.createdAt；tracksCreated=activities.createdAt（同 summary「新增轨迹」）；
+ * tracksFinished=status finished 且 endTime（同 summary「轨迹完成」，按完成时间归桶）。
  */
 export async function operatorTrend(
   range: string,
@@ -98,7 +102,7 @@ export async function operatorTrend(
   const { from, to, starts } = windowOf(range, g, now);
   const match = { createdAt: { $gte: new Date(from), $lt: new Date(to) } };
 
-  const [loginRows, userRows, trackRows] = await Promise.all([
+  const [loginRows, userRows, trackCreatedRows, trackFinishedRows] = await Promise.all([
     LoginLogModel.aggregate<{ _id: string; uv: number; pv: number }>([
       { $match: match },
       { $group: { _id: { k: keyExpr(g), u: '$userId' }, n: { $sum: 1 } } },
@@ -112,11 +116,17 @@ export async function operatorTrend(
       { $match: match },
       { $group: { _id: keyExpr(g), n: { $sum: 1 } } },
     ]),
+    ActivityModel.aggregate<{ _id: string; n: number }>([
+      { $match: { status: 'finished', endTime: { $gte: from, $lt: to } } },
+      { $group: { _id: keyExpr(g, 'endTime'), n: { $sum: 1 } } },
+    ]),
   ]);
 
   const byKey = new Map<string, TrendBucket>();
   for (const s of starts) {
-    byKey.set(bjDateStr(s), { key: bjDateStr(s), label: bucketLabel(s), newUsers: 0, uv: 0, pv: 0, tracksCreated: 0 });
+    byKey.set(bjDateStr(s), {
+      key: bjDateStr(s), label: bucketLabel(s), newUsers: 0, uv: 0, pv: 0, tracksCreated: 0, tracksFinished: 0,
+    });
   }
   for (const r of loginRows) {
     const b = byKey.get(r._id);
@@ -129,9 +139,13 @@ export async function operatorTrend(
     const b = byKey.get(r._id);
     if (b) b.newUsers = r.n;
   }
-  for (const r of trackRows) {
+  for (const r of trackCreatedRows) {
     const b = byKey.get(r._id);
     if (b) b.tracksCreated = r.n;
+  }
+  for (const r of trackFinishedRows) {
+    const b = byKey.get(r._id);
+    if (b) b.tracksFinished = r.n;
   }
   return { range, granularity: g, buckets: [...byKey.values()] };
 }
