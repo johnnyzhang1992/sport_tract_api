@@ -12,6 +12,7 @@ import { requireOperator, operatorIdOf } from '../utils/operator-auth.js';
 import { UserModel } from '../models/user.model.js';
 import { bjToday0 } from '../utils/bj-time.js';
 import { collectDailyStats, bjMonthDay } from '../services/admin-daily-stats.js';
+import { operatorTrend } from '../services/operator-trend.js';
 
 const DAY = 86_400_000;
 
@@ -43,6 +44,12 @@ export async function operatorRoutes(fastify: FastifyInstance) {
       yesterday: { ...yesterday, dateLabel: bjMonthDay(yesterday.date) },
       generatedAt: Date.now(),
     });
+  });
+
+  // 趋势：注册/登录 UV/PV/轨迹，范围×粒度组合约束在 service 校验（400 带实际值）
+  fastify.get('/stats/trend', guard, async (request) => {
+    const q = request.query as { range?: string; granularity?: string };
+    return success(await operatorTrend(q.range ?? 'week', q.granularity));
   });
 
 }

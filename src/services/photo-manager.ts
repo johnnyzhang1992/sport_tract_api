@@ -21,6 +21,7 @@ import { isObjectIdLike } from '../utils/object-id.js';
 import { countPhotos, getPhotoQuota, settlePhotoQuota } from './photo-quota.js';
 import { cleanUrl, deleteOssObjects, getSignedUrl, getThumbUrl } from './oss.js';
 import { bjDateStr } from '../utils/bj-time.js';
+import { ACTIVITY_TYPE_META } from '../config/constants.js';
 
 export type PhotoOwnerKind = 'activity' | 'footprint';
 
@@ -87,10 +88,12 @@ export async function listMyPhotos(userId: string): Promise<MyPhotosResult> {
       urls.push(...markerPhotos(m));
     }
     if (!urls.length) continue;
+    // 分组头带运动类型（原来统一叫「运动轨迹」分不清是哪条）；有备注名再追加
+    const typeLabel = ACTIVITY_TYPE_META[String(a.type) as keyof typeof ACTIVITY_TYPE_META]?.label ?? String(a.type);
     groups.push({
       kind: 'activity',
       id: String(a._id),
-      title: `${String(a.name || '运动轨迹')}`,
+      title: a.name ? `${typeLabel} · ${a.name}` : typeLabel,
       dateText: a.startTime ? bjDateStr(Number(a.startTime)) : '',
       photos: urls.map((u) => ({ url: getSignedUrl(u), thumb: getThumbUrl(u) })),
     });

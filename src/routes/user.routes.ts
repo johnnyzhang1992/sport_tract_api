@@ -67,6 +67,15 @@ export async function userRoutes(fastify: FastifyInstance) {
       patch.profileCompleted = true;
     }
 
+    // 老版本兼容（2026-11-07）：新版前端已下线「默认运动类型」，保存时不再回传 defaultType。
+    // settings 是整体 $set——若放任缺省，新版一保存就会把老客户端存的偏好抹掉（或回落成模型默认）。
+    // 这里显式保留：新客户端没带 defaultType 时沿用库里的旧值，老版本随时回来都能读到自己的偏好。
+    if (body.settings && body.settings.defaultType === undefined) {
+      const cur = await UserModel.findById(request.user.userId).select('settings.defaultType').lean();
+      const stored = (cur?.settings as { defaultType?: string } | undefined)?.defaultType;
+      if (stored) body.settings.defaultType = stored;
+    }
+
     const user = await UserModel.findByIdAndUpdate(
       request.user.userId,
       { $set: patch },
