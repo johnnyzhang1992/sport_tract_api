@@ -155,8 +155,9 @@ function latestSummary(latest: NonNullable<WeeklySportsData['latest']>): string 
 /** 模板字段：character_string4 本周跑步里程 / thing2 累计运动天数 / thing1 最近运动数据 / time3 最近运动时间 */
 export function buildWeeklySportsData(data: WeeklySportsData): Record<string, { value: string }> {
   if (!data.latest) throw new Error('上周没有运动记录，不能生成运动数据提醒');
+  // character_string 类型只允许数字/字母/符号（47003：不能带中文与空格），单位缩写用 km
   return {
-    character_string4: { value: `${(data.runningMeters / 1000).toFixed(2)} 公里` },
+    character_string4: { value: `${(data.runningMeters / 1000).toFixed(2)}km` },
     thing2: { value: truncateChars(`上周 ${data.activeDays} 天`, 20) },
     thing1: { value: truncateChars(latestSummary(data.latest), 20) },
     time3: { value: fmtCnDateTime(data.latest.startTime) },

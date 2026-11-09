@@ -145,7 +145,7 @@ test('WS-1 窗口与口径：只算上周已完成轨迹；跑步里程、活跃
   assert.equal(data.latest?.startTime, at(8, 10, 0));
 
   const tpl = buildWeeklySportsData(data);
-  assert.equal(tpl.character_string4.value, '8.00 公里');
+  assert.equal(tpl.character_string4.value, '8.00km');
   assert.equal(tpl.thing2.value, '上周 3 天');
   assert.equal(tpl.thing1.value, '上周骑行 12.00 公里');
   assert.equal(tpl.time3.value, '2026年11月8日 10:00');
@@ -194,7 +194,7 @@ test('WS-3 有额度有数据：发一条、消耗额度、同周不重发', asy
   assert.equal(sends[0].openid, OPENID);
   assert.equal(sends[0].templateId, 'TPL_WEEKLY');
   assert.equal(sends[0].page, '/pages/stats/stats');
-  assert.equal(sends[0].data.character_string4.value, '5.00 公里');
+  assert.equal(sends[0].data.character_string4.value, '5.00km');
   assert.equal(sends[0].data.thing2.value, '上周 2 天');
   assert.equal(sends[0].data.thing1.value, '上周骑行 12.00 公里');
   assert.equal(sends[0].data.time3.value, '2026年11月8日 10:00');
