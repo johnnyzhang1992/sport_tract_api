@@ -1050,9 +1050,8 @@ export function planOnTheList(
 }
 
 /**
- * 上榜通知正文：**多行分块**（通知详情页 white-space: pre-wrap 会原样渲染换行），
- * 对齐每日报告「结论段 / 空行 / 一行一项」的排版（2026-11-09 文案反馈：
- * 逐榜一行里的「·月榜」后缀每行重复、「最高名次」行冗余——明细已按名次好→差排序，首行即最好成绩）。
+ * 上榜通知正文：**多行紧凑**（2026-11-09 反馈：去掉段间空行，一行一项直接连排），
+ * 逐榜行去掉「·月榜」后缀（周期在「统计周期」行说清），删「最高名次」行（首行即最好成绩）。
  */
 export function onTheListContent(
   period: BoardPeriod,
@@ -1068,16 +1067,13 @@ export function onTheListContent(
   if (sorted.length === 1) {
     return [
       `恭喜！你在「${TYPE_LABEL[sorted[0].type] ?? sorted[0].type}榜」获得第 ${sorted[0].rank} 名`,
-      '',
       `统计周期：${label}`,
       '继续加油，下期继续冲榜！',
     ].join('\n');
   }
   return [
     `恭喜！你在本期榜单上榜 ${sorted.length} 项`,
-    '',
     ...sorted.map((e) => lineOf(e)),
-    '',
     `统计周期：${label}`,
     '继续加油，下期继续冲榜！',
   ].join('\n');

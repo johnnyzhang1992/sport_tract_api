@@ -147,10 +147,10 @@ test('OL-2 onTheListContent：多行分块、逐榜一行、名次好的排前�
   const one = onTheListContent('week', WEEK_KEY, [{ type: 'running', rank: 3 }]);
   const oneLines = one.split('\n');
   assert.equal(oneLines[0], '恭喜！你在「跑步榜」获得第 3 名');
-  assert.equal(oneLines[1], '', '结论与周期之间留空行');
-  assert.match(one, /^统计周期：/m);
+  assert.equal(oneLines[1], '统计周期：2031/03/03 至 2031/03/09');
   assert.equal(one.includes('这一周'), false, '统计周期不带「这一周」后缀');
   assert.match(one, /继续加油/);
+  assert.equal(one.includes('\n\n'), false, '不保留空白行');
 
   const many = onTheListContent('month', MONTH_KEY, [
     { type: 'running', rank: 5 },
@@ -158,9 +158,10 @@ test('OL-2 onTheListContent：多行分块、逐榜一行、名次好的排前�
   ]);
   const lines = many.split('\n');
   assert.equal(lines[0], '恭喜！你在本期榜单上榜 2 项');
-  assert.equal(lines[1], '', '空行分隔');
-  assert.equal(lines[2], '骑行榜：第 2 名', '名次好的排前面');
-  assert.equal(lines[3], '跑步榜：第 5 名');
+  assert.equal(lines[1], '骑行榜：第 2 名', '名次好的排前面');
+  assert.equal(lines[2], '跑步榜：第 5 名');
+  assert.equal(lines[3], '统计周期：2031年3月');
+  assert.equal(many.includes('\n\n'), false, '不保留空白行');
   assert.equal(many.includes('最高名次'), false, '删最高名次行（明细首行即最好成绩）');
   assert.equal(many.includes('。最高'), false, '不再是一段到底的长句');
 });
