@@ -703,6 +703,60 @@ test('分享查看：B 用户读 A 的 finished 轨迹 → 200 + isOwner=false�
   await ActivityModel.deleteOne({ _id: id });
 });
 
+test('分享隐私：非本人/游客读 finished 轨迹 → 不下发备注与打点数据（本人完整可见）', async () => {
+  const created = await req('POST', '/sport-track/api/activities', {
+    token: tokenA,
+    body: { type: 'running', startTime: TEST_NOW - 60000 },
+  });
+  const id = created.json().data.activityId;
+  // 备注走 meta；打点随 finish 终包全量替换写入（含自定义文案与备注）
+  await req('PUT', `/sport-track/api/activities/${id}/meta`, {
+    token: tokenA,
+    body: { note: '私人备注：跟朋友一起的晨跑' },
+  });
+  const finished = await req('PUT', `/sport-track/api/activities/${id}/finish`, {
+    token: tokenA,
+    body: {
+      trackPoints: [
+        { seq: 1, lat: 31.25, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 120000 },
+        { seq: 2, lat: 31.251, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW - 60000 },
+        { seq: 3, lat: 31.252, lng: 121.1, altitude: null, speed: null, timestamp: TEST_NOW },
+      ],
+      endTime: TEST_NOW,
+      pausedMs: 0,
+      markers: [
+        {
+          id: 'm1', lat: 31.251, lng: 121.1, timestamp: TEST_NOW - 60000,
+          type: 'checkpoint', label: '自定义文案', note: '打点备注', photos: [],
+        },
+      ],
+    },
+  });
+  assert.equal(finished.statusCode, 200, finished.body);
+
+  // 本人 → 备注与打点完整
+  const mine = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenA });
+  assert.equal(mine.json().data.isOwner, true);
+  assert.equal(mine.json().data.note, '私人备注：跟朋友一起的晨跑');
+  assert.equal(mine.json().data.markers.length, 1);
+  assert.equal(mine.json().data.markers[0].label, '自定义文案');
+
+  // B → note 置空、markers 清空，轨迹点与公共指标照常
+  const shared = await req('GET', `/sport-track/api/activities/${id}`, { token: tokenB });
+  const data = shared.json().data;
+  assert.equal(data.isOwner, false);
+  assert.equal(data.note, '', '轨迹备注不下发');
+  assert.equal(data.markers.length, 0, '打点数据不下发');
+  assert.equal(data.trackPoints.length, 3, '轨迹点照常可见');
+
+  // 游客同口径
+  const guest = await req('GET', `/sport-track/api/activities/${id}`);
+  assert.equal(guest.json().data.note, '');
+  assert.equal(guest.json().data.markers.length, 0);
+
+  await ActivityModel.deleteOne({ _id: id });
+});
+
 test('分享查看：非本人读取未完成（in_progress）轨迹 → 404', async () => {
   const created = await req('POST', '/sport-track/api/activities', {
     token: tokenA,

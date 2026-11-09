@@ -1014,7 +1014,15 @@ export async function getActivityDetailView(
   if (!isOwner && activity.status !== 'finished') {
     throw new AppError(404, '活动不存在');
   }
-  return { ...toActivityDto(activity), isOwner };
+  const dto = toActivityDto(activity);
+  if (!isOwner) {
+    // 隐私口径（2026-11-09）：轨迹备注与打点数据（文案/备注/打点照片）仅本人可见，
+    // 非本人（含游客）不下发——分享出去的轨迹只展示轨迹本身与公共指标。
+    // 字段保留但置空：老客户端拿到空值自然不渲染对应区块，不会炸。
+    dto.note = '';
+    dto.markers = [];
+  }
+  return { ...dto, isOwner };
 }
 
 /** 重新纠偏：对已完成活动重跑 海拔清洗→轨迹纠偏→平滑→重算指标（决策：事后清洗历史脏数据） */
