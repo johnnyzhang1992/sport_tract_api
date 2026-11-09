@@ -4,6 +4,8 @@ import { ActivityModel } from '../models/activity.model.js';
 import { UserModel } from '../models/user.model.js';
 import { SubscribeGrantModel } from '../models/subscribe-grant.model.js';
 import { SubscribeMessageLogModel } from '../models/subscribe-message-log.model.js';
+import { NotificationModel } from '../models/notification.model.js';
+import { createNotification } from './notification.js';
 import { sendSubscribeMessage, type SubscribeSendResult } from './subscribe-message.js';
 import { ACTIVITY_TYPE_META, type ActivityType } from '../config/constants.js';
 import { AppError } from '../utils/app-error.js';
@@ -168,6 +170,17 @@ export function weeklyDedupeKey(userId: string, weekKey: string): string {
   return `weeklySports:wechat:${userId}:${weekKey}`;
 }
 
+/** 站内通知幂等键（每周一条；与微信 dedupe 互相独立） */
+function weeklyInappDedupeKey(userId: string, weekKey: string): string {
+  return `weeklySports:inapp:${userId}:${weekKey}`;
+}
+
+/** 站内正文：与微信模板同口径（跑步里程只算 running），供消息中心兜底展示 */
+function weeklyInappContent(data: WeeklySportsData): string {
+  const latest = data.latest!;
+  return `上周跑步 ${(data.runningMeters / 1000).toFixed(2)} 公里，运动 ${data.activeDays} 天；最近一次：${latestSummary(latest)}（${fmtCnDateTime(latest.startTime)}）`;
+}
+
 /** 周一 09:00（东八区）起才发；force 仅供后台手动跑 */
 export function isWeeklySendTime(now: number): boolean {
   const d = new Date(now + BJ_OFFSET_MS);
@@ -198,6 +211,8 @@ function miniprogramState(): 'developer' | 'trial' | 'formal' {
 export interface WeeklySportsRunResult {
   sent: number;
   noData: number;
+  /** 站内定向通知（保底通道，与微信结果解耦） */
+  inapp: number;
   skipped: number;
   failed: number;
 }
@@ -221,7 +236,7 @@ export async function runWeeklySportsReminders(
     onlyUserIds?: string[];
   } = {},
 ): Promise<WeeklySportsRunResult> {
-  const result: WeeklySportsRunResult = { sent: 0, noData: 0, skipped: 0, failed: 0 };
+  const result: WeeklySportsRunResult = { sent: 0, noData: 0, inapp: 0, skipped: 0, failed: 0 };
   const settings = await getWeeklySportsSettings(now);
   if (!settings.enabled) return result;
   if (!opts.force && !isWeeklySendTime(now)) return result;
@@ -269,12 +284,28 @@ export async function runWeeklySportsReminders(
       result.noData += 1;
       continue;
     }
+    const summary = summarizeWeeklySports(weekStart, weekEnd, list);
+    const data = buildWeeklySportsData(summary);
+
+    // 站内保底：先于微信、与微信结果解耦（43101/网络失败/无 openid 都已送达）；
+    // 每用户每周一条，createNotification 撞 dedupe 唯一索引时返回既有行
+    const inappKey = weeklyInappDedupeKey(userId, weekKey);
+    if (!(await NotificationModel.exists({ dedupeKey: inappKey }))) {
+      await createNotification({
+        title: '每周运动数据',
+        content: weeklyInappContent(summary),
+        category: 'system',
+        published: true,
+        userId: new Types.ObjectId(userId),
+      }, inappKey);
+      result.inapp += 1;
+    }
+
     const openid = openidOf.get(userId);
     if (!openid) {
       result.skipped += 1;
       continue;
     }
-    const data = buildWeeklySportsData(summarizeWeeklySports(weekStart, weekEnd, list));
     const dedupeKey = weeklyDedupeKey(userId, weekKey);
     try {
       await SubscribeMessageLogModel.create({

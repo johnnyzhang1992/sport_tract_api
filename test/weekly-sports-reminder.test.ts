@@ -14,6 +14,7 @@ import { UserModel } from '../src/models/user.model.js';
 import { AppSettingModel } from '../src/models/app-setting.model.js';
 import { SubscribeGrantModel } from '../src/models/subscribe-grant.model.js';
 import { SubscribeMessageLogModel } from '../src/models/subscribe-message-log.model.js';
+import { NotificationModel } from '../src/models/notification.model.js';
 import { AdminModel, hashPassword } from '../src/models/admin.model.js';
 import { bjIsoWeekLabel, bjIsoWeekStart } from '../src/utils/bj-time.js';
 import {
@@ -100,6 +101,8 @@ beforeEach(async () => {
   await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(uid) });
   await SubscribeGrantModel.deleteMany({ userId: new mongoose.Types.ObjectId(uid) });
   await SubscribeMessageLogModel.deleteMany({ templateKey: WEEKLY_SPORTS_TEMPLATE_KEY });
+  await SubscribeGrantModel.deleteMany({ scene: 'ws10_ghost' });
+  await NotificationModel.deleteMany({ dedupeKey: { $regex: '^weeklySports:inapp:' } });
   await AppSettingModel.deleteMany({ _id: { $in: [WEEKLY_SPORTS_SETTINGS_KEY, REMINDER_SETTINGS_KEY] } });
   resetWeeklySportsSettingsCacheForTest();
   resetReminderSettingsCacheForTest();
@@ -117,6 +120,7 @@ after(async () => {
   await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(uid) });
   await SubscribeGrantModel.deleteMany({ userId: new mongoose.Types.ObjectId(uid) });
   await SubscribeMessageLogModel.deleteMany({ templateKey: WEEKLY_SPORTS_TEMPLATE_KEY });
+  await NotificationModel.deleteMany({ dedupeKey: { $regex: '^weeklySports:inapp:' } });
   await AppSettingModel.deleteMany({ _id: { $in: [WEEKLY_SPORTS_SETTINGS_KEY, REMINDER_SETTINGS_KEY] } });
   await UserModel.deleteMany({ openid: OPENID });
   await AdminModel.deleteMany({ username: ADMIN_USER });
@@ -208,6 +212,17 @@ test('WS-3 有额度有数据：发一条、消耗额度、同周不重发', asy
   }).lean();
   assert.equal(log?.status, 'sent');
 
+  // 站内保底：微信成功也同步写站内定向通知
+  assert.equal(r.inapp, 1);
+  const inapp = await NotificationModel.findOne({
+    dedupeKey: `weeklySports:inapp:${uid}:${bjIsoWeekLabel(WEEK_START)}`,
+  }).lean();
+  assert.ok(inapp, '站内通知已写入');
+  assert.equal(inapp?.title, '每周运动数据');
+  assert.equal(inapp?.category, 'system');
+  assert.ok(String(inapp?.content).includes('上周跑步 5.00 公里'), String(inapp?.content));
+  assert.ok(String(inapp?.content).includes('最近一次'), String(inapp?.content));
+
   // 同周重跑：额度已消耗，不在扫描名单；不重发
   const again = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(again.sent, 0);
@@ -242,6 +257,10 @@ test('WS-4 上周无运动：不发、不消耗额度；没有额度的人不在
   const noGrant = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(noGrant.sent, 0);
   assert.equal(sends.length, 0);
+  assert.equal(
+    await NotificationModel.countDocuments({ dedupeKey: { $regex: '^weeklySports:inapp:' } }), 0,
+    '空数据/无额度都不发站内',
+  );
 });
 
 test('WS-5 43101：额度作废、记失败；同周不重试', async () => {
@@ -263,6 +282,10 @@ test('WS-5 43101：额度作废、记失败；同周不重试', async () => {
   }).lean();
   assert.equal(log?.status, 'failed');
   assert.equal(log?.errcode, 43101);
+  assert.equal(r.inapp, 1, '微信 43101 站内仍写入');
+  assert.ok(await NotificationModel.exists({
+    dedupeKey: `weeklySports:inapp:${uid}:${bjIsoWeekLabel(WEEK_START)}`,
+  }), '站内保底');
 
   const again = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(again.sent, 0);
@@ -280,9 +303,18 @@ test('WS-6 网络失败：删占位，下一轮可重试；额度不消耗', asy
   assert.equal(await hasWeeklySportsGrant(uid), true, '失败不消耗额度');
   assert.equal(await SubscribeMessageLogModel.countDocuments({}), 0, '网络失败删掉 sending 占位');
 
+  assert.equal(first.inapp, 1, '微信网络失败站内仍写入');
+  assert.ok(await NotificationModel.exists({
+    dedupeKey: `weeklySports:inapp:${uid}:${bjIsoWeekLabel(WEEK_START)}`,
+  }), '站内保底');
+
   sendThrows = false;
   const second = await runWeeklySportsReminders(NOW, { onlyUserIds: [uid] });
   assert.equal(second.sent, 1, '下一轮重试成功');
+  assert.equal(second.inapp, 0, '站内同周不重复');
+  assert.equal(
+    await NotificationModel.countDocuments({ dedupeKey: { $regex: '^weeklySports:inapp:' } }), 1,
+  );
 });
 
 test('WS-7 后台设置：默认关闭；保存后读取生效；非法模板 ID 拒绝', async () => {
@@ -355,4 +387,37 @@ test('WS-8 消息订阅列表：两项按开关出现；每周运动数据按本
     () => grantMessageSubscription(uid, WEEKLY_SPORTS_TEMPLATE_KEY, 'message_center'),
     /暂未开放/,
   );
+});
+
+test('WS-10 站内保底：无 openid 也发站内；同周重跑站内不重复', async () => {
+  // 用「有额度+有数据但无用户文档（openid 缺失）」的幽灵 userId 走 skipped 分支：
+  // 不碰共享库 users 表（openid 唯一索引非 sparse，双 null 会撞键）
+  const ghostId = new mongoose.Types.ObjectId();
+  await setWeeklySportsSettings({ enabled: true, templateId: 'TPL_WEEKLY' });
+  await SubscribeGrantModel.create({
+    userId: ghostId, templateKey: WEEKLY_SPORTS_TEMPLATE_KEY,
+    templateId: 'TPL_WEEKLY', scene: 'ws10_ghost', status: 'granted', grantedAt: Date.now(),
+  });
+  await ActivityModel.create({
+    userId: ghostId, type: 'running', status: 'finished',
+    startTime: at(3, 8, 0), endTime: at(3, 8, 30), duration: 1800, distance: 5000,
+  });
+
+  const r = await runWeeklySportsReminders(NOW, { onlyUserIds: [String(ghostId)] });
+  assert.equal(r.inapp, 1, '无 openid 也写站内');
+  assert.equal(r.skipped, 1, '微信跳过');
+  assert.equal(sends.length, 0);
+  assert.ok(await NotificationModel.exists({
+    dedupeKey: `weeklySports:inapp:${ghostId}:${bjIsoWeekLabel(WEEK_START)}`,
+  }));
+
+  const again = await runWeeklySportsReminders(NOW, { onlyUserIds: [String(ghostId)] });
+  assert.equal(again.inapp, 0, '重跑不重复写站内');
+  assert.equal(
+    await NotificationModel.countDocuments({ dedupeKey: { $regex: '^weeklySports:inapp:' } }), 1,
+  );
+
+  // 清理幽灵数据行（openid 缺失分支不会留 WeChat 台账/额度消耗）
+  await SubscribeGrantModel.deleteMany({ userId: ghostId });
+  await ActivityModel.deleteMany({ userId: ghostId });
 });
