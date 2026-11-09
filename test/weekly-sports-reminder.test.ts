@@ -221,6 +221,7 @@ test('WS-3 有额度有数据：发一条、消耗额度、同周不重发', asy
   assert.equal(inapp?.title, '每周运动数据');
   assert.equal(inapp?.category, 'sports', '运动数据类消息用独立分类');
   assert.ok(String(inapp?.content).includes('上周跑步 5.00 公里'), String(inapp?.content));
+  assert.ok(String(inapp?.content).includes('\n'), '正文要多行分段');
   assert.ok(String(inapp?.content).includes('最近一次'), String(inapp?.content));
 
   // 同周重跑：额度已消耗，不在扫描名单；不重发

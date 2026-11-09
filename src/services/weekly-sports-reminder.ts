@@ -175,10 +175,14 @@ function weeklyInappDedupeKey(userId: string, weekKey: string): string {
   return `weeklySports:inapp:${userId}:${weekKey}`;
 }
 
-/** 站内正文：与微信模板同口径（跑步里程只算 running），供消息中心兜底展示 */
+/** 站内正文：与微信模板同口径（跑步里程只算 running），多行分段提升手机端可读性 */
 function weeklyInappContent(data: WeeklySportsData): string {
   const latest = data.latest!;
-  return `上周跑步 ${(data.runningMeters / 1000).toFixed(2)} 公里，运动 ${data.activeDays} 天；最近一次：${latestSummary(latest)}（${fmtCnDateTime(latest.startTime)}）`;
+  return [
+    `上周跑步 ${(data.runningMeters / 1000).toFixed(2)} 公里，运动 ${data.activeDays} 天`,
+    '',
+    `最近一次：${latestSummary(latest)}（${fmtCnDateTime(latest.startTime)}）`,
+  ].join('\n');
 }
 
 /** 周一 09:00（东八区）起才发；force 仅供后台手动跑 */
