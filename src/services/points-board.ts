@@ -1001,7 +1001,10 @@ export async function deliverPendingBoardNotifications(
 export const ON_THE_LIST_TOP_N = 10;
 /** 只对周榜/月榜发上榜通知（年榜不发：产品明确只要周/月） */
 export const ON_THE_LIST_PERIODS: readonly BoardPeriod[] = ['week', 'month'];
-export const ON_THE_LIST_TITLE = '运动榜上榜通知';
+/** 上榜通知标题：带榜单周期类型（用户要求「[运动榜周榜]上榜通知」形态） */
+export function onTheListTitle(period: BoardPeriod): string {
+  return `[运动榜${PERIOD_LABEL[period]}]上榜通知`;
+}
 
 export function boardOnTheListDedupeKey(
   period: BoardPeriod,
@@ -1123,7 +1126,7 @@ export async function notifyOnTheListOfBoards(
         userId,
         category: 'sports',
         published: true,
-        title: ON_THE_LIST_TITLE,
+        title: onTheListTitle(period),
         content: onTheListContent(period, periodKey, entries),
       }, boardOnTheListDedupeKey(period, periodKey, userId));
       notified += 1;

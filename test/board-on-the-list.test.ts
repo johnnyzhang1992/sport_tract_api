@@ -32,7 +32,7 @@ import { config } from '../src/config/index.js';
 import { BJ_OFFSET_MS } from '../src/utils/bj-time.js';
 import { MIN_PLAUSIBLE_PACE_SEC_PER_KM } from '../src/config/constants.js';
 import {
-  ON_THE_LIST_TITLE,
+  onTheListTitle,
   boardOnTheListDedupeKey,
   notifyOnTheListOfBoards,
   onTheListContent,
@@ -179,7 +179,7 @@ test('OL-3 发分开关关闭：前 3 名也收到上榜通知，且不发积分
     dedupeKey: boardOnTheListDedupeKey('week', WEEK_KEY, String(users[0])),
   }).lean();
   assert.ok(top1, '开关关着，第 1 名也要收到上榜通知（他没有到账通知）');
-  assert.equal(top1?.title, ON_THE_LIST_TITLE);
+  assert.equal(top1?.title, onTheListTitle('week'), '标题带榜单周期类型');
   assert.equal(top1?.category, 'sports', '归类运动数据，不再挂榜单奖励');
   assert.equal(top1?.published, true);
 
@@ -230,9 +230,9 @@ test('OL-5 幂等：同一单元重复调用不新增通知', async () => {
   await setBoardRewardsEnabled(false);
   await seedRunBoard(WEEK_START);
   await notifyOnTheListOfBoards('week', WEEK_KEY, WEEK_END, WEEK_END);
-  const first = await NotificationModel.countDocuments({ title: ON_THE_LIST_TITLE });
+  const first = await NotificationModel.countDocuments({ title: onTheListTitle('week') });
   await notifyOnTheListOfBoards('week', WEEK_KEY, WEEK_END, WEEK_END);
-  const second = await NotificationModel.countDocuments({ title: ON_THE_LIST_TITLE });
+  const second = await NotificationModel.countDocuments({ title: onTheListTitle('week') });
   assert.equal(second, first, '重复 pass 不能多发（dedupeKey 唯一）');
 });
 
