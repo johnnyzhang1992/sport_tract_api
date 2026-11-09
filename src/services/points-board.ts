@@ -987,10 +987,10 @@ export async function deliverPendingBoardNotifications(
  *
  * 三条口径：
  * 1. **前 10 名**（与 leaderboard 展示的默认条数一致），并列全含（与发分的并列口径一致）；
- * 2. **与发分开关解耦**：关闸时没人收到到账通知，前 3 名也要发；开闸时前 3 名/被撤回者
- *    已有到账（撤回）通知，上榜通知把他们排除——同一件事不发两条；
- *    判定依据是**台账里真有 credited/revoked 行**（真的发过通知），不是只看开关：某个榜没过
- *    参与人数门槛时没人拿到奖励，那个榜的前 3 名照常收上榜通知；
+ * 2. **与发分开关解耦**（2026-11-09 二次确认，曾短暂改为跟随开关后撤销）：关闸时没人收到
+ *    到账通知，前 3 名也要发；开闸时前 3 名/被撤回者已有到账（撤回）通知，上榜通知把他们
+ *    排除——同一件事不发两条；判定依据是**台账里真有 credited/revoked 行**（真的发过通知），
+ *    不是只看开关：某个榜没过参与人数门槛时没人拿到奖励，那个榜的前 3 名照常收上榜通知；
  * 3. **每人每周期一条汇总**（一个人可能同时在多个榜上榜，不能按榜轰炸），年榜不发。
  *
  * 幂等：Notification.dedupeKey 的唯一索引（一个周期单元 + 一个人 = 一条），
@@ -1001,7 +1001,7 @@ export async function deliverPendingBoardNotifications(
 export const ON_THE_LIST_TOP_N = 10;
 /** 只对周榜/月榜发上榜通知（年榜不发：产品明确只要周/月） */
 export const ON_THE_LIST_PERIODS: readonly BoardPeriod[] = ['week', 'month'];
-export const ON_THE_LIST_TITLE = '榜单上榜通知';
+export const ON_THE_LIST_TITLE = '运动榜上榜通知';
 
 export function boardOnTheListDedupeKey(
   period: BoardPeriod,
@@ -1047,35 +1047,35 @@ export function planOnTheList(
 }
 
 /**
- * 上榜通知正文：**多行分块**（通知详情页 white-space: pre-wrap 会原样渲染换行）。
- * 一段到底的句子在手机上读起来很挤（2026-11-05 反馈），所以拆成
- * 「一句结论 / 空行 / 逐榜一行 / 空行 / 周期 / 加油」四段，一眼能扫完。
+ * 上榜通知正文：**多行分块**（通知详情页 white-space: pre-wrap 会原样渲染换行），
+ * 对齐每日报告「结论段 / 空行 / 一行一项」的排版（2026-11-09 文案反馈：
+ * 逐榜一行里的「·月榜」后缀每行重复、「最高名次」行冗余——明细已按名次好→差排序，首行即最好成绩）。
  */
 export function onTheListContent(
   period: BoardPeriod,
   periodKey: string,
   entries: OnTheListEntry[],
 ): string {
-  const label = boardLabel(period, periodKey);
-  const periodLabel = PERIOD_LABEL[period];
-  const lineOf = (e: OnTheListEntry) => `${TYPE_LABEL[e.type] ?? e.type}·${periodLabel} 第 ${e.rank} 名`;
+  // 「这一周」后缀只服务于结算到账文案的口语化（SP-6 两套形态不许互相统一）：
+  // 上榜通知的「统计周期」行只要日期区间，局部去掉，不动 boardLabel 本体
+  const label = boardLabel(period, periodKey).replace(/ 这一周$/, '');
+  const lineOf = (e: OnTheListEntry) => `${TYPE_LABEL[e.type] ?? e.type}榜：第 ${e.rank} 名`;
   // 名次好的排前面：用户最关心的是自己最好那一项
   const sorted = [...entries].sort((a, b) => a.rank - b.rank);
   if (sorted.length === 1) {
     return [
-      `你在「${lineOf(sorted[0])}」上榜`,
+      `恭喜！你在「${TYPE_LABEL[sorted[0].type] ?? sorted[0].type}榜」获得第 ${sorted[0].rank} 名`,
       '',
       `统计周期：${label}`,
       '继续加油，下期继续冲榜！',
     ].join('\n');
   }
   return [
-    `你在 ${sorted.length} 个${periodLabel}上榜`,
+    `恭喜！你在本期榜单上榜 ${sorted.length} 项`,
     '',
-    ...sorted.map((e) => `· ${lineOf(e)}`),
+    ...sorted.map((e) => lineOf(e)),
     '',
     `统计周期：${label}`,
-    `最高名次：${lineOf(sorted[0])}`,
     '继续加油，下期继续冲榜！',
   ].join('\n');
 }
@@ -1092,6 +1092,7 @@ export async function notifyOnTheListOfBoards(
   now = Date.now(),
   deps: SettleDeps = {},
 ): Promise<{ notified: number }> {
+  // 口径 2：与发分开关解耦——关闸也发上榜通知（发分才看开关，见 settlePeriod）
   if (!ON_THE_LIST_PERIODS.includes(period)) return { notified: 0 };
   const boundaryMs = settleBoundaryMs(period, periodKey);
   if (now < boundaryMs) return { notified: 0 }; // 周期还没结束
@@ -1120,7 +1121,7 @@ export async function notifyOnTheListOfBoards(
     try {
       await notify({
         userId,
-        category: 'reward',
+        category: 'sports',
         published: true,
         title: ON_THE_LIST_TITLE,
         content: onTheListContent(period, periodKey, entries),
