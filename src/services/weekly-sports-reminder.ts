@@ -149,9 +149,9 @@ function summarizeWeeklySports(weekStart: number, weekEnd: number, rows: Activit
 
 function latestSummary(latest: NonNullable<WeeklySportsData['latest']>): string {
   const label = ACTIVITY_TYPE_META[latest.type]?.label ?? '运动';
-  if (latest.distance > 0) return `上周${label} ${(latest.distance / 1000).toFixed(2)} 公里`;
-  if (latest.duration > 0) return `上周${label} ${Math.max(1, Math.round(latest.duration / 60))} 分钟`;
-  return `上周${label}`;
+  if (latest.distance > 0) return `${label} ${(latest.distance / 1000).toFixed(2)} 公里`;
+  if (latest.duration > 0) return `${label} ${Math.max(1, Math.round(latest.duration / 60))} 分钟`;
+  return `${label}`;
 }
 
 /** 模板字段：character_string4 本周跑步里程 / thing2 累计运动天数 / thing1 最近运动数据 / time3 最近运动时间 */
@@ -160,7 +160,7 @@ export function buildWeeklySportsData(data: WeeklySportsData): Record<string, { 
   // character_string 类型只允许数字/字母/符号（47003：不能带中文与空格），单位缩写用 km
   return {
     character_string4: { value: `${(data.runningMeters / 1000).toFixed(2)}km` },
-    thing2: { value: truncateChars(`上周 ${data.activeDays} 天`, 20) },
+    thing2: { value: truncateChars(`${data.activeDays} 天`, 20) },
     thing1: { value: truncateChars(latestSummary(data.latest), 20) },
     time3: { value: fmtCnDateTime(data.latest.startTime) },
   };
@@ -175,12 +175,12 @@ function weeklyInappDedupeKey(userId: string, weekKey: string): string {
   return `weeklySports:inapp:${userId}:${weekKey}`;
 }
 
-/** 站内正文：与微信模板同口径（跑步里程只算 running），多行分段提升手机端可读性 */
+/** 站内正文：对齐每日报告「一行一项：标签：值」格式（模板字段口径：里程只算 running） */
 function weeklyInappContent(data: WeeklySportsData): string {
   const latest = data.latest!;
   return [
-    `上周跑步 ${(data.runningMeters / 1000).toFixed(2)} 公里，运动 ${data.activeDays} 天`,
-    '',
+    `跑步里程：${(data.runningMeters / 1000).toFixed(2)} 公里`,
+    `运动天数：${data.activeDays} 天`,
     `最近一次：${latestSummary(latest)}（${fmtCnDateTime(latest.startTime)}）`,
   ].join('\n');
 }
