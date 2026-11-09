@@ -5,19 +5,20 @@ import { UserModel } from '../models/user.model.js';
 import { AppError } from '../utils/app-error.js';
 import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
 
-export const NOTIFICATION_CATEGORIES = ['system', 'member', 'reward'] as const;
+export const NOTIFICATION_CATEGORIES = ['system', 'member', 'reward', 'sports'] as const;
 export type NotificationCategory = (typeof NOTIFICATION_CATEGORIES)[number];
 
 const CATEGORY_LABELS: Record<NotificationCategory, string> = {
   system: '系统通知',
   member: '会员服务',
   reward: '榜单奖励',
+  sports: '运动数据',
 };
-const CATEGORY_ORDER: NotificationCategory[] = ['system', 'member', 'reward'];
+const CATEGORY_ORDER: NotificationCategory[] = ['system', 'member', 'reward', 'sports'];
 
 /** 历史行（字段缺失/null）一律归入系统通知，不能让分类筛选把它漏掉 */
 export function notificationCategoryOf(raw: unknown): NotificationCategory {
-  return raw === 'member' || raw === 'reward' ? raw : 'system';
+  return raw === 'member' || raw === 'reward' || raw === 'sports' ? raw : 'system';
 }
 
 export function notificationCategoryLabel(raw: unknown): string {

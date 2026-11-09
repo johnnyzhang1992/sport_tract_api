@@ -31,7 +31,7 @@
 3. **写站内通知**（先于微信，站内是保底通道）：
    - `dedupeKey = weeklySports:inapp:{userId}:{weekKey}`（对齐 `memberExpiry:inapp:` 命名风格；唯一 partial 索引幂等）；
    - 写入前 `NotificationModel.exists({ dedupeKey })` 预检，存在即跳过（与 member/daily 同款防重写法，避免撞唯一索引抛错）；
-   - `createNotification({ title: '每周运动数据', content, category: 'system', published: true, userId }, dedupeKey)`；
+   - `createNotification({ title: '每周运动数据', content, category: 'sports', published: true, userId }, dedupeKey)`（2026-11-09 追加：运动数据类消息新增独立分类 `sports`/「运动数据」，不再挂 system；webadmin 发布表单同步增加选项）；
    - 正文：`上周跑步 5.20 公里，运动 3 天；最近一次：上周骑行 12.00 公里（11-06 08:30）`（复用 summarize/latestSummary/fmtCnDateTime 口径）；
    - 成功写入计入新计数 `inapp`；
 4. 无 `openid` → `skipped`（站内已送达，仅微信跳过）；

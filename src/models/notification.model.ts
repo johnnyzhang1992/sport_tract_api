@@ -8,10 +8,10 @@ const notificationSchema = new Schema(
     title: { type: String, required: true },
     content: { type: String, required: true },
     /**
-     * 消息中心分类：system=系统通知、member=会员服务、reward=榜单奖励。
+     * 消息中心分类：system=系统通知、member=会员服务、reward=榜单奖励、sports=运动数据。
      * 2026-11-04 之前的历史行没有这个字段，读路径一律按 system 处理（见 notification service）。
      */
-    category: { type: String, enum: ['system', 'member', 'reward'], default: 'system' },
+    category: { type: String, enum: ['system', 'member', 'reward', 'sports'], default: 'system' },
     published: { type: Boolean, default: false },
     publishedAt: { type: Number, default: null },
     /** 定向收件人（方案 A/D14：榜单结算等系统流水只发给赢家）；null/缺省＝全站广播 */

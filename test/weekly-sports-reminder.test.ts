@@ -219,7 +219,7 @@ test('WS-3 有额度有数据：发一条、消耗额度、同周不重发', asy
   }).lean();
   assert.ok(inapp, '站内通知已写入');
   assert.equal(inapp?.title, '每周运动数据');
-  assert.equal(inapp?.category, 'system');
+  assert.equal(inapp?.category, 'sports', '运动数据类消息用独立分类');
   assert.ok(String(inapp?.content).includes('上周跑步 5.00 公里'), String(inapp?.content));
   assert.ok(String(inapp?.content).includes('最近一次'), String(inapp?.content));
 

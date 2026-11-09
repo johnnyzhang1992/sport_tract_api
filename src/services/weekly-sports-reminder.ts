@@ -294,7 +294,7 @@ export async function runWeeklySportsReminders(
       await createNotification({
         title: '每周运动数据',
         content: weeklyInappContent(summary),
-        category: 'system',
+        category: 'sports',
         published: true,
         userId: new Types.ObjectId(userId),
       }, inappKey);
