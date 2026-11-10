@@ -127,3 +127,20 @@ test('EPS3 路由：GET /plan/summary 需登录；登录后返回概况与奖杯
   }
   assert.ok(Array.isArray(d.milestones) && d.milestones.length > 0);
 });
+
+test('EPS4 更高倍数档位：400%/500% 也有奖杯，且高倍数同时计入低档', async () => {
+  await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await makeSnap(-3, 4, true);  // 400%
+  await makeSnap(-2, 5, true);  // 500%
+  await makeSnap(-1, 5.5, true); // 550%（超过 5x，仍计入 5x 档）
+  const s = await getPlanSummary(userId);
+  const byKey = Object.fromEntries(s.milestones.map((m) => [m.key, m]));
+  assert.ok('x4' in byKey && 'x5' in byKey, '400%/500% 档位存在');
+  assert.equal(byKey.x4.cur, 3, '≥400% 的周期数');
+  assert.equal(byKey.x5.cur, 2, '≥500% 的周期数（550% 也计入）');
+  assert.equal(byKey.x2.cur, 3, '高倍数同时计入低档');
+  assert.equal(byKey.x4.need, 5);
+  assert.equal(byKey.x5.need, 3);
+  assert.equal(byKey.first.unlocked, true);
+  assert.equal(byKey.x4.unlocked, false, '3/5 还没解锁');
+});

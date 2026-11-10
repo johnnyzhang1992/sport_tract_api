@@ -651,7 +651,12 @@ export const PLAN_MILESTONES: readonly PlanMilestoneDef[] = [
   { key: 'x2', label: '双倍火力', desc: '200% 达成 10 次', ratio: 2, times: 10 },
   { key: 'x2pro', label: '双倍宗师', desc: '200% 达成 20 次', ratio: 2, times: 20 },
   { key: 'x3', label: '三倍王者', desc: '300% 达成 10 次', ratio: 3, times: 10 },
+  { key: 'x4', label: '四倍狂人', desc: '400% 达成 5 次', ratio: 4, times: 5 },
+  { key: 'x5', label: '五倍传奇', desc: '500% 达成 3 次', ratio: 5, times: 3 },
 ];
+
+/** 里程碑支持的倍数档位（ratio → 该档周期计数）；新加档位时同步这里 */
+const RATIO_TIERS = [1, 2, 3, 4, 5] as const;
 
 export interface PlanSummaryResult {
   /** 已结算周期总数（日+周） */
@@ -696,8 +701,8 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
 
   let achieved = 0;
   const totals = { distanceM: 0, durationSec: 0, count: 0 };
-  // 按倍数分档计数（1x/2x/3x）
-  const ratioCount = { 1: 0, 2: 0, 3: 0 };
+  // 按倍数分档计数（1x…5x）
+  const ratioCount: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
   for (const r of rows) {
     const targets: PlanTargets = {
       distanceM: r.targets?.distanceM || 0,
@@ -714,9 +719,9 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     totals.durationSec += progress.durationSec;
     totals.count += progress.count;
     const ratio = minRatioOf(progress, targets);
-    if (ratio >= 1) ratioCount[1] += 1;
-    if (ratio >= 2) ratioCount[2] += 1;
-    if (ratio >= 3) ratioCount[3] += 1;
+    for (const tier of RATIO_TIERS) {
+      if (ratio >= tier) ratioCount[tier] += 1;
+    }
   }
 
   // 连续达成：只看当前计划周期类型（日/周），按窗口正序扫一遍
@@ -737,8 +742,8 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   for (let i = seq.length - 1; i >= 0 && seq[i].allAchieved; i -= 1) current += 1;
 
   const milestones = PLAN_MILESTONES.map((def) => {
-    const key = def.ratio >= 3 ? 3 : def.ratio >= 2 ? 2 : 1;
-    const cur = (ratioCount as Record<number, number>)[key] || 0;
+    const tier = RATIO_TIERS.filter((t) => t <= def.ratio).pop() ?? 1;
+    const cur = ratioCount[tier] || 0;
     return {
       key: def.key,
       label: def.label,
