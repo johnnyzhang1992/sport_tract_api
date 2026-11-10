@@ -103,9 +103,9 @@ test('EPS2 里程碑：按最弱一项的完成倍数计数（1x/2x/3x）', asyn
 
   const s = await getPlanSummary(userId);
   const byKey = Object.fromEntries(s.milestones.map((m) => [m.key, m]));
-  assert.equal(byKey.first.cur, 3, '1x 达成 3 次');
-  assert.equal(byKey.x2.cur, 3, '200% 达成 3 次（300% 也计入 2x 档）');
-  assert.equal(byKey.x3.cur, 1, '300% 只有 1 次');
+  assert.equal(byKey.first.cur, 3, '1x 档＝达成次数（3 次都达成）');
+  assert.equal(byKey.x2.cur, 2, '200% 档只算落在 [200%,300%) 的 2 期');
+  assert.equal(byKey.x3.cur, 1, '300% 档只算落在 [300%,400%) 的 1 期');
   assert.equal(byKey.first.unlocked, true, '首次达成已解锁');
   assert.equal(byKey.week.unlocked, false, '7 次还没到');
   assert.equal(byKey.x2.need, 10);
@@ -128,19 +128,34 @@ test('EPS3 路由：GET /plan/summary 需登录；登录后返回概况与奖杯
   assert.ok(Array.isArray(d.milestones) && d.milestones.length > 0);
 });
 
-test('EPS4 更高倍数档位：400%/500% 也有奖杯，且高倍数同时计入低档', async () => {
+test('EPS4 更高倍数档位：400%/500% 也有奖杯', async () => {
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
-  await makeSnap(-3, 4, true);  // 400%
-  await makeSnap(-2, 5, true);  // 500%
-  await makeSnap(-1, 5.5, true); // 550%（超过 5x，仍计入 5x 档）
+  await makeSnap(-3, 4, true);   // 400% → 4x
+  await makeSnap(-2, 5, true);   // 500% → 5x
+  await makeSnap(-1, 5.5, true); // 550% → 5x（超过 5x 仍归 5x）
   const s = await getPlanSummary(userId);
   const byKey = Object.fromEntries(s.milestones.map((m) => [m.key, m]));
   assert.ok('x4' in byKey && 'x5' in byKey, '400%/500% 档位存在');
-  assert.equal(byKey.x4.cur, 3, '≥400% 的周期数');
-  assert.equal(byKey.x5.cur, 2, '≥500% 的周期数（550% 也计入）');
-  assert.equal(byKey.x2.cur, 3, '高倍数同时计入低档');
+  assert.equal(byKey.x4.cur, 1, '只有 400% 那期落 4x 档');
+  assert.equal(byKey.x5.cur, 2, '500% 与 550% 都落 5x 档');
   assert.equal(byKey.x4.need, 5);
   assert.equal(byKey.x5.need, 3);
-  assert.equal(byKey.first.unlocked, true);
-  assert.equal(byKey.x4.unlocked, false, '3/5 还没解锁');
+  assert.equal(byKey.first.unlocked, true, '1x 档按达成次数算');
+  assert.equal(byKey.x4.unlocked, false, '1/5 还没解锁');
+});
+
+test('EPS5 分档不重复计数：500% 的一期只进 5x，不进 1x~4x 档', async () => {
+  await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await makeSnap(-4, 5, true);   // 落 5x
+  await makeSnap(-3, 3.5, true); // 落 3x
+  await makeSnap(-2, 2.4, true); // 落 2x
+  await makeSnap(-1, 1.2, true); // 落 1x
+  const s = await getPlanSummary(userId);
+  const byKey = Object.fromEntries(s.milestones.map((m) => [m.key, m]));
+
+  assert.equal(byKey.x5.cur, 1, '500% 只进 5x');
+  assert.equal(byKey.x4.cur, 0, '没有落在 4x 档的周期');
+  assert.equal(byKey.x3.cur, 1, '350% 落 3x');
+  assert.equal(byKey.x2.cur, 1, '240% 落 2x');
+  assert.equal(byKey.first.cur, 4, '1x 档＝达成总次数（4 期都达成）');
 });

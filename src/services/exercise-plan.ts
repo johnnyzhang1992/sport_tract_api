@@ -658,6 +658,18 @@ export const PLAN_MILESTONES: readonly PlanMilestoneDef[] = [
 /** 里程碑支持的倍数档位（ratio → 该档周期计数）；新加档位时同步这里 */
 const RATIO_TIERS = [1, 2, 3, 4, 5] as const;
 
+/**
+ * 一个周期落在哪一档：只按它达到的最高档归位，**不向低档重复计数**
+ * （500% 的一期只算 5x，不算 1x/2x/3x/4x）。未达成（<100%）返回 0。
+ */
+function tierOf(ratio: number): number {
+  let tier = 0;
+  for (const t of RATIO_TIERS) {
+    if (ratio >= t) tier = t;
+  }
+  return tier;
+}
+
 export interface PlanSummaryResult {
   /** 已结算周期总数（日+周） */
   totalPeriods: number;
@@ -701,7 +713,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
 
   let achieved = 0;
   const totals = { distanceM: 0, durationSec: 0, count: 0 };
-  // 按倍数分档计数（1x…5x）
+  // 按倍数分档计数（1x…5x）：每期只进它所在的那一档，不向低档重复计数
   const ratioCount: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
   for (const r of rows) {
     const targets: PlanTargets = {
@@ -718,10 +730,8 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     totals.distanceM += progress.distanceM;
     totals.durationSec += progress.durationSec;
     totals.count += progress.count;
-    const ratio = minRatioOf(progress, targets);
-    for (const tier of RATIO_TIERS) {
-      if (ratio >= tier) ratioCount[tier] += 1;
-    }
+    const tier = tierOf(minRatioOf(progress, targets));
+    if (tier > 0) ratioCount[tier] += 1;
   }
 
   // 连续达成：只看当前计划周期类型（日/周），按窗口正序扫一遍
@@ -742,8 +752,9 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   for (let i = seq.length - 1; i >= 0 && seq[i].allAchieved; i -= 1) current += 1;
 
   const milestones = PLAN_MILESTONES.map((def) => {
+    // 1x 档就是「达成」本身（≥100% 都算）；2x 及以上只统计落在该档的周期
     const tier = RATIO_TIERS.filter((t) => t <= def.ratio).pop() ?? 1;
-    const cur = ratioCount[tier] || 0;
+    const cur = tier === 1 ? achieved : (ratioCount[tier] || 0);
     return {
       key: def.key,
       label: def.label,
