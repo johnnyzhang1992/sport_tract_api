@@ -679,6 +679,8 @@ export interface PlanSummaryResult {
   rate: number;
   /** 连续达成：按当前计划周期类型统计 */
   streak: { current: number; best: number };
+  /** 连续超额：从最近一期往前数连续 ≥200% 的期数（按当前计划周期类型；计划可能偏轻的信号） */
+  overStreak: number;
   /** 已结算周期累计（跨周期求和） */
   totals: { distanceM: number; durationSec: number; count: number };
   milestones: Array<{
@@ -751,6 +753,24 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   let current = 0;
   for (let i = seq.length - 1; i >= 0 && seq[i].allAchieved; i -= 1) current += 1;
 
+  // 连续超额：从最后一次往前数连续 minRatio ≥ OVER_RATIO 的期数（加量建议的触发信号）
+  const OVER_RATIO = 2;
+  const ratioOfRow = (r: (typeof seq)[number]) =>
+    minRatioOf(
+      {
+        distanceM: r.progress?.distanceM || 0,
+        durationSec: r.progress?.durationSec || 0,
+        count: r.progress?.count || 0,
+      },
+      {
+        distanceM: r.targets?.distanceM || 0,
+        durationMin: r.targets?.durationMin || 0,
+        count: r.targets?.count || 0,
+      },
+    );
+  let overStreak = 0;
+  for (let i = seq.length - 1; i >= 0 && ratioOfRow(seq[i]) >= OVER_RATIO; i -= 1) overStreak += 1;
+
   const milestones = PLAN_MILESTONES.map((def) => {
     // 1x 档就是「达成」本身（≥100% 都算）；2x 及以上只统计落在该档的周期
     const tier = RATIO_TIERS.filter((t) => t <= def.ratio).pop() ?? 1;
@@ -771,6 +791,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     achievedPeriods: achieved,
     rate: totalPeriods > 0 ? achieved / totalPeriods : 0,
     streak: { current, best },
+    overStreak,
     totals,
     milestones,
   };
