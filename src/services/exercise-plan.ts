@@ -385,3 +385,245 @@ export function startPlanSnapshotJob(intervalMs = 60 * 60 * 1000): NodeJS.Timeou
   first.unref?.();
   return timer;
 }
+
+/* ==========================================================================
+ * 月历与单日详情（2026-11-10，参照 Apple 健身的月历三环 + 单日大环）
+ * - 有周期快照的日期/周 → 直接用快照（历史目标，改计划不追溯）
+ * - 尚未结算的当期（今天/本周）→ 实时聚合（当前目标）
+ * ========================================================================== */
+
+export interface PlanCalendarDay {
+  /** 东八区 YYYY-MM-DD */
+  date: string;
+  /** 当天窗口起点（epoch ms） */
+  windowStart: number;
+  /** 三项完成度环（无数据时 pct 全 0） */
+  rings: PlanRing[];
+  allAchieved: boolean;
+  /** snapshot=历史快照；live=当期实时聚合；none=该日无计划记录 */
+  source: 'snapshot' | 'live' | 'none';
+}
+
+export interface PlanCalendarWeek extends PlanPeriodSnapshot {
+  /** snapshot=已结算；live=本周实时 */
+  source: 'snapshot' | 'live';
+}
+
+export interface PlanCalendarResult {
+  /** YYYY-MM */
+  month: string;
+  days: PlanCalendarDay[];
+  /** 与本月有交集的周计划记录（周计划用户用；单独列在月历下方） */
+  weeks: PlanCalendarWeek[];
+}
+
+/** 'YYYY-MM' → 该月东八区窗口 [start, end) */
+function monthRange(month: string): { start: number; end: number } {
+  const m = /^(\d{4})-(\d{2})$/.exec(month);
+  if (!m) throw new AppError(400, '月份格式应为 YYYY-MM');
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  if (mo < 1 || mo > 12) throw new AppError(400, '月份不合法');
+  return { start: Date.UTC(y, mo - 1, 1) - 8 * 3600_000, end: Date.UTC(y, mo, 1) - 8 * 3600_000 };
+}
+
+/** 某天窗口内按轨迹聚合（单日/单周通用） */
+async function sumByDay(userId: string, from: number, to: number) {
+  const rows = await ActivityModel.aggregate<{ _id: number; distance: number; duration: number; count: number }>([
+    { $match: { userId: new Types.ObjectId(userId), status: 'finished', startTime: { $gte: from, $lt: to } } },
+    {
+      $group: {
+        // 按东八区自然日分桶：startTime + 8h 后取整日
+        _id: { $floor: { $divide: [{ $add: ['$startTime', 8 * 3600_000] }, 86_400_000] } },
+        distance: { $sum: '$distance' },
+        duration: { $sum: '$duration' },
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+  const byDay = new Map<number, { distanceM: number; durationSec: number; count: number }>();
+  for (const r of rows) {
+    byDay.set(Number(r._id), {
+      distanceM: r.distance || 0,
+      durationSec: r.duration || 0,
+      count: r.count || 0,
+    });
+  }
+  return byDay;
+}
+
+/**
+ * 月历：每天一项完成度 + 本月涉及的周计划记录。
+ * 有快照用快照；当期（今天）实时聚合；再往前没有快照的日期按「当前目标」实时聚合（功能上线前的历史）。
+ */
+export async function listPlanCalendar(
+  userId: string,
+  month: string,
+  now = Date.now(),
+): Promise<PlanCalendarResult> {
+  if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
+  const { start, end } = monthRange(month);
+  const uid = new Types.ObjectId(userId);
+  const plan = await getPlan(userId);
+  const targets: PlanTargets = plan?.targets || { distanceM: 0, durationMin: 0, count: 0 };
+
+  // 1) 本月内的日快照
+  const daySnaps = await ExercisePlanPeriodModel.find({
+    userId: uid, period: 'daily', windowStart: { $gte: start, $lt: end },
+  }).lean();
+  const snapByDate = new Map(daySnaps.map((s) => [String(s.periodKey), s]));
+
+  // 2) 本月涉及的周快照（窗口与本月有交集：从月初前 7 天开始找）
+  const weekSnaps = await ExercisePlanPeriodModel.find({
+    userId: uid, period: 'weekly', windowStart: { $gte: start - 7 * 86_400_000, $lt: end },
+  }).sort({ windowStart: -1 }).lean();
+
+  // 3) 实时聚合本月全部轨迹（按月一次查完，避免逐天 N 次）
+  const liveByDayIdx = await sumByDay(userId, start, end);
+
+  const days: PlanCalendarDay[] = [];
+  const todayStart = windowStart('daily', now);
+  for (let ws = start; ws < end; ws += 86_400_000) {
+    const date = bjDateStr(ws);
+    const snap = snapByDate.get(date);
+    if (snap) {
+      days.push({
+        date,
+        windowStart: ws,
+        rings: buildSnapshot('daily', ws, ws + 86_400_000, {
+          distanceM: snap.targets?.distanceM || 0,
+          durationMin: snap.targets?.durationMin || 0,
+          count: snap.targets?.count || 0,
+        }, {
+          distanceM: snap.progress?.distanceM || 0,
+          durationSec: snap.progress?.durationSec || 0,
+          count: snap.progress?.count || 0,
+        }).rings,
+        allAchieved: !!snap.allAchieved,
+        source: 'snapshot',
+      });
+      continue;
+    }
+    // 当期（今天）与上线前无快照的日期：实时聚合，目标用当前计划
+    const idx = Math.floor((ws + 8 * 3600_000) / 86_400_000);
+    const agg = liveByDayIdx.get(idx) || { distanceM: 0, durationSec: 0, count: 0 };
+    const hasData = agg.distanceM > 0 || agg.durationSec > 0 || agg.count > 0;
+    const snapBuilt = buildSnapshot('daily', ws, ws + 86_400_000, targets, agg);
+    const future = ws > todayStart;
+    days.push({
+      date,
+      windowStart: ws,
+      rings: snapBuilt.rings,
+      allAchieved: !future && hasData && snapBuilt.allAchieved,
+      source: (future || !hasData) ? 'none' : 'live',
+    });
+  }
+
+  // 4) 周记录：快照 + 本周实时（若本月包含本周）
+  const weeks: PlanCalendarWeek[] = weekSnaps.map((s) => ({
+    ...buildSnapshot('weekly', Number(s.windowStart), Number(s.windowEnd), {
+      distanceM: s.targets?.distanceM || 0,
+      durationMin: s.targets?.durationMin || 0,
+      count: s.targets?.count || 0,
+    }, {
+      distanceM: s.progress?.distanceM || 0,
+      durationSec: s.progress?.durationSec || 0,
+      count: s.progress?.count || 0,
+    }),
+    source: 'snapshot' as const,
+  }));
+  const thisWeekStart = windowStart('weekly', now);
+  const inThisMonth = thisWeekStart >= start && thisWeekStart < end;
+  // 只有当前计划就是「每周」时，才把本周实时进度作为一条周记录（否则周目标＝日目标，会显示成 6.2/3.0）
+  if (plan?.period === 'weekly' && inThisMonth && !weeks.some((w) => w.windowStart === thisWeekStart)) {
+    const agg = await sumActivities(userId, thisWeekStart, thisWeekStart + 7 * 86_400_000);
+    weeks.unshift({
+      ...buildSnapshot('weekly', thisWeekStart, thisWeekStart + 7 * 86_400_000, targets, agg),
+      source: 'live',
+    });
+  }
+  weeks.sort((a, b) => b.windowStart - a.windowStart);
+
+  return { month, days, weeks };
+}
+
+export interface PlanDayDetail {
+  date: string;
+  windowStart: number;
+  rings: PlanRing[];
+  allAchieved: boolean;
+  source: 'snapshot' | 'live' | 'none';
+  /** 当天轨迹摘要（按开始时间正序，最多 20 条） */
+  tracks: Array<{
+    id: string;
+    type: string;
+    distanceM: number;
+    durationSec: number;
+    startTime: number;
+  }>;
+}
+
+/** 单日详情：三环 + 当天轨迹摘要（Apple 单日页的简化版，不带分时图表） */
+export async function getPlanDayDetail(
+  userId: string,
+  date: string,
+  now = Date.now(),
+): Promise<PlanDayDetail> {
+  if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new AppError(400, '日期格式应为 YYYY-MM-DD');
+  const ws = Date.parse(`${date}T00:00:00+08:00`);
+  if (Number.isNaN(ws) || bjDateStr(ws) !== date) throw new AppError(400, '日期不合法');
+  const we = ws + 86_400_000;
+  const uid = new Types.ObjectId(userId);
+
+  const plan = await getPlan(userId);
+  const targets: PlanTargets = plan?.targets || { distanceM: 0, durationMin: 0, count: 0 };
+
+  const snap = await ExercisePlanPeriodModel.findOne({ userId: uid, period: 'daily', periodKey: date }).lean();
+  const rows = await ActivityModel.find({ userId: uid, status: 'finished', startTime: { $gte: ws, $lt: we } })
+    .select({ type: 1, distance: 1, duration: 1, startTime: 1 })
+    .sort({ startTime: 1 })
+    .limit(20)
+    .lean();
+  const agg = rows.reduce((acc, r) => ({
+    distanceM: acc.distanceM + (Number(r.distance) || 0),
+    durationSec: acc.durationSec + (Number(r.duration) || 0),
+    count: acc.count + 1,
+  }), { distanceM: 0, durationSec: 0, count: 0 });
+
+  const useSnap = !!snap;
+  const built = buildSnapshot(
+    'daily',
+    ws,
+    we,
+    useSnap
+      ? {
+        distanceM: snap!.targets?.distanceM || 0,
+        durationMin: snap!.targets?.durationMin || 0,
+        count: snap!.targets?.count || 0,
+      }
+      : targets,
+    useSnap
+      ? {
+        distanceM: snap!.progress?.distanceM || 0,
+        durationSec: snap!.progress?.durationSec || 0,
+        count: snap!.progress?.count || 0,
+      }
+      : agg,
+  );
+  const hasData = agg.count > 0;
+  return {
+    date,
+    windowStart: ws,
+    rings: built.rings,
+    allAchieved: useSnap ? !!snap!.allAchieved : (hasData && built.allAchieved),
+    source: useSnap ? 'snapshot' : (hasData ? 'live' : 'none'),
+    tracks: rows.map((r) => ({
+      id: String(r._id),
+      type: String(r.type || ''),
+      distanceM: Number(r.distance) || 0,
+      durationSec: Number(r.duration) || 0,
+      startTime: Number(r.startTime) || 0,
+    })),
+  };
+}
