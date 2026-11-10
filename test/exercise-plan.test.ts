@@ -96,9 +96,9 @@ test('EP2 保存成功 + 覆盖更新：同用户只有一份计划', async () =
   const again = await putPlan({ period: 'weekly', targets: { distanceM: 20000, durationMin: 120, count: 3 } });
   assert.equal(again.statusCode, 200);
 
-  const docs = await ExercisePlanModel.find({}).countDocuments();
+  const docs = await ExercisePlanModel.countDocuments({ userId: idP });
   const mine = await ExercisePlanModel.findOne({ userId: idP }).lean();
-  assert.equal(docs, 1, '同用户 upsert，不重复建档');
+  assert.equal(docs, 1, '同用户 upsert，不重复建档（共享库里有其他用户的计划，只数自己）');
   assert.equal(mine?.period, 'weekly');
   assert.equal(mine?.targets.distanceM, 20000);
 });
