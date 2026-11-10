@@ -22,6 +22,7 @@ const userSchema = new Schema(
       highAccuracy: { type: Boolean, default: true },
       showBodyData: { type: Boolean, default: true }, // 个人中心是否展示身高体重
       showSportData: { type: Boolean, default: true }, // 他人点开资料卡时是否展示累计运动数据
+      privacyMode: { type: Boolean, default: false }, // 隐私模式：运动榜/步数榜上榜条目对他人匿名，资料卡对他人关闭
       kmAnnounce: { type: Boolean, default: true }, // 记录中整公里震动+横幅播报
       dailyStepSync: { type: Boolean, default: true }, // 每天进入小程序时同步微信步数；关闭后仅活动页按需同步
     },

@@ -50,13 +50,14 @@ export async function statsRoutes(fastify: FastifyInstance) {
     return success(result);
   });
 
-  // 榜单用户公开资料：点击排行榜用户列时拉取（白名单字段 + 累计八项）
-  fastify.get('/profile/:uid', async (request) => {
+  // 榜单用户公开资料：点击排行榜用户列时拉取（白名单字段 + 累计八项）。
+  // 可选鉴权（2026-11-09）：查看者=本人时隐私模式不生效（自己看自己保持真实）
+  fastify.get('/profile/:uid', { onRequest: [fastify.authenticateOptional] }, async (request) => {
     // 先限流再校验/查库：非法 UID 的扫描请求同样计数
     assertProfileQuota(request.ip);
     const uid = Number((request.params as { uid?: string }).uid);
     if (!Number.isInteger(uid) || uid <= 0) throw new AppError(400, 'UID 不合法');
-    const profile = await publicProfileByUid(uid);
+    const profile = await publicProfileByUid(uid, request.user?.userId);
     if (!profile) throw new AppError(404, '用户不存在');
     return success(profile);
   });

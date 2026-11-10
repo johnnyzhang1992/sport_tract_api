@@ -11,6 +11,8 @@ import { getAvatarUrl, getMediumUrl } from './oss.js';
 import { AppError } from '../utils/app-error.js';
 
 export interface PublicProfile {
+  /** 目标用户开了隐私模式 → 仅此字段为 true，其余字段全部零值（前端 toast 后不弹半屏） */
+  privacyMode: boolean;
   uid: number;
   nickname: string;
   avatarUrl: string;
@@ -35,11 +37,24 @@ export interface PublicProfile {
   } | null;
 }
 
-export async function publicProfileByUid(uid: number): Promise<PublicProfile | null> {
+export async function publicProfileByUid(
+  uid: number,
+  /** 查看者（可选）：等于目标用户本人时不匿名（Q2 自己看自己保持真实） */
+  viewerId?: string | null,
+): Promise<PublicProfile | null> {
   const user = await UserModel.findOne({ uid })
     .select({ uid: 1, nickname: 1, avatarUrl: 1, avatarPreset: 1, createdAt: 1, settings: 1 })
     .lean();
   if (!user) return null;
+  // 隐私模式（2026-11-09）：目标用户开了隐私 → 身份与数据一概不下发，双保险（榜单行已置 uid=0）。
+  // 例外：查看者就是目标本人（Q2 自己看自己保持真实）。
+  const isSelf = !!viewerId && String(user._id) === String(viewerId);
+  if (user.settings?.privacyMode === true && !isSelf) {
+    return {
+      privacyMode: true, uid: 0, nickname: '', avatarUrl: '', avatarLargeUrl: '', avatarPreset: '',
+      joinDays: 0, memberActive: false, showSportData: false, total: null, footprint: null,
+    };
+  }
   const id = String(user._id);
   const showSportData = user.settings?.showSportData !== false;
   // 关闭展示时不跑 overview/footprint（两个聚合都不便宜），只保留身份与会员徽标
@@ -48,6 +63,7 @@ export async function publicProfileByUid(uid: number): Promise<PublicProfile | n
     : [null, null, await activeMemberUserIds([id])];
   const createdAt = new Date(user.createdAt as never).getTime();
   return {
+    privacyMode: false,
     uid: Number(user.uid) || 0,
     nickname: user.nickname || '运动用户',
     avatarUrl: user.avatarUrl ? getAvatarUrl(user.avatarUrl) : '',

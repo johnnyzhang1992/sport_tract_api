@@ -98,7 +98,7 @@ test('PPROF1 公开资料：白名单字段 + 累计八项，不含私密字段'
   assert.ok(d.avatarLargeUrl, '头像大图 URL 要下发（预览用）');
   assert.deepEqual(
     Object.keys(d).sort(),
-    ['avatarLargeUrl', 'avatarPreset', 'avatarUrl', 'footprint', 'joinDays', 'memberActive', 'nickname', 'showSportData', 'total', 'uid'].sort(),
+    ['avatarLargeUrl', 'avatarPreset', 'avatarUrl', 'footprint', 'joinDays', 'memberActive', 'nickname', 'privacyMode', 'showSportData', 'total', 'uid'].sort(),
     '顶层字段必须严格是白名单',
   );
   for (const secret of ['openid', 'settings', 'heightCm', 'weightKg', 'userId']) {

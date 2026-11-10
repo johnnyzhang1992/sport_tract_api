@@ -56,6 +56,8 @@ export interface RankRow {
   uid: number;
   /** 此刻是否为付费会员（头像徽标用；不含积分免广告卡） */
   memberActive: boolean;
+  /** 该行用户开了隐私模式（对非本人查看者）：身份已匿名（昵称/头像/uid），运动数据照常展示；行不可点开资料卡 */
+  privacy?: boolean;
   /** 用户 id（仅管理端 includeUserId 时下发，用户端不暴露） */
   userId?: string;
 }
@@ -76,6 +78,8 @@ export interface BestRow {
   avatarPreset: string;
   /** 此刻是否为付费会员（头像徽标用） */
   memberActive: boolean;
+  /** 保持者开了隐私模式（对非本人查看者）：保持者匿名、value 不下发真实值 */
+  privacy?: boolean;
 }
 
 /** 各运动类型的本榜最佳指标（顺序即展示顺序；所有类型都有距离/时长，耐力类加专项指标） */
@@ -421,7 +425,7 @@ export async function leaderboard(
     ...bestDocs.map((b) => String(b.doc.userId)),
   ]);
   const users = await UserModel.find({ _id: { $in: [...involvedIds] } })
-    .select({ uid: 1, nickname: 1, gender: 1, avatarUrl: 1, avatarPreset: 1 })
+    .select({ uid: 1, nickname: 1, gender: 1, avatarUrl: 1, avatarPreset: 1, 'settings.privacyMode': 1 })
     .lean();
   const infoById = new Map(
     users.map((u) => [
@@ -432,16 +436,33 @@ export async function leaderboard(
         gender: u.gender ?? 0,
         avatarUrl: u.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
         avatarPreset: u.avatarPreset || '',
+        privacy: u.settings?.privacyMode === true,
       },
     ]),
   );
   const memberIds = await activeMemberUserIds([...involvedIds]);
 
+  // 隐私模式（2026-11-09，口径修订）：行用户开了隐私 **且不是查看者本人**（Q2）→ 仅隐藏身份
+  // （昵称→隐私用户、头像/性别/会员徽标清空、uid 置 0 不可点开资料卡）；运动数据（距离/条数/时长/配速）照常展示。
   const toRow = (
     r: { _id: unknown; distance: number; count: number; duration: number },
     rank: number,
   ): RankRow => {
     const info = infoById.get(String(r._id));
+    const anonymize = !!info && info.privacy && String(r._id) !== String(userId);
+    if (anonymize) {
+      const durationSec = Math.round(r.duration || 0);
+      return {
+        rank, uid: 0, name: '隐私用户', gender: 0, avatarUrl: '', avatarPreset: '',
+        distanceKm: Math.round((r.distance / 1000) * 100) / 100,
+        count: r.count,
+        durationSec,
+        paceSecPerKm: r.distance > 0 && durationSec > 0 ? Math.round(durationSec / (r.distance / 1000)) : null,
+        memberActive: false,
+        privacy: true,
+        ...(includeUserId ? { userId: String(r._id) } : {}),
+      };
+    }
     const durationSec = Math.round(r.duration || 0);
     return {
       rank,
@@ -460,9 +481,19 @@ export async function leaderboard(
     };
   };
 
-  // 组装本榜最佳
+  // 组装本榜最佳（隐私模式同 toRow 口径：非本人查看 → 保持者匿名，纪录值不下发）
   const best: BestRow[] = bestDocs.map(({ key, doc }) => {
     const info = infoById.get(String(doc.userId));
+    if (info && info.privacy && String(doc.userId) !== String(userId)) {
+      // 口径修订（2026-11-09）：本榜最佳的纪录值照常展示，仅保持者身份匿名
+      return {
+        key,
+        value: key === 'fastestAvg' ? Number(doc.speedKmh) : Number(doc[BEST_METRIC_SPEC[key].field]),
+        ...(key === 'farthest' && Number(doc.duration) > 0 ? { durationSec: Number(doc.duration) } : {}),
+        name: '隐私用户', gender: 0, avatarUrl: '', avatarPreset: '',
+        memberActive: false, privacy: true,
+      };
+    }
     return {
       key,
       // fastestAvg 为 km/h；其余直接取原始字段（米 / 秒 / 秒每公里）

@@ -74,6 +74,7 @@ export const UpdateMeSchema = z
         highAccuracy: z.boolean().optional(),
         showBodyData: z.boolean().optional(),
         showSportData: z.boolean().optional(), // 资料卡累计运动数据展示开关
+        privacyMode: z.boolean().optional(), // 隐私模式：榜单条目对他人匿名、资料卡对他人关闭
         kmAnnounce: z.boolean().optional(), // 记录中整公里震动+横幅播报开关
         dailyStepSync: z.boolean().optional(), // 每天进入小程序同步微信步数
       })

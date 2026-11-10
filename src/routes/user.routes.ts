@@ -75,6 +75,13 @@ export async function userRoutes(fastify: FastifyInstance) {
       const stored = (cur?.settings as { defaultType?: string } | undefined)?.defaultType;
       if (stored) body.settings.defaultType = stored;
     }
+    // 展示运动数据开关已并入隐私模式（2026-11-09），新客户端保存时不再回传 showSportData——
+    // settings 是整体 $set，这里显式保留库里的旧值：老用户「已关闭」的状态不会被保存动作重置成默认 true。
+    if (body.settings && body.settings.showSportData === undefined) {
+      const cur = await UserModel.findById(request.user.userId).select('settings.showSportData').lean();
+      const stored = (cur?.settings as { showSportData?: boolean } | undefined)?.showSportData;
+      if (stored !== undefined) body.settings.showSportData = stored;
+    }
 
     const user = await UserModel.findByIdAndUpdate(
       request.user.userId,

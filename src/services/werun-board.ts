@@ -29,6 +29,8 @@ export interface WerunRankRow {
   avatarPreset: string;
   uid: number;
   memberActive: boolean;
+  /** 该行用户开了隐私模式（对非本人查看者）：身份已匿名（昵称/头像/uid），步数照常展示；行不可点开资料卡 */
+  privacy?: boolean;
   /** 该周期步数合计 */
   step: number;
 }
@@ -253,7 +255,7 @@ export async function werunBoard(
 
   const involvedIds = [...new Set([...topRows.map((r) => String(r._id)), ...(meRow ? [String(meRow._id)] : [])])];
   const users = await UserModel.find({ _id: { $in: involvedIds } })
-    .select({ uid: 1, nickname: 1, gender: 1, avatarUrl: 1, avatarPreset: 1 })
+    .select({ uid: 1, nickname: 1, gender: 1, avatarUrl: 1, avatarPreset: 1, 'settings.privacyMode': 1 })
     .lean();
   const infoById = new Map(
     users.map((u) => [
@@ -264,13 +266,23 @@ export async function werunBoard(
         gender: u.gender ?? 0,
         avatarUrl: u.avatarUrl ? getAvatarUrl(u.avatarUrl) : '',
         avatarPreset: u.avatarPreset || '',
+        privacy: u.settings?.privacyMode === true,
       },
     ]),
   );
   const memberIds = await activeMemberUserIds(involvedIds);
 
+  // 隐私模式（2026-11-09，口径修订）：仅隐藏身份（昵称→隐私用户、头像/性别/会员徽标清空、
+  // uid 置 0 不可点开资料卡）；步数照常展示。
   const toRow = (r: { _id: unknown; step: number }, rank: number): WerunRankRow => {
     const info = infoById.get(String(r._id));
+    const anonymize = !!info && info.privacy && String(r._id) !== String(userId);
+    if (anonymize) {
+      return {
+        rank, uid: 0, name: '隐私用户', gender: 0, avatarUrl: '', avatarPreset: '',
+        memberActive: false, step: r.step, privacy: true,
+      };
+    }
     return {
       rank,
       uid: (info && info.uid) || 0,
