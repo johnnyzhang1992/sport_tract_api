@@ -62,8 +62,14 @@ function normalizeTargets(input: unknown): PlanTargets {
   };
 }
 
-/** 创建/更新本人计划：三项至少一项 > 0（全零＝没有目标，拒绝） */
-export async function upsertPlan(userId: string, input: unknown): Promise<ExercisePlanDto> {
+/**
+ * 创建/更新本人计划：三项至少一项 > 0（全零＝没有目标，拒绝）。
+ *
+ * 改计划不追溯（2026-11-10）：保存前先把「新周期窗口内、改动之前」的已完成进度冻结为基线，
+ * 之后进度 = 基线 + 改动之后的新轨迹。所以改目标不会让已经完成的进度倒退/跳增，
+ * 改周期（每天↔每周）也只是把新窗口里改动之前的成绩计入基线，同样不被追溯修改。
+ */
+export async function upsertPlan(userId: string, input: unknown, now = Date.now()): Promise<ExercisePlanDto> {
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
   const body = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
   const period = body.period as PlanPeriod;
@@ -72,9 +78,21 @@ export async function upsertPlan(userId: string, input: unknown): Promise<Exerci
   if (targets.distanceM <= 0 && targets.durationMin <= 0 && targets.count <= 0) {
     throw new AppError(400, '至少设置一项目标（距离/时间/次数）');
   }
+  // 冻结基线：新周期窗口内、此刻之前已经完成的进度（轨迹不可变，这就是「过去日期」的真实成绩）
+  const start = windowStart(period, now);
+  const before = await sumActivities(userId, start, now);
   await ExercisePlanModel.findOneAndUpdate(
     { userId: new Types.ObjectId(userId) },
-    { $set: { period, targets, updatedAt: new Date() } },
+    {
+      $set: {
+        period,
+        targets,
+        baseline: before,
+        baselineWindowStart: start,
+        baselineAt: now,
+        updatedAt: new Date(),
+      },
+    },
     { upsert: true, setDefaultsOnInsert: true },
   );
   const doc = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) }).lean();
@@ -143,11 +161,23 @@ export async function getPlanWithProgress(userId: string, now = Date.now()): Pro
     return { plan: null, progress: { distanceM: 0, durationSec: 0, count: 0 }, today, rings: [] };
   }
   const start = windowStart(plan.period, now);
-  const progress = await sumActivities(
-    userId,
-    start,
-    start + (plan.period === 'daily' ? 86_400_000 : 7 * 86_400_000),
-  );
+  const end = start + (plan.period === 'daily' ? 86_400_000 : 7 * 86_400_000);
+  const real = await sumActivities(userId, start, end);
+  /**
+   * 改计划不追溯（2026-11-10）：窗口内真实合计永远算全（补录的旧日期轨迹也算，不做时间点切分），
+   * 只是用保存计划那一刻冻结的成绩做**下限**——改计划不会让已完成的进度倒退。
+   * 基线只在同一周期窗口内有效：换天/换周后窗口起点变了，不沿用旧基线。
+   */
+  const doc = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) })
+    .select({ baseline: 1, baselineWindowStart: 1, baselineAt: 1 })
+    .lean();
+  const sameWindow = !!doc && Number(doc.baselineWindowStart) === start && Number(doc.baselineAt) > 0;
+  const floor = sameWindow ? (doc!.baseline || { distanceM: 0, durationSec: 0, count: 0 }) : null;
+  const progress = {
+    distanceM: Math.max(real.distanceM, floor?.distanceM || 0),
+    durationSec: Math.max(real.durationSec, floor?.durationSec || 0),
+    count: Math.max(real.count, floor?.count || 0),
+  };
   const t = plan.targets;
   const pctOf = (value: number, target: number) => (target > 0 ? Math.min(1, value / target) : 0);
   const rings: PlanRing[] = [

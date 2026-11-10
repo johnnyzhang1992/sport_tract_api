@@ -15,6 +15,18 @@ const exercisePlanSchema = new Schema(
       durationMin: { type: Number, default: 0 }, // 目标时长（分钟）
       count: { type: Number, default: 0 }, // 目标次数
     },
+    /**
+     * 改计划不追溯（2026-11-10）：保存新计划的瞬间，把「该周期窗口内、改动之前」的已完成进度冻结成基线。
+     * 展示进度 = 基线 + 改动之后的新轨迹；改计划不会让已完成的进度倒退或跳增。
+     * baselineWindowStart 是冻结时所属窗口的起点：换天/换周后窗口变了，基线自动失效（不跨周期沿用）。
+     */
+    baseline: {
+      distanceM: { type: Number, default: 0 },
+      durationSec: { type: Number, default: 0 },
+      count: { type: Number, default: 0 },
+    },
+    baselineWindowStart: { type: Number, default: 0 },
+    baselineAt: { type: Number, default: 0 },
   },
   { timestamps: true, versionKey: false },
 );

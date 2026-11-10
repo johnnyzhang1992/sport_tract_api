@@ -157,3 +157,65 @@ test('EP5 用户隔离 + 无计划：B 不可见/不影响 A；B 无计划返回
   const mine = await getCurrent(tokenP);
   assert.equal(mine.json().data.plan.period, 'weekly', 'A 的计划仍在');
 });
+
+test('EP6 改计划不追溯：改目标后进度不倒退，之后新增照常累加', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  // 先建每天计划 10km，并跑一条 4km（相当于今天已完成 4km）
+  await putPlan({ period: 'daily', targets: { distanceM: 10000, durationMin: 60, count: 2 } });
+  const today = bjTodayAt(9);
+  await seedActivity({ type: 'running', start: today, distance: 4000, duration: 1800 });
+
+  const before = (await getCurrent()).json().data;
+  assert.equal(before.progress.distanceM, 4000);
+  const pctBefore = before.rings.find((r: { key: string }) => r.key === 'distance').pct;
+  assert.ok(Math.abs(pctBefore - 0.4) < 1e-9, '4km/10km = 40%');
+
+  // 中途把目标改成 5km（比当前已完成的大一点）：已完成的 4km 不能被新目标「追溯」改掉
+  await putPlan({ period: 'daily', targets: { distanceM: 5000, durationMin: 60, count: 2 } });
+  const after = (await getCurrent()).json().data;
+  assert.equal(after.progress.distanceM, 4000, '改动前的 4km 仍然计入');
+  assert.ok(
+    Math.abs(after.rings.find((r: { key: string }) => r.key === 'distance').pct - 0.8) < 1e-9,
+    '新目标 5km 下 4km = 80%（按新目标重算比例，但进度值不丢）',
+  );
+
+  // 改动之后新增的轨迹照常累加
+  await seedActivity({ type: 'running', start: Date.now() - 60_000, distance: 3000, duration: 1200 });
+  const later = (await getCurrent()).json().data;
+  assert.equal(later.progress.distanceM, 7000, '基线 4km + 改动后 3km');
+});
+
+test('EP7 基线不跨周期：换天后按新窗口全量重算', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await putPlan({ period: 'daily', targets: { distanceM: 5000, durationMin: 60, count: 1 } });
+  await seedActivity({ type: 'running', start: bjTodayAt(8), distance: 2000, duration: 900 });
+
+  const now = (await getCurrent()).json().data;
+  assert.equal(now.progress.distanceM, 2000);
+
+  // 直接读库确认基线被写在本窗口起点上；模拟「到了第二天」→ 用明天的时刻查询，基线应失效
+  const doc = await ExercisePlanModel.findOne({ userId: idP }).lean();
+  assert.ok(doc && doc.baselineWindowStart > 0, '保存时写了基线窗口起点');
+  const tomorrow = Date.now() + 86_400_000;
+  const { getPlanWithProgress } = await import('../src/services/exercise-plan.js');
+  const next = await getPlanWithProgress(idP, tomorrow);
+  assert.equal(next.progress.distanceM, 0, '新的一天没有轨迹 → 进度 0（不沿用昨天的基线）');
+});
+
+test('EP8 下限语义：改动后即便轨迹被作废，进度也不会低于改动那一刻的成绩', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await putPlan({ period: 'daily', targets: { distanceM: 10000, durationMin: 60, count: 2 } });
+  const a = await ActivityModel.create({
+    userId: new (await import('mongoose')).default.Types.ObjectId(idP),
+    type: 'running', status: 'finished',
+    startTime: bjTodayAt(7), endTime: bjTodayAt(7) + 1800_000,
+    duration: 1800, distance: 6000, trackPoints: [], markers: [],
+  });
+  // 改计划：此刻已 6km → 基线 6km
+  await putPlan({ period: 'daily', targets: { distanceM: 8000, durationMin: 60, count: 2 } });
+  assert.equal((await getCurrent()).json().data.progress.distanceM, 6000);
+
+  // 把那条轨迹作废：真实合计变 0，但进度不倒退（基线兜底）
+  await ActivityModel.updateOne({ _id: a._id }, { $set: { status: 'cancelled' } });
+  assert.equal((await getCurrent()).json().data.progress.distanceM, 6000, '已完成的成绩不因后续作废而倒退');
+});
