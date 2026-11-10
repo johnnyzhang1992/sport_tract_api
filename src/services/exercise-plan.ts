@@ -627,3 +627,135 @@ export async function getPlanDayDetail(
     })),
   };
 }
+
+/* ==========================================================================
+ * 记录数据概况 + 里程碑奖杯（2026-11-10）
+ * 奖杯口径：某个周期「三项里最弱的一项」的完成倍数 ratio（100%=达成、200%/300%=超额），
+ * 达到指定倍数的周期数够了就解锁——比只看次数更能体现持续与超额完成。
+ * ========================================================================== */
+
+export interface PlanMilestoneDef {
+  key: string;
+  label: string;
+  desc: string;
+  /** 需要的最低完成倍数（1=达成目标，2=200%，3=300%） */
+  ratio: number;
+  /** 需要达到该倍数的周期次数 */
+  times: number;
+}
+
+export const PLAN_MILESTONES: readonly PlanMilestoneDef[] = [
+  { key: 'first', label: '首次达成', desc: '完成 1 次目标', ratio: 1, times: 1 },
+  { key: 'week', label: '坚持一周', desc: '达成 7 次', ratio: 1, times: 7 },
+  { key: 'habit', label: '习惯养成', desc: '达成 20 次', ratio: 1, times: 20 },
+  { key: 'x2', label: '双倍火力', desc: '200% 达成 10 次', ratio: 2, times: 10 },
+  { key: 'x2pro', label: '双倍宗师', desc: '200% 达成 20 次', ratio: 2, times: 20 },
+  { key: 'x3', label: '三倍王者', desc: '300% 达成 10 次', ratio: 3, times: 10 },
+];
+
+export interface PlanSummaryResult {
+  /** 已结算周期总数（日+周） */
+  totalPeriods: number;
+  /** 其中达成（三项全达标）的次数 */
+  achievedPeriods: number;
+  /** 达成率 0–1 */
+  rate: number;
+  /** 连续达成：按当前计划周期类型统计 */
+  streak: { current: number; best: number };
+  /** 已结算周期累计（跨周期求和） */
+  totals: { distanceM: number; durationSec: number; count: number };
+  milestones: Array<{
+    key: string;
+    label: string;
+    desc: string;
+    unlocked: boolean;
+    /** 当前已完成次数 / 需要次数 */
+    cur: number;
+    need: number;
+  }>;
+}
+
+/** 一个周期的「最弱一项」完成倍数：三项里 progress/target 的最小值（目标 0 的项跳过） */
+function minRatioOf(progress: { distanceM: number; durationSec: number; count: number }, targets: PlanTargets): number {
+  const ratios: number[] = [];
+  if (targets.distanceM > 0) ratios.push((progress.distanceM || 0) / targets.distanceM);
+  if (targets.durationMin > 0) ratios.push((progress.durationSec || 0) / (targets.durationMin * 60));
+  if (targets.count > 0) ratios.push((progress.count || 0) / targets.count);
+  if (!ratios.length) return 0;
+  return Math.min(...ratios);
+}
+
+/** 记录数据概况 + 里程碑（历史快照聚合；无历史时全 0、奖杯全灰） */
+export async function getPlanSummary(userId: string): Promise<PlanSummaryResult> {
+  if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
+  const plan = await getPlan(userId);
+  const rows = await ExercisePlanPeriodModel.find({ userId: new Types.ObjectId(userId) })
+    .select({ period: 1, periodKey: 1, windowStart: 1, targets: 1, progress: 1, allAchieved: 1 })
+    .sort({ windowStart: 1 })
+    .lean();
+
+  let achieved = 0;
+  const totals = { distanceM: 0, durationSec: 0, count: 0 };
+  // 按倍数分档计数（1x/2x/3x）
+  const ratioCount = { 1: 0, 2: 0, 3: 0 };
+  for (const r of rows) {
+    const targets: PlanTargets = {
+      distanceM: r.targets?.distanceM || 0,
+      durationMin: r.targets?.durationMin || 0,
+      count: r.targets?.count || 0,
+    };
+    const progress = {
+      distanceM: r.progress?.distanceM || 0,
+      durationSec: r.progress?.durationSec || 0,
+      count: r.progress?.count || 0,
+    };
+    if (r.allAchieved) achieved += 1;
+    totals.distanceM += progress.distanceM;
+    totals.durationSec += progress.durationSec;
+    totals.count += progress.count;
+    const ratio = minRatioOf(progress, targets);
+    if (ratio >= 1) ratioCount[1] += 1;
+    if (ratio >= 2) ratioCount[2] += 1;
+    if (ratio >= 3) ratioCount[3] += 1;
+  }
+
+  // 连续达成：只看当前计划周期类型（日/周），按窗口正序扫一遍
+  const periodType: PlanPeriod = plan?.period ?? 'daily';
+  const seq = rows.filter((r) => r.period === periodType);
+  let best = 0;
+  let run = 0;
+  for (const r of seq) {
+    if (r.allAchieved) {
+      run += 1;
+      best = Math.max(best, run);
+    } else {
+      run = 0;
+    }
+  }
+  // 当前连续：从最后一次往前数
+  let current = 0;
+  for (let i = seq.length - 1; i >= 0 && seq[i].allAchieved; i -= 1) current += 1;
+
+  const milestones = PLAN_MILESTONES.map((def) => {
+    const key = def.ratio >= 3 ? 3 : def.ratio >= 2 ? 2 : 1;
+    const cur = (ratioCount as Record<number, number>)[key] || 0;
+    return {
+      key: def.key,
+      label: def.label,
+      desc: def.desc,
+      unlocked: cur >= def.times,
+      cur,
+      need: def.times,
+    };
+  });
+
+  const totalPeriods = rows.length;
+  return {
+    totalPeriods,
+    achievedPeriods: achieved,
+    rate: totalPeriods > 0 ? achieved / totalPeriods : 0,
+    streak: { current, best },
+    totals,
+    milestones,
+  };
+}

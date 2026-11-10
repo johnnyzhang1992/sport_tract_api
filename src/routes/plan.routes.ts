@@ -2,7 +2,7 @@
 import type { FastifyInstance } from 'fastify';
 import {
   getPlanWithProgress, upsertPlan, listPlanHistory, finalizePreviousPeriod,
-  listPlanCalendar, getPlanDayDetail,
+  listPlanCalendar, getPlanDayDetail, getPlanSummary,
 } from '../services/exercise-plan.js';
 import { success } from '../utils/response.js';
 
@@ -43,6 +43,11 @@ export async function planRoutes(fastify: FastifyInstance) {
       : new Date(now + 8 * 3600_000).toISOString().slice(0, 10);
     return success(await getPlanDayDetail(request.user.userId, date));
   });
+
+  // 记录数据概况 + 里程碑奖杯（历史快照聚合）
+  fastify.get('/summary', { onRequest: [fastify.authenticate] }, async (request) =>
+    success(await getPlanSummary(request.user.userId)),
+  );
 
   fastify.put('/', { onRequest: [fastify.authenticate] }, async (request) => {
     const saved = await upsertPlan(request.user.userId, request.body);
