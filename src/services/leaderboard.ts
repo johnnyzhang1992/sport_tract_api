@@ -599,6 +599,7 @@ export function homeLeaderboardSummary(
 ): Promise<{ period: LeaderboardPeriod | null; ranks: MeRankRow[] }> {
   return pickFirstRanked(LEADERBOARD_PERIODS, async (period) => {
     const res = await leaderboardMe(userId, '全国', period);
-    return res.ranks;
+    // 首页摘要只带一条上榜数据（2026-11-09 产品口径）：排序后首条＝名次最好的那一项
+    return res.ranks.slice(0, 1);
   });
 }
