@@ -39,6 +39,8 @@ export interface PlanRing {
 export interface PlanCurrentResult {
   plan: ExercisePlanDto | null;
   progress: { distanceM: number; durationSec: number; count: number };
+  /** 今日已完成轨迹合计（与计划周期无关）：首页卡右侧「今日」栏用 */
+  today: { distanceM: number; durationSec: number; count: number };
   rings: PlanRing[];
 }
 
@@ -112,28 +114,40 @@ function windowStart(period: PlanPeriod, now: number): number {
 }
 
 /** 当期进度 + 三环（超额封顶；目标缺失的环 pct=0） */
-export async function getPlanWithProgress(userId: string, now = Date.now()): Promise<PlanCurrentResult> {
-  if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
-  const plan = await getPlan(userId);
-  if (!plan) {
-    return { plan: null, progress: { distanceM: 0, durationSec: 0, count: 0 }, rings: [] };
-  }
-  const start = windowStart(plan.period, now);
+/** 某窗口内的已完成轨迹合计 */
+async function sumActivities(userId: string, from: number, to: number) {
   const [agg] = await ActivityModel.aggregate<{ distance: number; duration: number; count: number }>([
     {
       $match: {
         userId: new Types.ObjectId(userId),
         status: 'finished',
-        startTime: { $gte: start, $lt: start + (plan.period === 'daily' ? 86_400_000 : 7 * 86_400_000) },
+        startTime: { $gte: from, $lt: to },
       },
     },
     { $group: { _id: null, distance: { $sum: '$distance' }, duration: { $sum: '$duration' }, count: { $sum: 1 } } },
   ]);
-  const progress = {
+  return {
     distanceM: agg?.distance || 0,
     durationSec: agg?.duration || 0,
     count: agg?.count || 0,
   };
+}
+
+export async function getPlanWithProgress(userId: string, now = Date.now()): Promise<PlanCurrentResult> {
+  if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
+  const plan = await getPlan(userId);
+  // 今日栏与计划周期无关：无计划也要给（首页卡引导态之外的「今日」数据）
+  const todayStart = windowStart('daily', now);
+  const today = await sumActivities(userId, todayStart, todayStart + 86_400_000);
+  if (!plan) {
+    return { plan: null, progress: { distanceM: 0, durationSec: 0, count: 0 }, today, rings: [] };
+  }
+  const start = windowStart(plan.period, now);
+  const progress = await sumActivities(
+    userId,
+    start,
+    start + (plan.period === 'daily' ? 86_400_000 : 7 * 86_400_000),
+  );
   const t = plan.targets;
   const pctOf = (value: number, target: number) => (target > 0 ? Math.min(1, value / target) : 0);
   const rings: PlanRing[] = [
@@ -142,5 +156,5 @@ export async function getPlanWithProgress(userId: string, now = Date.now()): Pro
     { key: 'duration', value: progress.durationSec, target: t.durationMin * 60, pct: pctOf(progress.durationSec, t.durationMin * 60) },
     { key: 'count', value: progress.count, target: t.count, pct: pctOf(progress.count, t.count) },
   ];
-  return { plan, progress, rings };
+  return { plan, progress, today, rings };
 }
