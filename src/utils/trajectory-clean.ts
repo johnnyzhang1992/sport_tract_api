@@ -108,6 +108,8 @@ export interface CleanOptions {
   minOutlierM?: number;
   /** 孤立点倍数（相对局部尺度） */
   outlierRatio?: number;
+  /** 是否启用「起始稳定」剔除（默认 true；对比/回归时可关掉） */
+  startFix?: boolean;
 }
 
 /** —— 精度因子（accuracy）加严判定 ——
@@ -117,6 +119,17 @@ export interface CleanOptions {
 export const ACC_BAD_M = 50;
 /** 差精度点离群距离系数：点偏离前后连线中点 > accuracy × 该系数 即判漂移 */
 export const ACC_OUTLIER_FACTOR = 1.0;
+
+/** 起始稳定阈值（accuracy 米）：开头连续丢点，直到出现第一个 accuracy < 该值的可信定位（2026-11-10）。
+ *  背景：录制开始时 GPS 未收敛（冷启动漂移），前几秒坐标能甩出几百米且多带 accBad/vehicle
+ *  标记——现行规则因 vehicle 保留语义不会剔它们，导致轨迹开头飞到河里/楼里。
+ *  取 50 而不取 30 的理由（本地 1139 条已完成轨迹 dry-run）：
+ *  - 30m：影响 24.1%（274 条）——大量轨迹首点 accuracy 恰为 30~35，属于「可用」却被剔，属过度修饰；
+ *  - 50m：影响 0.4%（4 条），且与清洗器既有的 ACC_BAD_M = 50「差精度」定义同口径；
+ *  - 两条真实问题轨迹（开头 62/161/136/95 与 242×3）在 50m 阈值下都能完整修好。 */
+export const START_FIX_M = 50;
+/** 起始剔除上限（个）：室内全程差精度时最多剔前 10 个连续点，剩余保留（室内运动合法） */
+export const START_TRIM_MAX = 10;
 
 /**
  * 轨迹纠偏：剔除尖刺点与孤立离群点（保持首尾）
@@ -134,6 +147,7 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
     minTurnDeg = 100,
     minOutlierM = 25,
     outlierRatio = 5,
+    startFix = true,
   } = opts;
   const maxAbsSpeed = typeCfg.maxAbsSpeed;
   const n = points.length;
@@ -232,6 +246,31 @@ export function cleanTrajectory<T extends CleanTrackPoint>(
   for (let i = 0; i < n; i++) {
     if (drop[i] && points[i].vehicle) drop[i] = false;
   }
+
+  // 起始稳定（2026-11-10）：开头 GPS 未收敛的漂移段整段剔除，直到第一个可信定位
+  // （accuracy < START_FIX_M）。缺失 accuracy 的点（旧数据/导入）视为可信、不剔除。
+  // 注意这一步在 vehicle 保留**之后**执行：开头的漂移点即使带 vehicle 标记也剔
+  // （冷启动阶段谈不上"乘车语义"，保留只会让轨迹起点飞到河里）。
+  //
+  // 室内/弱信号场景（全程 accuracy ≥ 30）的保护：
+  // 1) 找不到任何可信定位 → 一个都不剔（室内运动是合法轨迹，整段保留）；
+  // 2) 有可信定位时，最多只剔前 START_TRIM_MAX(=10) 个连续坏点，且至少保留 2 点。
+  // 起始稳定开关关闭时直接返回（仅用于对比实验/回归）
+  if (!startFix) return points.filter((_, i) => !drop[i]);
+
+  // 1) 先找第一个可信定位（没有则视为「全程弱信号」，不做起始剔除）
+  let firstGoodIdx = -1;
+  for (let i = 0; i < n; i++) {
+    const acc = points[i].accuracy;
+    if (acc == null || acc < START_FIX_M) { firstGoodIdx = i; break; }
+  }
+  // 2) 剔除量 = min(开头坏点个数, 上限 10, 保留至少 2 点)
+  //    室内/弱信号（firstGoodIdx === -1）→ trimCount = 0：整段都是真实轨迹，一个都不剔。
+  const keepMin = 2; // 至少保留起终点两点，避免剔成单点/空轨迹
+  const trimCount = firstGoodIdx > 0
+    ? Math.min(firstGoodIdx, START_TRIM_MAX, Math.max(0, n - keepMin))
+    : 0;
+  for (let i = 0; i < trimCount; i++) drop[i] = true;
 
   return points.filter((_, i) => !drop[i]);
 }

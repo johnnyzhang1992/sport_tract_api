@@ -164,3 +164,99 @@ test('无 accuracy 字段的点：行为与旧版完全一致', () => {
   const cleaned = cleanTrajectory(withDrift, {}, 'cycling');
   assert.equal(cleaned.length, withDrift.length, '无 accuracy 的漂移点不被剔除（与旧版行为一致）');
 });
+
+test('起始稳定：开头 GPS 未收敛段（accBad/vehicle 标记）整段剔除，直到第一个可信定位', () => {
+  // 模拟冷启动：前 4 点 accuracy 62–161m、坐标甩动 250m+、带 vehicle 标记；
+  // 第 5 点 accuracy 21m 恢复可信，之后正常步进
+  const pts = [
+    { lat: 22.8066555, lng: 108.3044070, timestamp: 0, accuracy: 62, vehicle: true },
+    { lat: 22.8060788, lng: 108.3054620, timestamp: 63, accuracy: 161, vehicle: true },
+    { lat: 22.8065484, lng: 108.3062031, timestamp: 640, accuracy: 136, vehicle: true },
+    { lat: 22.8054460, lng: 108.3063561, timestamp: 651, accuracy: 95, vehicle: true },
+    { lat: 22.8063569, lng: 108.3035140, timestamp: 2631, accuracy: 21 },
+    { lat: 22.8063800, lng: 108.3034500, timestamp: 4600, accuracy: 15 },
+    { lat: 22.8063100, lng: 108.3034800, timestamp: 6600, accuracy: 14 },
+  ];
+  const cleaned = cleanTrajectory(pts as never, {}, 'running');
+  // 前 4 个未收敛点整段剔除，轨迹从第一个可信定位开始
+  assert.equal(cleaned.length, 3);
+  assert.equal(cleaned[0].lat, 22.8063569, '起点 = 第一个 accuracy<30 的点');
+  assert.equal((cleaned[0] as { vehicle?: boolean }).vehicle, undefined, '被剔除点不含 vehicle 语义');
+  // 步长合理（不引入新的异常跳点）
+  const d = (a: { lat: number; lng: number }, b: { lat: number; lng: number }) => {
+    const R = 6371000, rad = Math.PI / 180;
+    const dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  };
+  for (let i = 1; i < cleaned.length; i++) {
+    const step = d(cleaned[i - 1], cleaned[i]);
+    assert.ok(step < 30, `清洗后相邻步长应正常（${i}: ${step.toFixed(1)}m）`);
+  }
+});
+
+test('起始稳定：首点即可信（accuracy < 30）则一个不剔', () => {
+  const pts = [
+    { lat: 22.8066555, lng: 108.3044070, timestamp: 0, accuracy: 15 },
+    { lat: 22.8060788, lng: 108.3054620, timestamp: 600, accuracy: 12 },
+    { lat: 22.8065484, lng: 108.3062031, timestamp: 1200, accuracy: 11 },
+  ];
+  const cleaned = cleanTrajectory(pts as never, {}, 'running');
+  assert.equal(cleaned.length, 3, '开头可信时不 trim');
+});
+
+test('起始稳定：无 accuracy 字段（旧数据/导入）视为可信，不剔', () => {
+  const pts = [
+    { lat: 22.8066555, lng: 108.3044070, timestamp: 0 },
+    { lat: 22.8060788, lng: 108.3054620, timestamp: 600 },
+    { lat: 22.8065484, lng: 108.3062031, timestamp: 1200 },
+  ];
+  const cleaned = cleanTrajectory(pts as never, {}, 'running');
+  assert.equal(cleaned.length, 3, '缺失 accuracy 不触发起始 trim');
+});
+
+test('起始稳定：整段都没收敛（全 accuracy ≥ 30）→ 保持原样，不剔到空', () => {
+  const pts = [
+    { lat: 22.8066555, lng: 108.3044070, timestamp: 0, accuracy: 95, vehicle: true },
+    { lat: 22.8060788, lng: 108.3054620, timestamp: 600, accuracy: 161, vehicle: true },
+    { lat: 22.8065484, lng: 108.3062031, timestamp: 1200, accuracy: 136, vehicle: true },
+  ];
+  const cleaned = cleanTrajectory(pts as never, {}, 'running');
+  assert.equal(cleaned.length, 3, '无可信定位时不剔除（避免空轨迹）');
+});
+
+test('室内/弱信号：全程 accuracy ≥ 30 → 一个点都不剔（真实轨迹不能剔光）', () => {
+  // 室内跑步：所有点精度都差（40–120m），但坐标本身是连续可信的行走轨迹
+  const pts = Array.from({ length: 20 }, (_, i) => ({
+    lat: 22.8066 + i * 0.00002,
+    lng: 108.3035 + i * 0.00002,
+    timestamp: i * 1000,
+    accuracy: 40 + (i % 5) * 20,
+  }));
+  const cleaned = cleanTrajectory(pts as never, {}, 'running');
+  assert.equal(cleaned.length, 20, '室内全程差精度不作起始剔除');
+});
+
+test('室内/弱信号：短轨迹（5 点）全程差精度也不剔', () => {
+  const pts = Array.from({ length: 5 }, (_, i) => ({
+    lat: 22.8066 + i * 0.00002,
+    lng: 108.3035,
+    timestamp: i * 1000,
+    accuracy: 80,
+  }));
+  const cleaned = cleanTrajectory(pts as never, {}, 'walking');
+  assert.equal(cleaned.length, 5);
+});
+
+test('起始剔除上限：开头 30 个坏点只剔前 10 个，其余保留', () => {
+  // 整条路径连续（每点纬度 +0.00002° ≈ 2.2m/s，正常步行），只是前 30 点精度差
+  const all = Array.from({ length: 40 }, (_, i) => ({
+    lat: 22.8066 + i * 0.00002,
+    lng: 108.3035,
+    timestamp: i * 1000,
+    accuracy: i < 30 ? 90 : 12,
+  }));
+  const cleaned = cleanTrajectory(all as never, {}, 'walking');
+  assert.equal(cleaned.length, 30, '最多剔 START_TRIM_MAX(10) 个');
+  assert.equal(cleaned[0].lat, all[10].lat, '从第 11 个点开始保留（后面 20 个坏精度点是真实轨迹）');
+});
