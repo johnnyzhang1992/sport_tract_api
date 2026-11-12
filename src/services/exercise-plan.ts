@@ -43,6 +43,10 @@ export interface PlanCurrentResult {
   /** 今日已完成轨迹合计（与计划周期无关）：首页卡右侧「今日」栏用 */
   today: { distanceM: number; durationSec: number; count: number };
   rings: PlanRing[];
+  /** 当期周期键（东八区：日=YYYY-MM-DD、周=周一日期）：端上「当期达成」弹窗按期去重用；无计划时缺省 */
+  periodKey?: string;
+  /** 当期三项是否都设了目标且都达到（与结算快照同判据） */
+  allAchieved?: boolean;
 }
 
 /** 目标归一化：非负整数（距离米/时长分/次数）；非法即 400（对象+实际值提示由调用方组装） */
@@ -187,7 +191,17 @@ export async function getPlanWithProgress(userId: string, now = Date.now()): Pro
     { key: 'duration', value: progress.durationSec, target: t.durationMin * 60, pct: pctOf(progress.durationSec, t.durationMin * 60) },
     { key: 'count', value: progress.count, target: t.count, pct: pctOf(progress.count, t.count) },
   ];
-  return { plan, progress, today, rings };
+  // 当期达成（与结算快照同判据）：三项都设了目标且都达到；端上据此当天弹「目标达成」
+  const achieved = {
+    distance: t.distanceM > 0 && progress.distanceM >= t.distanceM,
+    duration: t.durationMin > 0 && progress.durationSec >= t.durationMin * 60,
+    count: t.count > 0 && progress.count >= t.count,
+  };
+  return {
+    plan, progress, today, rings,
+    periodKey: periodKeyOf(plan.period, start),
+    allAchieved: achieved.distance && achieved.duration && achieved.count,
+  };
 }
 
 /* ==========================================================================

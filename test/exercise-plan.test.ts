@@ -9,6 +9,7 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { ExercisePlanModel } from '../src/models/exercise-plan.model.js';
+import { bjDateStr, bjIsoWeekStart } from '../src/utils/bj-time.js';
 
 let app: FastifyInstance;
 const NOW = Date.now();
@@ -16,6 +17,7 @@ const PREFIX = 'openid:exercise-plan';
 let tokenP = '';
 let tokenQ = '';
 let idP = '';
+let idQ = '';
 
 async function login(openid: string): Promise<string> {
   const res = await app.inject({
@@ -31,9 +33,9 @@ const bjTodayAt = (hour: number) => {
   return Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate(), hour - 8) + 60_000;
 };
 
-async function seedActivity(o: { type: string; start: number; distance: number; duration: number }) {
+async function seedActivity(o: { type: string; start: number; distance: number; duration: number }, userId = idP) {
   await ActivityModel.create({
-    userId: idP, type: o.type, status: 'finished',
+    userId, type: o.type, status: 'finished',
     startTime: o.start, endTime: o.start + o.duration * 1000,
     duration: o.duration, distance: o.distance, trackPoints: [], markers: [],
   });
@@ -56,6 +58,11 @@ before(async () => {
     headers: { authorization: `Bearer ${tokenP}` },
   });
   idP = me.json().data.id;
+  const meQ = await app.inject({
+    method: 'GET', url: '/sport-track/api/users/me',
+    headers: { authorization: `Bearer ${tokenQ}` },
+  });
+  idQ = meQ.json().data.id;
 });
 
 after(async () => {
@@ -218,4 +225,24 @@ test('EP8 下限语义：改动后即便轨迹被作废，进度也不会低于�
   // 把那条轨迹作废：真实合计变 0，但进度不倒退（基线兜底）
   await ActivityModel.updateOne({ _id: a._id }, { $set: { status: 'cancelled' } });
   assert.equal((await getCurrent()).json().data.progress.distanceM, 6000, '已完成的成绩不因后续作废而倒退');
+});
+
+test('EP9 当期达成旗标：periodKey 为东八区周期键；三项都达标才 allAchieved', async () => {
+  await putPlan({ period: 'daily', targets: { distanceM: 1000, durationMin: 10, count: 2 } }, tokenQ);
+  await seedActivity({ type: 'running', start: bjTodayAt(9), distance: 2000, duration: 1200 }, idQ);
+  let d = (await getCurrent(tokenQ)).json().data;
+  assert.equal(d.periodKey, bjDateStr(NOW), '日计划 periodKey=东八区今天');
+  assert.equal(d.allAchieved, false, '次数未达标（1/2）');
+
+  await seedActivity({ type: 'walking', start: bjTodayAt(11), distance: 100, duration: 60 }, idQ);
+  d = (await getCurrent(tokenQ)).json().data;
+  assert.equal(d.allAchieved, true, '三项都达标');
+
+  // 周计划：periodKey=东八区本周一
+  await ActivityModel.deleteMany({ userId: idQ });
+  await putPlan({ period: 'weekly', targets: { distanceM: 1000, durationMin: 10, count: 1 } }, tokenQ);
+  await seedActivity({ type: 'running', start: bjTodayAt(12), distance: 2000, duration: 1200 }, idQ);
+  d = (await getCurrent(tokenQ)).json().data;
+  assert.equal(d.periodKey, bjDateStr(bjIsoWeekStart(NOW)), '周计划 periodKey=本周一');
+  assert.equal(d.allAchieved, true);
 });
