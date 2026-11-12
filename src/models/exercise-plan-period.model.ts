@@ -15,7 +15,7 @@ const exercisePlanPeriodSchema = new Schema(
     userId: { type: Schema.Types.ObjectId, required: true },
     /** daily=每天、weekly=每周 */
     period: { type: String, enum: ['daily', 'weekly'], required: true },
-    /** 周期键：daily=该日 YYYY-MM-DD；weekly=该周周一 YYYY-MM-DD（东八区） */
+    /** 周期键：daily=该日 YYYY-MM-DD；weekly=本期起点日期 YYYY-MM-DD（东八区，锚点起固定 7 天一期） */
     periodKey: { type: String, required: true },
     /** 窗口 [windowStart, windowEnd)（epoch ms，东八区零点对齐） */
     windowStart: { type: Number, required: true },

@@ -10,6 +10,11 @@ const exercisePlanSchema = new Schema(
   {
     userId: { type: Schema.Types.ObjectId, required: true, unique: true },
     period: { type: String, enum: ['daily', 'weekly'], required: true },
+    /**
+     * 周计划锚点（东八区某天 0 点，epoch ms）：从锚点起固定 7 天一期，不在期内逐日平移。
+     * 新建周计划＝创建当天；存量周计划首次读取时锚到当天（见 getPlan）；每天计划为 0。
+     */
+    periodStart: { type: Number, default: 0 },
     targets: {
       distanceM: { type: Number, default: 0 }, // 目标距离（米）
       durationMin: { type: Number, default: 0 }, // 目标时长（分钟）

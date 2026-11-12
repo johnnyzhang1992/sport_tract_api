@@ -7,7 +7,7 @@ import { AppError } from '../utils/app-error.js';
 import { ExercisePlanModel } from '../models/exercise-plan.model.js';
 import { ExercisePlanPeriodModel } from '../models/exercise-plan-period.model.js';
 import { ActivityModel } from '../models/activity.model.js';
-import { bjDateStr, bjIsoWeekStart } from '../utils/bj-time.js';
+import { bjDateStr, bjDayStart } from '../utils/bj-time.js';
 
 export type PlanPeriod = 'daily' | 'weekly';
 export const PLAN_PERIODS: readonly PlanPeriod[] = ['daily', 'weekly'];
@@ -25,6 +25,8 @@ export interface ExercisePlanDto {
   period: PlanPeriod;
   targets: PlanTargets;
   updatedAt: number;
+  /** 周计划锚点（东八区某天 0 点，固定 7 天一期从锚点起切块）；每天计划为 0 */
+  periodStart: number;
 }
 
 export interface PlanRing {
@@ -43,7 +45,10 @@ export interface PlanCurrentResult {
   /** 今日已完成轨迹合计（与计划周期无关）：首页卡右侧「今日」栏用 */
   today: { distanceM: number; durationSec: number; count: number };
   rings: PlanRing[];
-  /** 当期周期键（东八区：日=YYYY-MM-DD、周=周一日期）：端上「当期达成」弹窗按期去重用；无计划时缺省 */
+  /** 当期窗口 [windowStart, windowEnd)（epoch ms）；无计划时缺省 */
+  windowStart?: number;
+  windowEnd?: number;
+  /** 当期周期键（东八区：日=当天、周=本期起点日期）：端上「当期达成」弹窗按期去重用；无计划时缺省 */
   periodKey?: string;
   /** 当期三项是否都设了目标且都达到（与结算快照同判据） */
   allAchieved?: boolean;
@@ -83,8 +88,18 @@ export async function upsertPlan(userId: string, input: unknown, now = Date.now(
   if (targets.distanceM <= 0 && targets.durationMin <= 0 && targets.count <= 0) {
     throw new AppError(400, '至少设置一项目标（距离/时间/次数）');
   }
+  /**
+   * 周计划锚点：新计划 / 从每天切过来 → 锚到当天 0 点（第一期＝今天起 7 天）；
+   * 本来就是每周 → 沿用原锚点（改目标不重开当期）。每天计划不需要锚点（0）。
+   */
+  const prev = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) })
+    .select({ period: 1, periodStart: 1 }).lean();
+  const prevAnchor = Number(prev?.periodStart) || 0;
+  const periodStart = period === 'weekly'
+    ? (prev?.period === 'weekly' && prevAnchor > 0 ? prevAnchor : bjDayStart(now))
+    : 0;
   // 冻结基线：新周期窗口内、此刻之前已经完成的进度（轨迹不可变，这就是「过去日期」的真实成绩）
-  const start = windowStart(period, now);
+  const start = windowStart(period, now, periodStart);
   const before = await sumActivities(userId, start, now);
   await ExercisePlanModel.findOneAndUpdate(
     { userId: new Types.ObjectId(userId) },
@@ -95,6 +110,7 @@ export async function upsertPlan(userId: string, input: unknown, now = Date.now(
         baseline: before,
         baselineWindowStart: start,
         baselineAt: now,
+        periodStart,
         updatedAt: new Date(),
       },
     },
@@ -105,19 +121,31 @@ export async function upsertPlan(userId: string, input: unknown, now = Date.now(
 }
 
 /** 查询本人计划；无计划返回 null */
-export async function getPlan(userId: string): Promise<ExercisePlanDto | null> {
+export async function getPlan(userId: string, now = Date.now()): Promise<ExercisePlanDto | null> {
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
   const doc = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) }).lean();
-  return doc ? toDto(doc) : null;
+  if (!doc) return null;
+  // 存量周计划没有锚点：首次读取时锚定到当天 0 点（上线迁移），不再沿用旧的「本周一」口径
+  if (doc.period === 'weekly' && !(Number(doc.periodStart) > 0)) {
+    const anchor = bjDayStart(now);
+    await ExercisePlanModel.updateOne(
+      { _id: doc._id, $or: [{ periodStart: 0 }, { periodStart: { $exists: false } }] },
+      { $set: { periodStart: anchor } },
+    );
+    doc.periodStart = anchor;
+  }
+  return toDto(doc);
 }
 
 function toDto(doc: {
   period: PlanPeriod;
   targets: PlanTargets;
   updatedAt: Date;
+  periodStart?: number;
 }): ExercisePlanDto {
   return {
     period: doc.period,
+    periodStart: Number(doc.periodStart) || 0,
     targets: {
       distanceM: doc.targets.distanceM || 0,
       durationMin: doc.targets.durationMin || 0,
@@ -127,13 +155,21 @@ function toDto(doc: {
   };
 }
 
-/** 完成度窗口起点（东八区）：daily=今天 00:00；weekly=本周一 00:00（含首尾，窗口＝[start, start+周期)） */
-function windowStart(period: PlanPeriod, now: number): number {
-  if (period === 'daily') {
-    const b = new Date(now + 8 * 3600_000);
-    return Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate()) - 8 * 3600_000;
-  }
-  return bjIsoWeekStart(now);
+/**
+ * 周计划固定 7 天一期：从锚点日 0 点起每 7 天切块，返回含 now 的那一期起点。
+ * 不在期内逐日平移——11-12 定计划，本期一直是 11-12~11-18。
+ */
+function weeklyStartOf(anchor: number, now: number): number {
+  const span = 7 * 86_400_000;
+  const k = Math.max(0, Math.floor((now - anchor) / span));
+  return anchor + k * span;
+}
+
+/** 完成度窗口起点（东八区）：daily=今天 00:00；weekly=锚点起固定 7 天一期（窗口＝[start, start+周期)） */
+function windowStart(period: PlanPeriod, now: number, weeklyAnchor = 0): number {
+  if (period === 'daily') return bjDayStart(now);
+  const anchor = weeklyAnchor > 0 ? weeklyAnchor : bjDayStart(now);
+  return weeklyStartOf(anchor, now);
 }
 
 /** 当期进度 + 三环（超额封顶；目标缺失的环 pct=0） */
@@ -158,14 +194,14 @@ async function sumActivities(userId: string, from: number, to: number) {
 
 export async function getPlanWithProgress(userId: string, now = Date.now()): Promise<PlanCurrentResult> {
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
-  const plan = await getPlan(userId);
+  const plan = await getPlan(userId, now);
   // 今日栏与计划周期无关：无计划也要给（首页卡引导态之外的「今日」数据）
   const todayStart = windowStart('daily', now);
   const today = await sumActivities(userId, todayStart, todayStart + 86_400_000);
   if (!plan) {
     return { plan: null, progress: { distanceM: 0, durationSec: 0, count: 0 }, today, rings: [] };
   }
-  const start = windowStart(plan.period, now);
+  const start = windowStart(plan.period, now, plan.periodStart);
   const end = start + (plan.period === 'daily' ? 86_400_000 : 7 * 86_400_000);
   const real = await sumActivities(userId, start, end);
   /**
@@ -199,6 +235,8 @@ export async function getPlanWithProgress(userId: string, now = Date.now()): Pro
   };
   return {
     plan, progress, today, rings,
+    windowStart: start,
+    windowEnd: end,
     periodKey: periodKeyOf(plan.period, start),
     allAchieved: achieved.distance && achieved.duration && achieved.count,
   };
@@ -222,15 +260,15 @@ export interface PlanPeriodSnapshot {
   allAchieved: boolean;
 }
 
-/** 周期键：daily=该日 YYYY-MM-DD；weekly=该周周一 YYYY-MM-DD（东八区） */
+/** 周期键：daily=该日 YYYY-MM-DD；weekly=本期起点日期 YYYY-MM-DD（东八区） */
 function periodKeyOf(period: PlanPeriod, windowStartMs: number): string {
   return bjDateStr(windowStartMs);
 }
 
 /** 给定时刻所属窗口；上一窗口＝当前窗口整体往前挪一个周期 */
-function previousWindow(period: PlanPeriod, now: number): { start: number; end: number } {
+function previousWindow(period: PlanPeriod, now: number, weeklyAnchor = 0): { start: number; end: number } {
   const span = period === 'daily' ? 86_400_000 : 7 * 86_400_000;
-  const end = windowStart(period, now);
+  const end = windowStart(period, now, weeklyAnchor);
   return { start: end - span, end };
 }
 
@@ -309,11 +347,20 @@ export async function finalizePlanPeriod(
   return snap;
 }
 
+/**
+ * 周计划从锚点开始才有「期」：上一期起点早于锚点 → 该时段没有真实计划周期，不能补快照
+ * （否则迁移后会把 11-05~11-11 这种虚构期写进历史）。
+ */
+function beforeWeeklyAnchor(period: PlanPeriod, anchor: number, windowStartMs: number): boolean {
+  return period === 'weekly' && anchor > 0 && windowStartMs < anchor;
+}
+
 /** 上一周期结算（用户打开卡/页面时顺手补一条，保证活跃用户一定有历史） */
 export async function finalizePreviousPeriod(userId: string, now = Date.now()): Promise<void> {
-  const plan = await getPlan(userId);
+  const plan = await getPlan(userId, now);
   if (!plan) return;
-  const w = previousWindow(plan.period, now);
+  const w = previousWindow(plan.period, now, plan.periodStart);
+  if (beforeWeeklyAnchor(plan.period, plan.periodStart, w.start)) return;
   await finalizePlanPeriod(userId, plan.period, w.start, w.end);
 }
 
@@ -322,11 +369,16 @@ export async function finalizePreviousPeriod(userId: string, now = Date.now()): 
  * 只处理「上一周期已结束」的那一个单元，幂等可反复跑。
  */
 export async function finalizeAllPreviousPeriods(now = Date.now()): Promise<{ done: number; failed: number }> {
-  const plans = await ExercisePlanModel.find({}).select({ userId: 1, period: 1 }).lean();
+  const plans = await ExercisePlanModel.find({}).select({ userId: 1, period: 1, periodStart: 1 }).lean();
   let done = 0;
   let failed = 0;
   for (const p of plans) {
-    const w = previousWindow(p.period as PlanPeriod, now);
+    const period = p.period as PlanPeriod;
+    const anchor = Number(p.periodStart) || 0;
+    // 存量周计划尚未锚定：等用户首次读取锚定后再结算；锚点之前的时段没有真实期
+    if (period === 'weekly' && !anchor) continue;
+    const w = previousWindow(period, now, anchor);
+    if (beforeWeeklyAnchor(period, anchor, w.start)) continue;
     try {
       await finalizePlanPeriod(String(p.userId), p.period as PlanPeriod, w.start, w.end);
       done += 1;
@@ -360,8 +412,13 @@ export async function listPlanHistory(
   if (!period) return { items: [], nextCursor: null };
   const limit = Math.max(1, Math.min(60, Math.floor(Number(query.limit) || 20)));
   const filter: Record<string, unknown> = { userId: new Types.ObjectId(userId), period };
+  // 周计划只返回锚点之后的期（迁移不回推：锚点前的旧自然周/虚构期不展示）
+  const anchor = plan?.period === 'weekly' && period === 'weekly' ? plan.periodStart : 0;
+  const windowCond: Record<string, number> = {};
+  if (anchor > 0) windowCond.$gte = anchor;
   const cursor = Number(query.cursor);
-  if (Number.isFinite(cursor) && cursor > 0) filter.windowStart = { $lt: cursor };
+  if (Number.isFinite(cursor) && cursor > 0) windowCond.$lt = cursor;
+  if (Object.keys(windowCond).length) filter.windowStart = windowCond;
 
   const rows = await ExercisePlanPeriodModel.find(filter)
     .sort({ windowStart: -1 })
@@ -478,7 +535,7 @@ export async function listPlanCalendar(
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
   const { start, end } = monthRange(month);
   const uid = new Types.ObjectId(userId);
-  const plan = await getPlan(userId);
+  const plan = await getPlan(userId, now);
   const targets: PlanTargets = plan?.targets || { distanceM: 0, durationMin: 0, count: 0 };
 
   // 1) 本月内的日快照
@@ -488,8 +545,11 @@ export async function listPlanCalendar(
   const snapByDate = new Map(daySnaps.map((s) => [String(s.periodKey), s]));
 
   // 2) 本月涉及的周快照（窗口与本月有交集：从月初前 7 天开始找）
+  // 周计划从锚点开始才有真实期：锚点之前的旧自然周/虚构期不参与展示
+  const weeklyAnchor = plan?.period === 'weekly' ? plan.periodStart : 0;
+  const weekFrom = weeklyAnchor > 0 ? Math.max(start - 7 * 86_400_000, weeklyAnchor) : start - 7 * 86_400_000;
   const weekSnaps = await ExercisePlanPeriodModel.find({
-    userId: uid, period: 'weekly', windowStart: { $gte: start - 7 * 86_400_000, $lt: end },
+    userId: uid, period: 'weekly', windowStart: { $gte: weekFrom, $lt: end },
   }).sort({ windowStart: -1 }).lean();
 
   // 3) 实时聚合本月全部轨迹（按月一次查完，避免逐天 N 次）
@@ -546,13 +606,14 @@ export async function listPlanCalendar(
     }),
     source: 'snapshot' as const,
   }));
-  const thisWeekStart = windowStart('weekly', now);
-  const inThisMonth = thisWeekStart >= start && thisWeekStart < end;
-  // 只有当前计划就是「每周」时，才把本周实时进度作为一条周记录（否则周目标＝日目标，会显示成 6.2/3.0）
-  if (plan?.period === 'weekly' && inThisMonth && !weeks.some((w) => w.windowStart === thisWeekStart)) {
-    const agg = await sumActivities(userId, thisWeekStart, thisWeekStart + 7 * 86_400_000);
+  // 当前期＝锚点起固定 7 天一期；与本月有交集就列出来（跨月的一期也要显示）
+  const curPeriodStart = plan?.period === 'weekly' ? windowStart('weekly', now, plan.periodStart) : 0;
+  const overlapsMonth = curPeriodStart > 0 && curPeriodStart < end && curPeriodStart + 7 * 86_400_000 > start;
+  // 只有当前计划就是「每周」时，才把本期实时进度作为一条期记录（否则期目标＝日目标，会显示成 6.2/3.0）
+  if (plan?.period === 'weekly' && overlapsMonth && !weeks.some((w) => w.windowStart === curPeriodStart)) {
+    const agg = await sumActivities(userId, curPeriodStart, curPeriodStart + 7 * 86_400_000);
     weeks.unshift({
-      ...buildSnapshot('weekly', thisWeekStart, thisWeekStart + 7 * 86_400_000, targets, agg),
+      ...buildSnapshot('weekly', curPeriodStart, curPeriodStart + 7 * 86_400_000, targets, agg),
       source: 'live',
     });
   }
@@ -722,6 +783,7 @@ function minRatioOf(progress: { distanceM: number; durationSec: number; count: n
 export async function getPlanSummary(userId: string): Promise<PlanSummaryResult> {
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
   const plan = await getPlan(userId);
+  // 概况是累计成就：锚点之前的历史快照照常计入（仅展示列表按锚点过滤）
   const rows = await ExercisePlanPeriodModel.find({ userId: new Types.ObjectId(userId) })
     .select({ period: 1, periodKey: 1, windowStart: 1, targets: 1, progress: 1, allAchieved: 1 })
     .sort({ windowStart: 1 })

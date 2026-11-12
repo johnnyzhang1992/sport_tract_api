@@ -9,7 +9,12 @@ import { buildApp } from '../src/app.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { ExercisePlanModel } from '../src/models/exercise-plan.model.js';
-import { bjDateStr, bjIsoWeekStart } from '../src/utils/bj-time.js';
+import { ExercisePlanPeriodModel } from '../src/models/exercise-plan-period.model.js';
+import { bjDateStr, bjDayStart } from '../src/utils/bj-time.js';
+import {
+  upsertPlan, getPlan, getPlanWithProgress, finalizePreviousPeriod, listPlanCalendar,
+  listPlanHistory,
+} from '../src/services/exercise-plan.js';
 
 let app: FastifyInstance;
 const NOW = Date.now();
@@ -134,20 +139,20 @@ test('EP3 每日计划：只计今天窗口的轨迹；超额封顶 pct=1', asyn
   assert.equal(byKey.count.pct, 1);
 });
 
-test('EP4 每周计划：窗口＝本周一 00:00 起；上周轨迹不计', async () => {
+test('EP4 每周计划：窗口＝定计划当天 0 点起固定 7 天；前一天轨迹不计', async () => {
   await ActivityModel.deleteMany({ userId: idP }); // 清掉 EP3 的种子，隔离断言
   await putPlan({ period: 'weekly', targets: { distanceM: 20000, durationMin: 120, count: 3 } });
-  // 本周一 00:30 的轨迹（一定在本周窗口内）；上周日的不计
-  const monday = new Date(Date.now() + 8 * 3600_000);
-  const dow = monday.getUTCDay();
-  const mondayUtc = Date.UTC(monday.getUTCFullYear(), monday.getUTCMonth(), monday.getUTCDate()) - ((dow + 6) % 7) * 86_400_000 - 8 * 3600_000;
-  await seedActivity({ type: 'cycling', start: mondayUtc + 1800_000, distance: 8000, duration: 2400 });
-  await seedActivity({ type: 'running', start: mondayUtc - 3600_000, distance: 9999, duration: 3600 });
+  const today0 = bjDayStart(NOW);
+  await seedActivity({ type: 'cycling', start: today0 + 1800_000, distance: 8000, duration: 2400 });
+  await seedActivity({ type: 'running', start: today0 - 3600_000, distance: 9999, duration: 3600 });
 
   const res = await getCurrent();
   const d = res.json().data;
   assert.equal(d.plan.period, 'weekly');
-  assert.equal(d.progress.distanceM, 8000, '本周一的一条计入，上周日的不计');
+  assert.equal(d.windowStart, today0, '本期起点＝定计划当天 0 点');
+  assert.equal(d.windowEnd, today0 + 7 * 86_400_000, '本期固定 7 天');
+  assert.equal(d.periodKey, bjDateStr(today0));
+  assert.equal(d.progress.distanceM, 8000, '当天的一条计入，前一天的轨迹不计');
   assert.equal(d.progress.count, 1);
 
   const byKey = Object.fromEntries(d.rings.map((r: { key: string }) => [r.key, r]));
@@ -238,11 +243,170 @@ test('EP9 当期达成旗标：periodKey 为东八区周期键；三项都达标
   d = (await getCurrent(tokenQ)).json().data;
   assert.equal(d.allAchieved, true, '三项都达标');
 
-  // 周计划：periodKey=东八区本周一
+  // 周计划：periodKey=本期起点（定计划当天）
   await ActivityModel.deleteMany({ userId: idQ });
   await putPlan({ period: 'weekly', targets: { distanceM: 1000, durationMin: 10, count: 1 } }, tokenQ);
   await seedActivity({ type: 'running', start: bjTodayAt(12), distance: 2000, duration: 1200 }, idQ);
   d = (await getCurrent(tokenQ)).json().data;
-  assert.equal(d.periodKey, bjDateStr(bjIsoWeekStart(NOW)), '周计划 periodKey=本周一');
+  assert.equal(d.periodKey, bjDateStr(bjDayStart(NOW)), '周计划 periodKey=本期起点日期');
   assert.equal(d.allAchieved, true);
+});
+
+test('EP10 周计划固定 7 天一期：次日仍同一期，7 天后进下一期并懒结算', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  // 东八区 2026-11-12 10:00
+  const T = Date.UTC(2026, 10, 12, 2, 0, 0);
+  const day0 = bjDayStart(T);
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T);
+  await seedActivity({ type: 'running', start: day0 + 3600_000, distance: 5000, duration: 1800 });
+
+  let d = await getPlanWithProgress(idP, T + 86_400_000); // 次日
+  assert.equal(d.windowStart, day0, '次日不重锚');
+  assert.equal(d.windowEnd, day0 + 7 * 86_400_000);
+  assert.equal(d.progress.distanceM, 5000, '本期轨迹持续累计');
+  assert.equal(d.periodKey, bjDateStr(day0));
+
+  const T7 = day0 + 8 * 86_400_000; // 11-20，已进入下一期（11-19 起）
+  await seedActivity({ type: 'running', start: T7, distance: 3000, duration: 1200 });
+  d = await getPlanWithProgress(idP, T7);
+  assert.equal(d.windowStart, day0 + 7 * 86_400_000, '7 天后自动进入下一期');
+  assert.equal(d.progress.distanceM, 3000, '上一期成绩不带入下一期');
+
+  await finalizePreviousPeriod(idP, T7);
+  const snap = await ExercisePlanPeriodModel.findOne({
+    userId: idP, period: 'weekly', periodKey: bjDateStr(day0),
+  }).lean();
+  assert.ok(snap, '上一期应落快照');
+  assert.equal(Number(snap!.progress?.distanceM), 5000);
+});
+
+test('EP11 存量周计划无锚点：首次读取锚定当天，之前轨迹不计且锚点落库', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.UTC(2026, 10, 12, 2, 0, 0);
+  const day0 = bjDayStart(T);
+  await ExercisePlanModel.create({
+    userId: idP, period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 },
+  });
+  await seedActivity({ type: 'running', start: day0 - 3600_000, distance: 9000, duration: 3000 });
+  await seedActivity({ type: 'running', start: day0 + 3600_000, distance: 4000, duration: 1500 });
+
+  const d1 = await getPlanWithProgress(idP, T);
+  assert.equal(d1.windowStart, day0, '存量计划首次读取锚定当天 0 点');
+  assert.equal(d1.progress.distanceM, 4000, '锚点之前的轨迹不计');
+
+  const raw = await ExercisePlanModel.findOne({ userId: idP }).lean();
+  assert.equal(Number(raw!.periodStart), day0, '锚点要落库');
+
+  const d2 = await getPlanWithProgress(idP, T + 3 * 3600_000);
+  assert.equal(d2.windowStart, day0, '同一天再读不重锚');
+});
+
+test('EP12 改目标不重锚；每天↔每周切换才重锚', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.UTC(2026, 10, 12, 2, 0, 0);
+  const day0 = bjDayStart(T);
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T);
+  assert.equal((await getPlan(idP))!.periodStart, day0);
+
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 10000, durationMin: 210, count: 7 } }, T + 2 * 3600_000);
+  assert.equal((await getPlan(idP))!.periodStart, day0, '改目标保持本期起点');
+
+  await upsertPlan(idP, { period: 'daily', targets: { distanceM: 5000, durationMin: 30, count: 1 } }, T + 2 * 3600_000);
+  assert.equal((await getPlan(idP))!.periodStart, 0, '每天计划不存锚点');
+
+  const T1 = T + 86_400_000;
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T1);
+  assert.equal((await getPlan(idP))!.periodStart, bjDayStart(T1), '切回每周从当天重锚');
+});
+
+test('EP13 月历周记录实时项＝当前固定 7 天一期', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.UTC(2026, 10, 12, 2, 0, 0);
+  const day0 = bjDayStart(T);
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T);
+  // 到了第二期（11-20）再看：当前期应是 11-19~11-25，而不是「今天起切」
+  const later = day0 + 8 * 86_400_000;
+  await seedActivity({ type: 'running', start: later + 3600_000, distance: 5000, duration: 1800 });
+
+  const month = bjDateStr(day0).slice(0, 7);
+  const cal = await listPlanCalendar(idP, month, later);
+  const live = cal.weeks.find((w) => w.source === 'live');
+  assert.ok(live, '本月应有一条实时周记录');
+  assert.equal(live!.windowStart, day0 + 7 * 86_400_000, '实时记录用锚点推导的当前期');
+  assert.equal(live!.windowEnd, day0 + 14 * 86_400_000);
+  assert.equal(live!.progress.distanceM, 5000);
+});
+
+/** 直接造一条周期快照（模拟历史/迁移数据） */
+async function seedSnap(o: {
+  period: 'daily' | 'weekly'; start: number; end: number; distanceM?: number;
+}) {
+  await ExercisePlanPeriodModel.create({
+    userId: idP,
+    period: o.period,
+    periodKey: bjDateStr(o.start),
+    windowStart: o.start,
+    windowEnd: o.end,
+    targets: { distanceM: 21000, durationMin: 210, count: 7 },
+    progress: { distanceM: o.distanceM || 0, durationSec: 0, count: 0 },
+    achieved: { distance: false, duration: false, count: false },
+    allAchieved: false,
+  });
+}
+
+test('EP14 迁移后不补锚点之前的「虚构上一期」', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.UTC(2026, 10, 12, 2, 0, 0);
+  const day0 = bjDayStart(T);
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T);
+
+  await finalizePreviousPeriod(idP, T);
+  assert.equal(
+    await ExercisePlanPeriodModel.countDocuments({ userId: idP, period: 'weekly' }),
+    0,
+    '锚点之前没有真实期，不能补出 11-05~11-11 这样的记录',
+  );
+});
+
+test('EP15 月历周记录只列锚点之后的期（旧自然周/虚构期不展示）', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.UTC(2026, 10, 12, 2, 0, 0);
+  const day0 = bjDayStart(T);
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T);
+
+  await seedSnap({ period: 'weekly', start: day0 - 7 * 86_400_000, end: day0, distanceM: 5000 }); // 锚点前（虚构）
+  await seedSnap({ period: 'weekly', start: day0, end: day0 + 7 * 86_400_000, distanceM: 8000 }); // 第一期快照
+
+  const cal = await listPlanCalendar(idP, '2026-11', T + 8 * 86_400_000);
+  const starts = cal.weeks.map((w) => w.windowStart);
+  assert.ok(!starts.includes(day0 - 7 * 86_400_000), '锚点前的周记录不出现');
+  assert.ok(starts.includes(day0), '锚点后的已结算期保留');
+  assert.ok(starts.includes(day0 + 7 * 86_400_000), '当前期实时记录保留');
+});
+
+test('EP16 历史查询只返回锚点之后的周记录', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.UTC(2026, 10, 12, 2, 0, 0);
+  const day0 = bjDayStart(T);
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T);
+
+  await seedSnap({ period: 'weekly', start: day0 - 7 * 86_400_000, end: day0, distanceM: 5000 });
+  await seedSnap({ period: 'weekly', start: day0, end: day0 + 7 * 86_400_000, distanceM: 8000 });
+
+  const page = await listPlanHistory(idP, { period: 'weekly' });
+  assert.deepEqual(page.items.map((i) => i.windowStart), [day0], '锚点前的按周快照不返回');
 });
