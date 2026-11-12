@@ -142,6 +142,7 @@ test('EPC2 周计划记录：当前期实时一条 + 已结算的期快照', asy
 
 test('EPC3 单日详情：三环 + 当天轨迹摘要', async () => {
   const d = bjDayStart(-5);
+  await backdatePlan(6); // 计划 6 天前就存在，否则该日属「当天没有计划」
   await seed(d + 7 * 3600_000, 2000, 1200, 'running');
   await seed(d + 18 * 3600_000, 1000, 600, 'walking');
 
@@ -180,4 +181,28 @@ test('EPC4 路由：/calendar 与 /day 需登录；非法参数 400', async () =
   });
   assert.equal(day.statusCode, 200, day.body);
   assert.ok(Array.isArray(day.json().data.tracks));
+});
+
+test('EPC5 未覆盖计划期的日期：noPlan=true、目标为 0，不拿当前目标回溯评价', async () => {
+  // 计划从今天-6 开始（EPC3 回拨过），今天-10 在计划开始之前
+  const before = bjDayStart(-10);
+  await seed(before + 8 * 3600_000, 2000, 1200, 'running');
+  await seed(before + 19 * 3600_000, 1000, 600, 'walking');
+  const detail = await getPlanDayDetail(userId, bjDateStr(before));
+  assert.equal(detail.noPlan, true, '计划开始之前 → 当天没有计划');
+  assert.equal(detail.source, 'none');
+  assert.equal(detail.allAchieved, false, '不算达成');
+  for (const r of detail.rings) assert.equal(r.target, 0, `目标应为 0（${r.key}）`);
+  assert.equal(detail.tracks.length, 2, '当天轨迹照常返回（数据本身还是要能看）');
+
+  // 月历同一格也要带 noPlan，且三环全空
+  const cal = await listPlanCalendar(userId, monthOf(before));
+  const cell = cal.days.find((x) => x.date === bjDateStr(before))!;
+  assert.equal(cell.noPlan, true);
+  assert.equal(cell.allAchieved, false);
+  for (const r of cell.rings) assert.equal(r.pct, 0, '目标 0 → 完成度 0');
+
+  // 计划期之内的今天：noPlan=false，正常按当前目标评价
+  const today = await getPlanDayDetail(userId, bjDateStr(bjDayStart(0)));
+  assert.equal(today.noPlan, false);
 });

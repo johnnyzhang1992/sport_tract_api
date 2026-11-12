@@ -27,6 +27,8 @@ export interface ExercisePlanDto {
   updatedAt: number;
   /** 周计划锚点（东八区某天 0 点，固定 7 天一期从锚点起切块）；每天计划为 0 */
   periodStart: number;
+  /** 计划生效起点（东八区某天 0 点）：早于它的日期没有计划期，端上不作「未达成」评价 */
+  activeFrom: number;
 }
 
 export interface PlanRing {
@@ -248,15 +250,24 @@ export function isPlanIdle(
   return idleMs > Math.max(periodMs, PLAN_IDLE_DAYS * 86_400_000);
 }
 
+/** 计划生效起点（DTO 版）：activeFrom 缺失时回退 periodStart；都没有返回 0（视为不限制） */
+function planActiveFromOf(plan: ExercisePlanDto | null): number {
+  if (!plan) return 0;
+  return Number(plan.activeFrom) || Number(plan.periodStart) || 0;
+}
+
 function toDto(doc: {
   period: PlanPeriod;
   targets: PlanTargets;
   updatedAt: Date;
   periodStart?: number;
+  activeFrom?: number;
+  createdAt?: Date;
 }): ExercisePlanDto {
   return {
     period: doc.period,
     periodStart: Number(doc.periodStart) || 0,
+    activeFrom: planActiveFrom(doc),
     targets: {
       distanceM: doc.targets.distanceM || 0,
       durationMin: doc.targets.durationMin || 0,
@@ -603,6 +614,11 @@ export interface PlanCalendarDay {
   /** 三项完成度环（无数据时 pct 全 0） */
   rings: PlanRing[];
   allAchieved: boolean;
+  /**
+   * 该日不在任何计划期内（计划还没开始 / 已取消），三环目标为 0、不算达成。
+   * 端上据此显示「当天没有计划」而不是拿当前目标去回溯评价历史。
+   */
+  noPlan: boolean;
   /** snapshot=历史快照；live=当期实时聚合；none=该日无计划记录 */
   source: 'snapshot' | 'live' | 'none';
 }
@@ -669,6 +685,8 @@ export async function listPlanCalendar(
   const uid = new Types.ObjectId(userId);
   const plan = await getPlan(userId, now);
   const targets: PlanTargets = plan?.targets || { distanceM: 0, durationMin: 0, count: 0 };
+  // 计划生效起点：早于它的日期没有计划期（历史日期不拿当前目标回溯评价）
+  const planStart = plan ? planActiveFromOf(plan) : 0;
 
   // 1) 本月内的日快照
   const daySnaps = await ExercisePlanPeriodModel.find({
@@ -706,22 +724,27 @@ export async function listPlanCalendar(
           count: snap.progress?.count || 0,
         }).rings,
         allAchieved: !!snap.allAchieved,
+        noPlan: false, // 有快照＝该日确实在计划期内
         source: 'snapshot',
       });
       continue;
     }
-    // 当期（今天）与上线前无快照的日期：实时聚合，目标用当前计划
+    // 无快照的日期：只有「计划期内」才用当前目标评价；计划开始之前（含计划已取消）算「当天没有计划」
     const idx = Math.floor((ws + 8 * 3600_000) / 86_400_000);
     const agg = liveByDayIdx.get(idx) || { distanceM: 0, durationSec: 0, count: 0 };
     const hasData = agg.distanceM > 0 || agg.durationSec > 0 || agg.count > 0;
-    const snapBuilt = buildSnapshot('daily', ws, ws + 86_400_000, targets, agg);
+    const noPlan = planStart > 0 && ws < planStart;
+    // noPlan：目标全 0（三环全空、不算达成），历史日期不再被当前目标回溯评价
+    const dayTargets: PlanTargets = noPlan ? { distanceM: 0, durationMin: 0, count: 0 } : targets;
+    const snapBuilt = buildSnapshot('daily', ws, ws + 86_400_000, dayTargets, agg);
     const future = ws > todayStart;
     days.push({
       date,
       windowStart: ws,
       rings: snapBuilt.rings,
-      allAchieved: !future && hasData && snapBuilt.allAchieved,
-      source: (future || !hasData) ? 'none' : 'live',
+      allAchieved: !noPlan && !future && hasData && snapBuilt.allAchieved,
+      noPlan,
+      source: noPlan ? 'none' : ((future || !hasData) ? 'none' : 'live'),
     });
   }
 
@@ -759,6 +782,8 @@ export interface PlanDayDetail {
   windowStart: number;
   rings: PlanRing[];
   allAchieved: boolean;
+  /** 该日不在任何计划期内（计划还没开始/已取消）：目标为 0，端上显示「当天没有计划」 */
+  noPlan: boolean;
   source: 'snapshot' | 'live' | 'none';
   /** 当天轨迹摘要（按开始时间正序，最多 20 条） */
   tracks: Array<{
@@ -783,8 +808,9 @@ export async function getPlanDayDetail(
   const we = ws + 86_400_000;
   const uid = new Types.ObjectId(userId);
 
-  const plan = await getPlan(userId);
+  const plan = await getPlan(userId, now);
   const targets: PlanTargets = plan?.targets || { distanceM: 0, durationMin: 0, count: 0 };
+  const planStart = plan ? planActiveFromOf(plan) : 0;
 
   const snap = await ExercisePlanPeriodModel.findOne({ userId: uid, period: 'daily', periodKey: date }).lean();
   const rows = await ActivityModel.find({ userId: uid, status: 'finished', startTime: { $gte: ws, $lt: we } })
@@ -799,6 +825,8 @@ export async function getPlanDayDetail(
   }), { distanceM: 0, durationSec: 0, count: 0 });
 
   const useSnap = !!snap;
+  // 没有快照且该日早于计划生效起点：当天没有计划 → 目标全 0（不拿当前目标回溯）
+  const noPlan = !useSnap && planStart > 0 && ws < planStart;
   const built = buildSnapshot(
     'daily',
     ws,
@@ -809,7 +837,7 @@ export async function getPlanDayDetail(
         durationMin: snap!.targets?.durationMin || 0,
         count: snap!.targets?.count || 0,
       }
-      : targets,
+      : (noPlan ? { distanceM: 0, durationMin: 0, count: 0 } : targets),
     useSnap
       ? {
         distanceM: snap!.progress?.distanceM || 0,
@@ -823,8 +851,9 @@ export async function getPlanDayDetail(
     date,
     windowStart: ws,
     rings: built.rings,
-    allAchieved: useSnap ? !!snap!.allAchieved : (hasData && built.allAchieved),
-    source: useSnap ? 'snapshot' : (hasData ? 'live' : 'none'),
+    allAchieved: useSnap ? !!snap!.allAchieved : (!noPlan && hasData && built.allAchieved),
+    noPlan,
+    source: useSnap ? 'snapshot' : ((noPlan || !hasData) ? 'none' : 'live'),
     tracks: rows.map((r) => ({
       id: String(r._id),
       type: String(r.type || ''),
