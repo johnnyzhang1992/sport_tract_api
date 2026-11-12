@@ -92,12 +92,18 @@ export async function upsertPlan(userId: string, input: unknown, now = Date.now(
    * 周计划锚点：新计划 / 从每天切过来 → 锚到当天 0 点（第一期＝今天起 7 天）；
    * 本来就是每周 → 沿用原锚点（改目标不重开当期）。每天计划不需要锚点（0）。
    */
-  const prev = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) })
-    .select({ period: 1, periodStart: 1 }).lean();
+  const prev = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) }).lean();
   const prevAnchor = Number(prev?.periodStart) || 0;
   const periodStart = period === 'weekly'
     ? (prev?.period === 'weekly' && prevAnchor > 0 ? prevAnchor : bjDayStart(now))
     : 0;
+  /**
+   * 计划生效起点：新计划 / 切换周期类型 → 今天 0 点（重新开始算「计划周期」与闲置计时）；
+   * 改目标不重置（否则天天改目标就永远不会被判定闲置，历史边界也会一直往后挪）。
+   */
+  const activeFrom = !prev || prev.period !== period
+    ? bjDayStart(now)
+    : (planActiveFrom(prev) || bjDayStart(now));
   // 冻结基线：新周期窗口内、此刻之前已经完成的进度（轨迹不可变，这就是「过去日期」的真实成绩）
   const start = windowStart(period, now, periodStart);
   const before = await sumActivities(userId, start, now);
@@ -111,6 +117,7 @@ export async function upsertPlan(userId: string, input: unknown, now = Date.now(
         baselineWindowStart: start,
         baselineAt: now,
         periodStart,
+        activeFrom,
         updatedAt: new Date(),
       },
     },
@@ -133,8 +140,112 @@ export async function getPlan(userId: string, now = Date.now()): Promise<Exercis
       { $set: { periodStart: anchor } },
     );
     doc.periodStart = anchor;
+    if (!(Number(doc.activeFrom) > 0)) doc.activeFrom = anchor;
+  }
+
+  // 闲置取消（见 isPlanIdle）：用户回来读计划时判定，到期即取消，之后按「无计划」引导重建
+  const lastActive = await lastActivityAt(userId);
+  if (isPlanIdle(doc, lastActive, now)) {
+    // 先补上「刚结束的那一期」——里面有真实运动就落一条快照，取消不等于抹掉已发生的成绩
+    await settleLastPeriodBeforeCancel(userId, doc, now);
+    await cancelPlan(userId, doc, now);
+    return null;
   }
   return toDto(doc);
+}
+
+/**
+ * 取消前补最后一条快照：只结算「刚结束的那一期」，且该期确实有运动才写法——
+ * 空期直接跳过（长期不活跃的用户不该被塞一堆 0 进度记录）。
+ */
+async function settleLastPeriodBeforeCancel(
+  userId: string,
+  doc: { period: PlanPeriod; periodStart?: number; activeFrom?: number; createdAt?: Date },
+  now: number,
+): Promise<void> {
+  const activeFrom = planActiveFrom(doc);
+  const w = previousWindow(doc.period, now, Number(doc.periodStart) || 0);
+  if (w.start <= 0) return;
+  if (activeFrom > 0 && w.start < activeFrom) return; // 该期早于计划生效：本来就没有计划周期
+  const progress = await sumActivities(userId, w.start, w.end);
+  if (progress.distanceM <= 0 && progress.durationSec <= 0 && progress.count <= 0) return;
+  await finalizePlanPeriod(userId, doc.period, w.start, w.end);
+}
+
+/**
+ * 取消闲置计划：删计划文档（历史快照保留）。删除条件是「仍是同一份计划」——
+ * 防止刚删完用户就保存了新计划时把新计划误删（并发）。
+ */
+async function cancelPlan(
+  userId: string,
+  doc: { _id: unknown; period: PlanPeriod; targets: PlanTargets },
+  now: number,
+): Promise<void> {
+  const res = await ExercisePlanModel.deleteOne({
+    _id: doc._id,
+    period: doc.period,
+    'targets.distanceM': doc.targets?.distanceM || 0,
+    'targets.durationMin': doc.targets?.durationMin || 0,
+    'targets.count': doc.targets?.count || 0,
+  });
+  if (res.deletedCount) {
+    console.log(`[exercise-plan] 闲置超过 ${PLAN_IDLE_DAYS} 天，已自动取消计划 userId=${userId} at=${now}`);
+  }
+}
+
+/**
+ * 计划生效起点（东八区某天 0 点）：activeFrom（新计划/切换类型）→ periodStart（存量周计划锚点）
+ * → createdAt 当天（存量每天计划）。用来给结算快照划边界、给闲置取消算计时起点。
+ */
+function planActiveFrom(doc: {
+  activeFrom?: number;
+  periodStart?: number;
+  createdAt?: Date;
+}): number {
+  const active = Number(doc.activeFrom) || 0;
+  if (active > 0) return active;
+  const anchor = Number(doc.periodStart) || 0;
+  if (anchor > 0) return anchor;
+  const created = doc.createdAt ? new Date(doc.createdAt).getTime() : 0;
+  return created > 0 ? bjDayStart(created) : 0;
+}
+
+/**
+ * 闲置取消（2026-11-12）：超过一个周期且连续 7 天以上没有任何运动 → 计划自动取消。
+ *
+ * 判断起点取「最近一次运动」与「计划生效起点」的较晚者：
+ * - 刚建计划还没开始运动：从建计划那天算，不会第二天就被取消；
+ * - 一直在运动：从最近一次运动算，停下来 7 天后才取消。
+ * 取消＝删掉计划文档（历史快照保留，月历/概况照旧可看），用户下次回来就是「无计划」态，
+ * 会重新走创建引导。
+ */
+export const PLAN_IDLE_DAYS = 7;
+
+/** 用户最近一次运动（含进行中）的 startTime；从无轨迹返回 0 */
+async function lastActivityAt(userId: string): Promise<number> {
+  const last = await ActivityModel.findOne({
+    userId: new Types.ObjectId(userId),
+    status: { $in: ['finished', 'in_progress'] },
+  }).sort({ startTime: -1 }).select({ startTime: 1 }).lean();
+  return Number(last?.startTime) || 0;
+}
+
+/**
+ * 计划是否已闲置到期：距「最近运动 / 计划生效起点」的较晚者已超过 7 天。
+ * 同时要求确实跨过了一个完整周期（每天计划 1 天、每周计划 7 天）——对每天/每周计划，
+ * 7 天都已覆盖，这里保留周期判断做语义兜底（将来加别的周期类型不必再改）。
+ */
+export function isPlanIdle(
+  plan: { period: PlanPeriod; activeFrom?: number; periodStart?: number; createdAt?: Date },
+  lastActiveAt: number,
+  now = Date.now(),
+): boolean {
+  const from = planActiveFrom(plan);
+  const anchor = Math.max(from || 0, Number(lastActiveAt) || 0);
+  if (!anchor) return false; // 两个时间都拿不到：不动用户数据
+  const periodMs = plan.period === 'weekly' ? 7 * 86_400_000 : 86_400_000;
+  const idleMs = now - anchor;
+  return idleMs > Math.max(periodMs, PLAN_IDLE_DAYS * 86_400_000);
 }
 
 function toDto(doc: {
@@ -305,7 +416,12 @@ function buildSnapshot(
 
 /**
  * 结算某个已结束的周期并落快照（幂等：唯一索引 {userId,period,periodKey}）。
- * 目标取「该周期最后一次保存的计划目标」——历史周期用当时的目标评价，之后改计划不影响历史。
+ *
+ * 两条硬规则（2026-11-12 修复）：
+ * 1. **不补「计划还不存在」的期**：窗口起点早于计划生效起点（planActiveFrom）直接不写快照。
+ *    否则用户今天新建计划，就会给昨天补出一条「已完成/已达成」的假历史。
+ * 2. **目标只在首次结算时冻结**：之后改计划不重算历史——重结算只更新 progress/达成，
+ *    不再用当前目标改写 targets（否则改目标会把昨天的「已达成」翻成「未达成」）。
  */
 export async function finalizePlanPeriod(
   userId: string,
@@ -314,29 +430,45 @@ export async function finalizePlanPeriod(
   end: number,
 ): Promise<PlanPeriodSnapshot | null> {
   if (!Types.ObjectId.isValid(userId)) return null;
-  const doc = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) })
-    .select({ targets: 1 }).lean();
+  const uid = new Types.ObjectId(userId);
+  const doc = await ExercisePlanModel.findOne({ userId: uid })
+    .select({ targets: 1, activeFrom: 1, periodStart: 1, createdAt: 1 }).lean();
   if (!doc) return null;
+  // 规则 1：计划生效之前没有「计划周期」这回事（含存量计划迁移前的空档）
+  const activeFrom = planActiveFrom(doc);
+  if (activeFrom > 0 && start < activeFrom) return null;
+
+  const periodKey = periodKeyOf(period, start);
+  // 规则 2：已有快照的目标是当时冻结的，重结算沿用（不存在才用当前目标）
+  const existing = await ExercisePlanPeriodModel.findOne({ userId: uid, period, periodKey })
+    .select({ targets: 1 }).lean();
+  const targets: PlanTargets = existing
+    ? {
+        distanceM: existing.targets?.distanceM || 0,
+        durationMin: existing.targets?.durationMin || 0,
+        count: existing.targets?.count || 0,
+      }
+    : {
+        distanceM: doc.targets?.distanceM || 0,
+        durationMin: doc.targets?.durationMin || 0,
+        count: doc.targets?.count || 0,
+      };
+
   const real = await sumActivities(userId, start, end);
-  const targets: PlanTargets = {
-    distanceM: doc.targets?.distanceM || 0,
-    durationMin: doc.targets?.durationMin || 0,
-    count: doc.targets?.count || 0,
-  };
   const snap = buildSnapshot(period, start, end, targets, real);
   try {
     await ExercisePlanPeriodModel.updateOne(
-      { userId: new Types.ObjectId(userId), period, periodKey: snap.periodKey },
+      { userId: uid, period, periodKey: snap.periodKey },
       {
         $set: {
           windowStart: snap.windowStart,
           windowEnd: snap.windowEnd,
-          targets: snap.targets,
           progress: snap.progress,
           achieved: snap.achieved,
           allAchieved: snap.allAchieved,
         },
-        $setOnInsert: { userId: new Types.ObjectId(userId), period, periodKey: snap.periodKey },
+        // 目标只在插入时写入：重结算不改历史目标
+        $setOnInsert: { userId: uid, period, periodKey: snap.periodKey, targets: snap.targets },
       },
       { upsert: true },
     );

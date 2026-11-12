@@ -15,6 +15,13 @@ const exercisePlanSchema = new Schema(
      * 新建周计划＝创建当天；存量周计划首次读取时锚到当天（见 getPlan）；每天计划为 0。
      */
     periodStart: { type: Number, default: 0 },
+    /**
+     * 计划生效起点（东八区某天 0 点，epoch ms）：新建计划 / 切换周期类型时重置，改目标不重置。
+     * 两个用途：① 结算快照的边界（早于此刻的窗口不算计划周期，避免补出「计划不存在」的历史）；
+     * ② 闲置取消的判断起点（用户长期无运动时把计划取消）。
+     * 存量计划为 0，按 periodStart / createdAt 回退（见 planActiveFrom）。
+     */
+    activeFrom: { type: Number, default: 0 },
     targets: {
       distanceM: { type: Number, default: 0 }, // 目标距离（米）
       durationMin: { type: Number, default: 0 }, // 目标时长（分钟）

@@ -13,7 +13,7 @@ import { ExercisePlanPeriodModel } from '../src/models/exercise-plan-period.mode
 import { bjDateStr, bjDayStart } from '../src/utils/bj-time.js';
 import {
   upsertPlan, getPlan, getPlanWithProgress, finalizePreviousPeriod, listPlanCalendar,
-  listPlanHistory,
+  listPlanHistory, finalizePlanPeriod, getPlanSummary,
 } from '../src/services/exercise-plan.js';
 
 let app: FastifyInstance;
@@ -388,6 +388,12 @@ test('EP15 月历周记录只列锚点之后的期（旧自然周/虚构期不�
 
   await seedSnap({ period: 'weekly', start: day0 - 7 * 86_400_000, end: day0, distanceM: 5000 }); // 锚点前（虚构）
   await seedSnap({ period: 'weekly', start: day0, end: day0 + 7 * 86_400_000, distanceM: 8000 }); // 第一期快照
+  // 读取时间（T+8 天）要「最近有运动」，否则会触发闲置取消（见 EP19）
+  await ActivityModel.create({
+    userId: idP, type: 'running', status: 'finished',
+    startTime: T + 8 * 86_400_000, endTime: T + 8 * 86_400_000 + 1800_000,
+    duration: 1800, distance: 3000, trackPoints: [], markers: [],
+  });
 
   const cal = await listPlanCalendar(idP, '2026-11', T + 8 * 86_400_000);
   const starts = cal.weeks.map((w) => w.windowStart);
@@ -407,6 +413,114 @@ test('EP16 历史查询只返回锚点之后的周记录', async () => {
   await seedSnap({ period: 'weekly', start: day0 - 7 * 86_400_000, end: day0, distanceM: 5000 });
   await seedSnap({ period: 'weekly', start: day0, end: day0 + 7 * 86_400_000, distanceM: 8000 });
 
+  // 保持活跃（否则计划会因闲置被取消，历史默认周期也就查不到了）
+  await ActivityModel.create({
+    userId: idP, type: 'running', status: 'finished',
+    startTime: Date.now() - 3600_000, endTime: Date.now(), duration: 1800, distance: 3000,
+    trackPoints: [], markers: [],
+  });
+
   const page = await listPlanHistory(idP, { period: 'weekly' });
   assert.deepEqual(page.items.map((i) => i.windowStart), [day0], '锚点前的按周快照不返回');
+});
+
+/* ==========================================================================
+ * 2026-11-12 修复：结算边界（不补计划开始前的期）、目标首次冻结、闲置取消
+ * ========================================================================== */
+
+test('EP17 结算边界：计划创建之前的窗口不落快照（不造假历史）', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  // 今天才建计划；昨天有一条 8km 轨迹（计划不存在时的运动）
+  await upsertPlan(idP, { period: 'daily', targets: { distanceM: 5000, durationMin: 30, count: 1 } });
+  const yesterday = bjDayStart(Date.now()) - 86_400_000;
+  await seedActivity({ type: 'running', start: yesterday + 10 * 3600_000, distance: 8000, duration: 3600 });
+
+  const snap = await finalizePlanPeriod(idP, 'daily', yesterday, yesterday + 86_400_000);
+  assert.equal(snap, null, '计划生效之前的窗口不结算');
+  assert.equal(await ExercisePlanPeriodModel.countDocuments({ userId: idP }), 0, '一条快照都不该写');
+
+  const sum = await getPlanSummary(idP);
+  assert.equal(sum.totalPeriods, 0, '概况里也不会出现假周期');
+
+  // 对照：今天这一期（计划生效之后）正常结算
+  const today = bjDayStart(Date.now());
+  await seedActivity({ type: 'running', start: today + 9 * 3600_000, distance: 6000, duration: 2000 });
+  const ok = await finalizePlanPeriod(idP, 'daily', today, today + 86_400_000);
+  assert.ok(ok, '计划生效之后的窗口照常结算');
+  assert.equal(ok!.progress.distanceM, 6000);
+  assert.equal(await ExercisePlanPeriodModel.countDocuments({ userId: idP }), 1, '只写生效之后那一条');
+});
+
+test('EP18 目标首次冻结：改计划后重结算不重写历史快照的目标与达成', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.now() - 3 * 86_400_000; // 3 天前建计划（保证昨天的窗口在生效之后）
+  await upsertPlan(idP, { period: 'daily', targets: { distanceM: 5000, durationMin: 30, count: 1 } }, T);
+  const yesterday = bjDayStart(Date.now()) - 86_400_000;
+  await seedActivity({ type: 'running', start: yesterday + 10 * 3600_000, distance: 8000, duration: 3600 });
+
+  const first = await finalizePlanPeriod(idP, 'daily', yesterday, yesterday + 86_400_000);
+  assert.equal(first!.allAchieved, true, '8km 达成 5km 目标');
+  assert.equal(first!.targets.distanceM, 5000);
+
+  // 今天把目标提到 10km（只影响以后）
+  await putPlan({ period: 'daily', targets: { distanceM: 10000, durationMin: 30, count: 1 } });
+  const again = await finalizePlanPeriod(idP, 'daily', yesterday, yesterday + 86_400_000);
+  assert.equal(again!.targets.distanceM, 5000, '历史目标保持首次结算时的值');
+  assert.equal(again!.allAchieved, true, '历史达成状态不被新目标翻掉');
+
+  const row = await ExercisePlanPeriodModel.findOne({ userId: idP, period: 'daily', periodKey: bjDateStr(yesterday) }).lean();
+  assert.equal(row!.targets.distanceM, 5000, '库里也保持冻结目标');
+  assert.equal(row!.allAchieved, true);
+});
+
+test('EP19 闲置取消：超过 7 天没有任何运动 → 计划自动取消，历史快照保留', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.now() - 10 * 86_400_000; // 10 天前建计划
+  await upsertPlan(idP, { period: 'daily', targets: { distanceM: 5000, durationMin: 30, count: 1 } }, T);
+  // 最后一次运动在 9 天前
+  const lastRun = bjDayStart(Date.now()) - 9 * 86_400_000 + 10 * 3600_000;
+  await seedActivity({ type: 'running', start: lastRun, distance: 6000, duration: 2400 });
+  await seedSnap({ period: 'daily', start: bjDayStart(Date.now()) - 9 * 86_400_000, end: bjDayStart(Date.now()) - 8 * 86_400_000, distanceM: 6000 });
+
+  const cur = await getCurrent();
+  assert.equal(cur.json().data.plan, null, '闲置 9 天 → 计划被取消，接口返回无计划');
+  assert.equal(await ExercisePlanModel.countDocuments({ userId: idP }), 0, '计划文档已删除');
+  assert.ok(await ExercisePlanPeriodModel.countDocuments({ userId: idP }) > 0, '历史快照保留');
+});
+
+test('EP20 闲置取消：刚建计划还没运动、或 3 天前刚运动过 → 不取消', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  // 今天新建、还没运动
+  await upsertPlan(idP, { period: 'daily', targets: { distanceM: 5000, durationMin: 30, count: 1 } });
+  assert.ok((await getCurrent()).json().data.plan, '刚建的计划不能被取消');
+
+  // 3 天前运动过：仍活跃
+  const threeDaysAgo = bjDayStart(Date.now()) - 3 * 86_400_000 + 10 * 3600_000;
+  await seedActivity({ type: 'running', start: threeDaysAgo, distance: 5000, duration: 1800 });
+  assert.ok((await getCurrent()).json().data.plan, '3 天前有运动 → 保留');
+});
+
+test('EP21 闲置取消：取消前把「刚结束那一期」里的真实成绩落成快照，空期不写', async () => {
+  await ActivityModel.deleteMany({ userId: idP });
+  await ExercisePlanModel.deleteMany({ userId: idP });
+  await ExercisePlanPeriodModel.deleteMany({ userId: idP });
+  const T = Date.now() - 20 * 86_400_000;
+  await upsertPlan(idP, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } }, T);
+  // 上一期（T+7~T+14）里有运动，之后停摆
+  await seedActivity({ type: 'running', start: T + 8 * 86_400_000, distance: 9000, duration: 3000 });
+
+  const cur = await getCurrent();
+  assert.equal(cur.json().data.plan, null, '闲置超过 7 天 → 已取消');
+  const snaps = await ExercisePlanPeriodModel.find({ userId: idP }).lean();
+  assert.equal(snaps.length, 1, '只补了「含运动的上一期」这一条，空期不写');
+  assert.equal(snaps[0].period, 'weekly');
+  assert.equal(snaps[0].progress.distanceM, 9000, '成绩被保留下来');
 });

@@ -70,10 +70,23 @@ after(async () => {
   await app.close();
 });
 
+/**
+ * 把计划「回拨」成 days 天前创建（模拟老用户）。
+ * 2026-11-12 起结算有生效边界：早于计划开始的窗口不再补快照，
+ * 所以「结算昨天」这类用例必须先把计划回拨，否则会被边界正确拦下。
+ */
+async function backdatePlan(days: number) {
+  await ExercisePlanModel.updateOne(
+    { userId: new mongoose.Types.ObjectId(userId) },
+    { $set: { activeFrom: bjDayStart(-days) } },
+  );
+}
+
 test('EPH1 昨日快照：目标 + 最终完成值 + 达成标记，且幂等', async () => {
   await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
   await upsertPlan(userId, { period: 'daily', targets: { distanceM: 3000, durationMin: 30, count: 1 } });
+  await backdatePlan(4); // 计划 4 天前就存在（否则昨天的窗口早于生效边界）
 
   const yesterdayStart = bjDayStart(-1);
   // 昨天跑了 4km/40 分钟（两项超额，次数 1 次达成）→ 全部达成
@@ -139,6 +152,7 @@ test('EPH4 改计划不影响已生成的历史快照', async () => {
 test('EPH5 全量结算：给所有有计划的人补上一周期快照', async () => {
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
   await upsertPlan(userId, { period: 'daily', targets: { distanceM: 1000, durationMin: 10, count: 1 } });
+  await backdatePlan(2);
   const r = await finalizeAllPreviousPeriods();
   assert.ok(r.done >= 1, `至少结算了本用户，实际 ${r.done}`);
   const rows = await ExercisePlanPeriodModel.countDocuments({ userId: new mongoose.Types.ObjectId(userId) });

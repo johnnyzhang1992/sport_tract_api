@@ -68,10 +68,19 @@ after(async () => {
   await app.close();
 });
 
+/** 把计划回拨成 days 天前创建：结算有生效边界，结算「昨天」前必须先回拨（2026-11-12） */
+async function backdatePlan(days: number) {
+  await ExercisePlanModel.updateOne(
+    { userId: new mongoose.Types.ObjectId(userId) },
+    { $set: { activeFrom: bjDayStart(-days) } },
+  );
+}
+
 test('EPC1 月历：整月每天一项；有快照用快照，今天实时聚合算 live', async () => {
   await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
   await upsertPlan(userId, { period: 'daily', targets: { distanceM: 3000, durationMin: 30, count: 1 } });
+  await backdatePlan(2);
 
   // 昨天：跑 4km → 结算成快照（目标 3km，全达成）
   const yest = bjDayStart(-1);
