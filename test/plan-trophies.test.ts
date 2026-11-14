@@ -118,11 +118,11 @@ async function summary() {
   return res.json().data;
 }
 
-test('TP1 trophies 全量下发：7 里程碑 + 25 阶梯 + 4 完美周 = 36 座', async () => {
+test('TP1 trophies 全量下发：7 里程碑 + 30 阶梯 + 4 完美周 = 41 座', async () => {
   const s = await summary();
-  assert.equal(s.trophies.length, 36, '单项完美周拆分后 36 座');
+  assert.equal(s.trophies.length, 41, '累计里程/时长替换完成目标后 41 座');
   const keys = new Set(s.trophies.map((t: PlanTrophy) => t.key));
-  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-2000', 'streak-365', 'ring-100', 'goal-500', 'perfect-week-all', 'perfect-week-distance', 'perfect-week-duration', 'perfect-week-count', 'x2', 'x3', 'x4']) {
+  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-2000', 'streak-365', 'ring-100', 'total-dist-5000', 'total-dur-500', 'perfect-week-all', 'perfect-week-distance', 'perfect-week-duration', 'perfect-week-count', 'x2', 'x3', 'x4']) {
     assert.ok(keys.has(key), `缺奖杯 ${key}`);
   }
 });
@@ -173,9 +173,9 @@ test('TP3 合环与活动：daily 快照全达成 100 次、累计活动 120 次
   assert.equal(ring365.earnedCount, 0, '未获得');
   assert.equal(ring365.pct, Math.round((100 / 365) * 100), '进度条百分比');
   assert.equal(ring100.nextTier, 365, '合环 100 → 下一档 365');
-  const goal100 = s.trophies.find((t: PlanTrophy) => t.key === 'goal-100');
-  assert.equal(goal100.cur, 120, '活动次数 = 120 天各 1 次');
-  assert.equal(goal100.unlocked, true);
+  // 「完成目标」系列已下线（与合环重复），改为累计里程：总量口径另见 TP10
+  const totalDist = s.trophies.find((t: PlanTrophy) => t.key === 'total-dist-100');
+  assert.equal(totalDist.unlocked, true, '累计里程已过 100km 档');
 });
 
 test('TP4 完美周：全能 / 距离 / 时长 / 次数 四项各算各的，互不冒充', async () => {
@@ -242,7 +242,7 @@ test('TP6 脏数据不炸接口：periodKey 不是合法日期时跳过该行（
   });
   assert.equal(res.statusCode, 200, '脏数据不能让接口 500');
   const s = res.json().data;
-  assert.equal(s.trophies.length, 36, '奖杯照常下发');
+  assert.equal(s.trophies.length, 41, '奖杯照常下发');
   const perfectAll = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-all');
   assert.equal(perfectAll.cur, before, '非法日期不计入完美周（计数与插入脏数据前一致）');
 
@@ -320,4 +320,43 @@ test('TP9 倍数章口径一致：300% 的周期同时算完成 200%（unlocked/
   assert.equal(x3.unlocked, true);
   assert.equal(x3.pct, 100);
   assert.equal(s.trophies.find((t: PlanTrophy) => t.key === 'x4').unlocked, false, '400% 未达成');
+});
+
+test('TP10 累计里程/时长：全历史总量、阶梯按 km/小时、跨档那天为获取日期', async () => {
+  const uid = (await UserModel.findOne({ openid: 'wrt-a' }).select('_id').lean())!._id;
+  // 自己造三天数据（TP9 已清空活动）：60 + 50 + 40 = 150km；3 × 7000s = 21000s ≈ 5 小时
+  await ActivityModel.deleteMany({ userId: uid });
+  await ExercisePlanPeriodModel.deleteMany({ userId: uid });
+  const plan = [
+    { off: 3, dist: 60000, dur: 7000 },
+    { off: 2, dist: 50000, dur: 7000 },
+    { off: 1, dist: 40000, dur: 7000 },
+  ];
+  for (const p of plan) {
+    const start = bjDayStartMs(p.off) + 3600_000;
+    await ActivityModel.create({
+      userId: uid, type: 'running', status: 'finished',
+      startTime: start, endTime: start + p.dur * 1000, duration: p.dur, distance: p.dist,
+      trackPoints: [], markers: [],
+    });
+  }
+
+  const s = await summary();
+  const d100 = s.trophies.find((t: PlanTrophy) => t.key === 'total-dist-100');
+  const d500 = s.trophies.find((t: PlanTrophy) => t.key === 'total-dist-500');
+  assert.equal(d100.cur, 150, '累计里程按整公里：150km');
+  assert.equal(d100.unlocked, true, '150 ≥ 100km 档解锁');
+  assert.equal(d500.unlocked, false, '150 < 500km 未解锁');
+  assert.equal(d100.nextTier, 500, '下一档 500km');
+  assert.equal(d100.earnedCount, 1, '跨过 100km 时获得一次');
+  assert.equal(d100.earnDateText, bjDate(2), '60+50=110km，在第二天跨过 100km');
+  assert.equal(d100.valueText, '150 km', '卡面展示当前累计里程');
+
+  const h10 = s.trophies.find((t: PlanTrophy) => t.key === 'total-dur-10');
+  const h50 = s.trophies.find((t: PlanTrophy) => t.key === 'total-dur-50');
+  assert.equal(h10.cur, 5, '21000s ≈ 5 小时（按整小时取整）');
+  assert.equal(h10.unlocked, false, '5 < 10 小时未解锁');
+  assert.equal(h10.nextTier, 10, '累计时长下一档 10 小时');
+  assert.equal(h50.nextTier, 10, 'cur 5 → 下一档同为 10（阶梯首个大于 cur 的档）');
+  assert.equal(h10.earnedCount, 0, '未获得');
 });

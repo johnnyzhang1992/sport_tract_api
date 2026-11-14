@@ -1065,12 +1065,17 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   const rec = computeRecordStats(days);
   const dailyRows = rows.filter((r) => r.period === 'daily');
   const perfect = perfectWeekCounts(dailyRows);
+  // 累计总量（原始单位：米 / 秒）——阶梯按 km / 小时比，卡面显示原始值
+  const totalDistanceM = days.reduce((acc, d) => acc + d.distanceM, 0);
+  const totalDurationSec = days.reduce((acc, d) => acc + d.durationSec, 0);
   const counts = {
     breaksDistance: rec.breaksDistance,
     breaksDuration: rec.breaksDuration,
     streakBest: rec.streak.best,
     ringsClosed: dailyRows.filter((r) => r.allAchieved).length,
-    activities: days.reduce((acc, d) => acc + d.count, 0),
+    // 累计总量（全历史，不设计划边界：与「破纪录」看峰值互补）
+    totalDistanceKm: Math.floor(totalDistanceM / 1000),
+    totalDurationHour: Math.floor(totalDurationSec / 3600),
     perfectWeekAll: perfect.all,
     perfectWeekDistance: perfect.distance,
     perfectWeekDuration: perfect.duration,
@@ -1105,7 +1110,11 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     ...PLAN_TROPHY_DEFS.map((def): PlanTrophy => {
       const cur = metricCountOf(def.metric, counts);
       // 下一档：阶梯里第一个大于当前计数的档位（完美周无阶梯为 null）
-      const nextTier = def.group === 'week' ? null : (TROPHY_TIERS.find((t) => t > cur) ?? null);
+      const nextTier = def.group === 'week'
+        ? null
+        : ((def.group === 'total-distance' ? TOTAL_KM_TIERS
+          : def.group === 'total-duration' ? TOTAL_HOUR_TIERS
+            : TROPHY_TIERS).find((t) => t > cur) ?? null);
       const extra: { valueText?: string; dateText?: string } = {};
       if (def.group === 'record' && def.metric === 'breaksDistance') {
         extra.valueText = formatKmText(rec.distance.bestM);
@@ -1114,6 +1123,12 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       if (def.group === 'record' && def.metric === 'breaksDuration') {
         extra.valueText = formatDurText(rec.duration.bestSec);
         extra.dateText = rec.duration.dateText;
+      }
+      if (def.group === 'total-distance') {
+        extra.valueText = formatKmText(totalDistanceM);
+      }
+      if (def.group === 'total-duration') {
+        extra.valueText = formatDurText(totalDurationSec);
       }
       if (def.group === 'streak') {
         extra.valueText = `${rec.streak.best} 天`;
@@ -1169,7 +1184,8 @@ export type PlanTrophyMetric =
   | 'breaksDuration'
   | 'streakBest'
   | 'ringsClosed'
-  | 'activities'
+  | 'totalDistanceKm'
+  | 'totalDurationHour'
   | 'perfectWeekAll'
   | 'perfectWeekDistance'
   | 'perfectWeekDuration'
@@ -1185,11 +1201,15 @@ export interface PlanTrophyDef {
   metric: PlanTrophyMetric;
   /** 解锁档位（该计数达到 tier 即解锁） */
   tier: number;
-  group: 'record' | 'streak' | 'rings' | 'goal' | 'week';
+  group: 'record' | 'streak' | 'rings' | 'total-distance' | 'total-duration' | 'week';
 }
 
-/** 破纪录/合环/活动次数的统一阶梯（配置数组，随时可调） */
+/** 破纪录/合环的统一阶梯（配置数组，随时可调） */
 const TROPHY_TIERS = [100, 365, 500, 1000, 2000] as const;
+/** 累计里程阶梯（公里） */
+const TOTAL_KM_TIERS = [100, 500, 1000, 2000, 5000] as const;
+/** 累计时长阶梯（小时） */
+const TOTAL_HOUR_TIERS = [10, 50, 100, 200, 500] as const;
 
 /** 各系列奖杯定义（每档一座独立奖杯） */
 export const PLAN_TROPHY_DEFS: readonly PlanTrophyDef[] = [
@@ -1237,15 +1257,27 @@ export const PLAN_TROPHY_DEFS: readonly PlanTrophyDef[] = [
       group: 'rings',
     }),
   ),
-  ...TROPHY_TIERS.map(
+  // 累计里程/时长（2026-11-14 替换原「完成目标」，与合上圆环区分开：一个看总量、一个看当日达标）
+  ...TOTAL_KM_TIERS.map(
     (t): PlanTrophyDef => ({
-      key: `goal-${t}`,
-      label: `完成目标·${t}次`,
-      desc: `累计完成运动 ${t} 次`,
-      icon: '🎯',
-      metric: 'activities',
+      key: `total-dist-${t}`,
+      label: `累计里程·${t}km`,
+      desc: `累计运动里程达到 ${t} 公里`,
+      icon: '🛣️',
+      metric: 'totalDistanceKm',
       tier: t,
-      group: 'goal',
+      group: 'total-distance',
+    }),
+  ),
+  ...TOTAL_HOUR_TIERS.map(
+    (t): PlanTrophyDef => ({
+      key: `total-dur-${t}`,
+      label: `累计时长·${t}小时`,
+      desc: `累计运动时长达到 ${t} 小时`,
+      icon: '⌛',
+      metric: 'totalDurationHour',
+      tier: t,
+      group: 'total-duration',
     }),
   ),
   {
@@ -1319,7 +1351,7 @@ export interface PlanTrophy {
   valueText?: string;
   /** 记录型：纪录产生日期（YYYY-MM-DD） */
   dateText?: string;
-  group: 'plan' | 'record' | 'streak' | 'rings' | 'goal' | 'week';
+  group: 'plan' | 'record' | 'streak' | 'rings' | 'total-distance' | 'total-duration' | 'week';
 }
 
 export interface PlanRecords {
@@ -1576,15 +1608,25 @@ function computeTrophyEarns(
   }
   for (const t of TROPHY_TIERS) if (ringDates[t]) mark(`ring-${t}`, ringDates[t]);
 
-  // 完成目标：累计第 N 次 finished 运动（单日多段跨过档位也算当天）
-  let act = 0;
-  const goalDates: Record<number, string> = {};
+  // 累计里程/时长：逐日累加，第一次跨过档位的那天即获取日期
+  let cumDist = 0;
+  let cumDur = 0;
+  const distDates: Record<number, string> = {};
+  const durDates: Record<number, string> = {};
   for (const d of days) {
-    const before = act;
-    act += d.count;
-    for (const t of TROPHY_TIERS) if (before < t && act >= t && !goalDates[t]) goalDates[t] = d.date;
+    const prevDist = cumDist;
+    const prevDur = cumDur;
+    cumDist += d.distanceM;
+    cumDur += d.durationSec;
+    for (const t of TOTAL_KM_TIERS) {
+      if (prevDist < t * 1000 && cumDist >= t * 1000 && !distDates[t]) distDates[t] = d.date;
+    }
+    for (const t of TOTAL_HOUR_TIERS) {
+      if (prevDur < t * 3600 && cumDur >= t * 3600 && !durDates[t]) durDates[t] = d.date;
+    }
   }
-  for (const t of TROPHY_TIERS) if (goalDates[t]) mark(`goal-${t}`, goalDates[t]);
+  for (const t of TOTAL_KM_TIERS) if (distDates[t]) mark(`total-dist-${t}`, distDates[t]);
+  for (const t of TOTAL_HOUR_TIERS) if (durDates[t]) mark(`total-dur-${t}`, durDates[t]);
 
   // 完美周：可重复获得 → 次数；首次获取日期 = 最早合格周的最后一天
   const perfect = perfectWeekCounts(dailyRows);
@@ -1627,7 +1669,8 @@ interface TrophyCounts {
   breaksDuration: number;
   streakBest: number;
   ringsClosed: number;
-  activities: number;
+  totalDistanceKm: number;
+  totalDurationHour: number;
   perfectWeekAll: number;
   perfectWeekDistance: number;
   perfectWeekDuration: number;
@@ -1642,7 +1685,8 @@ function metricCountOf(metric: PlanTrophyMetric, m: TrophyCounts): number {
     case 'breaksDuration': return m.breaksDuration;
     case 'streakBest': return m.streakBest;
     case 'ringsClosed': return m.ringsClosed;
-    case 'activities': return m.activities;
+    case 'totalDistanceKm': return m.totalDistanceKm;
+    case 'totalDurationHour': return m.totalDurationHour;
     case 'perfectWeekAll': return m.perfectWeekAll;
     case 'perfectWeekDistance': return m.perfectWeekDistance;
     case 'perfectWeekDuration': return m.perfectWeekDuration;
