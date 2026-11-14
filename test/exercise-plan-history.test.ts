@@ -16,7 +16,7 @@ import { ActivityModel } from '../src/models/activity.model.js';
 import { ExercisePlanModel } from '../src/models/exercise-plan.model.js';
 import { ExercisePlanPeriodModel } from '../src/models/exercise-plan-period.model.js';
 import {
-  finalizePlanPeriod, listPlanHistory, finalizeAllPreviousPeriods, upsertPlan,
+  finalizePlanPeriod, listPlanHistory, finalizeAllPreviousPeriods, upsertPlan, CATCH_UP_MAX_PERIODS,
 } from '../src/services/exercise-plan.js';
 import { bjDateStr } from '../src/utils/bj-time.js';
 
@@ -149,14 +149,24 @@ test('EPH4 改计划不影响已生成的历史快照', async () => {
   assert.equal(same!.allAchieved, true, '达成标记也不变');
 });
 
-test('EPH5 全量结算：给所有有计划的人补上一周期快照', async () => {
+test('EPH5 全量结算：漏掉的周期一次补齐（catch-up，不再只补紧邻上一期）', async () => {
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
   await upsertPlan(userId, { period: 'daily', targets: { distanceM: 1000, durationMin: 10, count: 1 } });
-  await backdatePlan(2);
+  await backdatePlan(2); // 计划 2 天前生效 → 应补「昨天」和「前天」两期
   const r = await finalizeAllPreviousPeriods();
-  assert.ok(r.done >= 1, `至少结算了本用户，实际 ${r.done}`);
-  const rows = await ExercisePlanPeriodModel.countDocuments({ userId: new mongoose.Types.ObjectId(userId) });
-  assert.equal(rows, 1, '上一周期已落库');
+  assert.ok(r.done >= 2, `补齐两期，实际 ${r.done}`);
+  const snaps = await ExercisePlanPeriodModel.find({ userId: new mongoose.Types.ObjectId(userId) }).lean();
+  assert.equal(snaps.length, 2, '计划生效起的两期都落库');
+  const keys = snaps.map((x) => x.periodKey).sort();
+  assert.deepEqual(keys, [bjDateStr(bjDayStart(-2)), bjDateStr(bjDayStart(-1))], '正好是前天与昨天，不含今天');
+
+  // 幂等：再跑一次不新增
+  await finalizeAllPreviousPeriods();
+  assert.equal(
+    await ExercisePlanPeriodModel.countDocuments({ userId: new mongoose.Types.ObjectId(userId) }),
+    2,
+    '重复跑不会重复写',
+  );
 });
 
 test('EPH6 路由：GET /plan/history 需登录；登录后返回快照列表', async () => {
@@ -175,4 +185,48 @@ test('EPH6 路由：GET /plan/history 需登录；登录后返回快照列表', 
   for (const key of ['period', 'periodKey', 'windowStart', 'windowEnd', 'targets', 'progress', 'rings', 'achieved', 'allAchieved']) {
     assert.ok(key in item, `快照应包含 ${key}`);
   }
+});
+
+/* --------- 2026-11-14 补结算（catch-up）：停机漏结算的周期自动补齐 --------- */
+
+test('EPH7 catch-up：停机 3 天后一次补齐漏掉的 3 期，且不含今天', async () => {
+  await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await upsertPlan(userId, { period: 'daily', targets: { distanceM: 1000, durationMin: 10, count: 1 } });
+  await backdatePlan(10); // 计划 10 天前生效
+  // 只结算到「4 天前」（模拟停机：4 天前之后的 3 天都没结算）
+  const settledTo = bjDayStart(-4);
+  await finalizePlanPeriod(userId, 'daily', settledTo, settledTo + DAY);
+
+  await finalizeAllPreviousPeriods();
+
+  const keys = (await ExercisePlanPeriodModel.find({ userId: new mongoose.Types.ObjectId(userId) }).lean())
+    .map((x) => x.periodKey).sort();
+  // 已结算 4 天前 → 应补：3 天前、2 天前、昨天（今天不结算）
+  assert.deepEqual(keys, [
+    bjDateStr(bjDayStart(-4)), bjDateStr(bjDayStart(-3)),
+    bjDateStr(bjDayStart(-2)), bjDateStr(bjDayStart(-1)),
+  ], '漏掉的 3 期被补齐，今天仍未结算');
+});
+
+test('EPH8 catch-up：不越界到计划生效之前（计划前那段不补假期）', async () => {
+  await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await upsertPlan(userId, { period: 'daily', targets: { distanceM: 1000, durationMin: 10, count: 1 } });
+  await backdatePlan(2);
+  await finalizeAllPreviousPeriods();
+  const snaps = await ExercisePlanPeriodModel.find({ userId: new mongoose.Types.ObjectId(userId) }).lean();
+  const oldest = Math.min(...snaps.map((x) => Number(x.windowStart)));
+  assert.equal(oldest, bjDayStart(-2), '最早一期就是计划生效那天，更早的不补');
+});
+
+test('EPH9 catch-up：超长闲置按 CATCH_UP_MAX_PERIODS 截断（不一次补几百期）', async () => {
+  await ActivityModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
+  await upsertPlan(userId, { period: 'daily', targets: { distanceM: 1000, durationMin: 10, count: 1 } });
+  await backdatePlan(CATCH_UP_MAX_PERIODS + 30); // 闲置 90 天
+  const r = await finalizeAllPreviousPeriods();
+  const rows = await ExercisePlanPeriodModel.countDocuments({ userId: new mongoose.Types.ObjectId(userId) });
+  assert.ok(r.done >= CATCH_UP_MAX_PERIODS, `至少补到上限，实际 ${r.done}`);
+  assert.ok(rows <= CATCH_UP_MAX_PERIODS, `补写量被上限约束（实际 ${rows}）`);
 });

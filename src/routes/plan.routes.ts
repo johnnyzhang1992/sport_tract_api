@@ -45,9 +45,15 @@ export async function planRoutes(fastify: FastifyInstance) {
   });
 
   // 记录数据概况 + 里程碑奖杯（历史快照聚合）
-  fastify.get('/summary', { onRequest: [fastify.authenticate] }, async (request) =>
-    success(await getPlanSummary(request.user.userId)),
-  );
+  // 每次都会跑一遍「全部轨迹按日聚合」：加一条慢查询日志，等真实数据决定要不要上缓存
+  // （触发条件：单用户轨迹 > 5000 条，或这里持续 > 100ms，见 docs 里的性能小节）
+  fastify.get('/summary', { onRequest: [fastify.authenticate] }, async (request) => {
+    const t0 = Date.now();
+    const data = await getPlanSummary(request.user.userId);
+    const ms = Date.now() - t0;
+    if (ms > 200) request.log.warn({ ms, userId: request.user.userId }, '[plan] summary 慢查询');
+    return success(data);
+  });
 
   fastify.put('/', { onRequest: [fastify.authenticate] }, async (request) => {
     const saved = await upsertPlan(request.user.userId, request.body);

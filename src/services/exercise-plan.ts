@@ -498,21 +498,100 @@ function beforeWeeklyAnchor(period: PlanPeriod, anchor: number, windowStartMs: n
   return period === 'weekly' && anchor > 0 && windowStartMs < anchor;
 }
 
-/** 上一周期结算（用户打开卡/页面时顺手补一条，保证活跃用户一定有历史） */
-export async function finalizePreviousPeriod(userId: string, now = Date.now()): Promise<void> {
-  const plan = await getPlan(userId, now);
-  if (!plan) return;
-  const w = previousWindow(plan.period, now, plan.periodStart);
-  if (beforeWeeklyAnchor(plan.period, plan.periodStart, w.start)) return;
-  await finalizePlanPeriod(userId, plan.period, w.start, w.end);
+/** 补结算上限：一次最多补这么多期（超长闲置用户不至于一次跑几百次） */
+export const CATCH_UP_MAX_PERIODS = 60;
+
+/** 周期跨度（毫秒）：每天 1 天、每周 7 天 */
+function periodSpan(period: PlanPeriod): number {
+  return period === 'daily' ? 86_400_000 : 7 * 86_400_000;
 }
 
 /**
- * 全量结算（定时任务用）：给所有有计划的人补上一周期快照。
- * 只处理「上一周期已结束」的那一个单元，幂等可反复跑。
+ * 把「已漏掉的周期」一次性补齐（2026-11-14）。
+ *
+ * 为什么需要：结算原来是「只补紧邻上一期」——服务器停机/任务失败一整天，那天就永久没快照
+ * （完美周因此报废），离开多个周期回来也只补一条。
+ *
+ * 做法：取该用户已结算的最新一期（没有则从计划生效起点后的第一期开始），
+ * 逐段推进到「当前期之前」，每段调 finalizePlanPeriod（幂等 upsert）。
+ * 边界仍由 activeFrom / 周锚点兜住（计划开始之前不会有期）。
+ * @returns 本次补写的期数
+ */
+async function catchUpPeriods(
+  userId: string,
+  doc: { period: PlanPeriod; periodStart?: number; activeFrom?: number; createdAt?: Date },
+  now: number,
+): Promise<number> {
+  const period = doc.period;
+  const span = periodSpan(period);
+  const anchor = Number(doc.periodStart) || 0;
+  const activeFrom = planActiveFrom(doc);
+  const curStart = windowStart(period, now, anchor);
+  if (curStart <= 0) return 0;
+
+  // 已结算到哪一期（同一周期类型的最新一条）
+  const last = await ExercisePlanPeriodModel.findOne({ userId: new Types.ObjectId(userId), period })
+    .sort({ windowStart: -1 })
+    .select({ windowStart: 1 })
+    .lean();
+  const lastSettled = Number(last?.windowStart) || 0;
+
+  // 起点：已结算的下一期；从未结算过 → 计划生效起点所在的那一期
+  let from = lastSettled > 0
+    ? lastSettled + span
+    : Math.max(activeFrom > 0 ? activeFrom : curStart - span, 0);
+  if (from <= 0) return 0;
+  // 对齐到周期栅格（周计划锚点起每 7 天一期）
+  if (anchor > 0) {
+    const k = Math.max(0, Math.ceil((from - anchor) / span));
+    from = anchor + k * span;
+  }
+  if (from >= curStart) {
+    // 没有漏掉的期：仍要结算「紧邻上一期」（常规路径）
+    const w = previousWindow(period, now, anchor);
+    if (w.start <= 0) return 0;
+    if (activeFrom > 0 && w.start < activeFrom) return 0;
+    if (beforeWeeklyAnchor(period, anchor, w.start)) return 0;
+    if (lastSettled === w.start) return 0; // 已结算过，省一次查询
+    await finalizePlanPeriod(userId, period, w.start, w.end);
+    return 1;
+  }
+
+  let written = 0;
+  let cursor = from;
+  while (cursor < curStart && written < CATCH_UP_MAX_PERIODS) {
+    if (activeFrom > 0 && cursor < activeFrom) {
+      cursor += span;
+      continue;
+    }
+    if (beforeWeeklyAnchor(period, anchor, cursor)) {
+      cursor += span;
+      continue;
+    }
+    await finalizePlanPeriod(userId, period, cursor, cursor + span);
+    written += 1;
+    cursor += span;
+  }
+  return written;
+}
+
+/** 上一周期结算（用户打开卡/页面时顺手补齐）：含漏结算的多期补写，见 catchUpPeriods */
+export async function finalizePreviousPeriod(userId: string, now = Date.now()): Promise<void> {
+  const plan = await getPlan(userId, now);
+  if (!plan) return;
+  const doc = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) }).lean();
+  if (!doc) return;
+  await catchUpPeriods(userId, doc, now);
+}
+
+/**
+ * 全量结算（定时任务用）：给所有有计划的人补齐漏掉的周期。
+ * 每期结算幂等（唯一索引 + 首次冻结目标），可反复跑。
  */
 export async function finalizeAllPreviousPeriods(now = Date.now()): Promise<{ done: number; failed: number }> {
-  const plans = await ExercisePlanModel.find({}).select({ userId: 1, period: 1, periodStart: 1 }).lean();
+  const plans = await ExercisePlanModel.find({})
+    .select({ userId: 1, period: 1, periodStart: 1, activeFrom: 1, createdAt: 1 })
+    .lean();
   let done = 0;
   let failed = 0;
   for (const p of plans) {
@@ -520,11 +599,8 @@ export async function finalizeAllPreviousPeriods(now = Date.now()): Promise<{ do
     const anchor = Number(p.periodStart) || 0;
     // 存量周计划尚未锚定：等用户首次读取锚定后再结算；锚点之前的时段没有真实期
     if (period === 'weekly' && !anchor) continue;
-    const w = previousWindow(period, now, anchor);
-    if (beforeWeeklyAnchor(period, anchor, w.start)) continue;
     try {
-      await finalizePlanPeriod(String(p.userId), p.period as PlanPeriod, w.start, w.end);
-      done += 1;
+      done += await catchUpPeriods(String(p.userId), p, now);
     } catch (e) {
       console.error('[exercise-plan] 周期结算失败', { userId: String(p.userId) }, e);
       failed += 1;
@@ -928,6 +1004,10 @@ export interface PlanSummaryResult {
     cur: number;
     need: number;
   }>;
+  /** 里程碑奖杯扩展（docs/21）：原 8 个 + 记录/坚持/圆环/目标/完美周，统一卡面（图标+名称+次数） */
+  trophies: PlanTrophy[];
+  /** 记录与坚持明细（记录型奖杯的详情数据源） */
+  records: PlanRecords;
 }
 
 /** 一个周期的「最弱一项」完成倍数：三项里 progress/target 的最小值（目标 0 的项跳过） */
@@ -946,7 +1026,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   const plan = await getPlan(userId);
   // 概况是累计成就：锚点之前的历史快照照常计入（仅展示列表按锚点过滤）
   const rows = await ExercisePlanPeriodModel.find({ userId: new Types.ObjectId(userId) })
-    .select({ period: 1, periodKey: 1, windowStart: 1, targets: 1, progress: 1, allAchieved: 1 })
+    .select({ period: 1, periodKey: 1, windowStart: 1, windowEnd: 1, targets: 1, progress: 1, allAchieved: 1 })
     .sort({ windowStart: 1 })
     .lean();
 
@@ -1022,6 +1102,82 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     };
   });
 
+  // —— 里程碑奖杯扩展（docs/21）——
+  const days = await dailyActivityTotals(userId);
+  const rec = computeRecordStats(days);
+  const dailyRows = rows.filter((r) => r.period === 'daily');
+  const perfect = perfectWeekCounts(dailyRows);
+  const counts = {
+    breaksDistance: rec.breaksDistance,
+    breaksDuration: rec.breaksDuration,
+    streakBest: rec.streak.best,
+    ringsClosed: dailyRows.filter((r) => r.allAchieved).length,
+    activities: days.reduce((acc, d) => acc + d.count, 0),
+    perfectWeekAll: perfect.all,
+    perfectWeekSingle: perfect.single,
+    achievedPeriods: achieved,
+  };
+  // 每座奖杯的获得记录（获得次数 + 首次获取日期）——卡片三态展示的数据源
+  const earns = computeTrophyEarns(days, dailyRows, rows);
+  // 数组进度百分比：兼容新奖杯（tier）与原 8 里程碑（字段名是 need）——曾只读 tier 导致里程碑进度条恒 0%
+  const pctOf = (t: { cur?: number; tier?: number; need?: number }) => {
+    const cur = t.cur ?? 0;
+    const tier = t.tier ?? t.need ?? 0;
+    return tier > 0 ? Math.min(Math.round((cur / tier) * 100), 100) : 0;
+  };
+  const trophies: PlanTrophy[] = [
+    ...milestones.map(
+      (m): PlanTrophy => ({
+        key: m.key,
+        label: m.label,
+        desc: m.desc,
+        icon: MILESTONE_ICONS[m.key] || '🏆',
+        unlocked: m.unlocked,
+        cur: m.cur,
+        tier: m.need,
+        nextTier: null, // 原 8 个各是独立目标，无阶梯成长线
+        earnedCount: earns[m.key] ? 1 : 0,
+        earnDateText: (earns[m.key] && earns[m.key].earnDate) || '',
+        pct: pctOf(m),
+        group: 'plan',
+      }),
+    ),
+    ...PLAN_TROPHY_DEFS.map((def): PlanTrophy => {
+      const cur = metricCountOf(def.metric, counts);
+      // 下一档：阶梯里第一个大于当前计数的档位（完美周无阶梯为 null）
+      const nextTier = def.group === 'week' ? null : (TROPHY_TIERS.find((t) => t > cur) ?? null);
+      const extra: { valueText?: string; dateText?: string } = {};
+      if (def.group === 'record' && def.metric === 'breaksDistance') {
+        extra.valueText = formatKmText(rec.distance.bestM);
+        extra.dateText = rec.distance.dateText;
+      }
+      if (def.group === 'record' && def.metric === 'breaksDuration') {
+        extra.valueText = formatDurText(rec.duration.bestSec);
+        extra.dateText = rec.duration.dateText;
+      }
+      if (def.group === 'streak') {
+        extra.valueText = `${rec.streak.best} 天`;
+        extra.dateText = rec.streak.bestEndText;
+      }
+      const earn = earns[def.key];
+      return {
+        key: def.key,
+        label: def.label,
+        desc: def.desc,
+        icon: def.icon,
+        unlocked: cur >= def.tier,
+        cur,
+        tier: def.tier,
+        nextTier,
+        earnedCount: earn ? earn.earnedCount : 0,
+        earnDateText: (earn && earn.earnDate) || '',
+        pct: pctOf({ cur, tier: def.tier }),
+        group: def.group,
+        ...extra,
+      };
+    }),
+  ];
+
   const totalPeriods = rows.length;
   return {
     totalPeriods,
@@ -1031,5 +1187,452 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     overStreak,
     totals,
     milestones,
+    trophies,
+    records: {
+      distance: { bestM: rec.distance.bestM, dateText: rec.distance.dateText, breaks: rec.breaksDistance },
+      duration: { bestSec: rec.duration.bestSec, dateText: rec.duration.dateText, breaks: rec.breaksDuration },
+      streak: { best: rec.streak.best, bestEndText: rec.streak.bestEndText, current: rec.streak.current },
+    },
   };
+}
+
+/* ==========================================================================
+ * 里程碑奖杯扩展（2026-11-14，docs/21）
+ * 新增 27 座：记录与坚持（新距离/新时长/最坚持 × 5 档）+ 圆环与目标（合环/完成目标 × 5 档）
+ * + 完美周（全能/单项 × 1）。与原 8 个倍数里程碑统一进 summary.trophies（卡面：图标+名称+次数）。
+ * 口径拍板见 docs/21：圆环完成≡目标达成（三项都已设且全达成，未设项不算）、圆环只计 daily 快照、
+ * 记录=单日合计（东八区自然日，全部 finished 运动）、完美周按自然周（周一~周日）。
+ * ========================================================================== */
+
+export type PlanTrophyMetric =
+  | 'breaksDistance'
+  | 'breaksDuration'
+  | 'streakBest'
+  | 'ringsClosed'
+  | 'activities'
+  | 'perfectWeekAll'
+  | 'perfectWeekSingle'
+  | 'achieved'; // 原 8 个倍数里程碑沿用各自 cur
+
+export interface PlanTrophyDef {
+  key: string;
+  label: string;
+  desc: string;
+  icon: string;
+  /** 计数口径键；'achieved' 表示沿用原里程碑倍数档 */
+  metric: PlanTrophyMetric;
+  /** 解锁档位（该计数达到 tier 即解锁） */
+  tier: number;
+  group: 'record' | 'streak' | 'rings' | 'goal' | 'week';
+}
+
+/** 破纪录/合环/活动次数的统一阶梯（配置数组，随时可调） */
+const TROPHY_TIERS = [100, 365, 500, 1000, 2000] as const;
+
+/** 各系列奖杯定义（每档一座独立奖杯） */
+export const PLAN_TROPHY_DEFS: readonly PlanTrophyDef[] = [
+  ...TROPHY_TIERS.map(
+    (t): PlanTrophyDef => ({
+      key: `rec-dist-${t}`,
+      label: `新距离记录·${t}次`,
+      desc: `刷新单日运动距离纪录 ${t} 次（纪录指自然日运动距离合计的历史新高）`,
+      icon: '📏',
+      metric: 'breaksDistance',
+      tier: t,
+      group: 'record',
+    }),
+  ),
+  ...TROPHY_TIERS.map(
+    (t): PlanTrophyDef => ({
+      key: `rec-dur-${t}`,
+      label: `新时长记录·${t}次`,
+      desc: `刷新单日运动时长纪录 ${t} 次`,
+      icon: '⏱️',
+      metric: 'breaksDuration',
+      tier: t,
+      group: 'record',
+    }),
+  ),
+  ...TROPHY_TIERS.map(
+    (t): PlanTrophyDef => ({
+      key: `streak-${t}`,
+      label: `最坚持奖·${t}天`,
+      desc: `连续运动天数（连续每天有运动记录）达到 ${t} 天`,
+      icon: '🔥',
+      metric: 'streakBest',
+      tier: t,
+      group: 'streak',
+    }),
+  ),
+  ...TROPHY_TIERS.map(
+    (t): PlanTrophyDef => ({
+      key: `ring-${t}`,
+      label: `合上圆环·${t}次`,
+      desc: `三圆环全合（当日三项目标全部达成）累计 ${t} 次`,
+      icon: '⭕',
+      metric: 'ringsClosed',
+      tier: t,
+      group: 'rings',
+    }),
+  ),
+  ...TROPHY_TIERS.map(
+    (t): PlanTrophyDef => ({
+      key: `goal-${t}`,
+      label: `完成目标·${t}次`,
+      desc: `累计完成运动 ${t} 次`,
+      icon: '🎯',
+      metric: 'activities',
+      tier: t,
+      group: 'goal',
+    }),
+  ),
+  {
+    key: 'perfect-week-all',
+    label: '完美一周·全能',
+    desc: '一个自然周（周一至周日）里七天三项全部达成',
+    icon: '🌟',
+    metric: 'perfectWeekAll',
+    tier: 1,
+    group: 'week',
+  },
+  {
+    key: 'perfect-week-single',
+    label: '完美一周·单项',
+    desc: '一个自然周里，同一单项（距离或时长或次数）七天全部达成',
+    icon: '✨',
+    metric: 'perfectWeekSingle',
+    tier: 1,
+    group: 'week',
+  },
+];
+
+/** 原 8 个倍数里程碑的卡面图标 */
+const MILESTONE_ICONS: Record<string, string> = {
+  first: '🥇',
+  week: '📅',
+  habit: '💪',
+  x2: '🔥',
+  x2pro: '⚡',
+  x3: '👑',
+  x4: '🚀',
+  x5: '🏆',
+};
+
+export interface PlanTrophy {
+  key: string;
+  label: string;
+  desc: string;
+  icon: string;
+  unlocked: boolean;
+  /** 当前计数（所有奖杯都有——记录型的计数是「破纪录次数」） */
+  cur: number;
+  /** 解锁档位（cur >= tier 解锁） */
+  tier: number;
+  /** 下一档（次数档位型的成长线）；完美周无阶梯为 null */
+  nextTier: number | null;
+  /** 获得次数（里程碑型恒 1；完美周为合格周数；未获得 0）——卡片三态展示用 */
+  earnedCount: number;
+  /** 首次获取日期（YYYY-MM-DD）；未获得空串 */
+  earnDateText: string;
+  /** 进度条百分比 0-100（cur/tier 封顶）——未获得时卡片展示进度条 */
+  pct: number;
+  /** 记录型当前纪录文案（卡面第二行），如 '12.3 km' / '2小时05分' / '15 天' */
+  valueText?: string;
+  /** 记录型：纪录产生日期（YYYY-MM-DD） */
+  dateText?: string;
+  group: 'plan' | 'record' | 'streak' | 'rings' | 'goal' | 'week';
+}
+
+export interface PlanRecords {
+  distance: { bestM: number; dateText: string; breaks: number };
+  duration: { bestSec: number; dateText: string; breaks: number };
+  streak: { best: number; bestEndText: string; current: number };
+}
+
+/** 自然周键（东八区周一为一周起点）：'YYYY-MM-DD'（周一日期）。
+ *  星期要按「北京日历」取——ms 是东八区零点的绝对时刻，UTC 侧还是前一天下午，
+ *  直接 getUTCDay() 会算成前一天的星期（差一天导致周一识别错位，完美周永远凑不齐 7 天） */
+function weekKeyOfDate(dateStr: string): string {
+  const ms = Date.parse(`${dateStr}T00:00:00+08:00`);
+  // 历史/导入数据的 periodKey 可能不是 YYYY-MM-DD：返回空串让调用方跳过，
+  // 绝不能让 bjDateStr(NaN) 抛 RangeError 把整个 /plan/summary 打成 500
+  if (!Number.isFinite(ms)) return '';
+  const dow = new Date(ms + 8 * 3600_000).getUTCDay(); // 0=周日（北京日历口径）
+  const monday = ms - ((dow + 6) % 7) * 86_400_000;
+  return new Date(monday + 8 * 3600_000).toISOString().slice(0, 10);
+}
+
+/** 相邻两个自然日相差天数（两个都是 YYYY-MM-DD） */
+function dayDiff(a: string, b: string): number {
+  return Math.round((Date.parse(`${b}T00:00:00+08:00`) - Date.parse(`${a}T00:00:00+08:00`)) / 86_400_000);
+}
+
+interface DailyTotalsRow {
+  date: string;
+  distanceM: number;
+  durationSec: number;
+  count: number;
+}
+
+/** 按东八区自然日聚合全部已完成运动（距离合计/时长合计/次数）——日期升序 */
+export async function dailyActivityTotals(userId: string): Promise<DailyTotalsRow[]> {
+  return ActivityModel.aggregate<DailyTotalsRow>([
+    { $match: { userId: new Types.ObjectId(userId), status: 'finished' } },
+    {
+      $group: {
+        // startTime 库内是 epoch 毫秒（Number），$dateToString 前先 $toDate；按东八区自然日分桶
+        _id: {
+          $dateToString: { format: '%Y-%m-%d', date: { $toDate: '$startTime' }, timezone: '+08:00' },
+        },
+        distanceM: { $sum: { $ifNull: ['$distance', 0] } },
+        durationSec: { $sum: { $ifNull: ['$duration', 0] } },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { _id: 1 } },
+    { $project: { _id: 0, date: '$_id', distanceM: 1, durationSec: 1, count: 1 } },
+  ]);
+}
+
+/** 记录与坚持：破纪录次数/当前纪录+日期/最长连续+结束日期/当前连续 */
+export function computeRecordStats(days: DailyTotalsRow[]): PlanRecords & { breaksDistance: number; breaksDuration: number } {
+  let bestDist = 0;
+  let bestDistDate = '';
+  let breaksDist = 0;
+  let bestDur = 0;
+  let bestDurDate = '';
+  let breaksDur = 0;
+  // 连续段：日期升序扫，只看有运动的日子；段内相邻日期差 1 天即延续
+  let bestRun = 0;
+  let bestRunEnd = '';
+  let run = 0;
+  let prevDate = '';
+  for (const d of days) {
+    if (d.distanceM > bestDist) {
+      bestDist = d.distanceM;
+      breaksDist += 1;
+      bestDistDate = d.date;
+    }
+    if (d.durationSec > bestDur) {
+      bestDur = d.durationSec;
+      breaksDur += 1;
+      bestDurDate = d.date;
+    }
+    run = prevDate && dayDiff(prevDate, d.date) === 1 ? run + 1 : 1;
+    if (run > bestRun) {
+      bestRun = run;
+      bestRunEnd = d.date;
+    }
+    prevDate = d.date;
+  }
+  // 当前连续：从最后一天往前数连续段
+  let current = 0;
+  if (days.length) {
+    const set = new Set(days.map((d) => d.date));
+    // 今天还没动不算断：从「今天或昨天」起算（与 stats streakDays 同口径）
+    let cursor = set.has(bjDateStr(Date.now())) ? bjDateStr(Date.now()) : bjDateStr(Date.now() - 86_400_000);
+    while (set.has(cursor)) {
+      current += 1;
+      cursor = bjDateStr(Date.parse(`${cursor}T00:00:00+08:00`) - 86_400_000);
+    }
+  }
+  return {
+    distance: { bestM: bestDist, dateText: bestDistDate, breaks: breaksDist },
+    duration: { bestSec: bestDur, dateText: bestDurDate, breaks: breaksDur },
+    streak: { best: bestRun, bestEndText: bestRunEnd, current },
+    breaksDistance: breaksDist,
+    breaksDuration: breaksDur,
+  };
+}
+
+/** 完美周计数（基于 daily 快照；快照只在计划活跃期存在，属于计划域成就）：
+ *  全能 = 一个自然周七天的 daily 快照齐全且全部 allAchieved；
+ *  单项 = 七天快照齐全且存在同一单项每天都达成。 */
+function perfectWeekCounts(dailyRows: Array<Record<string, unknown>>): {
+  all: number;
+  single: number;
+  /** 首次获取日期（最早合格自然周的最后一天，YYYY-MM-DD）；无则空串 */
+  firstAllEnd: string;
+  firstSingleEnd: string;
+} {
+  interface WeekAcc {
+    days: number;
+    allAchieved: number;
+    metric: { distance: number; duration: number; count: number };
+  }
+  const weeks = new Map<string, WeekAcc>();
+  for (const r of dailyRows) {
+    const wk = weekKeyOfDate(String(r.periodKey));
+    if (!wk) continue; // periodKey 不是合法日期（脏数据）：不计入完美周，也不影响其它统计
+    const acc = weeks.get(wk) ?? { days: 0, allAchieved: 0, metric: { distance: 0, duration: 0, count: 0 } };
+    acc.days += 1;
+    if (r.allAchieved) acc.allAchieved += 1;
+    const targets = (r.targets ?? {}) as Record<string, number>;
+    const progress = (r.progress ?? {}) as Record<string, number>;
+    // 单项达成：该项设了目标且完成达标（与结算快照同判据）
+    if ((targets.distanceM || 0) > 0 && (progress.distanceM || 0) >= (targets.distanceM || 0)) acc.metric.distance += 1;
+    if ((targets.durationMin || 0) > 0 && (progress.durationSec || 0) >= (targets.durationMin || 0) * 60) acc.metric.duration += 1;
+    if ((targets.count || 0) > 0 && (progress.count || 0) >= (targets.count || 0)) acc.metric.count += 1;
+    weeks.set(wk, acc);
+  }
+  let all = 0;
+  let single = 0;
+  let firstAllEnd = '';
+  let firstSingleEnd = '';
+  for (const [wk, acc] of weeks.entries()) {
+    if (acc.days !== 7) continue; // 快照不足七天（计划周内建立/取消）不算完美周
+    const end = bjDateStr(Date.parse(`${wk}T00:00:00+08:00`) + 6 * 86_400_000); // 周日
+    if (acc.allAchieved === 7) {
+      all += 1;
+      if (!firstAllEnd || end < firstAllEnd) firstAllEnd = end;
+    }
+    if (acc.metric.distance === 7 || acc.metric.duration === 7 || acc.metric.count === 7) {
+      single += 1;
+      if (!firstSingleEnd || end < firstSingleEnd) firstSingleEnd = end;
+    }
+  }
+  return { all, single, firstAllEnd, firstSingleEnd };
+}
+
+function formatKmText(m: number): string {
+  return `${(Math.round(m / 10) / 100).toFixed(m % 1000 === 0 ? 0 : 2)} km`;
+}
+
+function formatDurText(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const min = Math.round((sec % 3600) / 60);
+  return h > 0 ? `${h}小时${String(min).padStart(2, '0')}分` : `${min}分钟`;
+}
+
+/** 奖杯获得记录：earnedCount（获得次数，里程碑恒 1）+ earnDate（首次获取日期） */
+interface TrophyEarn {
+  earnedCount: number;
+  earnDate: string;
+}
+
+/**
+ * 每座奖杯的获得记录（卡片三态：获得一次=日期 / 多次=次数 / 未获得=进度条）。
+ * 各系列获取时点口径：
+ *   - 破纪录：第 N 次刷新纪录的那一天
+ *   - 最坚持：连续天数第一次达到档位的那一天
+ *   - 合上圆环：第 N 个三项全达成日快照的日期
+ *   - 完成目标：累计第 N 次 finished 运动的那一天
+ *   - 完美周：可重复获得——次数 = 合格自然周数，日期 = 最早合格周的最后一天
+ *   - 原 8 里程碑：达成次数跨过 need 的那个周期的结束日期
+ */
+function computeTrophyEarns(
+  days: DailyTotalsRow[],
+  dailyRows: Array<Record<string, unknown>>,
+  periodRows: Array<Record<string, unknown>>,
+): Record<string, TrophyEarn> {
+  const earns: Record<string, TrophyEarn> = {};
+  const mark = (key: string, date: string) => {
+    earns[key] = { earnedCount: 1, earnDate: date };
+  };
+
+  // 破纪录：逐日扫描，新高即破一次，记下每次破纪录的日期
+  const breakDist: string[] = [];
+  const breakDur: string[] = [];
+  let maxD = 0;
+  let maxDur = 0;
+  for (const d of days) {
+    if (d.distanceM > maxD) {
+      maxD = d.distanceM;
+      breakDist.push(d.date);
+    }
+    if (d.durationSec > maxDur) {
+      maxDur = d.durationSec;
+      breakDur.push(d.date);
+    }
+  }
+  for (const t of TROPHY_TIERS) {
+    if (breakDist.length >= t) mark(`rec-dist-${t}`, breakDist[t - 1]);
+    if (breakDur.length >= t) mark(`rec-dur-${t}`, breakDur[t - 1]);
+  }
+
+  // 最坚持：连续段第一次到达档位天数的那一天
+  let run = 0;
+  let prev = '';
+  const streakDates: Record<number, string> = {};
+  for (const d of days) {
+    run = prev && dayDiff(prev, d.date) === 1 ? run + 1 : 1;
+    for (const t of TROPHY_TIERS) if (run === t && !streakDates[t]) streakDates[t] = d.date;
+    prev = d.date;
+  }
+  for (const t of TROPHY_TIERS) if (streakDates[t]) mark(`streak-${t}`, streakDates[t]);
+
+  // 合上圆环：第 N 个三项全达成日快照
+  let rings = 0;
+  const ringDates: Record<number, string> = {};
+  for (const r of dailyRows) {
+    if (!r.allAchieved) continue;
+    rings += 1;
+    for (const t of TROPHY_TIERS) if (rings === t && !ringDates[t]) ringDates[t] = String(r.periodKey);
+  }
+  for (const t of TROPHY_TIERS) if (ringDates[t]) mark(`ring-${t}`, ringDates[t]);
+
+  // 完成目标：累计第 N 次 finished 运动（单日多段跨过档位也算当天）
+  let act = 0;
+  const goalDates: Record<number, string> = {};
+  for (const d of days) {
+    const before = act;
+    act += d.count;
+    for (const t of TROPHY_TIERS) if (before < t && act >= t && !goalDates[t]) goalDates[t] = d.date;
+  }
+  for (const t of TROPHY_TIERS) if (goalDates[t]) mark(`goal-${t}`, goalDates[t]);
+
+  // 完美周：可重复获得 → 次数；首次获取日期 = 最早合格周的最后一天
+  const perfect = perfectWeekCounts(dailyRows);
+  if (perfect.all > 0) earns['perfect-week-all'] = { earnedCount: perfect.all, earnDate: perfect.firstAllEnd };
+  if (perfect.single > 0) earns['perfect-week-single'] = { earnedCount: perfect.single, earnDate: perfect.firstSingleEnd };
+
+  // 原 8 里程碑：达成计数跨过 need 的那个周期的结束日期
+  let achieved = 0;
+  const ratioCount: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  for (const r of periodRows) {
+    const targets = (r.targets ?? {}) as Record<string, number>;
+    const progress = (r.progress ?? {}) as Record<string, number>;
+    const ratio = minRatioOf(
+      { distanceM: progress.distanceM || 0, durationSec: progress.durationSec || 0, count: progress.count || 0 },
+      { distanceM: targets.distanceM || 0, durationMin: targets.durationMin || 0, count: targets.count || 0 },
+    );
+    const tier = tierOf(ratio);
+    if (tier > 0) ratioCount[tier] += 1;
+    if (r.allAchieved) achieved += 1;
+    const end = bjDateStr(Number(r.windowEnd) - 1); // windowEnd 是「下一期 0 点」，减 1ms 取本期最后一天
+    for (const def of PLAN_MILESTONES) {
+      if (earns[def.key]) continue;
+      const useTier = RATIO_TIERS.filter((x) => x <= def.ratio).pop() ?? 1;
+      const counter = useTier === 1 ? achieved : (ratioCount[useTier] || 0);
+      if (counter >= def.times) mark(def.key, end);
+    }
+  }
+  return earns;
+}
+
+
+/** 奖杯计数的聚合形状（getPlanSummary 组装后传给 metricCountOf） */
+interface TrophyCounts {
+  breaksDistance: number;
+  breaksDuration: number;
+  streakBest: number;
+  ringsClosed: number;
+  activities: number;
+  perfectWeekAll: number;
+  perfectWeekSingle: number;
+  achievedPeriods: number;
+}
+
+/** 计数 → 该指标当前值（与各奖杯 tier 对比得出解锁态） */
+function metricCountOf(metric: PlanTrophyMetric, m: TrophyCounts): number {
+  switch (metric) {
+    case 'breaksDistance': return m.breaksDistance;
+    case 'breaksDuration': return m.breaksDuration;
+    case 'streakBest': return m.streakBest;
+    case 'ringsClosed': return m.ringsClosed;
+    case 'activities': return m.activities;
+    case 'perfectWeekAll': return m.perfectWeekAll;
+    case 'perfectWeekSingle': return m.perfectWeekSingle;
+    case 'achieved': return m.achievedPeriods;
+  }
 }
