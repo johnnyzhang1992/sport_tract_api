@@ -111,34 +111,6 @@ test('EPC1 月历：整月每天一项；有快照用快照，今天实时聚合
   }
 });
 
-test('EPC2 周计划记录：当前期实时一条 + 已结算的期快照', async () => {
-  await upsertPlan(userId, { period: 'weekly', targets: { distanceM: 21000, durationMin: 210, count: 7 } });
-  // 固定 7 天一期：锚点＝定计划当天；上一期结算一条快照
-  const curStart = bjDayStart(0);
-  const prevStart = curStart - 7 * DAY;
-  // 落在上一期第一天，避开 EPC3 用到的「今天-5」那天
-  await seed(prevStart + 3600_000, 12000, 7200);
-  await finalizePlanPeriod(userId, 'weekly', prevStart, curStart);
-  // 本期跑一点 → 本期 live
-  await seed(curStart + 9 * 3600_000, 3000, 1800);
-
-  const cal = await listPlanCalendar(userId, monthOf(Date.now()));
-  assert.ok(cal.weeks.length >= 1);
-  const live = cal.weeks.find((w) => w.windowStart === curStart);
-  assert.ok(live, '当前期实时记录存在');
-  assert.equal(live!.source, 'live');
-  // 当前期实时进度 = 本期全部已完成轨迹合计 / 期目标（本期还有前面用例造的轨迹，按实际合计断言）
-  const rows = await ActivityModel.find({
-    userId: new mongoose.Types.ObjectId(userId), status: 'finished',
-    startTime: { $gte: curStart, $lt: curStart + 7 * DAY },
-  }).select({ distance: 1 }).lean();
-  const weekDist = rows.reduce((n, r) => n + (Number(r.distance) || 0), 0);
-  assert.equal(live!.rings[0].value, weekDist, '周进度＝本周合计');
-  assert.ok(
-    Math.abs(live!.rings[0].pct - Math.min(1, weekDist / 21000)) < 1e-9,
-    `周完成度按 21km 目标换算（实际 ${weekDist}m）`,
-  );
-});
 
 test('EPC3 单日详情：三环 + 当天轨迹摘要', async () => {
   const d = bjDayStart(-5);

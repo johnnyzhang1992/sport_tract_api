@@ -81,16 +81,11 @@ before(async () => {
   id = me.json().data.id;
   const meQ = await app.inject({ method: 'GET', url: '/sport-track/api/users/me', headers: { authorization: `Bearer ${tokenQ}` } });
   idQ = meQ.json().data.id;
-  // 建计划：P 每日 / Q 每周（overStreak 只统计与当前计划同周期的快照）
+  // 建计划：P 每日。Q 的周计划入口已关闭（2026-11-14 周计划下线）→ Q 无计划，按 daily 口径统计
   await app.inject({
     method: 'PUT', url: '/sport-track/api/plan',
     headers: { authorization: `Bearer ${token}` },
     payload: { period: 'daily', targets: { distanceM: 3000, durationMin: 0, count: 0 } },
-  });
-  await app.inject({
-    method: 'PUT', url: '/sport-track/api/plan',
-    headers: { authorization: `Bearer ${tokenQ}` },
-    payload: { period: 'weekly', targets: { distanceM: 21000, durationMin: 0, count: 0 } },
   });
 });
 
@@ -136,16 +131,16 @@ test('OS4 最弱一项口径：距离超额但次数未达标（<200%）→ 不�
   assert.equal(res.json().data.overStreak, 0);
 });
 
-test('OS5 只统计当前计划周期类型（双向）：daily 计划不算 weekly 快照；weekly 计划只算 weekly', async () => {
-  // Q 是 weekly 计划：3 个连续 ≥200% 的周快照 → overStreak=3；插 daily 超额快照不影响
+test('OS5 周计划下线后按 daily 统计：存量周快照不参与 overStreak', async () => {
+  // Q 无计划（周计划入口已关）：3 个连续 ≥200% 的存量周快照 + 1 个 daily 超额快照
   await seedPeriodFor({ userId: idQ, period: 'weekly', offsetDays: -21, distTarget: 21000, distMul: 2.1 });
   await seedPeriodFor({ userId: idQ, period: 'weekly', offsetDays: -14, distTarget: 21000, distMul: 3 });
   await seedPeriodFor({ userId: idQ, period: 'weekly', offsetDays: -7, distTarget: 21000, distMul: 2.5 });
   await seedPeriodFor({ userId: idQ, period: 'daily', offsetDays: -1, distTarget: 21000, distMul: 5 });
   const q = await app.inject({ method: 'GET', url: '/sport-track/api/plan/summary', headers: { authorization: `Bearer ${tokenQ}` } });
-  assert.equal(q.json().data.overStreak, 3, 'weekly 计划只统计 weekly 快照');
+  assert.equal(q.json().data.overStreak, 1, '周快照不计入（周计划已下线），只数 daily 的连续超额');
 
-  // P 是 daily 计划：最近的 daily 快照未超额 → 0（weekly 快照本来也不在统计内）
+  // P 是 daily 计划：最近的 daily 快照未超额 → 0
   const p = await getSummary();
   assert.equal(p.json().data.overStreak, 0);
 });

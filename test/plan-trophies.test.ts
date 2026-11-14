@@ -120,9 +120,9 @@ async function summary() {
 
 test('TP1 trophies 全量下发：原 8 + 新 27 = 35 座', async () => {
   const s = await summary();
-  assert.equal(s.trophies.length, 35);
+  assert.equal(s.trophies.length, 34, '双倍宗师与 200% 章合并后 34 座');
   const keys = new Set(s.trophies.map((t: PlanTrophy) => t.key));
-  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-2000', 'streak-365', 'ring-100', 'goal-500', 'perfect-week-all', 'perfect-week-single']) {
+  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-2000', 'streak-365', 'ring-100', 'goal-500', 'perfect-week-all', 'perfect-week-single', 'x2', 'x3', 'x4']) {
     assert.ok(keys.has(key), `缺奖杯 ${key}`);
   }
 });
@@ -228,7 +228,7 @@ test('TP6 脏数据不炸接口：periodKey 不是合法日期时跳过该行（
   });
   assert.equal(res.statusCode, 200, '脏数据不能让接口 500');
   const s = res.json().data;
-  assert.equal(s.trophies.length, 35, '奖杯照常下发');
+  assert.equal(s.trophies.length, 34, '奖杯照常下发');
   const perfectAll = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-all');
   assert.equal(perfectAll.cur, before, '非法日期不计入完美周（计数与插入脏数据前一致）');
 
@@ -273,4 +273,37 @@ test('TP8 里程碑获取日期取本期最后一天（曾用 windowEnd 偏一�
   assert.equal(first.unlocked, true);
   // TP7 造的 3 天里，第 1 次达成发生在 3 天前 → 获取日期必须是那天，不是第二天
   assert.equal(first.earnDateText, bjDate(3), 'earnDate = 该期窗口最后一天（不是 windowEnd 的次日）');
+});
+
+test('TP9 倍数章口径一致：300% 的周期同时算完成 200%（unlocked/cur/pct/earnedCount 不自相矛盾）', async () => {
+  const uid = (await UserModel.findOne({ openid: 'wrt-a' }).select('_id').lean())!._id;
+  await ExercisePlanPeriodModel.deleteMany({ userId: uid });
+  await ActivityModel.deleteMany({ userId: uid });
+
+  // 一个三项都 300% 的日周期
+  const d = bjDayStartMs(3);
+  await ExercisePlanPeriodModel.create({
+    userId: uid, period: 'daily', periodKey: bjDate(3),
+    windowStart: d, windowEnd: d + DAY,
+    targets: { distanceM: 3000, durationMin: 30, count: 1 },
+    progress: { distanceM: 9000, durationSec: 5400, count: 3 },
+    achieved: { distance: true, duration: true, count: true }, allAchieved: true,
+  });
+
+  const res = await app.inject({
+    method: 'GET', url: `${API}/plan/summary`, headers: { authorization: `Bearer ${tokenA}` },
+  });
+  const s = res.json().data;
+  const x2 = s.trophies.find((t: PlanTrophy) => t.key === 'x2');
+  const x3 = s.trophies.find((t: PlanTrophy) => t.key === 'x3');
+
+  // 300% 的期：x3 直接达成；x2 按累计口径也算达成（一次 300% 就是「完成了 200%」）
+  assert.equal(x2.unlocked, true, 'x2 解锁（累计口径）');
+  assert.equal(x2.cur, 1);
+  assert.equal(x2.earnedCount, 1, 'earnedCount 与 unlocked 必须一致（曾为 0 → 卡面「已解锁但未获得」）');
+  assert.equal(x2.earnDateText, bjDate(3), '获取日期为该周期最后一天');
+  assert.equal(x2.pct, 100, '完成一次即满格（曾按 cur/tier 算成 1%）');
+  assert.equal(x3.unlocked, true);
+  assert.equal(x3.pct, 100);
+  assert.equal(s.trophies.find((t: PlanTrophy) => t.key === 'x4').unlocked, false, '400% 未达成');
 });

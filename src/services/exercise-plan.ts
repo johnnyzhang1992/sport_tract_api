@@ -1,5 +1,5 @@
 /**
- * 运动计划（苹果活动目标式三环）：一个用户一份计划（周期每天/每周二选一），
+ * 运动计划（苹果活动目标式三环）：一个用户一份计划（2026-11-14 周计划下线，仅每日），
  * 三项目标（距离米/时长分钟/次数），完成度按所选周期的已完成轨迹实时聚合。
  */
 import { Types } from 'mongoose';
@@ -9,11 +9,11 @@ import { ExercisePlanPeriodModel } from '../models/exercise-plan-period.model.js
 import { ActivityModel } from '../models/activity.model.js';
 import { bjDateStr, bjDayStart } from '../utils/bj-time.js';
 
-export type PlanPeriod = 'daily' | 'weekly';
-export const PLAN_PERIODS: readonly PlanPeriod[] = ['daily', 'weekly'];
+export type PlanPeriod = 'daily';
+export const PLAN_PERIODS: readonly PlanPeriod[] = ['daily'];
 
-/** 目标上限：距离 500km、时长 10080 分钟（一周）、次数 999 */
-export const PLAN_LIMITS = { distanceM: 500_000, durationMin: 10_080, count: 999 };
+/** 目标上限：距离 500km、时长 1440 分钟（一天，日计划口径）、次数 999 */
+export const PLAN_LIMITS = { distanceM: 500_000, durationMin: 1_440, count: 999 };
 
 export interface PlanTargets {
   distanceM: number;
@@ -25,7 +25,7 @@ export interface ExercisePlanDto {
   period: PlanPeriod;
   targets: PlanTargets;
   updatedAt: number;
-  /** 周计划锚点（东八区某天 0 点，固定 7 天一期从锚点起切块）；每天计划为 0 */
+  /** 周计划锚点：已随周计划下线废弃，恒 0 */
   periodStart: number;
   /** 计划生效起点（东八区某天 0 点）：早于它的日期没有计划期，端上不作「未达成」评价 */
   activeFrom: number;
@@ -79,26 +79,31 @@ function normalizeTargets(input: unknown): PlanTargets {
  *
  * 改计划不追溯（2026-11-10）：保存前先把「新周期窗口内、改动之前」的已完成进度冻结为基线，
  * 之后进度 = 基线 + 改动之后的新轨迹。所以改目标不会让已经完成的进度倒退/跳增，
- * 改周期（每天↔每周）也只是把新窗口里改动之前的成绩计入基线，同样不被追溯修改。
+ * 改目标也只是把新窗口里改动之前的成绩计入基线，同样不被追溯修改。
  */
 export async function upsertPlan(userId: string, input: unknown, now = Date.now()): Promise<ExercisePlanDto> {
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
   const body = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
-  const period = body.period as PlanPeriod;
-  if (!PLAN_PERIODS.includes(period)) throw new AppError(400, '计划周期需为 daily 或 weekly');
+  /**
+   * 周期口径（2026-11-14 周计划下线）：一律按 daily 保存。
+   * 宽容处理 weekly 而不是 400——旧版小程序仍带「每周」选项、存量计划打开编辑会把 weekly 原样回传，
+   * 直接拒绝会让这些用户「保存不了计划」。收到 weekly 就静默升级为日计划（目标值原样保留）。
+   */
+  const rawPeriod = body.period;
+  if (rawPeriod != null && rawPeriod !== 'daily' && rawPeriod !== 'weekly') {
+    throw new AppError(400, '计划周期需为 daily（周计划已下线）');
+  }
+  const period: PlanPeriod = 'daily';
+  if (rawPeriod === 'weekly') {
+    console.info('[exercise-plan] 收到已下线的 weekly 周期，按日计划保存', { userId });
+  }
   const targets = normalizeTargets(body.targets);
   if (targets.distanceM <= 0 && targets.durationMin <= 0 && targets.count <= 0) {
     throw new AppError(400, '至少设置一项目标（距离/时间/次数）');
   }
-  /**
-   * 周计划锚点：新计划 / 从每天切过来 → 锚到当天 0 点（第一期＝今天起 7 天）；
-   * 本来就是每周 → 沿用原锚点（改目标不重开当期）。每天计划不需要锚点（0）。
-   */
   const prev = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) }).lean();
-  const prevAnchor = Number(prev?.periodStart) || 0;
-  const periodStart = period === 'weekly'
-    ? (prev?.period === 'weekly' && prevAnchor > 0 ? prevAnchor : bjDayStart(now))
-    : 0;
+  // 周计划已下线：仅每日计划，锚点概念随之移除（periodStart 恒 0）
+  const periodStart = 0;
   /**
    * 计划生效起点：新计划 / 切换周期类型 → 今天 0 点（重新开始算「计划周期」与闲置计时）；
    * 改目标不重置（否则天天改目标就永远不会被判定闲置，历史边界也会一直往后挪）。
@@ -107,7 +112,7 @@ export async function upsertPlan(userId: string, input: unknown, now = Date.now(
     ? bjDayStart(now)
     : (planActiveFrom(prev) || bjDayStart(now));
   // 冻结基线：新周期窗口内、此刻之前已经完成的进度（轨迹不可变，这就是「过去日期」的真实成绩）
-  const start = windowStart(period, now, periodStart);
+  const start = windowStart(period, now);
   const before = await sumActivities(userId, start, now);
   await ExercisePlanModel.findOneAndUpdate(
     { userId: new Types.ObjectId(userId) },
@@ -134,15 +139,16 @@ export async function getPlan(userId: string, now = Date.now()): Promise<Exercis
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
   const doc = await ExercisePlanModel.findOne({ userId: new Types.ObjectId(userId) }).lean();
   if (!doc) return null;
-  // 存量周计划没有锚点：首次读取时锚定到当天 0 点（上线迁移），不再沿用旧的「本周一」口径
-  if (doc.period === 'weekly' && !(Number(doc.periodStart) > 0)) {
-    const anchor = bjDayStart(now);
+  // 存量周计划（2026-11-14 下线前创建）：读到即规范化成日计划——
+  // 迁移脚本 migrate-weekly-plans.ts 会批量转正，这里做兜底，避免漏迁移的文档
+  // 让端上显示「每周」、按日窗口却配周目标，或被后续结算写出跨粒度的脏快照。
+  if ((doc as { period?: string }).period !== 'daily') {
     await ExercisePlanModel.updateOne(
-      { _id: doc._id, $or: [{ periodStart: 0 }, { periodStart: { $exists: false } }] },
-      { $set: { periodStart: anchor } },
+      { _id: doc._id, period: { $ne: 'daily' } },
+      { $set: { period: 'daily', periodStart: 0 } },
     );
-    doc.periodStart = anchor;
-    if (!(Number(doc.activeFrom) > 0)) doc.activeFrom = anchor;
+    (doc as { period?: string }).period = 'daily';
+    (doc as { periodStart?: number }).periodStart = 0;
   }
 
   // 闲置取消（见 isPlanIdle）：用户回来读计划时判定，到期即取消，之后按「无计划」引导重建
@@ -157,21 +163,40 @@ export async function getPlan(userId: string, now = Date.now()): Promise<Exercis
 }
 
 /**
- * 取消前补最后一条快照：只结算「刚结束的那一期」，且该期确实有运动才写法——
- * 空期直接跳过（长期不活跃的用户不该被塞一堆 0 进度记录）。
+ * 取消前补快照：从「上次结算到的下一期」逐期推进到当前期之前，含真实运动的期落快照、
+ * 空期跳过——取消不等于抹掉已发生的成绩，但长期不活跃的用户也不该被塞一堆 0 进度记录。
+ * （周计划下线后 span 一律按日；闲置判定要求连续 7 天无运动，所以「只补紧邻上一期」
+ * 对闲置用户必然为空，必须回溯整个未结算区间才能保住已发生的成绩。）
  */
 async function settleLastPeriodBeforeCancel(
   userId: string,
   doc: { period: PlanPeriod; periodStart?: number; activeFrom?: number; createdAt?: Date },
   now: number,
 ): Promise<void> {
+  // 周期一律按日（周计划已下线）：span 恒 1 天，若沿用 doc.period='weekly'
+  // 就会写出「标记 weekly、窗口 1 天」的脏快照行
+  const period: PlanPeriod = 'daily';
+  const span = periodSpan(period);
   const activeFrom = planActiveFrom(doc);
-  const w = previousWindow(doc.period, now, Number(doc.periodStart) || 0);
-  if (w.start <= 0) return;
-  if (activeFrom > 0 && w.start < activeFrom) return; // 该期早于计划生效：本来就没有计划周期
-  const progress = await sumActivities(userId, w.start, w.end);
-  if (progress.distanceM <= 0 && progress.durationSec <= 0 && progress.count <= 0) return;
-  await finalizePlanPeriod(userId, doc.period, w.start, w.end);
+  const curStart = windowStart(period, now);
+  if (curStart <= 0) return;
+  const last = await ExercisePlanPeriodModel.findOne({ userId: new Types.ObjectId(userId), period })
+    .sort({ windowStart: -1 }).select({ windowStart: 1 }).lean();
+  const lastSettled = Number(last?.windowStart) || 0;
+  let cursor = lastSettled > 0
+    ? lastSettled + span
+    : Math.max(activeFrom > 0 ? activeFrom : curStart - span, 0);
+  let written = 0;
+  while (cursor > 0 && cursor < curStart && written < CATCH_UP_MAX_PERIODS) {
+    if (!(activeFrom > 0 && cursor < activeFrom)) {
+      const progress = await sumActivities(userId, cursor, cursor + span);
+      if (progress.distanceM > 0 || progress.durationSec > 0 || progress.count > 0) {
+        await finalizePlanPeriod(userId, period, cursor, cursor + span);
+        written += 1;
+      }
+    }
+    cursor += span;
+  }
 }
 
 /**
@@ -234,8 +259,8 @@ async function lastActivityAt(userId: string): Promise<number> {
 
 /**
  * 计划是否已闲置到期：距「最近运动 / 计划生效起点」的较晚者已超过 7 天。
- * 同时要求确实跨过了一个完整周期（每天计划 1 天、每周计划 7 天）——对每天/每周计划，
- * 7 天都已覆盖，这里保留周期判断做语义兜底（将来加别的周期类型不必再改）。
+ * 同时要求确实跨过了一个完整周期（每天计划 1 天）——1 天都已覆盖 7 天闲置线，
+ * 这里保留周期判断做语义兜底（将来加别的周期类型不必再改）。
  */
 export function isPlanIdle(
   plan: { period: PlanPeriod; activeFrom?: number; periodStart?: number; createdAt?: Date },
@@ -245,7 +270,7 @@ export function isPlanIdle(
   const from = planActiveFrom(plan);
   const anchor = Math.max(from || 0, Number(lastActiveAt) || 0);
   if (!anchor) return false; // 两个时间都拿不到：不动用户数据
-  const periodMs = plan.period === 'weekly' ? 7 * 86_400_000 : 86_400_000;
+  const periodMs = 86_400_000;
   const idleMs = now - anchor;
   return idleMs > Math.max(periodMs, PLAN_IDLE_DAYS * 86_400_000);
 }
@@ -277,21 +302,9 @@ function toDto(doc: {
   };
 }
 
-/**
- * 周计划固定 7 天一期：从锚点日 0 点起每 7 天切块，返回含 now 的那一期起点。
- * 不在期内逐日平移——11-12 定计划，本期一直是 11-12~11-18。
- */
-function weeklyStartOf(anchor: number, now: number): number {
-  const span = 7 * 86_400_000;
-  const k = Math.max(0, Math.floor((now - anchor) / span));
-  return anchor + k * span;
-}
-
-/** 完成度窗口起点（东八区）：daily=今天 00:00；weekly=锚点起固定 7 天一期（窗口＝[start, start+周期)） */
-function windowStart(period: PlanPeriod, now: number, weeklyAnchor = 0): number {
-  if (period === 'daily') return bjDayStart(now);
-  const anchor = weeklyAnchor > 0 ? weeklyAnchor : bjDayStart(now);
-  return weeklyStartOf(anchor, now);
+/** 完成度窗口起点（东八区）：当天 00:00 */
+function windowStart(period: PlanPeriod, now: number): number {
+  return bjDayStart(now);
 }
 
 /** 当期进度 + 三环（超额封顶；目标缺失的环 pct=0） */
@@ -323,8 +336,8 @@ export async function getPlanWithProgress(userId: string, now = Date.now()): Pro
   if (!plan) {
     return { plan: null, progress: { distanceM: 0, durationSec: 0, count: 0 }, today, rings: [] };
   }
-  const start = windowStart(plan.period, now, plan.periodStart);
-  const end = start + (plan.period === 'daily' ? 86_400_000 : 7 * 86_400_000);
+  const start = windowStart(plan.period, now);
+  const end = start + 86_400_000;
   const real = await sumActivities(userId, start, end);
   /**
    * 改计划不追溯（2026-11-10）：窗口内真实合计永远算全（补录的旧日期轨迹也算，不做时间点切分），
@@ -382,15 +395,15 @@ export interface PlanPeriodSnapshot {
   allAchieved: boolean;
 }
 
-/** 周期键：daily=该日 YYYY-MM-DD；weekly=本期起点日期 YYYY-MM-DD（东八区） */
+/** 周期键：该日 YYYY-MM-DD（东八区） */
 function periodKeyOf(period: PlanPeriod, windowStartMs: number): string {
   return bjDateStr(windowStartMs);
 }
 
 /** 给定时刻所属窗口；上一窗口＝当前窗口整体往前挪一个周期 */
-function previousWindow(period: PlanPeriod, now: number, weeklyAnchor = 0): { start: number; end: number } {
-  const span = period === 'daily' ? 86_400_000 : 7 * 86_400_000;
-  const end = windowStart(period, now, weeklyAnchor);
+function previousWindow(period: PlanPeriod, now: number): { start: number; end: number } {
+  const span = 86_400_000;
+  const end = windowStart(period, now);
   return { start: end - span, end };
 }
 
@@ -490,20 +503,12 @@ export async function finalizePlanPeriod(
   return snap;
 }
 
-/**
- * 周计划从锚点开始才有「期」：上一期起点早于锚点 → 该时段没有真实计划周期，不能补快照
- * （否则迁移后会把 11-05~11-11 这种虚构期写进历史）。
- */
-function beforeWeeklyAnchor(period: PlanPeriod, anchor: number, windowStartMs: number): boolean {
-  return period === 'weekly' && anchor > 0 && windowStartMs < anchor;
-}
-
 /** 补结算上限：一次最多补这么多期（超长闲置用户不至于一次跑几百次） */
 export const CATCH_UP_MAX_PERIODS = 60;
 
-/** 周期跨度（毫秒）：每天 1 天、每周 7 天 */
+/** 周期跨度（毫秒）：1 天 */
 function periodSpan(period: PlanPeriod): number {
-  return period === 'daily' ? 86_400_000 : 7 * 86_400_000;
+  return 86_400_000;
 }
 
 /**
@@ -522,14 +527,15 @@ async function catchUpPeriods(
   doc: { period: PlanPeriod; periodStart?: number; activeFrom?: number; createdAt?: Date },
   now: number,
 ): Promise<number> {
-  const period = doc.period;
+  // 周期一律按日（周计划已下线）：doc.period 可能是未迁移的存量 'weekly'，
+  // 沿用它会把「1 天窗口 + 周目标」写成 period=weekly 的脏快照，污染历史查询
+  const period: PlanPeriod = 'daily';
   const span = periodSpan(period);
-  const anchor = Number(doc.periodStart) || 0;
   const activeFrom = planActiveFrom(doc);
-  const curStart = windowStart(period, now, anchor);
+  const curStart = windowStart(period, now);
   if (curStart <= 0) return 0;
 
-  // 已结算到哪一期（同一周期类型的最新一条）
+  // 已结算到哪一期（同周期类型的最新一条；存量周快照忽略——它们属于已下线的周计划）
   const last = await ExercisePlanPeriodModel.findOne({ userId: new Types.ObjectId(userId), period })
     .sort({ windowStart: -1 })
     .select({ windowStart: 1 })
@@ -541,17 +547,11 @@ async function catchUpPeriods(
     ? lastSettled + span
     : Math.max(activeFrom > 0 ? activeFrom : curStart - span, 0);
   if (from <= 0) return 0;
-  // 对齐到周期栅格（周计划锚点起每 7 天一期）
-  if (anchor > 0) {
-    const k = Math.max(0, Math.ceil((from - anchor) / span));
-    from = anchor + k * span;
-  }
   if (from >= curStart) {
     // 没有漏掉的期：仍要结算「紧邻上一期」（常规路径）
-    const w = previousWindow(period, now, anchor);
+    const w = previousWindow(period, now);
     if (w.start <= 0) return 0;
     if (activeFrom > 0 && w.start < activeFrom) return 0;
-    if (beforeWeeklyAnchor(period, anchor, w.start)) return 0;
     if (lastSettled === w.start) return 0; // 已结算过，省一次查询
     await finalizePlanPeriod(userId, period, w.start, w.end);
     return 1;
@@ -561,10 +561,6 @@ async function catchUpPeriods(
   let cursor = from;
   while (cursor < curStart && written < CATCH_UP_MAX_PERIODS) {
     if (activeFrom > 0 && cursor < activeFrom) {
-      cursor += span;
-      continue;
-    }
-    if (beforeWeeklyAnchor(period, anchor, cursor)) {
       cursor += span;
       continue;
     }
@@ -595,10 +591,6 @@ export async function finalizeAllPreviousPeriods(now = Date.now()): Promise<{ do
   let done = 0;
   let failed = 0;
   for (const p of plans) {
-    const period = p.period as PlanPeriod;
-    const anchor = Number(p.periodStart) || 0;
-    // 存量周计划尚未锚定：等用户首次读取锚定后再结算；锚点之前的时段没有真实期
-    if (period === 'weekly' && !anchor) continue;
     try {
       done += await catchUpPeriods(String(p.userId), p, now);
     } catch (e) {
@@ -625,19 +617,15 @@ export async function listPlanHistory(
 ): Promise<{ items: PlanPeriodSnapshot[]; nextCursor: number | null }> {
   if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
   const plan = await getPlan(userId);
-  const period = (query.period === 'daily' || query.period === 'weekly')
+  // period 缺省取计划自身的周期（存量周计划文档照常按 weekly 查询历史）
+  // period 缺省取计划自身周期（存量周计划文档照常按 weekly 查历史）；不再有「无周期」分支
+  const period: PlanPeriod = query.period === 'daily' || query.period === 'weekly'
     ? (query.period as PlanPeriod)
-    : (plan?.period ?? null);
-  if (!period) return { items: [], nextCursor: null };
+    : (plan?.period ?? 'daily');
   const limit = Math.max(1, Math.min(60, Math.floor(Number(query.limit) || 20)));
   const filter: Record<string, unknown> = { userId: new Types.ObjectId(userId), period };
-  // 周计划只返回锚点之后的期（迁移不回推：锚点前的旧自然周/虚构期不展示）
-  const anchor = plan?.period === 'weekly' && period === 'weekly' ? plan.periodStart : 0;
-  const windowCond: Record<string, number> = {};
-  if (anchor > 0) windowCond.$gte = anchor;
   const cursor = Number(query.cursor);
-  if (Number.isFinite(cursor) && cursor > 0) windowCond.$lt = cursor;
-  if (Object.keys(windowCond).length) filter.windowStart = windowCond;
+  if (Number.isFinite(cursor) && cursor > 0) filter.windowStart = { $lt: cursor };
 
   const rows = await ExercisePlanPeriodModel.find(filter)
     .sort({ windowStart: -1 })
@@ -699,17 +687,11 @@ export interface PlanCalendarDay {
   source: 'snapshot' | 'live' | 'none';
 }
 
-export interface PlanCalendarWeek extends PlanPeriodSnapshot {
-  /** snapshot=已结算；live=本周实时 */
-  source: 'snapshot' | 'live';
-}
 
 export interface PlanCalendarResult {
   /** YYYY-MM */
   month: string;
   days: PlanCalendarDay[];
-  /** 与本月有交集的周计划记录（周计划用户用；单独列在月历下方） */
-  weeks: PlanCalendarWeek[];
 }
 
 /** 'YYYY-MM' → 该月东八区窗口 [start, end) */
@@ -770,15 +752,7 @@ export async function listPlanCalendar(
   }).lean();
   const snapByDate = new Map(daySnaps.map((s) => [String(s.periodKey), s]));
 
-  // 2) 本月涉及的周快照（窗口与本月有交集：从月初前 7 天开始找）
-  // 周计划从锚点开始才有真实期：锚点之前的旧自然周/虚构期不参与展示
-  const weeklyAnchor = plan?.period === 'weekly' ? plan.periodStart : 0;
-  const weekFrom = weeklyAnchor > 0 ? Math.max(start - 7 * 86_400_000, weeklyAnchor) : start - 7 * 86_400_000;
-  const weekSnaps = await ExercisePlanPeriodModel.find({
-    userId: uid, period: 'weekly', windowStart: { $gte: weekFrom, $lt: end },
-  }).sort({ windowStart: -1 }).lean();
-
-  // 3) 实时聚合本月全部轨迹（按月一次查完，避免逐天 N 次）
+  // 2) 实时聚合本月全部轨迹（按月一次查完，避免逐天 N 次）；周计划下线后月历不再有周快照层
   const liveByDayIdx = await sumByDay(userId, start, end);
 
   const days: PlanCalendarDay[] = [];
@@ -824,33 +798,7 @@ export async function listPlanCalendar(
     });
   }
 
-  // 4) 周记录：快照 + 本周实时（若本月包含本周）
-  const weeks: PlanCalendarWeek[] = weekSnaps.map((s) => ({
-    ...buildSnapshot('weekly', Number(s.windowStart), Number(s.windowEnd), {
-      distanceM: s.targets?.distanceM || 0,
-      durationMin: s.targets?.durationMin || 0,
-      count: s.targets?.count || 0,
-    }, {
-      distanceM: s.progress?.distanceM || 0,
-      durationSec: s.progress?.durationSec || 0,
-      count: s.progress?.count || 0,
-    }),
-    source: 'snapshot' as const,
-  }));
-  // 当前期＝锚点起固定 7 天一期；与本月有交集就列出来（跨月的一期也要显示）
-  const curPeriodStart = plan?.period === 'weekly' ? windowStart('weekly', now, plan.periodStart) : 0;
-  const overlapsMonth = curPeriodStart > 0 && curPeriodStart < end && curPeriodStart + 7 * 86_400_000 > start;
-  // 只有当前计划就是「每周」时，才把本期实时进度作为一条期记录（否则期目标＝日目标，会显示成 6.2/3.0）
-  if (plan?.period === 'weekly' && overlapsMonth && !weeks.some((w) => w.windowStart === curPeriodStart)) {
-    const agg = await sumActivities(userId, curPeriodStart, curPeriodStart + 7 * 86_400_000);
-    weeks.unshift({
-      ...buildSnapshot('weekly', curPeriodStart, curPeriodStart + 7 * 86_400_000, targets, agg),
-      source: 'live',
-    });
-  }
-  weeks.sort((a, b) => b.windowStart - a.windowStart);
-
-  return { month, days, weeks };
+  return { month, days };
 }
 
 export interface PlanDayDetail {
@@ -960,11 +908,10 @@ export const PLAN_MILESTONES: readonly PlanMilestoneDef[] = [
   { key: 'first', label: '首次达成', desc: '完成 1 次目标', ratio: 1, times: 1 },
   { key: 'week', label: '坚持一周', desc: '达成 7 次', ratio: 1, times: 7 },
   { key: 'habit', label: '习惯养成', desc: '达成 20 次', ratio: 1, times: 20 },
-  { key: 'x2', label: '双倍火力', desc: '200% 达成 10 次', ratio: 2, times: 10 },
-  { key: 'x2pro', label: '双倍宗师', desc: '200% 达成 20 次', ratio: 2, times: 20 },
-  { key: 'x3', label: '三倍王者', desc: '300% 达成 10 次', ratio: 3, times: 10 },
-  { key: 'x4', label: '四倍狂人', desc: '400% 达成 5 次', ratio: 4, times: 5 },
-  { key: 'x5', label: '五倍传奇', desc: '500% 达成 3 次', ratio: 5, times: 3 },
+  { key: 'x2', label: '200%完成目标', desc: '单周期完成倍数达到 200% 即可获得', ratio: 2, times: 1 },
+  { key: 'x3', label: '300%完成目标', desc: '单周期完成倍数达到 300% 即可获得', ratio: 3, times: 1 },
+  { key: 'x4', label: '400%完成目标', desc: '单周期完成倍数达到 400% 即可获得', ratio: 4, times: 1 },
+  { key: 'x5', label: '500%完成目标', desc: '单周期完成倍数达到 500% 即可获得', ratio: 5, times: 1 },
 ];
 
 /** 里程碑支持的倍数档位（ratio → 该档周期计数）；新加档位时同步这里 */
@@ -1003,6 +950,10 @@ export interface PlanSummaryResult {
     /** 当前已完成次数 / 需要次数 */
     cur: number;
     need: number;
+    /** 徽章中央数字：倍数章=百分比（200/300/…），次数章=需要的次数 */
+    tier: number;
+    /** 进度条百分比（未获得的倍数章恒 0） */
+    pct: number;
   }>;
   /** 里程碑奖杯扩展（docs/21）：原 8 个 + 记录/坚持/圆环/目标/完美周，统一卡面（图标+名称+次数） */
   trophies: PlanTrophy[];
@@ -1089,9 +1040,12 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   for (let i = seq.length - 1; i >= 0 && ratioOfRow(seq[i]) >= OVER_RATIO; i -= 1) overStreak += 1;
 
   const milestones = PLAN_MILESTONES.map((def) => {
-    // 1x 档就是「达成」本身（≥100% 都算）；2x 及以上只统计落在该档的周期
-    const tier = RATIO_TIERS.filter((t) => t <= def.ratio).pop() ?? 1;
-    const cur = tier === 1 ? achieved : (ratioCount[tier] || 0);
+    // 1x 档就是「达成」本身（≥100% 都算）
+    const cur = def.ratio >= 2
+      // 倍数章（2026-11-14 调整）：完成一次对应百分比即获得——cur = 完成倍数 ≥ 该百分比的周期数
+      // （500% 的周期同样算完成了 200%，累计口径）
+      ? RATIO_TIERS.filter((t) => t >= def.ratio).reduce((acc, t) => acc + (ratioCount[t] || 0), 0)
+      : achieved;
     return {
       key: def.key,
       label: def.label,
@@ -1099,6 +1053,10 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       unlocked: cur >= def.times,
       cur,
       need: def.times,
+      // 徽章中央数字：倍数章印百分比（200/300/400/500），次数章印需要的次数（1/7/20）
+      tier: def.ratio >= 2 ? def.ratio * 100 : def.times,
+      // 进度条：倍数章完成一次即满格；次数章按达成次数/需要次数
+      pct: def.ratio >= 2 ? (cur >= 1 ? 100 : 0) : Math.min(Math.round((cur / def.times) * 100), 100),
     };
   });
 
@@ -1134,11 +1092,11 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
         icon: MILESTONE_ICONS[m.key] || '🏆',
         unlocked: m.unlocked,
         cur: m.cur,
-        tier: m.need,
+        tier: m.tier, // 倍数章=百分比数字（200/300/…），次数章=需要的次数
         nextTier: null, // 原 8 个各是独立目标，无阶梯成长线
         earnedCount: earns[m.key] ? 1 : 0,
         earnDateText: (earns[m.key] && earns[m.key].earnDate) || '',
-        pct: pctOf(m),
+        pct: m.pct, // 直接用 milestones 算好的百分比（倍数章「完成一次即满格」，不能再按 cur/tier 除）
         group: 'plan',
       }),
     ),
@@ -1312,7 +1270,6 @@ const MILESTONE_ICONS: Record<string, string> = {
   week: '📅',
   habit: '💪',
   x2: '🔥',
-  x2pro: '⚡',
   x3: '👑',
   x4: '🚀',
   x5: '🏆',
@@ -1602,8 +1559,11 @@ function computeTrophyEarns(
     const end = bjDateStr(Number(r.windowEnd) - 1); // windowEnd 是「下一期 0 点」，减 1ms 取本期最后一天
     for (const def of PLAN_MILESTONES) {
       if (earns[def.key]) continue;
-      const useTier = RATIO_TIERS.filter((x) => x <= def.ratio).pop() ?? 1;
-      const counter = useTier === 1 ? achieved : (ratioCount[useTier] || 0);
+      // 计数口径必须与 milestones 的 cur 完全一致（累计：500% 的期也算完成了 200%），
+      // 否则会出现「徽章已解锁但 earnedCount=0 / 无获取日期」的自相矛盾卡面
+      const counter = def.ratio >= 2
+        ? RATIO_TIERS.filter((x) => x >= def.ratio).reduce((acc, x) => acc + (ratioCount[x] || 0), 0)
+        : achieved;
       if (counter >= def.times) mark(def.key, end);
     }
   }

@@ -94,7 +94,7 @@ test('EPS1 概况：总周期/达成次数/达成率/累计 + 连续达成', asy
   assert.ok(s.totals.distanceM > 0 && s.totals.count > 0, '累计求和');
 });
 
-test('EPS2 里程碑：按最弱一项的完成倍数计数（1x/2x/3x）', async () => {
+test('EPS2 里程碑：倍数章按累计完成（≥ 该百分比的周期数），次数章按达成次数', async () => {
   // 清空后造：3 天 200%（含 1 天 300%）
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
   await makeSnap(-3, 2, true);
@@ -104,11 +104,13 @@ test('EPS2 里程碑：按最弱一项的完成倍数计数（1x/2x/3x）', asyn
   const s = await getPlanSummary(userId);
   const byKey = Object.fromEntries(s.milestones.map((m) => [m.key, m]));
   assert.equal(byKey.first.cur, 3, '1x 档＝达成次数（3 次都达成）');
-  assert.equal(byKey.x2.cur, 2, '200% 档只算落在 [200%,300%) 的 2 期');
-  assert.equal(byKey.x3.cur, 1, '300% 档只算落在 [300%,400%) 的 1 期');
+  assert.equal(byKey.x2.cur, 3, '200% 章 = 完成倍数 ≥200% 的周期数（两期 200% + 一期 300% 都算）');
+  assert.equal(byKey.x3.cur, 1, '300% 章 = 完成倍数 ≥300% 的周期数（只有那期 300%）');
   assert.equal(byKey.first.unlocked, true, '首次达成已解锁');
   assert.equal(byKey.week.unlocked, false, '7 次还没到');
-  assert.equal(byKey.x2.need, 10);
+  assert.equal(byKey.x2.need, 1, '倍数章完成一次即获得（2026-11-14 调整）');
+  assert.equal(byKey.x2.unlocked, true, 'cur 3 ≥ 1 已解锁');
+  assert.equal(byKey.x3.unlocked, true);
   assert.equal(s.milestones.length, PLAN_MILESTONES.length, '固定档位全量返回（未解锁也占位）');
 });
 
@@ -128,34 +130,39 @@ test('EPS3 路由：GET /plan/summary 需登录；登录后返回概况与奖杯
   assert.ok(Array.isArray(d.milestones) && d.milestones.length > 0);
 });
 
-test('EPS4 更高倍数档位：400%/500% 也有奖杯', async () => {
+test('EPS4 更高倍数档位：400%/500% 也有奖杯（完成一次即获得）', async () => {
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
-  await makeSnap(-3, 4, true);   // 400% → 4x
-  await makeSnap(-2, 5, true);   // 500% → 5x
-  await makeSnap(-1, 5.5, true); // 550% → 5x（超过 5x 仍归 5x）
+  await makeSnap(-3, 4, true);   // 400% → ≥4x
+  await makeSnap(-2, 5, true);   // 500% → ≥5x
+  await makeSnap(-1, 5.5, true); // 550% → ≥5x（超过 5x 仍计入）
   const s = await getPlanSummary(userId);
   const byKey = Object.fromEntries(s.milestones.map((m) => [m.key, m]));
   assert.ok('x4' in byKey && 'x5' in byKey, '400%/500% 档位存在');
-  assert.equal(byKey.x4.cur, 1, '只有 400% 那期落 4x 档');
-  assert.equal(byKey.x5.cur, 2, '500% 与 550% 都落 5x 档');
-  assert.equal(byKey.x4.need, 5);
-  assert.equal(byKey.x5.need, 3);
+  assert.equal(byKey.x4.cur, 3, '≥400% 的 3 期（400% + 500% + 550%）');
+  assert.equal(byKey.x5.cur, 2, '≥500% 的 2 期（500% + 550%）');
+  assert.equal(byKey.x4.need, 1, '完成一次即获得');
+  assert.equal(byKey.x5.need, 1);
   assert.equal(byKey.first.unlocked, true, '1x 档按达成次数算');
-  assert.equal(byKey.x4.unlocked, false, '1/5 还没解锁');
+  assert.equal(byKey.x4.unlocked, true, '完成一次 400% 即解锁');
+  assert.equal(byKey.x4.pct, 100);
 });
 
-test('EPS5 分档不重复计数：500% 的一期只进 5x，不进 1x~4x 档', async () => {
+test('EPS5 倍数章累计口径：500% 的周期同时计入 5x/4x/3x/2x 章（一次完成多档兑现）', async () => {
   await ExercisePlanPeriodModel.deleteMany({ userId: new mongoose.Types.ObjectId(userId) });
-  await makeSnap(-4, 5, true);   // 落 5x
-  await makeSnap(-3, 3.5, true); // 落 3x
-  await makeSnap(-2, 2.4, true); // 落 2x
-  await makeSnap(-1, 1.2, true); // 落 1x
+  await makeSnap(-4, 5, true);   // ≥5x 也 ≥4x/3x/2x
+  await makeSnap(-3, 3.5, true); // ≥3x 也 ≥2x
+  await makeSnap(-2, 2.4, true); // ≥2x
+  await makeSnap(-1, 1.2, true); // 仅 ≥1x
   const s = await getPlanSummary(userId);
   const byKey = Object.fromEntries(s.milestones.map((m) => [m.key, m]));
 
-  assert.equal(byKey.x5.cur, 1, '500% 只进 5x');
-  assert.equal(byKey.x4.cur, 0, '没有落在 4x 档的周期');
-  assert.equal(byKey.x3.cur, 1, '350% 落 3x');
-  assert.equal(byKey.x2.cur, 1, '240% 落 2x');
+  assert.equal(byKey.x5.cur, 1, '≥500%：1 期');
+  assert.equal(byKey.x4.cur, 1, '≥400%：1 期');
+  assert.equal(byKey.x3.cur, 2, '≥300%：2 期（350% 与 500%）');
+  assert.equal(byKey.x2.cur, 3, '≥200%：3 期（240%/350%/500%）');
   assert.equal(byKey.first.cur, 4, '1x 档＝达成总次数（4 期都达成）');
+  assert.equal(byKey.x2.unlocked, true, '各倍数章完成一次即解锁');
+  assert.equal(byKey.x3.unlocked, true);
+  assert.equal(byKey.x4.unlocked, true);
+  assert.equal(byKey.x5.unlocked, true);
 });
