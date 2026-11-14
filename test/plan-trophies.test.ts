@@ -118,11 +118,11 @@ async function summary() {
   return res.json().data;
 }
 
-test('TP1 trophies 全量下发：原 8 + 新 27 = 35 座', async () => {
+test('TP1 trophies 全量下发：7 里程碑 + 25 阶梯 + 4 完美周 = 36 座', async () => {
   const s = await summary();
-  assert.equal(s.trophies.length, 34, '双倍宗师与 200% 章合并后 34 座');
+  assert.equal(s.trophies.length, 36, '单项完美周拆分后 36 座');
   const keys = new Set(s.trophies.map((t: PlanTrophy) => t.key));
-  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-2000', 'streak-365', 'ring-100', 'goal-500', 'perfect-week-all', 'perfect-week-single', 'x2', 'x3', 'x4']) {
+  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-2000', 'streak-365', 'ring-100', 'goal-500', 'perfect-week-all', 'perfect-week-distance', 'perfect-week-duration', 'perfect-week-count', 'x2', 'x3', 'x4']) {
     assert.ok(keys.has(key), `缺奖杯 ${key}`);
   }
 });
@@ -178,15 +178,29 @@ test('TP3 合环与活动：daily 快照全达成 100 次、累计活动 120 次
   assert.equal(goal100.unlocked, true);
 });
 
-test('TP4 完美周：全能与单项分开计数、互不冒充', async () => {
+test('TP4 完美周：全能 / 距离 / 时长 / 次数 四项各算各的，互不冒充', async () => {
   const s = await summary();
   const all = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-all');
-  const single = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-single');
+  const dist = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-distance');
+  const dur = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-duration');
+  const cnt = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-count');
+
   assert.ok(all.cur >= 12, `100 个连续全达成天里至少十余个完整自然周，实际 ${all.cur}`);
-  assert.equal(single.cur, all.cur + 1, `单项完美周 = 全能周 + 上个自然周（距离/次数达成、时长没达）：${single.cur} vs ${all.cur}`);
-  assert.equal(all.unlocked, true, '档位 1，存在即解锁');
-  assert.equal(single.unlocked, true);
-  assert.equal(all.nextTier, null, '完美周无阶梯成长线');
+  // 种子场景：前 100 天三项全达成；紧接着 7 天「时长没达、距离+次数达标」
+  assert.equal(dist.cur, all.cur + 1, `距离完美周 = 全能周 + 那个时长没达的自然周：${dist.cur} vs ${all.cur}`);
+  assert.equal(cnt.cur, all.cur + 1, '次数完美周同上');
+  assert.equal(dur.cur, all.cur, '时长没达的那一周不计入时长完美周');
+
+  for (const t of [all, dist, dur, cnt]) {
+    assert.equal(t.unlocked, true, `${t.key} 档位 1，存在即解锁`);
+    assert.equal(t.nextTier, null, '完美周无阶梯成长线');
+    assert.ok(t.earnedCount > 0, `${t.key} 获得次数应 > 0`);
+    assert.match(t.earnDateText, /^\d{4}-\d{2}-\d{2}$/, `${t.key} 有首次获取日期`);
+  }
+  // 三座单项的卡面文案必须点明是哪一项
+  assert.match(dist.label, /距离/);
+  assert.match(dur.label, /时长/);
+  assert.match(cnt.label, /次数/);
 });
 
 test('TP5 记录口径=单日合计：同日两段运动加总后才破纪录', async () => {
@@ -228,7 +242,7 @@ test('TP6 脏数据不炸接口：periodKey 不是合法日期时跳过该行（
   });
   assert.equal(res.statusCode, 200, '脏数据不能让接口 500');
   const s = res.json().data;
-  assert.equal(s.trophies.length, 34, '奖杯照常下发');
+  assert.equal(s.trophies.length, 36, '奖杯照常下发');
   const perfectAll = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-all');
   assert.equal(perfectAll.cur, before, '非法日期不计入完美周（计数与插入脏数据前一致）');
 

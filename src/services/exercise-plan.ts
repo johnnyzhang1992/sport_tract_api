@@ -1072,7 +1072,9 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     ringsClosed: dailyRows.filter((r) => r.allAchieved).length,
     activities: days.reduce((acc, d) => acc + d.count, 0),
     perfectWeekAll: perfect.all,
-    perfectWeekSingle: perfect.single,
+    perfectWeekDistance: perfect.distance,
+    perfectWeekDuration: perfect.duration,
+    perfectWeekCount: perfect.count,
     achievedPeriods: achieved,
   };
   // 每座奖杯的获得记录（获得次数 + 首次获取日期）——卡片三态展示的数据源
@@ -1169,7 +1171,9 @@ export type PlanTrophyMetric =
   | 'ringsClosed'
   | 'activities'
   | 'perfectWeekAll'
-  | 'perfectWeekSingle'
+  | 'perfectWeekDistance'
+  | 'perfectWeekDuration'
+  | 'perfectWeekCount'
   | 'achieved'; // 原 8 个倍数里程碑沿用各自 cur
 
 export interface PlanTrophyDef {
@@ -1254,11 +1258,29 @@ export const PLAN_TROPHY_DEFS: readonly PlanTrophyDef[] = [
     group: 'week',
   },
   {
-    key: 'perfect-week-single',
-    label: '完美一周·单项',
-    desc: '一个自然周里，同一单项（距离或时长或次数）七天全部达成',
-    icon: '✨',
-    metric: 'perfectWeekSingle',
+    key: 'perfect-week-distance',
+    label: '完美一周·距离',
+    desc: '一个自然周（周一至周日）里，七天都达成距离目标',
+    icon: '📏',
+    metric: 'perfectWeekDistance',
+    tier: 1,
+    group: 'week',
+  },
+  {
+    key: 'perfect-week-duration',
+    label: '完美一周·时长',
+    desc: '一个自然周里，七天都达成时长目标',
+    icon: '⏱️',
+    metric: 'perfectWeekDuration',
+    tier: 1,
+    group: 'week',
+  },
+  {
+    key: 'perfect-week-count',
+    label: '完美一周·次数',
+    desc: '一个自然周里，七天都达成次数目标',
+    icon: '🔢',
+    metric: 'perfectWeekCount',
     tier: 1,
     group: 'week',
   },
@@ -1404,13 +1426,17 @@ export function computeRecordStats(days: DailyTotalsRow[]): PlanRecords & { brea
 
 /** 完美周计数（基于 daily 快照；快照只在计划活跃期存在，属于计划域成就）：
  *  全能 = 一个自然周七天的 daily 快照齐全且全部 allAchieved；
- *  单项 = 七天快照齐全且存在同一单项每天都达成。 */
+ *  单项（距离/时长/次数）= 七天快照齐全且该单项每天都达成（各算各的，互不冒充）。 */
 function perfectWeekCounts(dailyRows: Array<Record<string, unknown>>): {
   all: number;
-  single: number;
+  distance: number;
+  duration: number;
+  count: number;
   /** 首次获取日期（最早合格自然周的最后一天，YYYY-MM-DD）；无则空串 */
   firstAllEnd: string;
-  firstSingleEnd: string;
+  firstDistanceEnd: string;
+  firstDurationEnd: string;
+  firstCountEnd: string;
 } {
   interface WeekAcc {
     days: number;
@@ -1433,9 +1459,13 @@ function perfectWeekCounts(dailyRows: Array<Record<string, unknown>>): {
     weeks.set(wk, acc);
   }
   let all = 0;
-  let single = 0;
+  let distance = 0;
+  let duration = 0;
+  let count = 0;
   let firstAllEnd = '';
-  let firstSingleEnd = '';
+  let firstDistanceEnd = '';
+  let firstDurationEnd = '';
+  let firstCountEnd = '';
   for (const [wk, acc] of weeks.entries()) {
     if (acc.days !== 7) continue; // 快照不足七天（计划周内建立/取消）不算完美周
     const end = bjDateStr(Date.parse(`${wk}T00:00:00+08:00`) + 6 * 86_400_000); // 周日
@@ -1443,12 +1473,30 @@ function perfectWeekCounts(dailyRows: Array<Record<string, unknown>>): {
       all += 1;
       if (!firstAllEnd || end < firstAllEnd) firstAllEnd = end;
     }
-    if (acc.metric.distance === 7 || acc.metric.duration === 7 || acc.metric.count === 7) {
-      single += 1;
-      if (!firstSingleEnd || end < firstSingleEnd) firstSingleEnd = end;
+    // 单项完美周按项分别计数（2026-11-14：原来三项混成一个「单项」，卡面看不出是哪一项）
+    if (acc.metric.distance === 7) {
+      distance += 1;
+      if (!firstDistanceEnd || end < firstDistanceEnd) firstDistanceEnd = end;
+    }
+    if (acc.metric.duration === 7) {
+      duration += 1;
+      if (!firstDurationEnd || end < firstDurationEnd) firstDurationEnd = end;
+    }
+    if (acc.metric.count === 7) {
+      count += 1;
+      if (!firstCountEnd || end < firstCountEnd) firstCountEnd = end;
     }
   }
-  return { all, single, firstAllEnd, firstSingleEnd };
+  return {
+    all,
+    distance,
+    duration,
+    count,
+    firstAllEnd,
+    firstDistanceEnd,
+    firstDurationEnd,
+    firstCountEnd,
+  };
 }
 
 function formatKmText(m: number): string {
@@ -1541,7 +1589,9 @@ function computeTrophyEarns(
   // 完美周：可重复获得 → 次数；首次获取日期 = 最早合格周的最后一天
   const perfect = perfectWeekCounts(dailyRows);
   if (perfect.all > 0) earns['perfect-week-all'] = { earnedCount: perfect.all, earnDate: perfect.firstAllEnd };
-  if (perfect.single > 0) earns['perfect-week-single'] = { earnedCount: perfect.single, earnDate: perfect.firstSingleEnd };
+  if (perfect.distance > 0) earns['perfect-week-distance'] = { earnedCount: perfect.distance, earnDate: perfect.firstDistanceEnd };
+  if (perfect.duration > 0) earns['perfect-week-duration'] = { earnedCount: perfect.duration, earnDate: perfect.firstDurationEnd };
+  if (perfect.count > 0) earns['perfect-week-count'] = { earnedCount: perfect.count, earnDate: perfect.firstCountEnd };
 
   // 原 8 里程碑：达成计数跨过 need 的那个周期的结束日期
   let achieved = 0;
@@ -1579,7 +1629,9 @@ interface TrophyCounts {
   ringsClosed: number;
   activities: number;
   perfectWeekAll: number;
-  perfectWeekSingle: number;
+  perfectWeekDistance: number;
+  perfectWeekDuration: number;
+  perfectWeekCount: number;
   achievedPeriods: number;
 }
 
@@ -1592,7 +1644,9 @@ function metricCountOf(metric: PlanTrophyMetric, m: TrophyCounts): number {
     case 'ringsClosed': return m.ringsClosed;
     case 'activities': return m.activities;
     case 'perfectWeekAll': return m.perfectWeekAll;
-    case 'perfectWeekSingle': return m.perfectWeekSingle;
+    case 'perfectWeekDistance': return m.perfectWeekDistance;
+    case 'perfectWeekDuration': return m.perfectWeekDuration;
+    case 'perfectWeekCount': return m.perfectWeekCount;
     case 'achieved': return m.achievedPeriods;
   }
 }
