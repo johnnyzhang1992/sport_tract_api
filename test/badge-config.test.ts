@@ -119,7 +119,7 @@ test('BC8 reachedTier：档位映射单调、0 档返回 0', () => {
 });
 
 test('BC9 空数据下不给任何徽章解锁（不会凭空产生获得日期）', () => {
-  const earns = computeBadgeEarns({ days: [], dailyRows: [], periodRows: [] });
+  const earns = computeBadgeEarns({ days: [], typeDays: {}, dailyRows: [], periodRows: [] });
   assert.deepEqual(earns, {});
 });
 

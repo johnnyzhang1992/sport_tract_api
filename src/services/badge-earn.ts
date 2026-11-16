@@ -45,9 +45,12 @@ export interface BadgeEarnInput {
   days: BadgeDailyRow[];
   /**
    * 分运动类型的每日汇总（分类型徽章用）：type → 按日期升序的行。
-   * 不传时分类型徽章一律不解锁（老调用方不需要知道这个字段）。
+   *
+   * ⚠️ **必填**（2026-11-17 从可选改必填）：分运动类型徽章有 80 座，解锁日期只能从这里算。
+   * 之前是可选字段，名次那边漏传过一次 → 80 座徽章「已解锁但没有第 N 位」，编译期毫无提示。
+   * 现在漏传会直接编译失败；确实没有类型数据时传 `{}`。
    */
-  typeDays?: Record<string, BadgeDailyRow[]>;
+  typeDays: Record<string, BadgeDailyRow[]>;
   /** daily 周期快照 */
   dailyRows: BadgeRangeRow[];
   /** 全部周期快照（原 8 倍数里程碑用） */

@@ -36,7 +36,7 @@ function snap(date: string, achieved: boolean, period = 'daily', ratio = 2): Ran
 }
 
 function emptyInput(): RankInput {
-  return { days: [], dailyRows: [], periodRows: [] };
+  return { days: [], typeDays: {}, dailyRows: [], periodRows: [] };
 }
 
 test('TR1 破纪录：第 N 次刷新的那天解除，100 档取第 100 天', () => {

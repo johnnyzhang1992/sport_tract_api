@@ -124,7 +124,7 @@ export function __resetTrophyRankCache(): void {
  * 周期快照按用户取全部。
  */
 async function collectUnlockDates(): Promise<Map<string, Record<string, string>>> {
-  const [dayAgg, periodDocs] = await Promise.all([
+  const [dayAgg, typeAgg, periodDocs] = await Promise.all([
     ActivityModel.aggregate<{
       _id: { userId: Types.ObjectId; date: string };
       distanceM: number;
@@ -146,6 +146,28 @@ async function collectUnlockDates(): Promise<Map<string, Record<string, string>>
       { $sort: { '_id.date': 1 } },
       { $project: { _id: 1, distanceM: 1, durationSec: 1, count: 1 } },
     ]),
+    // 分运动类型的每日汇总（分类型徽章解锁日期用；缺这份数据 → 分类型徽章永远没有名次）
+    ActivityModel.aggregate<{
+      _id: { userId: Types.ObjectId; type: string; date: string };
+      distanceM: number;
+      durationSec: number;
+      count: number;
+    }>([
+      { $match: { status: 'finished' } },
+      {
+        $group: {
+          _id: {
+            userId: '$userId',
+            type: '$type',
+            date: { $dateToString: { format: '%Y-%m-%d', date: { $toDate: '$startTime' }, timezone: '+08:00' } },
+          },
+          distanceM: { $sum: { $ifNull: ['$distance', 0] } },
+          durationSec: { $sum: { $ifNull: ['$duration', 0] } },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { '_id.date': 1 } },
+    ]),
     ExercisePlanPeriodModel.find({})
       .select({ userId: 1, period: 1, periodKey: 1, windowEnd: 1, targets: 1, progress: 1, allAchieved: 1 })
       .lean(),
@@ -157,6 +179,18 @@ async function collectUnlockDates(): Promise<Map<string, Record<string, string>>
     const arr = daysByUser.get(uid) ?? [];
     arr.push({ date: r._id.date, distanceM: r.distanceM, durationSec: r.durationSec, count: r.count });
     daysByUser.set(uid, arr);
+  }
+
+  const typeDaysByUser = new Map<string, Record<string, RankDailyRow[]>>();
+  for (const r of typeAgg) {
+    const uid = String(r._id.userId);
+    const type = String(r._id.type || '');
+    if (!type) continue;
+    const perUser = typeDaysByUser.get(uid) ?? {};
+    const arr = perUser[type] ?? [];
+    arr.push({ date: r._id.date, distanceM: r.distanceM, durationSec: r.durationSec, count: r.count });
+    perUser[type] = arr;
+    typeDaysByUser.set(uid, perUser);
   }
 
   const periodsByUser = new Map<string, RankRangeRow[]>();
@@ -183,7 +217,7 @@ async function collectUnlockDates(): Promise<Map<string, Record<string, string>>
     periodsByUser.set(uid, arr);
   }
 
-  const users = new Set<string>([...daysByUser.keys(), ...periodsByUser.keys()]);
+  const users = new Set<string>([...daysByUser.keys(), ...periodsByUser.keys(), ...typeDaysByUser.keys()]);
   const out = new Map<string, Record<string, string>>();
   for (const uid of users) {
     const rows = periodsByUser.get(uid) ?? [];
@@ -194,6 +228,9 @@ async function collectUnlockDates(): Promise<Map<string, Record<string, string>>
         // 完美周/合环只认每日快照（周计划已下线，weekly 快照不参与名次）——见 unlockDatesOf 里的过滤
         dailyRows: rows,
         periodRows: rows,
+        // 分运动类型徽章（walk-*/run-*/hike-*/ride-*/climb-*）的解锁日期依赖这份数据；
+        // 漏传会让 80 座分类型徽章「已解锁但没有名次」（2026-11-17 修复）
+        typeDays: typeDaysByUser.get(uid) ?? {}, // 必填：没有分类型数据时给空表（编译期强制传）
       }),
     );
   }

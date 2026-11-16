@@ -201,3 +201,123 @@ test('BO-C2 无数据用户：earned=0、total 照常（全灰但结构完整）
   assert.equal(c.earned, 0);
   assert.ok(c.total > 0, `总数应为全部徽章，实际 ${c.total}`);
 });
+
+/* ── 分运动类型徽章的名次（2026-11-17 修复）──
+   症状：80 座分类型徽章「已解锁但没有第 N 位迹路者文案」。
+   原因：trophy-rank 的全站解锁日聚合只算了「用户 × 日」，漏了「用户 × 类型 × 日」，
+        unlockDatesOf 收不到 typeDays → 分类型指标算不出解锁日 → 名次表里没有这些 key。 */
+test('BO-R1 分运动类型徽章也要有名次（typeDays 必须参与全站解锁日计算）', async () => {
+  const { __resetTrophyRankCache } = await import('../src/services/trophy-rank.js');
+  const openid = 'bov-rank-type';
+  const old = await UserModel.findOne({ openid }).select('_id').lean();
+  if (old) {
+    await ActivityModel.deleteMany({ userId: old._id });
+    await UserModel.deleteMany({ _id: old._id });
+  }
+  const u = await UserModel.create({ openid, nickname: 'bov-rank-type' });
+  // 5 次跑步 × 20km = 100km → 解锁 run-dist-100
+  for (let i = 1; i <= 5; i++) {
+    const start = Date.now() - i * DAY;
+    await ActivityModel.create({
+      userId: u._id, type: 'running', status: 'finished',
+      startTime: start, endTime: start + 3600_000, duration: 3600, distance: 20_000,
+      trackPoints: [], markers: [],
+    });
+  }
+  const login = await app.inject({ method: 'POST', url: `${API}/auth/login`, payload: { code: `openid:${openid}` } });
+  const tk = login.json().data.accessToken;
+
+  __resetTrophyRankCache();
+  const res = await app.inject({
+    method: 'GET', url: `${API}/plan/summary`, headers: { authorization: `Bearer ${tk}` },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const t = res.json().data.trophies.find((x: { key: string }) => x.key === 'run-dist-100');
+  assert.ok(t, '必须有 run-dist-100 这座徽章');
+  assert.equal(t.unlocked, true, '100km 应解锁 run-dist-100');
+  assert.ok(t.rank >= 1, `已解锁的分类型徽章必须有名次（实际 rank=${t.rank}）`);
+  assert.ok(t.rankTotal >= 1, '名次分母不能为 0');
+
+  await ActivityModel.deleteMany({ userId: u._id });
+  await UserModel.deleteMany({ _id: u._id });
+  __resetTrophyRankCache();
+});
+
+/* ── 性质测试：新增徽章/新增指标时最容易漏的是「接名次」──────────────
+   历史教训（2026-11-17）：分运动类型 80 座徽章忘传 typeDays → 已解锁但 rank=0
+   → 详情半屏少一行「第 N 位迹路者」，前端只是少渲染一行，谁也发现不了。
+   这条不变式不关心具体哪座徽章，只要「已解锁却没有名次」就红。 */
+test('BO-R2 不变式：任何已解锁的徽章都必须有名次（跨系列覆盖）', async () => {
+  const { __resetTrophyRankCache } = await import('../src/services/trophy-rank.js');
+  const openid = 'bov-rank-invariant';
+  const old = await UserModel.findOne({ openid }).select('_id').lean();
+  if (old) {
+    await ActivityModel.deleteMany({ userId: old._id });
+    await ExercisePlanPeriodModel.deleteMany({ userId: old._id });
+    await UserModel.deleteMany({ _id: old._id });
+  }
+  const u = await UserModel.create({ openid, nickname: 'bov-invariant' });
+  const uid = u._id;
+
+  // 造 8 个连续自然日：每天一次跑步 20km / 2h，覆盖
+  //   记录（破纪录）、坚持（连续天数）、累计里程/时长、分类型里程/时长
+  const startOfToday = ((): number => {
+    const b = new Date(Date.now() + 8 * 3600_000);
+    return Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate()) - 8 * 3600_000;
+  })();
+  for (let i = 1; i <= 8; i++) {
+    const start = startOfToday - i * DAY + 3600_000;
+    await ActivityModel.create({
+      userId: uid, type: 'running', status: 'finished',
+      startTime: start, endTime: start + 7200_000, duration: 7200, distance: 20_000,
+      trackPoints: [], markers: [],
+    });
+  }
+  // 每天也落一条「三项全达成」的日快照 → 合上圆环 / 里程碑 / 完美周候选
+  for (let i = 1; i <= 8; i++) {
+    const key = new Date(startOfToday - i * DAY + 8 * 3600_000).toISOString().slice(0, 10);
+    const ws = startOfToday - i * DAY;
+    await ExercisePlanPeriodModel.create({
+      userId: uid, period: 'daily', periodKey: key,
+      windowStart: ws, windowEnd: ws + DAY,
+      targets: { distanceM: 3000, durationMin: 30, count: 1 },
+      progress: { distanceM: 20_000, durationSec: 7200, count: 1 },
+      achieved: { distance: true, duration: true, count: true }, allAchieved: true,
+    });
+  }
+
+  const login = await app.inject({ method: 'POST', url: `${API}/auth/login`, payload: { code: `openid:${openid}` } });
+  const tk = login.json().data.accessToken;
+
+  __resetTrophyRankCache();
+  const res = await app.inject({
+    method: 'GET', url: `${API}/plan/summary`, headers: { authorization: `Bearer ${tk}` },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  const trophies = res.json().data.trophies as Array<{
+    key: string; unlocked: boolean; rank: number; rankTotal: number; group: string;
+  }>;
+
+  const unlocked = trophies.filter((t) => t.unlocked);
+  assert.ok(unlocked.length >= 6, `种子数据应解锁多座徽章（覆盖多系列），实际 ${unlocked.length}`);
+
+  // 覆盖度自检：至少要跨 3 个分组，否则这条不变式其实没测到什么
+  const groups = new Set(unlocked.map((t) => t.group));
+  assert.ok(groups.size >= 3, `已解锁徽章应跨多个分组，实际 ${[...groups].join(',')}`);
+
+  const missing = unlocked.filter((t) => !(t.rank > 0));
+  assert.deepEqual(
+    missing.map((t) => t.key),
+    [],
+    `已解锁但没有名次的徽章（说明该系列没接到名次计算）：${missing.map((t) => t.key).join(', ')}`,
+  );
+  for (const t of unlocked) {
+    assert.ok(t.rankTotal >= 1, `${t.key} 的名次分母不能为 0`);
+    assert.ok(t.rank <= t.rankTotal, `${t.key} 名次不得大于总人数`);
+  }
+
+  await ActivityModel.deleteMany({ userId: uid });
+  await ExercisePlanPeriodModel.deleteMany({ userId: uid });
+  await UserModel.deleteMany({ _id: uid });
+  __resetTrophyRankCache();
+});
