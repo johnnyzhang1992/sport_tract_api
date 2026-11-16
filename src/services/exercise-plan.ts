@@ -8,6 +8,28 @@ import { ExercisePlanModel } from '../models/exercise-plan.model.js';
 import { ExercisePlanPeriodModel } from '../models/exercise-plan-period.model.js';
 import { ActivityModel } from '../models/activity.model.js';
 import { bjDateStr, bjDayStart } from '../utils/bj-time.js';
+import { ACTIVITY_TYPE_META } from '../config/constants.js';
+import { loadTrophyRanks } from './trophy-rank.js';
+import {
+  BADGE_DEFS,
+  MILESTONES,
+  RATIO_TIERS,
+  groupTitleOf,
+  categoryOfGroup,
+  seriesOfBadge,
+  type BadgeCategory,
+  type BadgeDef,
+  type BadgeGroup,
+  type BadgeMetric,
+} from '../config/badge-config.js';
+import {
+  computeBadgeEarns,
+  minRatioOf as minRatioOfShared,
+  perfectWeekCounts as perfectWeekCountsShared,
+  tierOf as tierOfRatio,
+  type BadgeDailyRow,
+  type BadgeRangeRow,
+} from './badge-earn.js';
 
 export type PlanPeriod = 'daily';
 export const PLAN_PERIODS: readonly PlanPeriod[] = ['daily'];
@@ -904,30 +926,14 @@ export interface PlanMilestoneDef {
   times: number;
 }
 
-export const PLAN_MILESTONES: readonly PlanMilestoneDef[] = [
-  { key: 'first', label: '首次达成', desc: '完成 1 次目标', ratio: 1, times: 1 },
-  { key: 'week', label: '坚持一周', desc: '达成 7 次', ratio: 1, times: 7 },
-  { key: 'habit', label: '习惯养成', desc: '达成 20 次', ratio: 1, times: 20 },
-  { key: 'x2', label: '200%完成目标', desc: '单周期完成倍数达到 200% 即可获得', ratio: 2, times: 1 },
-  { key: 'x3', label: '300%完成目标', desc: '单周期完成倍数达到 300% 即可获得', ratio: 3, times: 1 },
-  { key: 'x4', label: '400%完成目标', desc: '单周期完成倍数达到 400% 即可获得', ratio: 4, times: 1 },
-  { key: 'x5', label: '500%完成目标', desc: '单周期完成倍数达到 500% 即可获得', ratio: 5, times: 1 },
-];
-
-/** 里程碑支持的倍数档位（ratio → 该档周期计数）；新加档位时同步这里 */
-const RATIO_TIERS = [1, 2, 3, 4, 5] as const;
+export const PLAN_MILESTONES: readonly PlanMilestoneDef[] = MILESTONES;
 
 /**
  * 一个周期落在哪一档：只按它达到的最高档归位，**不向低档重复计数**
  * （500% 的一期只算 5x，不算 1x/2x/3x/4x）。未达成（<100%）返回 0。
+ * 实现已收口到 badge-earn.ts（与解锁日期同一套档位逻辑）。
  */
-function tierOf(ratio: number): number {
-  let tier = 0;
-  for (const t of RATIO_TIERS) {
-    if (ratio >= t) tier = t;
-  }
-  return tier;
-}
+const tierOf = tierOfRatio;
 
 export interface PlanSummaryResult {
   /** 已结算周期总数（日+周） */
@@ -959,17 +965,12 @@ export interface PlanSummaryResult {
   trophies: PlanTrophy[];
   /** 记录与坚持明细（记录型奖杯的详情数据源） */
   records: PlanRecords;
+  /** 分运动类型累计概览（我的徽章页「按类型」区用）：只含有数据的类型 */
+  activityTypes: Array<{ type: string; label: string; distanceM: number; durationSec: number; count: number }>;
 }
 
-/** 一个周期的「最弱一项」完成倍数：三项里 progress/target 的最小值（目标 0 的项跳过） */
-function minRatioOf(progress: { distanceM: number; durationSec: number; count: number }, targets: PlanTargets): number {
-  const ratios: number[] = [];
-  if (targets.distanceM > 0) ratios.push((progress.distanceM || 0) / targets.distanceM);
-  if (targets.durationMin > 0) ratios.push((progress.durationSec || 0) / (targets.durationMin * 60));
-  if (targets.count > 0) ratios.push((progress.count || 0) / targets.count);
-  if (!ratios.length) return 0;
-  return Math.min(...ratios);
-}
+/** 一个周期的「最弱一项」完成倍数（实现收口在 badge-earn.ts，与解锁日期同一套口径） */
+const minRatioOf = minRatioOfShared;
 
 /** 记录数据概况 + 里程碑（历史快照聚合；无历史时全 0、奖杯全灰） */
 export async function getPlanSummary(userId: string): Promise<PlanSummaryResult> {
@@ -1062,9 +1063,11 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
 
   // —— 里程碑奖杯扩展（docs/21）——
   const days = await dailyActivityTotals(userId);
+  // 分运动类型的每日汇总（分类型徽章 + 类型概览用）
+  const typeDays = await dailyTotalsByType(userId);
   const rec = computeRecordStats(days);
   const dailyRows = rows.filter((r) => r.period === 'daily');
-  const perfect = perfectWeekCounts(dailyRows);
+  const perfect = perfectWeekCountsShared(dailyRows as unknown as BadgeRangeRow[]);
   // 累计总量（原始单位：米 / 秒）——阶梯按 km / 小时比，卡面显示原始值
   const totalDistanceM = days.reduce((acc, d) => acc + d.distanceM, 0);
   const totalDurationSec = days.reduce((acc, d) => acc + d.durationSec, 0);
@@ -1081,73 +1084,138 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     perfectWeekDuration: perfect.duration,
     perfectWeekCount: perfect.count,
     achievedPeriods: achieved,
+    byType: buildByTypeCounts(typeDays),
   };
-  // 每座奖杯的获得记录（获得次数 + 首次获取日期）——卡片三态展示的数据源
-  const earns = computeTrophyEarns(days, dailyRows, rows);
-  // 数组进度百分比：兼容新奖杯（tier）与原 8 里程碑（字段名是 need）——曾只读 tier 导致里程碑进度条恒 0%
-  const pctOf = (t: { cur?: number; tier?: number; need?: number }) => {
-    const cur = t.cur ?? 0;
-    const tier = t.tier ?? t.need ?? 0;
-    return tier > 0 ? Math.min(Math.round((cur / tier) * 100), 100) : 0;
+  // 每座徽章的获得记录（获得次数 + 首次获取日期）——卡片三态展示的数据源（算法收口在 badge-earn.ts）
+  const earns = computeBadgeEarns({
+    days,
+    dailyRows: dailyRows as unknown as BadgeRangeRow[],
+    periodRows: rows as unknown as BadgeRangeRow[],
+    typeDays: typeDays as unknown as Record<string, BadgeDailyRow[]>,
+  });
+  // 全站「第 N 位迹路者」：按首次解锁日排名（同一天并列同名次）。
+  // 失败/超时不能连累整个 summary——名次是附加信息，缺了只是不显示这一行
+  const ranks = await loadTrophyRanks(userId).catch((e: unknown) => {
+    void e;
+    return {} as Record<string, { rank: number; total: number }>;
+  });
+  const rankOf = (key: string) => ranks[key] || { rank: 0, total: 0 };
+  // 进度百分比：普通系列按 cur/tier；原 8 里程碑用各自算好的 pct（倍数章「完成一次即满格」）
+  const pctOf = (cur: number, tier: number) =>
+    tier > 0 ? Math.min(Math.round((cur / tier) * 100), 100) : 0;
+
+  /**
+   * 详情半屏的进度文案：由配置里的模板渲染（前端不再自己拼文案）。
+   * 模板占位：{cur} 当前值、{tier} 档位、{remain} 还差多少、{valueText} 后端算好的展示值。
+   */
+  const renderDetail = (def: BadgeDef, cur: number, valueText: string): string => {
+    const rule = def.detail;
+    const remain = Math.max(0, def.tier - cur);
+    if (cur >= def.tier && rule) return rule.earned.replace('{cur}', String(cur)).replace('{valueText}', valueText);
+    if (rule && rule.locked) return rule.locked.replace('{remain}', String(remain)).replace('{tier}', String(def.tier));
+    return `已达成 ${cur} 次 · 目标 ${def.tier} 次`;
   };
+
+  /**
+   * 详情半屏的附加明细行：原先由前端按 key 前缀拼文案（哪些系列多一行"当前纪录…"硬编码在前端），
+   * 现收口到这里——加徽章只需在配置里写 detail 模板，前端不再判断系列。
+   */
+  const detailLinesOf = (def: BadgeDef | null, t: { key: string; cur: number }): string[] => {
+    const lines: string[] = [];
+    if (!def) return lines;
+    if (def.metric === 'breaksDistance' && rec.distance.bestM > 0) {
+      lines.push(`当前纪录 ${(Math.round(rec.distance.bestM / 10) / 100).toFixed(2)} km · 产生于 ${rec.distance.dateText}`);
+    } else if (def.metric === 'breaksDuration' && rec.duration.bestSec > 0) {
+      lines.push(`当前纪录 ${Math.round(rec.duration.bestSec / 60)} 分钟 · 产生于 ${rec.duration.dateText}`);
+    } else if (def.metric === 'streakBest') {
+      if (rec.streak.bestEndText) lines.push(`${rec.streak.bestEndText} 结束`);
+      lines.push(`目前连续 ${rec.streak.current} 天`);
+    }
+    return lines;
+  };
+
   const trophies: PlanTrophy[] = [
     ...milestones.map(
-      (m): PlanTrophy => ({
-        key: m.key,
-        label: m.label,
-        desc: m.desc,
-        icon: MILESTONE_ICONS[m.key] || '🏆',
-        unlocked: m.unlocked,
-        cur: m.cur,
-        tier: m.tier, // 倍数章=百分比数字（200/300/…），次数章=需要的次数
-        nextTier: null, // 原 8 个各是独立目标，无阶梯成长线
-        earnedCount: earns[m.key] ? 1 : 0,
-        earnDateText: (earns[m.key] && earns[m.key].earnDate) || '',
-        pct: m.pct, // 直接用 milestones 算好的百分比（倍数章「完成一次即满格」，不能再按 cur/tier 除）
-        group: 'plan',
-      }),
+      (m): PlanTrophy => {
+        const def = MILESTONES.find((x) => x.key === m.key);
+        return {
+          key: m.key,
+          label: m.label,
+          desc: m.desc,
+          icon: (def && def.icon) || '🏆',
+          shortLabel: (def && def.shortLabel) || m.label,
+          shape: (def && def.shape) || 'plan',
+          groupTitle: groupTitleOf('plan'),
+          category: categoryOfGroup('plan'),
+          badgeText: String(m.tier),
+          unlocked: m.unlocked,
+          cur: m.cur,
+          tier: m.tier, // 倍数章=百分比数字（200/300/…），次数章=需要的次数
+          nextTier: null, // 原 8 个各是独立目标，无阶梯成长线
+          earnedCount: earns[m.key] ? 1 : 0,
+          earnDateText: (earns[m.key] && earns[m.key].earnDate) || '',
+          rank: rankOf(m.key).rank,
+          rankTotal: rankOf(m.key).total,
+          pct: m.pct, // 直接用 milestones 算好的百分比
+          group: 'plan' as BadgeGroup,
+          detailText: `已达成 ${m.cur} 次 · 目标 ${m.tier} 次`,
+          detailLines: [],
+        };
+      },
     ),
-    ...PLAN_TROPHY_DEFS.map((def): PlanTrophy => {
-      const cur = metricCountOf(def.metric, counts);
-      // 下一档：阶梯里第一个大于当前计数的档位（完美周无阶梯为 null）
-      const nextTier = def.group === 'week'
-        ? null
-        : ((def.group === 'total-distance' ? TOTAL_KM_TIERS
-          : def.group === 'total-duration' ? TOTAL_HOUR_TIERS
-            : TROPHY_TIERS).find((t) => t > cur) ?? null);
+    ...BADGE_DEFS.map((def): PlanTrophy => {
+      const cur = metricCountOf(def.metric, counts, def.activityType);
+      const series = seriesOfBadge(def);
+      // 下一档：同系列阶梯里第一个大于当前计数的档位（完美周无阶梯为 null）
+      const nextTier = series.repeatable ? null : (series.tiers.find((t) => t > cur) ?? null);
       const extra: { valueText?: string; dateText?: string } = {};
-      if (def.group === 'record' && def.metric === 'breaksDistance') {
+      if (def.metric === 'breaksDistance') {
         extra.valueText = formatKmText(rec.distance.bestM);
         extra.dateText = rec.distance.dateText;
-      }
-      if (def.group === 'record' && def.metric === 'breaksDuration') {
+      } else if (def.metric === 'breaksDuration') {
         extra.valueText = formatDurText(rec.duration.bestSec);
         extra.dateText = rec.duration.dateText;
-      }
-      if (def.group === 'total-distance') {
+      } else if (def.metric === 'totalDistanceKm') {
         extra.valueText = formatKmText(totalDistanceM);
-      }
-      if (def.group === 'total-duration') {
+      } else if (def.metric === 'totalDurationHour') {
         extra.valueText = formatDurText(totalDurationSec);
-      }
-      if (def.group === 'streak') {
+      } else if (def.metric === 'streakBest') {
         extra.valueText = `${rec.streak.best} 天`;
         extra.dateText = rec.streak.bestEndText;
+      } else if (def.activityType) {
+        // 分类型徽章：展示该类型的累计值
+        const c = counts.byType[def.activityType] || { km: 0, hour: 0, count: 0, distanceM: 0, durationSec: 0 };
+        if (def.metric === 'typeDistanceKm') extra.valueText = formatKmText(c.distanceM);
+        else if (def.metric === 'typeDurationHour') extra.valueText = formatDurText(c.durationSec);
+        else extra.valueText = `${c.count} 次`;
       }
       const earn = earns[def.key];
+      const unlocked = cur >= def.tier;
       return {
         key: def.key,
         label: def.label,
         desc: def.desc,
         icon: def.icon,
-        unlocked: cur >= def.tier,
+        // ↓ 展示元数据：前端直接拿来渲染，不再维护映射表
+        shortLabel: def.shortLabel,
+        shape: def.shape,
+        groupTitle: groupTitleOf(def.group),
+        category: categoryOfGroup(def.group),
+        activityLabel: def.activityLabel || '',
+        activityIconId: def.activityIconId || '',
+        badgeText: def.badgeText || String(def.tier),
+        unlocked,
         cur,
         tier: def.tier,
         nextTier,
         earnedCount: earn ? earn.earnedCount : 0,
         earnDateText: (earn && earn.earnDate) || '',
-        pct: pctOf({ cur, tier: def.tier }),
+        rank: rankOf(def.key).rank,
+        rankTotal: rankOf(def.key).total,
+        pct: pctOf(cur, def.tier),
         group: def.group,
+        detailText: renderDetail(def, cur, extra.valueText || ''),
+        detailLines: detailLinesOf(def, { key: def.key, cur }),
         ...extra,
       };
     }),
@@ -1168,6 +1236,16 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       duration: { bestSec: rec.duration.bestSec, dateText: rec.duration.dateText, breaks: rec.breaksDuration },
       streak: { best: rec.streak.best, bestEndText: rec.streak.bestEndText, current: rec.streak.current },
     },
+    // 分运动类型概览：只拉有数据的类型（前端「按类型」区展示距离/时长/次数）
+    activityTypes: ACTIVITY_TYPE_META
+      ? Object.entries(counts.byType).map(([type, c]) => ({
+        type,
+        label: (ACTIVITY_TYPE_META as Record<string, { label?: string }>)[type]?.label || type,
+        distanceM: c.distanceM,
+        durationSec: c.durationSec,
+        count: c.count,
+      }))
+      : [],
   };
 }
 
@@ -1178,156 +1256,6 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
  * 口径拍板见 docs/21：圆环完成≡目标达成（三项都已设且全达成，未设项不算）、圆环只计 daily 快照、
  * 记录=单日合计（东八区自然日，全部 finished 运动）、完美周按自然周（周一~周日）。
  * ========================================================================== */
-
-export type PlanTrophyMetric =
-  | 'breaksDistance'
-  | 'breaksDuration'
-  | 'streakBest'
-  | 'ringsClosed'
-  | 'totalDistanceKm'
-  | 'totalDurationHour'
-  | 'perfectWeekAll'
-  | 'perfectWeekDistance'
-  | 'perfectWeekDuration'
-  | 'perfectWeekCount'
-  | 'achieved'; // 原 8 个倍数里程碑沿用各自 cur
-
-export interface PlanTrophyDef {
-  key: string;
-  label: string;
-  desc: string;
-  icon: string;
-  /** 计数口径键；'achieved' 表示沿用原里程碑倍数档 */
-  metric: PlanTrophyMetric;
-  /** 解锁档位（该计数达到 tier 即解锁） */
-  tier: number;
-  group: 'record' | 'streak' | 'rings' | 'total-distance' | 'total-duration' | 'week';
-}
-
-/** 破纪录/合环的统一阶梯（配置数组，随时可调） */
-const TROPHY_TIERS = [100, 365, 500, 1000, 2000] as const;
-/** 累计里程阶梯（公里） */
-const TOTAL_KM_TIERS = [100, 500, 1000, 2000, 5000] as const;
-/** 累计时长阶梯（小时） */
-const TOTAL_HOUR_TIERS = [10, 50, 100, 200, 500] as const;
-
-/** 各系列奖杯定义（每档一座独立奖杯） */
-export const PLAN_TROPHY_DEFS: readonly PlanTrophyDef[] = [
-  ...TROPHY_TIERS.map(
-    (t): PlanTrophyDef => ({
-      key: `rec-dist-${t}`,
-      label: `新距离记录·${t}次`,
-      desc: `刷新单日运动距离纪录 ${t} 次（纪录指自然日运动距离合计的历史新高）`,
-      icon: '📏',
-      metric: 'breaksDistance',
-      tier: t,
-      group: 'record',
-    }),
-  ),
-  ...TROPHY_TIERS.map(
-    (t): PlanTrophyDef => ({
-      key: `rec-dur-${t}`,
-      label: `新时长记录·${t}次`,
-      desc: `刷新单日运动时长纪录 ${t} 次`,
-      icon: '⏱️',
-      metric: 'breaksDuration',
-      tier: t,
-      group: 'record',
-    }),
-  ),
-  ...TROPHY_TIERS.map(
-    (t): PlanTrophyDef => ({
-      key: `streak-${t}`,
-      label: `最坚持奖·${t}天`,
-      desc: `连续运动天数（连续每天有运动记录）达到 ${t} 天`,
-      icon: '🔥',
-      metric: 'streakBest',
-      tier: t,
-      group: 'streak',
-    }),
-  ),
-  ...TROPHY_TIERS.map(
-    (t): PlanTrophyDef => ({
-      key: `ring-${t}`,
-      label: `合上圆环·${t}次`,
-      desc: `三圆环全合（当日三项目标全部达成）累计 ${t} 次`,
-      icon: '⭕',
-      metric: 'ringsClosed',
-      tier: t,
-      group: 'rings',
-    }),
-  ),
-  // 累计里程/时长（2026-11-14 替换原「完成目标」，与合上圆环区分开：一个看总量、一个看当日达标）
-  ...TOTAL_KM_TIERS.map(
-    (t): PlanTrophyDef => ({
-      key: `total-dist-${t}`,
-      label: `累计里程·${t}km`,
-      desc: `累计运动里程达到 ${t} 公里`,
-      icon: '🛣️',
-      metric: 'totalDistanceKm',
-      tier: t,
-      group: 'total-distance',
-    }),
-  ),
-  ...TOTAL_HOUR_TIERS.map(
-    (t): PlanTrophyDef => ({
-      key: `total-dur-${t}`,
-      label: `累计时长·${t}小时`,
-      desc: `累计运动时长达到 ${t} 小时`,
-      icon: '⌛',
-      metric: 'totalDurationHour',
-      tier: t,
-      group: 'total-duration',
-    }),
-  ),
-  {
-    key: 'perfect-week-all',
-    label: '完美一周·全能',
-    desc: '一个自然周（周一至周日）里七天三项全部达成',
-    icon: '🌟',
-    metric: 'perfectWeekAll',
-    tier: 1,
-    group: 'week',
-  },
-  {
-    key: 'perfect-week-distance',
-    label: '完美一周·距离',
-    desc: '一个自然周（周一至周日）里，七天都达成距离目标',
-    icon: '📏',
-    metric: 'perfectWeekDistance',
-    tier: 1,
-    group: 'week',
-  },
-  {
-    key: 'perfect-week-duration',
-    label: '完美一周·时长',
-    desc: '一个自然周里，七天都达成时长目标',
-    icon: '⏱️',
-    metric: 'perfectWeekDuration',
-    tier: 1,
-    group: 'week',
-  },
-  {
-    key: 'perfect-week-count',
-    label: '完美一周·次数',
-    desc: '一个自然周里，七天都达成次数目标',
-    icon: '🔢',
-    metric: 'perfectWeekCount',
-    tier: 1,
-    group: 'week',
-  },
-];
-
-/** 原 8 个倍数里程碑的卡面图标 */
-const MILESTONE_ICONS: Record<string, string> = {
-  first: '🥇',
-  week: '📅',
-  habit: '💪',
-  x2: '🔥',
-  x3: '👑',
-  x4: '🚀',
-  x5: '🏆',
-};
 
 export interface PlanTrophy {
   key: string;
@@ -1345,13 +1273,36 @@ export interface PlanTrophy {
   earnedCount: number;
   /** 首次获取日期（YYYY-MM-DD）；未获得空串 */
   earnDateText: string;
+  /** 全站第几位迹路者获得该徽章（按首次解锁日排名，同一天并列同名次）；未获得 0 */
+  rank: number;
+  /** 全站已获得该徽章的人数（徽章详情「第 N 位…」的分母参考）；未获得也照常给出 */
+  rankTotal: number;
+  /* ── 展示元数据（2026-11-16 配置化）：前端直接渲染，不再维护写死的映射表 ── */
+  /** 卡面短名（如「距离纪录」），同名各档共用 */
+  shortLabel: string;
+  /** 徽章形状（前端据 shape 取 CSS class：b-<shape>） */
+  shape: string;
+  /** 分区标题（前端分组用，顺序按 BADGE_GROUPS） */
+  groupTitle: string;
+  /** 大类：plan=运动计划（计划页）/ data=运动数据（我的徽章页） */
+  category: BadgeCategory;
+  /** 分运动类型徽章的类型名（如「跑步」），普通徽章为空 */
+  activityLabel?: string;
+  /** 分运动类型徽章的类型图标 id（前端拼 /assets/icons/activity-<id>-white.png） */
+  activityIconId?: string;
+  /** 徽章中央文字（档位数或固定 emoji） */
+  badgeText: string;
+  /** 详情半屏的一句进度文案（已由模板渲染好，前端直接显示） */
+  detailText: string;
+  /** 详情半屏的附加明细行（如当前纪录值与产生日期），已按系列渲染好 */
+  detailLines: string[];
   /** 进度条百分比 0-100（cur/tier 封顶）——未获得时卡片展示进度条 */
   pct: number;
   /** 记录型当前纪录文案（卡面第二行），如 '12.3 km' / '2小时05分' / '15 天' */
   valueText?: string;
   /** 记录型：纪录产生日期（YYYY-MM-DD） */
   dateText?: string;
-  group: 'plan' | 'record' | 'streak' | 'rings' | 'total-distance' | 'total-duration' | 'week';
+  group: BadgeGroup;
 }
 
 export interface PlanRecords {
@@ -1405,6 +1356,126 @@ export async function dailyActivityTotals(userId: string): Promise<DailyTotalsRo
   ]);
 }
 
+/**
+ * 按运动类型聚合（2026-11-16 分类型徽章）：
+ * 返回 type → 按东八区自然日汇总的行（日期升序），口径与 dailyActivityTotals 一致，只多一个类型维度。
+ */
+export async function dailyTotalsByType(userId: string): Promise<Record<string, DailyTotalsRow[]>> {
+  const rows = await ActivityModel.aggregate<{
+    _id: { type: string; date: string };
+    distanceM: number;
+    durationSec: number;
+    count: number;
+  }>([
+    { $match: { userId: new Types.ObjectId(userId), status: 'finished' } },
+    {
+      $group: {
+        _id: {
+          type: '$type',
+          date: { $dateToString: { format: '%Y-%m-%d', date: { $toDate: '$startTime' }, timezone: '+08:00' } },
+        },
+        distanceM: { $sum: { $ifNull: ['$distance', 0] } },
+        durationSec: { $sum: { $ifNull: ['$duration', 0] } },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { '_id.date': 1 } },
+  ]);
+  const out: Record<string, DailyTotalsRow[]> = {};
+  for (const r of rows) {
+    const type = String(r._id.type || '');
+    if (!type) continue;
+    (out[type] ??= []).push({ date: r._id.date, distanceM: r.distanceM, durationSec: r.durationSec, count: r.count });
+  }
+  return out;
+}
+
+/**
+ * 徽章总览（「我的徽章」页，2026-11-16）：
+ * 与 getPlanSummary 同源（同一套 earns/ranks），额外按大类分组 + 类型概览，
+ * 前端直接按 category → groups 渲染，不需要再自己分。
+ */
+export interface BadgeOverviewResult {
+  total: number;
+  earned: number;
+  categories: Array<{ key: BadgeCategory; title: string; total: number; earned: number }>;
+  groups: Array<{ key: string; title: string; category: BadgeCategory; total: number; earned: number }>;
+  trophies: PlanTrophy[];
+  activityTypes: Array<{ type: string; label: string; distanceM: number; durationSec: number; count: number }>;
+}
+
+const CATEGORY_TITLES: Record<BadgeCategory, string> = {
+  plan: '运动计划',
+  data: '运动数据',
+};
+
+export async function getBadgeOverview(userId: string): Promise<BadgeOverviewResult> {
+  // 复用 summary 的全部计算（轨迹聚合/计划快照/名次），保证同一座徽章两处结论一致
+  const sum = await getPlanSummary(userId);
+  const trophies = sum.trophies;
+  const earnedOf = (list: PlanTrophy[]) => list.filter((t) => t.unlocked).length;
+
+  const categories = (['plan', 'data'] as BadgeCategory[]).map((key) => {
+    const list = trophies.filter((t) => t.category === key);
+    return { key, title: CATEGORY_TITLES[key], total: list.length, earned: earnedOf(list) };
+  });
+
+  // 分组：顺序按 trophies 出现顺序（后端 BADGE_GROUPS 已排好），只保留有徽章的分组
+  const groups: BadgeOverviewResult['groups'] = [];
+  const seen = new Map<string, BadgeOverviewResult['groups'][number]>();
+  for (const t of trophies) {
+    let g = seen.get(t.group);
+    if (!g) {
+      g = { key: t.group, title: t.groupTitle, category: t.category, total: 0, earned: 0 };
+      seen.set(t.group, g);
+      groups.push(g);
+    }
+    g.total += 1;
+    if (t.unlocked) g.earned += 1;
+  }
+
+  return {
+    total: trophies.length,
+    earned: earnedOf(trophies),
+    categories,
+    groups,
+    trophies,
+    activityTypes: sum.activityTypes,
+  };
+}
+
+/**
+ * 轻量徽章计数（「我的」页角标用）：只回「已获得 / 总数」。
+ *
+ * 为什么单独一个接口：`/plan/badges` 会跑完整 summary（2 次全量轨迹聚合 + 名次），
+ * 而「我的」页只需要一个整数。这里加 5 分钟进程内缓存——同一用户 5 分钟内重复进
+ * 「我的」页不再重复计算；跨用户互不影响（Map 键是 userId）。
+ *
+ * 触发条件：若缓存命中率低/计算变慢，再考虑把「解锁日期」落成物化表（见 trophy-rank 的说明）。
+ */
+const BADGE_COUNT_TTL_MS = 5 * 60 * 1000;
+const badgeCountCache = new Map<string, { at: number; earned: number; total: number }>();
+
+export async function getBadgeCounts(userId: string): Promise<{ earned: number; total: number }> {
+  if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
+  const hit = badgeCountCache.get(userId);
+  if (hit && Date.now() - hit.at < BADGE_COUNT_TTL_MS) {
+    return { earned: hit.earned, total: hit.total };
+  }
+  const sum = await getPlanSummary(userId);
+  const earned = sum.trophies.filter((t) => t.unlocked).length;
+  const total = sum.trophies.length;
+  // 简单的容量上限保护：超过 5000 个用户时清空重建（没有引入 LRU 依赖）
+  if (badgeCountCache.size > 5000) badgeCountCache.clear();
+  badgeCountCache.set(userId, { at: Date.now(), earned, total });
+  return { earned, total };
+}
+
+/** 测试用：清空计数缓存 */
+export function __resetBadgeCountCache(): void {
+  badgeCountCache.clear();
+}
+
 /** 记录与坚持：破纪录次数/当前纪录+日期/最长连续+结束日期/当前连续 */
 export function computeRecordStats(days: DailyTotalsRow[]): PlanRecords & { breaksDistance: number; breaksDuration: number } {
   let bestDist = 0;
@@ -1456,81 +1527,6 @@ export function computeRecordStats(days: DailyTotalsRow[]): PlanRecords & { brea
   };
 }
 
-/** 完美周计数（基于 daily 快照；快照只在计划活跃期存在，属于计划域成就）：
- *  全能 = 一个自然周七天的 daily 快照齐全且全部 allAchieved；
- *  单项（距离/时长/次数）= 七天快照齐全且该单项每天都达成（各算各的，互不冒充）。 */
-function perfectWeekCounts(dailyRows: Array<Record<string, unknown>>): {
-  all: number;
-  distance: number;
-  duration: number;
-  count: number;
-  /** 首次获取日期（最早合格自然周的最后一天，YYYY-MM-DD）；无则空串 */
-  firstAllEnd: string;
-  firstDistanceEnd: string;
-  firstDurationEnd: string;
-  firstCountEnd: string;
-} {
-  interface WeekAcc {
-    days: number;
-    allAchieved: number;
-    metric: { distance: number; duration: number; count: number };
-  }
-  const weeks = new Map<string, WeekAcc>();
-  for (const r of dailyRows) {
-    const wk = weekKeyOfDate(String(r.periodKey));
-    if (!wk) continue; // periodKey 不是合法日期（脏数据）：不计入完美周，也不影响其它统计
-    const acc = weeks.get(wk) ?? { days: 0, allAchieved: 0, metric: { distance: 0, duration: 0, count: 0 } };
-    acc.days += 1;
-    if (r.allAchieved) acc.allAchieved += 1;
-    const targets = (r.targets ?? {}) as Record<string, number>;
-    const progress = (r.progress ?? {}) as Record<string, number>;
-    // 单项达成：该项设了目标且完成达标（与结算快照同判据）
-    if ((targets.distanceM || 0) > 0 && (progress.distanceM || 0) >= (targets.distanceM || 0)) acc.metric.distance += 1;
-    if ((targets.durationMin || 0) > 0 && (progress.durationSec || 0) >= (targets.durationMin || 0) * 60) acc.metric.duration += 1;
-    if ((targets.count || 0) > 0 && (progress.count || 0) >= (targets.count || 0)) acc.metric.count += 1;
-    weeks.set(wk, acc);
-  }
-  let all = 0;
-  let distance = 0;
-  let duration = 0;
-  let count = 0;
-  let firstAllEnd = '';
-  let firstDistanceEnd = '';
-  let firstDurationEnd = '';
-  let firstCountEnd = '';
-  for (const [wk, acc] of weeks.entries()) {
-    if (acc.days !== 7) continue; // 快照不足七天（计划周内建立/取消）不算完美周
-    const end = bjDateStr(Date.parse(`${wk}T00:00:00+08:00`) + 6 * 86_400_000); // 周日
-    if (acc.allAchieved === 7) {
-      all += 1;
-      if (!firstAllEnd || end < firstAllEnd) firstAllEnd = end;
-    }
-    // 单项完美周按项分别计数（2026-11-14：原来三项混成一个「单项」，卡面看不出是哪一项）
-    if (acc.metric.distance === 7) {
-      distance += 1;
-      if (!firstDistanceEnd || end < firstDistanceEnd) firstDistanceEnd = end;
-    }
-    if (acc.metric.duration === 7) {
-      duration += 1;
-      if (!firstDurationEnd || end < firstDurationEnd) firstDurationEnd = end;
-    }
-    if (acc.metric.count === 7) {
-      count += 1;
-      if (!firstCountEnd || end < firstCountEnd) firstCountEnd = end;
-    }
-  }
-  return {
-    all,
-    distance,
-    duration,
-    count,
-    firstAllEnd,
-    firstDistanceEnd,
-    firstDurationEnd,
-    firstCountEnd,
-  };
-}
-
 function formatKmText(m: number): string {
   return `${(Math.round(m / 10) / 100).toFixed(m % 1000 === 0 ? 0 : 2)} km`;
 }
@@ -1540,128 +1536,6 @@ function formatDurText(sec: number): string {
   const min = Math.round((sec % 3600) / 60);
   return h > 0 ? `${h}小时${String(min).padStart(2, '0')}分` : `${min}分钟`;
 }
-
-/** 奖杯获得记录：earnedCount（获得次数，里程碑恒 1）+ earnDate（首次获取日期） */
-interface TrophyEarn {
-  earnedCount: number;
-  earnDate: string;
-}
-
-/**
- * 每座奖杯的获得记录（卡片三态：获得一次=日期 / 多次=次数 / 未获得=进度条）。
- * 各系列获取时点口径：
- *   - 破纪录：第 N 次刷新纪录的那一天
- *   - 最坚持：连续天数第一次达到档位的那一天
- *   - 合上圆环：第 N 个三项全达成日快照的日期
- *   - 完成目标：累计第 N 次 finished 运动的那一天
- *   - 完美周：可重复获得——次数 = 合格自然周数，日期 = 最早合格周的最后一天
- *   - 原 8 里程碑：达成次数跨过 need 的那个周期的结束日期
- */
-function computeTrophyEarns(
-  days: DailyTotalsRow[],
-  dailyRows: Array<Record<string, unknown>>,
-  periodRows: Array<Record<string, unknown>>,
-): Record<string, TrophyEarn> {
-  const earns: Record<string, TrophyEarn> = {};
-  const mark = (key: string, date: string) => {
-    earns[key] = { earnedCount: 1, earnDate: date };
-  };
-
-  // 破纪录：逐日扫描，新高即破一次，记下每次破纪录的日期
-  const breakDist: string[] = [];
-  const breakDur: string[] = [];
-  let maxD = 0;
-  let maxDur = 0;
-  for (const d of days) {
-    if (d.distanceM > maxD) {
-      maxD = d.distanceM;
-      breakDist.push(d.date);
-    }
-    if (d.durationSec > maxDur) {
-      maxDur = d.durationSec;
-      breakDur.push(d.date);
-    }
-  }
-  for (const t of TROPHY_TIERS) {
-    if (breakDist.length >= t) mark(`rec-dist-${t}`, breakDist[t - 1]);
-    if (breakDur.length >= t) mark(`rec-dur-${t}`, breakDur[t - 1]);
-  }
-
-  // 最坚持：连续段第一次到达档位天数的那一天
-  let run = 0;
-  let prev = '';
-  const streakDates: Record<number, string> = {};
-  for (const d of days) {
-    run = prev && dayDiff(prev, d.date) === 1 ? run + 1 : 1;
-    for (const t of TROPHY_TIERS) if (run === t && !streakDates[t]) streakDates[t] = d.date;
-    prev = d.date;
-  }
-  for (const t of TROPHY_TIERS) if (streakDates[t]) mark(`streak-${t}`, streakDates[t]);
-
-  // 合上圆环：第 N 个三项全达成日快照
-  let rings = 0;
-  const ringDates: Record<number, string> = {};
-  for (const r of dailyRows) {
-    if (!r.allAchieved) continue;
-    rings += 1;
-    for (const t of TROPHY_TIERS) if (rings === t && !ringDates[t]) ringDates[t] = String(r.periodKey);
-  }
-  for (const t of TROPHY_TIERS) if (ringDates[t]) mark(`ring-${t}`, ringDates[t]);
-
-  // 累计里程/时长：逐日累加，第一次跨过档位的那天即获取日期
-  let cumDist = 0;
-  let cumDur = 0;
-  const distDates: Record<number, string> = {};
-  const durDates: Record<number, string> = {};
-  for (const d of days) {
-    const prevDist = cumDist;
-    const prevDur = cumDur;
-    cumDist += d.distanceM;
-    cumDur += d.durationSec;
-    for (const t of TOTAL_KM_TIERS) {
-      if (prevDist < t * 1000 && cumDist >= t * 1000 && !distDates[t]) distDates[t] = d.date;
-    }
-    for (const t of TOTAL_HOUR_TIERS) {
-      if (prevDur < t * 3600 && cumDur >= t * 3600 && !durDates[t]) durDates[t] = d.date;
-    }
-  }
-  for (const t of TOTAL_KM_TIERS) if (distDates[t]) mark(`total-dist-${t}`, distDates[t]);
-  for (const t of TOTAL_HOUR_TIERS) if (durDates[t]) mark(`total-dur-${t}`, durDates[t]);
-
-  // 完美周：可重复获得 → 次数；首次获取日期 = 最早合格周的最后一天
-  const perfect = perfectWeekCounts(dailyRows);
-  if (perfect.all > 0) earns['perfect-week-all'] = { earnedCount: perfect.all, earnDate: perfect.firstAllEnd };
-  if (perfect.distance > 0) earns['perfect-week-distance'] = { earnedCount: perfect.distance, earnDate: perfect.firstDistanceEnd };
-  if (perfect.duration > 0) earns['perfect-week-duration'] = { earnedCount: perfect.duration, earnDate: perfect.firstDurationEnd };
-  if (perfect.count > 0) earns['perfect-week-count'] = { earnedCount: perfect.count, earnDate: perfect.firstCountEnd };
-
-  // 原 8 里程碑：达成计数跨过 need 的那个周期的结束日期
-  let achieved = 0;
-  const ratioCount: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-  for (const r of periodRows) {
-    const targets = (r.targets ?? {}) as Record<string, number>;
-    const progress = (r.progress ?? {}) as Record<string, number>;
-    const ratio = minRatioOf(
-      { distanceM: progress.distanceM || 0, durationSec: progress.durationSec || 0, count: progress.count || 0 },
-      { distanceM: targets.distanceM || 0, durationMin: targets.durationMin || 0, count: targets.count || 0 },
-    );
-    const tier = tierOf(ratio);
-    if (tier > 0) ratioCount[tier] += 1;
-    if (r.allAchieved) achieved += 1;
-    const end = bjDateStr(Number(r.windowEnd) - 1); // windowEnd 是「下一期 0 点」，减 1ms 取本期最后一天
-    for (const def of PLAN_MILESTONES) {
-      if (earns[def.key]) continue;
-      // 计数口径必须与 milestones 的 cur 完全一致（累计：500% 的期也算完成了 200%），
-      // 否则会出现「徽章已解锁但 earnedCount=0 / 无获取日期」的自相矛盾卡面
-      const counter = def.ratio >= 2
-        ? RATIO_TIERS.filter((x) => x >= def.ratio).reduce((acc, x) => acc + (ratioCount[x] || 0), 0)
-        : achieved;
-      if (counter >= def.times) mark(def.key, end);
-    }
-  }
-  return earns;
-}
-
 
 /** 奖杯计数的聚合形状（getPlanSummary 组装后传给 metricCountOf） */
 interface TrophyCounts {
@@ -1676,10 +1550,35 @@ interface TrophyCounts {
   perfectWeekDuration: number;
   perfectWeekCount: number;
   achievedPeriods: number;
+  /** 分运动类型的累计（type → 公里/小时/次数 + 原始米与秒） */
+  byType: Record<string, { km: number; hour: number; count: number; distanceM: number; durationSec: number }>;
+}
+
+/** 分运动类型累计：把 typeDays 汇总成 { km, hour, count, distanceM, durationSec } */
+function buildByTypeCounts(typeDays: Record<string, DailyTotalsRow[]>): TrophyCounts['byType'] {
+  const out: TrophyCounts['byType'] = {};
+  for (const [type, rows] of Object.entries(typeDays)) {
+    let distanceM = 0;
+    let durationSec = 0;
+    let count = 0;
+    for (const r of rows) {
+      distanceM += r.distanceM;
+      durationSec += r.durationSec;
+      count += r.count;
+    }
+    out[type] = {
+      distanceM,
+      durationSec,
+      count,
+      km: Math.floor(distanceM / 1000),
+      hour: Math.floor(durationSec / 3600),
+    };
+  }
+  return out;
 }
 
 /** 计数 → 该指标当前值（与各奖杯 tier 对比得出解锁态） */
-function metricCountOf(metric: PlanTrophyMetric, m: TrophyCounts): number {
+function metricCountOf(metric: BadgeMetric, m: TrophyCounts, activityType?: string): number {
   switch (metric) {
     case 'breaksDistance': return m.breaksDistance;
     case 'breaksDuration': return m.breaksDuration;
@@ -1692,5 +1591,9 @@ function metricCountOf(metric: PlanTrophyMetric, m: TrophyCounts): number {
     case 'perfectWeekDuration': return m.perfectWeekDuration;
     case 'perfectWeekCount': return m.perfectWeekCount;
     case 'achieved': return m.achievedPeriods;
+    // 分运动类型：按 activityType 取该类型的累计值
+    case 'typeDistanceKm': return (m.byType[activityType || ''] || {}).km || 0;
+    case 'typeDurationHour': return (m.byType[activityType || ''] || {}).hour || 0;
+    case 'typeCount': return (m.byType[activityType || ''] || {}).count || 0;
   }
 }

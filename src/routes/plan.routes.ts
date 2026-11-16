@@ -2,7 +2,7 @@
 import type { FastifyInstance } from 'fastify';
 import {
   getPlanWithProgress, upsertPlan, listPlanHistory, finalizePreviousPeriod,
-  listPlanCalendar, getPlanDayDetail, getPlanSummary,
+  listPlanCalendar, getPlanDayDetail, getPlanSummary, getBadgeOverview, getBadgeCounts,
 } from '../services/exercise-plan.js';
 import { success } from '../utils/response.js';
 
@@ -52,6 +52,21 @@ export async function planRoutes(fastify: FastifyInstance) {
     const data = await getPlanSummary(request.user.userId);
     const ms = Date.now() - t0;
     if (ms > 200) request.log.warn({ ms, userId: request.user.userId }, '[plan] summary 慢查询');
+    return success(data);
+  });
+
+  // 轻量计数（「我的」页角标）：只回已获得/总数，5 分钟进程内缓存，避免为一个整数跑完整 summary
+  fastify.get('/badges/count', { onRequest: [fastify.authenticate] }, async (request) =>
+    success(await getBadgeCounts(request.user.userId)),
+  );
+
+  // 徽章总览（「我的徽章」页）：全量徽章 + 分类 + 分运动类型概览
+  // 与 /summary 同源计算，多一次全量聚合；慢查询同样打日志
+  fastify.get('/badges', { onRequest: [fastify.authenticate] }, async (request) => {
+    const t0 = Date.now();
+    const data = await getBadgeOverview(request.user.userId);
+    const ms = Date.now() - t0;
+    if (ms > 200) request.log.warn({ ms, userId: request.user.userId }, '[plan] badges 慢查询');
     return success(data);
   });
 

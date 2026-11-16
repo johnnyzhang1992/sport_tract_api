@@ -118,11 +118,11 @@ async function summary() {
   return res.json().data;
 }
 
-test('TP1 trophies 全量下发：7 里程碑 + 30 阶梯 + 4 完美周 = 41 座', async () => {
+test('TP1 trophies 全量下发：7 里程碑 + 32 阶梯 + 80 分类型 = 119 座', async () => {
   const s = await summary();
-  assert.equal(s.trophies.length, 41, '累计里程/时长替换完成目标后 41 座');
+  assert.equal(s.trophies.length, 119, '7 + 32 + 80 分运动类型 = 119 座');
   const keys = new Set(s.trophies.map((t: PlanTrophy) => t.key));
-  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-2000', 'streak-365', 'ring-100', 'total-dist-5000', 'total-dur-500', 'perfect-week-all', 'perfect-week-distance', 'perfect-week-duration', 'perfect-week-count', 'x2', 'x3', 'x4']) {
+  for (const key of ['first', 'x5', 'rec-dist-100', 'rec-dur-1000', 'streak-365', 'ring-100', 'total-dist-5000', 'total-dur-500', 'perfect-week-all', 'perfect-week-distance', 'perfect-week-duration', 'perfect-week-count', 'x2', 'x3', 'x4']) {
     assert.ok(keys.has(key), `缺奖杯 ${key}`);
   }
 });
@@ -154,8 +154,8 @@ test('TP2 记录与坚持：破纪录次数/当前纪录+日期/最长连续+结
   const streak365 = s.trophies.find((t: PlanTrophy) => t.key === 'streak-365');
   assert.equal(streak365.cur, 120);
   assert.equal(streak365.unlocked, false);
-  const streak2000 = s.trophies.find((t: PlanTrophy) => t.key === 'streak-2000');
-  assert.equal(streak2000.nextTier, 365, 'cur 120 → 下一档也是 365（阶梯首个大于 cur 的档）');
+  const streak1000 = s.trophies.find((t: PlanTrophy) => t.key === 'streak-1000');
+  assert.equal(streak1000.nextTier, 365, 'cur 120 → 下一档也是 365（阶梯首个大于 cur 的档）');
   assert.equal(streak365.valueText, '120 天');
 });
 
@@ -242,7 +242,7 @@ test('TP6 脏数据不炸接口：periodKey 不是合法日期时跳过该行（
   });
   assert.equal(res.statusCode, 200, '脏数据不能让接口 500');
   const s = res.json().data;
-  assert.equal(s.trophies.length, 41, '奖杯照常下发');
+  assert.equal(s.trophies.length, 119, '奖杯照常下发');
   const perfectAll = s.trophies.find((t: PlanTrophy) => t.key === 'perfect-week-all');
   assert.equal(perfectAll.cur, before, '非法日期不计入完美周（计数与插入脏数据前一致）');
 
