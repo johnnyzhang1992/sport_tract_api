@@ -4,6 +4,7 @@ import { WeightLogModel } from '../models/weight-log.model.js';
 import { checkImage, checkText } from '../services/wechat-sec.js';
 import { getAvatarUrl } from '../services/oss.js';
 import { UpdateMeSchema } from '../utils/validators.js';
+import { assertConfirmWord, purgeUser, EMPTY_NICKNAME_CONFIRM_WORD } from '../services/account-deletion.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 
@@ -155,5 +156,26 @@ export async function userRoutes(fastify: FastifyInstance) {
     return success({
       items: logs.map((l) => ({ weightKg: l.weightKg, createdAt: l.createdAt })),
     });
+  });
+
+  /**
+   * 账号注销（2026-11-17）：删除本人全部业务数据并移除账号。
+   * 需二次确认——请求体 `confirm` 必须是当前昵称（宽松匹配：忽略首尾空格与大小写）；
+   * 从没设过昵称的账号用固定词「注销」确认。
+   * 支付订单保留（对账/审计），其余数据全部删除，不可恢复。
+   */
+  fastify.post('/me/deactivate', { onRequest: [fastify.authenticate] }, async (request, reply) => {
+    const userId = request.user.userId;
+    const user = await UserModel.findById(userId);
+    if (!user) throw new AppError(404, '用户不存在');
+
+    const body = (request.body ?? {}) as { confirm?: unknown };
+    // 校验放在删除之前：不匹配直接 400，绝不进入删除流程
+    assertConfirmWord(body.confirm, user.nickname);
+
+    const stats = await purgeUser(userId);
+    // 只记条数，不记明细内容（避免日志里留个人数据）
+    request.log.info({ userId, ...stats }, '[users] 账号已注销');
+    return reply.send(success({ deleted: true }));
   });
 }
