@@ -94,6 +94,8 @@ export function initRedis(): void {
     degrade(e.message);
   });
   client.on('end', () => {
+    // 主动关闭（容器重启/SIGTERM）不是故障：不要打「不可用」告警
+    if (client === null) return;
     degrade('连接已断开');
   });
 }
@@ -107,7 +109,7 @@ export function cacheBackendNow(): CacheBackend {
 export async function closeRedis(): Promise<void> {
   if (!client) return;
   const c = client;
-  client = null;
+  client = null; // 先置空：'end' 处理器据此识别为「主动关闭」，不打告警
   backend = 'memory';
   retryAt = 0;
   try {
