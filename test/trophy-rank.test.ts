@@ -168,3 +168,24 @@ test('TR13 rankTableOf 是唯一实现：buildRankTable 结果与 rankTableOf �
   assert.deepEqual(viaWrapper.c, { rank: 0, total: 1 }, '未解锁 key 由包装版补 rank=0 + total');
   assert.equal(viaCore.c, undefined, '核心表只记录真正解锁的人');
 });
+
+/* ── 2026-11-17 review 修复的回归测试 ───────────────────── */
+
+test('TR14 脏数据：日期为空的条目不参与排名（rankTableOf 直接调用也不炸）', () => {
+  const byKey = new Map<string, Array<{ uid: string; date: string }>>([
+    ['x', [{ uid: 'a', date: '' }, { uid: 'b', date: '2026-01-01' }, { uid: 'c', date: '2026-02-01' }]],
+  ]);
+  const t = rankTableOf(byKey);
+  assert.equal(t.get('a'), undefined, '空日期不占名次');
+  assert.deepEqual(t.get('b')!.x, { rank: 1, total: 2 });
+  assert.deepEqual(t.get('c')!.x, { rank: 2, total: 2 });
+});
+
+test('TR15 同一 uid 重复出现不重复计数（合并实时解锁日时剔除本人）', () => {
+  const byKey = new Map<string, Array<{ uid: string; date: string }>>([
+    ['x', [{ uid: 'me', date: '2026-01-01' }, { uid: 'other', date: '2026-01-05' }]],
+  ]);
+  const t = rankTableOf(byKey);
+  assert.deepEqual(t.get('me')!.x, { rank: 1, total: 2 });
+  assert.deepEqual(t.get('other')!.x, { rank: 2, total: 2 });
+});

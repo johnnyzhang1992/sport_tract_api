@@ -10,6 +10,8 @@ services:
       NODE_ENV: production
       PORT: 3004
       MONGODB_URI: ${MONGODB_URI}
+      # Redis 可选：不配则用进程内内存缓存（单实例够用）；扩容前必须配置
+      REDIS_URL: ${REDIS_URL:-}
       JWT_SECRET: ${JWT_SECRET}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
       WX_APPID: ${WX_APPID}

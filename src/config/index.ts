@@ -43,6 +43,14 @@ export const config = {
   mongodbUri:
     process.env.MONGODB_URI ?? 'mongodb://localhost:27017/sport-track-dev',
 
+  /**
+   * Redis（2026-11-17，**可选**）：只用于徽章名次缓存等可重建的派生数据。
+   * 不配置 = 进程内内存缓存（单实例够用）；配置后多实例共享，避免同名次不同值。
+   * 连不上会自动降级回内存，不影响主流程。
+   * 例：redis://:密码@127.0.0.1:6379/0
+   */
+  redisUrl: process.env.REDIS_URL ?? '',
+
   // 榜单奖励灰度开关（spec §6）：默认 false——线上先小流量验一轮结算再放开。
   // 短路点在 settlePeriod/settleDueForUser 入口；回滚＝关掉它（已发的分不回收，台账保留）。
   boardRewardsEnabled: bool(process.env.BOARD_REWARDS_ENABLED, false),

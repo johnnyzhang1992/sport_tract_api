@@ -58,6 +58,7 @@ curl -X POST http://localhost:3004/api/auth/login \
 | 变量 | 说明 |
 |---|---|
 | `MONGODB_URI` | MongoDB 连接串（含认证） |
+| `REDIS_URL` | **可选**。徽章名次缓存（"第 N 位迹路者"）用它做跨实例共享；不配置则用进程内内存缓存。连不上自动降级，不影响主流程。例：`redis://:密码@127.0.0.1:6379/0` |
 | `JWT_SECRET` / `JWT_REFRESH_SECRET` | access/refresh token 密钥（生产必须更换） |
 | `WX_APPID` / `WX_SECRET` | 微信小程序凭据（公众平台） |
 | `WX_MOCK_LOGIN` | 开发期 mock 登录开关（无需真实 AppID） |

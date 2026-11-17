@@ -1094,8 +1094,11 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     typeDays: typeDays as unknown as Record<string, BadgeDailyRow[]>,
   });
   // 全站「第 N 位迹路者」：按首次解锁日排名（同一天并列同名次）。
+  // 传入**本人实时解锁日**（而不是让排名侧自己去缓存里查），保证「刚解锁的徽章立刻有名次」。
   // 失败/超时不能连累整个 summary——名次是附加信息，缺了只是不显示这一行
-  const ranks = await loadTrophyRanks(userId).catch((e: unknown) => {
+  const myUnlockDates: Record<string, string> = {};
+  for (const [key, v] of Object.entries(earns)) if (v.earnDate) myUnlockDates[key] = v.earnDate;
+  const ranks = await loadTrophyRanks(userId, myUnlockDates).catch((e: unknown) => {
     void e;
     return {} as Record<string, { rank: number; total: number }>;
   });
@@ -1120,6 +1123,25 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
    * 详情半屏的附加明细行：原先由前端按 key 前缀拼文案（哪些系列多一行"当前纪录…"硬编码在前端），
    * 现收口到这里——加徽章只需在配置里写 detail 模板，前端不再判断系列。
    */
+  /**
+   * 「获得信息」整行（2026-11-17）：
+   *   已解锁 → `2026年11月 · 第 3 位获得 · 共 12 人`
+   *   未解锁 → `全站已有 12 人获得`（让用户知道这枚章有多稀有 / 值不值得追）
+   *   - 时间只到**年月**（精确到日对用户没价值且暴露活跃度）
+   *   - 已解锁但名次缺失（缓存未就绪等）时只显示年月，不显示「第 0 位」
+   *   - 未解锁且全站 0 人获得 → 空串（前端整行不渲染）
+   */
+  const earnedTextOf = (earnDateText: string, rank: number, rankTotal: number): string => {
+    if (!earnDateText) {
+      return rankTotal > 0 ? `全站已有 ${rankTotal} 人获得` : '';
+    }
+    const ym = formatYearMonth(earnDateText);
+    const parts = [ym];
+    if (rank > 0) parts.push(`第 ${rank} 位获得`);
+    if (rankTotal > 0) parts.push(`共 ${rankTotal} 人`);
+    return parts.filter(Boolean).join(' · ');
+  };
+
   const detailLinesOf = (def: BadgeDef | null, t: { key: string; cur: number }): string[] => {
     const lines: string[] = [];
     if (!def) return lines;
@@ -1160,6 +1182,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
           group: 'plan' as BadgeGroup,
           detailText: `已达成 ${m.cur} 次 · 目标 ${m.tier} 次`,
           detailLines: [],
+          earnedText: earnedTextOf((earns[m.key] && earns[m.key].earnDate) || '', rankOf(m.key).rank, rankOf(m.key).total),
         };
       },
     ),
@@ -1216,6 +1239,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
         group: def.group,
         detailText: renderDetail(def, cur, extra.valueText || ''),
         detailLines: detailLinesOf(def, { key: def.key, cur }),
+        earnedText: earnedTextOf((earn && earn.earnDate) || '', rankOf(def.key).rank, rankOf(def.key).total),
         ...extra,
       };
     }),
@@ -1296,6 +1320,12 @@ export interface PlanTrophy {
   detailText: string;
   /** 详情半屏的附加明细行（如当前纪录值与产生日期），已按系列渲染好 */
   detailLines: string[];
+  /**
+   * 详情半屏的「获得信息」整行（2026-11-17）：`2026年11月 · 第 3 位获得 · 共 12 人`
+   * 已由后端拼好，前端直接显示，不再各自拼装（避免两个页面文案漂移）。
+   * 未解锁 / 名次缺失时为空串。
+   */
+  earnedText: string;
   /** 进度条百分比 0-100（cur/tier 封顶）——未获得时卡片展示进度条 */
   pct: number;
   /** 记录型当前纪录文案（卡面第二行），如 '12.3 km' / '2小时05分' / '15 天' */
@@ -1529,6 +1559,13 @@ export function computeRecordStats(days: DailyTotalsRow[]): PlanRecords & { brea
 
 function formatKmText(m: number): string {
   return `${(Math.round(m / 10) / 100).toFixed(m % 1000 === 0 ? 0 : 2)} km`;
+}
+
+/** 'YYYY-MM-DD' → 'YYYY年M月'；非法日期原样返回空串 */
+function formatYearMonth(dateStr: string): string {
+  const m = /^(\d{4})-(\d{2})/.exec(String(dateStr || ''));
+  if (!m) return '';
+  return `${m[1]}年${Number(m[2])}月`;
 }
 
 function formatDurText(sec: number): string {

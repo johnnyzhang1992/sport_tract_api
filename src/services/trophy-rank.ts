@@ -16,6 +16,7 @@
 import { Types } from 'mongoose';
 import { ExercisePlanPeriodModel } from '../models/exercise-plan-period.model.js';
 import { ActivityModel } from '../models/activity.model.js';
+import { cacheGet, cacheGetMany, cacheSetMany } from './redis.js';
 import {
   unlockDatesOf,
   type BadgeDailyRow,
@@ -50,7 +51,9 @@ export type RankTable = Record<string, { rank: number; total: number }>;
 export function rankTableOf(datesByKey: ReadonlyMap<string, readonly RankEntry[]>): Map<string, RankTable> {
   const out = new Map<string, RankTable>();
   for (const [key, entries] of datesByKey) {
-    const sorted = [...entries].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    // 脏数据防御：无日期的条目不参与排名（调用方通常已过滤，但 rankTableOf 也可能被直接调用）
+    const sorted = entries.filter((e) => !!e && !!e.date)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
     const total = sorted.length;
     for (let i = 0; i < sorted.length; ) {
       const day = sorted[i].date;
@@ -99,23 +102,72 @@ export function buildRankTable(
 }
 
 /**
- * 结果缓存（TTL）：全站人数成千上万时不必每次进页面都重算；无额外写放大。
+ * 结果缓存（2026-11-17 改用可插拔缓存层，见 services/redis.ts）
  *
- * ⚠️ 规模说明（2026-11-16 评估后暂不改）：首次计算 = 全站轨迹按 (userId, 日) 聚合
- * + 读出**全部**周期快照 + 每个用户跑一遍徽章解锁日（O(用户数 × 徽章数)）。
- * 当前全站 1549 条轨迹 ≈ 几十毫秒，可接受。
- * 触发改造的条件（先满足任一再动手）：
- *   - 轨迹总量 > 20 万条（聚合耗时 > 1s，或内存里的按日数组过大）
- *   - 徽章数翻倍（> 250 座），单用户解锁日计算成为瓶颈
- * 届时的做法：把「解锁日」落成物化表 badge_earns（徽章达成时增量写一行），
- * 名次退化为对该表按日期排序查询——`rankTableOf` 的入参结构不用改。
+ * 存什么：**全站其他人的解锁日**，按徽章 key 分片存储：
+ *     badge:unlock:<徽章key>  →  [{ uid, date }, ...]
+ *   - 分片而不是单个大 JSON：一次请求只读当前用户需要的 key（通常几十个），
+ *     而全量快照 ~289KB 每次都要反序列化，浪费 CPU 与网络
+ *   - 分片也便于单独失效（将来某座徽章口径变了，只需删它那一个 key）
+ *
+ * TTL 10 分钟；读不到（未配置 Redis / 连接失败 / 未命中）→ 现场算一遍再写回。
+ *
+ * ⚠️ 为什么缓存里不含本人：用户的解锁日是**实时**算的（getPlanSummary 的 computeBadgeEarns），
+ * 若名次也用缓存里的旧快照，用户刚解锁的那座徽章会出现「已解锁但无名次」
+ * （实测复现：缓存未过期时新解锁 x2，名次缺失）。现在本人的解锁日每次请求实时合并进来。
  */
 const CACHE_TTL_MS = 10 * 60 * 1000;
-let cache: { at: number; data: Record<string, RankTable> } | null = null;
+/** Redis 里所有徽章解锁日的 key 前缀（带应用前缀，避免与同实例的其它项目撞名） */
+export const UNLOCK_KEY_PREFIX = 'st:badge:unlock:';
+/** 全站快照「已构建」的时间戳键：多实例共享，避免每个实例各算一遍 */
+const SNAPSHOT_AT_KEY = `${UNLOCK_KEY_PREFIX}_at`;
+/** 快照包含哪些 key（分片索引） */
+const SNAPSHOT_KEYS_KEY = `${UNLOCK_KEY_PREFIX}_keys`;
 
-/** 测试用：清空缓存 */
+/** 正在进行的全站聚合：并发请求等同一个结果，避免缓存穿透把 CPU 打满 */
+let inflight: Promise<Map<string, RankEntry[]>> | null = null;
+/** 内存兜底已由 services/redis.ts 的 memory 层承担，这里只留快照时间戳（跨调用复用） */
+let localSnapshotAt = 0;
+
+/** 测试用：清空进程内状态 */
 export function __resetTrophyRankCache(): void {
-  cache = null;
+  inflight = null;
+  localSnapshotAt = 0;
+}
+
+/**
+ * 读全站快照（按 key 分片）。
+ * 缓存整体过期或缺失时：做一次全站聚合，然后把每个 key 写回缓存。
+ * @returns key → 解锁条目列表（**不含本人**的语义由调用方剔除）
+ */
+async function loadSnapshot(): Promise<Map<string, RankEntry[]>> {
+  // 1) 先看快照时间戳是否还在有效期内（一次往返，顺带读分片索引用 MGET 合并成 2 次往返）
+  const [atRaw, keys] = await cacheGetMany<number | string[]>([SNAPSHOT_AT_KEY, SNAPSHOT_KEYS_KEY]);
+  const at = (atRaw as number | null) ?? localSnapshotAt;
+  const fresh = typeof at === 'number' && at > 0 && Date.now() - at < CACHE_TTL_MS;
+  const keyList = Array.isArray(keys) ? (keys as string[]) : null;
+
+  if (fresh && keyList) {
+    // 2) 命中：**一次 MGET** 读全部徽章分片（原来是逐 key GET，上百座徽章就是上百次往返）
+    if (!keyList.length) return new Map(); // 全站确实还没人解锁：直接空表，不要每次重建
+    const chunks = await cacheGetMany<RankEntry[]>(keyList.map((k) => `${UNLOCK_KEY_PREFIX}${k}`));
+    const out = new Map<string, RankEntry[]>();
+    keyList.forEach((k, i) => {
+      const v = chunks[i];
+      if (v) out.set(k, v);
+    });
+    // 少部分 key 掉了（TTL 不齐/set 失败）也要能工作：缺的 key 视为无人解锁
+    if (out.size > 0) return out;
+    // 全部读空 → 落到重建（不把「缓存全丢」误当成「全站没人解锁」）
+  }
+
+  // 3) 未命中 → 聚合一次（并发共享同一个 Promise）
+  if (!inflight) {
+    inflight = buildSnapshot().finally(() => {
+      inflight = null; // 成功/失败都清掉，失败后下次请求可重试
+    });
+  }
+  return inflight;
 }
 
 /**
@@ -237,31 +289,71 @@ async function collectUnlockDates(): Promise<Map<string, Record<string, string>>
   return out;
 }
 
-/**
- * 取本人名次表（key → { rank, total }）。未登录/无数据返回空表。
- * 第一次调用做一次全站聚合，之后 10 分钟内复用缓存。
- *
- * 算法：每个 key 把全站「(解锁日, 用户)」按日期排序一次，扫一遍把同一天的人写成同一个名次
- * （并列同名次，名次 = 此前已排列的人数 + 1），复杂度 O(key 数 × 人数 log 人数)。
- */
-export async function loadTrophyRanks(userId: string): Promise<Record<string, { rank: number; total: number }>> {
-  if (!Types.ObjectId.isValid(userId)) return {};
-  if (!cache || Date.now() - cache.at > CACHE_TTL_MS) {
-    const all = await collectUnlockDates();
-    // 反转成「key → (uid, 解锁日)」，再交给唯一实现的 rankTableOf（并列同名次规则只有一份）
-    const byKey = new Map<string, RankEntry[]>();
-    for (const [uid, m] of all.entries()) {
-      for (const [key, date] of Object.entries(m)) {
-        if (!date) continue;
-        const arr = byKey.get(key) ?? [];
-        arr.push({ uid, date });
-        byKey.set(key, arr);
-      }
+/** 全站聚合 + 回写缓存（按 key 分片，**一次 pipeline** 写完） */
+async function buildSnapshot(): Promise<Map<string, RankEntry[]>> {
+  const all = await collectUnlockDates();
+  const byKey = new Map<string, RankEntry[]>();
+  for (const [uid, m] of all.entries()) {
+    for (const [key, date] of Object.entries(m)) {
+      if (!date) continue;
+      const arr = byKey.get(key) ?? [];
+      arr.push({ uid, date });
+      byKey.set(key, arr);
     }
-    const perUser = rankTableOf(byKey);
-    const data: Record<string, RankTable> = {};
-    for (const [uid, table] of perUser) data[uid] = table;
-    cache = { at: Date.now(), data };
   }
-  return cache.data[userId] ?? {};
+  // 回写：分片 + 索引 + 时间戳一次 pipeline 写完（比逐条 SET 少几十次往返）
+  const ttlSec = Math.floor(CACHE_TTL_MS / 1000);
+  const now = Date.now();
+  const entries: Array<{ key: string; value: unknown; ttlSec: number }> = [
+    ...[...byKey.entries()].map(([k, v]) => ({ key: `${UNLOCK_KEY_PREFIX}${k}`, value: v, ttlSec })),
+    { key: SNAPSHOT_KEYS_KEY, value: [...byKey.keys()], ttlSec },
+    // 时间戳最后写：只有前面的分片都写成功，才值得标记「新鲜」
+    { key: SNAPSHOT_AT_KEY, value: now, ttlSec },
+  ];
+  await cacheSetMany(entries);
+  localSnapshotAt = now;
+  return byKey;
+}
+
+/**
+ * 取本人名次表（key → { rank, total }）。未登录返回空表。
+ *
+ * @param userId 本人
+ * @param myDates 本人**实时**算出的「徽章 → 首次解锁日」（来自 computeBadgeEarns，不用缓存值）
+ *
+ * 算法：把「全站其他人的解锁日（缓存）」与「本人实时解锁日」合并成条目表，
+ * 交给唯一实现 rankTableOf（并列同名次，rank = 更早解锁的人数 + 1）。
+ * 名次永远与本人当前的解锁状态一致——不会出现「已解锁但没有名次」。
+ */
+export async function loadTrophyRanks(
+  userId: string,
+  myDates: Readonly<Record<string, string>>,
+): Promise<Record<string, { rank: number; total: number }>> {
+  if (!Types.ObjectId.isValid(userId)) return {};
+
+  const snapshot = await loadSnapshot(); // key → 全站条目（含本人历史数据）
+
+  const byKey = new Map<string, RankEntry[]>();
+  for (const [key, entries] of snapshot.entries()) {
+    // 剔除本人：本人的解锁日以 myDates（实时）为准，避免同一个人被算两次
+    const others = entries.filter((e) => e.uid !== userId);
+    if (others.length) byKey.set(key, others);
+  }
+  // 合并本人实时解锁日（最新、最准）
+  for (const [key, date] of Object.entries(myDates)) {
+    if (!date) continue;
+    const arr = byKey.get(key) ?? [];
+    arr.push({ uid: userId, date });
+    byKey.set(key, arr);
+  }
+
+  const table: Record<string, { rank: number; total: number }> = {
+    ...(rankTableOf(byKey).get(userId) ?? {}),
+  };
+  // 未解锁的徽章也要给出 total（「全站已有 N 人获得」）
+  for (const [key, entries] of byKey.entries()) {
+    if (table[key]) continue;
+    table[key] = { rank: 0, total: entries.length };
+  }
+  return table;
 }

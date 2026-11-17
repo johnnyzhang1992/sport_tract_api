@@ -162,6 +162,58 @@ test('BO8 分类型累计值正确（跑步/骑行各自的概览）', async () 
   assert.equal(ride.label, '骑行');
 });
 
+test('BO10 不变式：任何已解锁徽章都必须有 rank ≥ 1 且带 earnedText（2026-11-17 review 修复）', async () => {
+  const d = await overview();
+  const unlocked = d.trophies.filter((t: any) => t.unlocked);
+  assert.ok(unlocked.length > 0, '前置条件：该用户应有已解锁徽章');
+  for (const t of unlocked) {
+    assert.ok(t.rank >= 1, `${t.key} 已解锁但 rank=${t.rank}（会出现「已解锁却没有名次」的卡面）`);
+    assert.ok(t.earnedText, `${t.key} 缺 earnedText`);
+    assert.match(t.earnedText, /\d{4}年\d{1,2}月/, `${t.key} earnedText 应含年月`);
+    assert.match(t.earnedText, /第 \d+ 位获得/, `${t.key} earnedText 应含名次`);
+  }
+});
+
+test('BO11 earnedText 只到年月，不含具体日（隐私 + 用户要求）', async () => {
+  const d = await overview();
+  const t = d.trophies.find((x: any) => x.unlocked);
+  assert.ok(t, '需要一个已解锁徽章');
+  assert.ok(!/\d{4}年\d{1,2}月\d{1,2}日/.test(t.earnedText), '不应出现「日」');
+  assert.ok(!/\d{4}-\d{2}-\d{2}/.test(t.earnedText), '不应出现 YYYY-MM-DD');
+});
+
+test('BO12 未解锁徽章：若全站已有人获得，earnedText 显示「全站已有 N 人获得」', async () => {
+  const d = await overview();
+  const locked = d.trophies.filter((t: any) => !t.unlocked);
+  assert.ok(locked.length > 0, '前置条件：应有未解锁徽章');
+
+  const withPeople = locked.filter((t: any) => t.rankTotal > 0);
+  const nobody = locked.filter((t: any) => t.rankTotal === 0);
+
+  for (const t of withPeople) {
+    assert.equal(t.rank, 0, `${t.key} 未解锁不该有名次`);
+    assert.match(t.earnedText, /^全站已有 \d+ 人获得$/, `${t.key} 文案格式不对：${t.earnedText}`);
+    assert.ok(t.earnedText.includes(String(t.rankTotal)), `${t.key} 文案里的数字应与 rankTotal 一致`);
+  }
+  // 全站确实没人获得过的（极端档位）→ 空串，前端退回描述
+  for (const t of nobody) {
+    assert.equal(t.earnedText, '', `${t.key} 无人获得时不应有获得信息`);
+  }
+});
+
+test('BO13 未解锁徽章也有 rankTotal（全站已获得人数），供详情半屏展示', async () => {
+  const d = await overview();
+  // 榜里必然存在「别人拿到、我还没拿到」的徽章（测试用户只做了跑步/骑行）
+  const climb = d.trophies.filter((t: any) => t.key.startsWith('climb-'));
+  assert.ok(climb.length > 0, '应有爬山系列徽章');
+  const lockedClimb = climb.filter((t: any) => !t.unlocked);
+  assert.ok(lockedClimb.length > 0, '测试用户没爬山 → 爬山章应未解锁');
+  for (const t of lockedClimb) {
+    assert.equal(typeof t.rankTotal, 'number', `${t.key} rankTotal 必须是数字（不能是 undefined）`);
+    assert.equal(t.rank, 0, `${t.key} 未解锁 rank 应为 0`);
+  }
+});
+
 test('BO9 无数据用户：结构完整、全灰、不炸', async () => {
   const d = await overview(tokenEmpty);
   assert.equal(d.total, 119);
