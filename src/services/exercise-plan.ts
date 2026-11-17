@@ -1111,12 +1111,26 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
    * 详情半屏的进度文案：由配置里的模板渲染（前端不再自己拼文案）。
    * 模板占位：{cur} 当前值、{tier} 档位、{remain} 还差多少、{valueText} 后端算好的展示值。
    */
+  /**
+   * 详情半屏的进度行（2026-11-17 调整）：
+   *   - **未解锁**：显示进度（`还差 12 次…`）——这是用户真正需要的「离目标还有多远」
+   *   - **已解锁**：不再显示「已完成 24 次」这类已完成态流水账（徽章都拿到了，再报次数没信息量）；
+   *     只有「累计/当前纪录」这类**有独立价值的事实**才保留（如「已累计 415.38 km」「最长连续 120 天」）。
+   *     是否保留由下面的 keepWhenEarned 判定，而不是靠文案模板。
+   * 返回空串表示这一行不展示。
+   */
   const renderDetail = (def: BadgeDef, cur: number, valueText: string): string => {
     const rule = def.detail;
+    const unlocked = cur >= def.tier;
+    if (unlocked) {
+      // 已解锁：只有「当前值本身有独立意义」的指标才展示（累计量/纪录值），
+      // 次数类（已完成 N 次）不再重复播报
+      if (!KEEP_VALUE_WHEN_EARNED.has(def.metric)) return '';
+    }
     const remain = Math.max(0, def.tier - cur);
-    if (cur >= def.tier && rule) return rule.earned.replace('{cur}', String(cur)).replace('{valueText}', valueText);
+    if (unlocked && rule) return rule.earned.replace('{cur}', String(cur)).replace('{valueText}', valueText);
     if (rule && rule.locked) return rule.locked.replace('{remain}', String(remain)).replace('{tier}', String(def.tier));
-    return `已达成 ${cur} 次 · 目标 ${def.tier} 次`;
+    return unlocked ? '' : `已达成 ${cur} 次 · 目标 ${def.tier} 次`;
   };
 
   /**
@@ -1124,22 +1138,30 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
    * 现收口到这里——加徽章只需在配置里写 detail 模板，前端不再判断系列。
    */
   /**
-   * 「获得信息」整行（2026-11-17）：
-   *   已解锁 → `2026年11月 · 第 3 位获得 · 共 12 人`
-   *   未解锁 → `全站已有 12 人获得`（让用户知道这枚章有多稀有 / 值不值得追）
+   * 「获得信息」（2026-11-17）拆两句：
+   *   已解锁 → 第一句 `2026年9月 · 第 2 位获得此徽章的迹路者`，第二句 `6 位迹路者获得`
+   *   未解锁 → 只有第二句 `7 位迹路者获得`（让用户知道这枚章有多稀有）
    *   - 时间只到**年月**（精确到日对用户没价值且暴露活跃度）
    *   - 已解锁但名次缺失（缓存未就绪等）时只显示年月，不显示「第 0 位」
    *   - 未解锁且全站 0 人获得 → 空串（前端整行不渲染）
    */
-  const earnedTextOf = (earnDateText: string, rank: number, rankTotal: number): string => {
+  const earnedTextOf = (earnDateText: string, rank: number, rankTotal: number): EarnInfo => {
     if (!earnDateText) {
-      return rankTotal > 0 ? `全站已有 ${rankTotal} 人获得` : '';
+      // 未解锁：只报全站已获得人数（单独一句）
+      return {
+        earnedText: '',
+        rankText: '',
+        totalText: rankTotal > 0 ? `${rankTotal} 位迹路者获得` : '',
+      };
     }
-    const ym = formatYearMonth(earnDateText);
-    const parts = [ym];
-    if (rank > 0) parts.push(`第 ${rank} 位获得`);
-    if (rankTotal > 0) parts.push(`共 ${rankTotal} 人`);
-    return parts.filter(Boolean).join(' · ');
+    // 已解锁拆成两句：
+    //   第一句 `2026年9月 · 第 2 位获得此徽章的迹路者`
+    //   第二句 `6 位迹路者获得`（全站总人数）
+    return {
+      earnedText: formatYearMonth(earnDateText),
+      rankText: rank > 0 ? `第 ${rank} 位获得此徽章的迹路者` : '',
+      totalText: rankTotal > 0 ? `${rankTotal} 位迹路者获得` : '',
+    };
   };
 
   const detailLinesOf = (def: BadgeDef | null, t: { key: string; cur: number }): string[] => {
@@ -1180,9 +1202,10 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
           rankTotal: rankOf(m.key).total,
           pct: m.pct, // 直接用 milestones 算好的百分比
           group: 'plan' as BadgeGroup,
-          detailText: `已达成 ${m.cur} 次 · 目标 ${m.tier} 次`,
+          // 已解锁不再播报「已达成 N 次」（徽章已到手），未解锁才作为进度
+          detailText: m.unlocked ? '' : `已达成 ${m.cur} 次 · 目标 ${m.tier} 次`,
           detailLines: [],
-          earnedText: earnedTextOf((earns[m.key] && earns[m.key].earnDate) || '', rankOf(m.key).rank, rankOf(m.key).total),
+          ...earnedTextOf((earns[m.key] && earns[m.key].earnDate) || '', rankOf(m.key).rank, rankOf(m.key).total),
         };
       },
     ),
@@ -1239,7 +1262,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
         group: def.group,
         detailText: renderDetail(def, cur, extra.valueText || ''),
         detailLines: detailLinesOf(def, { key: def.key, cur }),
-        earnedText: earnedTextOf((earn && earn.earnDate) || '', rankOf(def.key).rank, rankOf(def.key).total),
+        ...earnedTextOf((earn && earn.earnDate) || '', rankOf(def.key).rank, rankOf(def.key).total),
         ...extra,
       };
     }),
@@ -1281,6 +1304,16 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
  * 记录=单日合计（东八区自然日，全部 finished 运动）、完美周按自然周（周一~周日）。
  * ========================================================================== */
 
+/** 详情半屏的「获得信息」两行（2026-11-17 拆行展示） */
+export interface EarnInfo {
+  /** 第一行：获得时间（只到年月，如 `2026年11月`）；未获得为空串 */
+  earnedText: string;
+  /** 名次段（如 `第 3 位获得此徽章的迹路者`）：已解锁才有；未获得为空串 */
+  rankText: string;
+  /** 总人数段（如 `6 位迹路者获得`）：已解锁=全站总人数；未解锁=已获得人数；无人获得为空串 */
+  totalText: string;
+}
+
 export interface PlanTrophy {
   key: string;
   label: string;
@@ -1321,11 +1354,20 @@ export interface PlanTrophy {
   /** 详情半屏的附加明细行（如当前纪录值与产生日期），已按系列渲染好 */
   detailLines: string[];
   /**
-   * 详情半屏的「获得信息」整行（2026-11-17）：`2026年11月 · 第 3 位获得 · 共 12 人`
-   * 已由后端拼好，前端直接显示，不再各自拼装（避免两个页面文案漂移）。
-   * 未解锁 / 名次缺失时为空串。
+   * 详情半屏「获得信息」第一句的第一段：获得时间，只到年月，如 `2026年9月`
+   * 未解锁为空串。
    */
   earnedText: string;
+  /**
+   * 详情半屏「获得信息」第一句的后半段：名次，如 `第 3 位获得此徽章的迹路者`
+   * 未解锁为空串（未解锁只有第二句 totalText）。
+   */
+  rankText: string;
+  /**
+   * 详情半屏「获得信息」第二句：总人数，如 `6 位迹路者获得`
+   * 已解锁=全站总人数；未解锁=已获得人数；全站无人获得为空串。
+   */
+  totalText: string;
   /** 进度条百分比 0-100（cur/tier 封顶）——未获得时卡片展示进度条 */
   pct: number;
   /** 记录型当前纪录文案（卡面第二行），如 '12.3 km' / '2小时05分' / '15 天' */
@@ -1560,6 +1602,24 @@ export function computeRecordStats(days: DailyTotalsRow[]): PlanRecords & { brea
 function formatKmText(m: number): string {
   return `${(Math.round(m / 10) / 100).toFixed(m % 1000 === 0 ? 0 : 2)} km`;
 }
+
+/**
+ * 已解锁后仍值得展示「当前值」的指标（2026-11-17）：
+ * 这些数值本身就是有用的成就事实（累计了多少公里、纪录多长、连续多久），
+ * 与「已完成 N 次」这种重复播报不同。次数类不在此列。
+ */
+const KEEP_VALUE_WHEN_EARNED = new Set<BadgeMetric>([
+  'totalDistanceKm',
+  'totalDurationHour',
+  'streakBest',
+  'typeDistanceKm',
+  'typeDurationHour',
+]);
+/**
+ * 破纪录系列（breaksDistance/breaksDuration）**故意不在此列**：
+ * 它们的「当前纪录值 + 产生日期」已由 detailLines 单独展示（如「当前纪录 12.30 km · 产生于 2026-09-19」），
+ * 再播报「已刷新距离纪录 24 次」就是纯次数流水账，与「已解锁不再报次数」的原则冲突。
+ */
 
 /** 'YYYY-MM-DD' → 'YYYY年M月'；非法日期原样返回空串 */
 function formatYearMonth(dateStr: string): string {

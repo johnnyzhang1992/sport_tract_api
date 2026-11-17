@@ -162,15 +162,20 @@ test('BO8 分类型累计值正确（跑步/骑行各自的概览）', async () 
   assert.equal(ride.label, '骑行');
 });
 
-test('BO10 不变式：任何已解锁徽章都必须有 rank ≥ 1 且带 earnedText（2026-11-17 review 修复）', async () => {
+test('BO10 不变式：已解锁徽章必须有 rank ≥ 1，且两句获得信息齐全（2026-11-17 拆两句）', async () => {
   const d = await overview();
   const unlocked = d.trophies.filter((t: any) => t.unlocked);
   assert.ok(unlocked.length > 0, '前置条件：该用户应有已解锁徽章');
   for (const t of unlocked) {
     assert.ok(t.rank >= 1, `${t.key} 已解锁但 rank=${t.rank}（会出现「已解锁却没有名次」的卡面）`);
-    assert.ok(t.earnedText, `${t.key} 缺 earnedText`);
-    assert.match(t.earnedText, /\d{4}年\d{1,2}月/, `${t.key} earnedText 应含年月`);
-    assert.match(t.earnedText, /第 \d+ 位获得/, `${t.key} earnedText 应含名次`);
+    // 第一段：获得时间（只到年月）
+    assert.match(t.earnedText, /^\d{4}年\d{1,2}月$/, `${t.key} earnedText 应是年月：${t.earnedText}`);
+    // 第一句的后半段：名次
+    assert.match(t.rankText, /^第 \d+ 位获得此徽章的迹路者$/, `${t.key} rankText 格式不对：${t.rankText}`);
+    assert.ok(t.rankText.includes(`第 ${t.rank} 位`), `${t.key} rankText 里的名次应与 rank 一致`);
+    // 第二句：总人数（单独一句）
+    assert.match(t.totalText, /^\d+ 位迹路者获得$/, `${t.key} totalText 格式不对：${t.totalText}`);
+    assert.ok(t.totalText.includes(String(t.rankTotal)), `${t.key} totalText 里的总数应与 rankTotal 一致`);
   }
 });
 
@@ -182,7 +187,7 @@ test('BO11 earnedText 只到年月，不含具体日（隐私 + 用户要求）'
   assert.ok(!/\d{4}-\d{2}-\d{2}/.test(t.earnedText), '不应出现 YYYY-MM-DD');
 });
 
-test('BO12 未解锁徽章：若全站已有人获得，earnedText 显示「全站已有 N 人获得」', async () => {
+test('BO12 未解锁徽章：只有 totalText「N 位迹路者获得」，没有年月与名次句', async () => {
   const d = await overview();
   const locked = d.trophies.filter((t: any) => !t.unlocked);
   assert.ok(locked.length > 0, '前置条件：应有未解锁徽章');
@@ -192,12 +197,16 @@ test('BO12 未解锁徽章：若全站已有人获得，earnedText 显示「全�
 
   for (const t of withPeople) {
     assert.equal(t.rank, 0, `${t.key} 未解锁不该有名次`);
-    assert.match(t.earnedText, /^全站已有 \d+ 人获得$/, `${t.key} 文案格式不对：${t.earnedText}`);
-    assert.ok(t.earnedText.includes(String(t.rankTotal)), `${t.key} 文案里的数字应与 rankTotal 一致`);
+    assert.equal(t.earnedText, '', `${t.key} 未解锁不该有获得时间`);
+    assert.equal(t.rankText, '', `${t.key} 未解锁不该有名次句`);
+    assert.match(t.totalText, /^\d+ 位迹路者获得$/, `${t.key} totalText 格式不对：${t.totalText}`);
+    assert.ok(t.totalText.includes(String(t.rankTotal)), `${t.key} 数字应与 rankTotal 一致`);
   }
-  // 全站确实没人获得过的（极端档位）→ 空串，前端退回描述
+  // 全站确实没人获得 → 三句都空，前端退回描述
   for (const t of nobody) {
-    assert.equal(t.earnedText, '', `${t.key} 无人获得时不应有获得信息`);
+    assert.equal(t.earnedText, '', `${t.key} 不应有获得时间`);
+    assert.equal(t.rankText, '', `${t.key} 不应有名次句`);
+    assert.equal(t.totalText, '', `${t.key} 不应有总人数句`);
   }
 });
 
@@ -372,4 +381,42 @@ test('BO-R2 不变式：任何已解锁的徽章都必须有名次（跨系列�
   await ExercisePlanPeriodModel.deleteMany({ userId: uid });
   await UserModel.deleteMany({ _id: uid });
   __resetTrophyRankCache();
+});
+
+test('BO14 已解锁的次数类徽章不再播报「已完成 N 次」；累计/纪录类保留当前值（2026-11-17）', async () => {
+  const d = await overview();
+  const lines = (t: any) => [t.detailText, ...(t.detailLines || [])].filter(Boolean);
+
+  // 次数类（metric=typeCount）：已解锁 → 进度行应为空
+  const earnedCount = d.trophies.filter((t: any) => t.unlocked && /type-count/.test(t.key));
+  for (const t of earnedCount) {
+    assert.deepEqual(lines(t), [], `${t.key} 已解锁不该再播报次数`);
+  }
+
+  // 里程碑（已完成 N 次 · 目标 M 次）：已解锁 → 为空
+  const earnedFirst = d.trophies.find((t: any) => t.key === 'first' && t.unlocked);
+  if (earnedFirst) assert.deepEqual(lines(earnedFirst), [], '里程碑已解锁不该再播报达成次数');
+
+  // 累计类：已解锁 → 保留当前值（有独立意义）
+  const earnedTotal = d.trophies.find((t: any) => t.key === 'total-dist-100' && t.unlocked);
+  if (earnedTotal) {
+    assert.ok(lines(earnedTotal).length > 0, '累计里程已解锁仍应展示累计值');
+    assert.match(lines(earnedTotal)[0], /已累计/, '应展示「已累计 …」');
+  }
+
+  // 破纪录系列：已解锁 → detailText 为空（不播报「已刷新 N 次」），但当前纪录值仍由 detailLines 给出
+  const earnedRec = d.trophies.filter((t: any) => t.unlocked && /rec-dist|rec-dur/.test(t.key));
+  for (const t of earnedRec) {
+    assert.equal(t.detailText, '', `${t.key} 已解锁不该再播报破纪录次数`);
+    assert.ok(
+      (t.detailLines || []).some((l: string) => l.includes('当前纪录')),
+      `${t.key} 的当前纪录值应仍在 detailLines`,
+    );
+  }
+
+  // 未解锁：进度行必须有内容（用户需要知道离目标多远）
+  const locked = d.trophies.filter((t: any) => !t.unlocked).slice(0, 20);
+  for (const t of locked) {
+    assert.ok(lines(t).length > 0, `${t.key} 未解锁应展示进度（还差多少）`);
+  }
 });
