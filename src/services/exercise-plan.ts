@@ -1072,8 +1072,6 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   const totalDistanceM = days.reduce((acc, d) => acc + d.distanceM, 0);
   const totalDurationSec = days.reduce((acc, d) => acc + d.durationSec, 0);
   const counts = {
-    breaksDistance: rec.breaksDistance,
-    breaksDuration: rec.breaksDuration,
     streakBest: rec.streak.best,
     ringsClosed: dailyRows.filter((r) => r.allAchieved).length,
     // 累计总量（全历史，不设计划边界：与「破纪录」看峰值互补）
@@ -1167,11 +1165,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   const detailLinesOf = (def: BadgeDef | null, t: { key: string; cur: number }): string[] => {
     const lines: string[] = [];
     if (!def) return lines;
-    if (def.metric === 'breaksDistance' && rec.distance.bestM > 0) {
-      lines.push(`当前纪录 ${(Math.round(rec.distance.bestM / 10) / 100).toFixed(2)} km · 产生于 ${rec.distance.dateText}`);
-    } else if (def.metric === 'breaksDuration' && rec.duration.bestSec > 0) {
-      lines.push(`当前纪录 ${Math.round(rec.duration.bestSec / 60)} 分钟 · 产生于 ${rec.duration.dateText}`);
-    } else if (def.metric === 'streakBest') {
+    if (def.metric === 'streakBest') {
       if (rec.streak.bestEndText) lines.push(`${rec.streak.bestEndText} 结束`);
       lines.push(`目前连续 ${rec.streak.current} 天`);
     }
@@ -1215,13 +1209,7 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       // 下一档：同系列阶梯里第一个大于当前计数的档位（完美周无阶梯为 null）
       const nextTier = series.repeatable ? null : (series.tiers.find((t) => t > cur) ?? null);
       const extra: { valueText?: string; dateText?: string } = {};
-      if (def.metric === 'breaksDistance') {
-        extra.valueText = formatKmText(rec.distance.bestM);
-        extra.dateText = rec.distance.dateText;
-      } else if (def.metric === 'breaksDuration') {
-        extra.valueText = formatDurText(rec.duration.bestSec);
-        extra.dateText = rec.duration.dateText;
-      } else if (def.metric === 'totalDistanceKm') {
+      if (def.metric === 'totalDistanceKm') {
         extra.valueText = formatKmText(totalDistanceM);
       } else if (def.metric === 'totalDurationHour') {
         extra.valueText = formatDurText(totalDurationSec);
@@ -1616,9 +1604,11 @@ const KEEP_VALUE_WHEN_EARNED = new Set<BadgeMetric>([
   'typeDurationHour',
 ]);
 /**
- * 破纪录系列（breaksDistance/breaksDuration）**故意不在此列**：
- * 它们的「当前纪录值 + 产生日期」已由 detailLines 单独展示（如「当前纪录 12.30 km · 产生于 2026-09-19」），
- * 再播报「已刷新距离纪录 24 次」就是纯次数流水账，与「已解锁不再报次数」的原则冲突。
+ * 次数类（typeCount / 里程碑 / 完美周等）**故意不在此列**：徽章已到手，再播报次数是流水账。
+ *
+ * 历史（2026-11-17）：这里的排除项原本是给「破纪录」系列（breaksDistance/breaksDuration）加的，
+ * 该系列后续整组下线（徽章墙去掉「新纪录」分组），相关 metric/earnKind 已从配置删除；
+ * 破纪录的**当前纪录值**仍由 summary.records 下发（不再挂徽章）。
  */
 
 /** 'YYYY-MM-DD' → 'YYYY年M月'；非法日期原样返回空串 */
@@ -1636,8 +1626,6 @@ function formatDurText(sec: number): string {
 
 /** 奖杯计数的聚合形状（getPlanSummary 组装后传给 metricCountOf） */
 interface TrophyCounts {
-  breaksDistance: number;
-  breaksDuration: number;
   streakBest: number;
   ringsClosed: number;
   totalDistanceKm: number;
@@ -1677,8 +1665,6 @@ function buildByTypeCounts(typeDays: Record<string, DailyTotalsRow[]>): TrophyCo
 /** 计数 → 该指标当前值（与各奖杯 tier 对比得出解锁态） */
 function metricCountOf(metric: BadgeMetric, m: TrophyCounts, activityType?: string): number {
   switch (metric) {
-    case 'breaksDistance': return m.breaksDistance;
-    case 'breaksDuration': return m.breaksDuration;
     case 'streakBest': return m.streakBest;
     case 'ringsClosed': return m.ringsClosed;
     case 'totalDistanceKm': return m.totalDistanceKm;

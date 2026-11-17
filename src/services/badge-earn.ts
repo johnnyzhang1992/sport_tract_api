@@ -162,25 +162,12 @@ export function perfectWeekCounts(dailyRows: BadgeRangeRow[]): PerfectWeekStats 
 }
 
 /** 破纪录次数 + 每次破纪录的日期（逐日扫描新高） */
-function breakDates(days: BadgeDailyRow[], key: 'distanceM' | 'durationSec'): string[] {
-  const out: string[] = [];
-  let max = 0;
-  for (const d of days) {
-    if (d[key] > max) {
-      max = d[key];
-      out.push(d.date);
-    }
-  }
-  return out;
-}
-
 /**
  * 每座徽章的获得记录（获得次数 + 首次获取日期）。**唯一实现**，供：
  *   - getPlanSummary：卡面三态（获得一次=日期 / 多次=次数 / 未获得=进度条）
  *   - trophy-rank：全站「第 N 位迹路者」排名
  *
  * 各 unlockKind 的口径：
- *   nthBreak   第 N 次刷新纪录的那一天
  *   streak     连续天数第一次达到 N 的那一天
  *   rings      第 N 个三项全达成日快照的日期
  *   cumulative 累计量第一次跨过阈值的那天
@@ -206,8 +193,6 @@ export function computeBadgeEarns(input: BadgeEarnInput): Record<string, BadgeEa
     .sort((a, b) => a.windowEnd - b.windowEnd);
 
   // ── 预计算各指标的时间序列 ──
-  const breakDist = breakDates(days, 'distanceM');
-  const breakDur = breakDates(days, 'durationSec');
 
   const streakDates: Record<number, string> = {};
   {
@@ -300,10 +285,6 @@ export function computeBadgeEarns(input: BadgeEarnInput): Record<string, BadgeEa
     const t = def.tier;
     let date = '';
     switch (def.earnKind) {
-      case 'nthBreak':
-        if (def.metric === 'breaksDistance') date = breakDist[t - 1] || '';
-        else if (def.metric === 'breaksDuration') date = breakDur[t - 1] || '';
-        break;
       case 'streak':
         date = streakDates[t] || '';
         break;
@@ -326,8 +307,6 @@ export function computeBadgeEarns(input: BadgeEarnInput): Record<string, BadgeEa
           perfectWeekDistance: { n: perfect.distance, first: perfect.firstDistanceEnd },
           perfectWeekDuration: { n: perfect.duration, first: perfect.firstDurationEnd },
           perfectWeekCount: { n: perfect.count, first: perfect.firstCountEnd },
-          breaksDistance: { n: 0, first: '' },
-          breaksDuration: { n: 0, first: '' },
           streakBest: { n: 0, first: '' },
           ringsClosed: { n: 0, first: '' },
           totalDistanceKm: { n: 0, first: '' },

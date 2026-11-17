@@ -24,10 +24,15 @@ import { XpayOrderModel } from '../src/models/xpay-order.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
 import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
 import { confirmWordMatches, purgeUser } from '../src/services/account-deletion.js';
-import { hashOpenid } from '../src/services/account-audit.js';
+import { hashOpenid, recordAccountDeletion } from '../src/services/account-audit.js';
 import { AccountDeletionModel } from '../src/models/account-deletion.model.js';
 
 const OPENID = 'acct-del-fixed';
+/**
+ * 「只注销过一次」的第二个 openid：用来反证 repeatOnly 真的过滤了
+ * （开发库若有历史数据，单靠「我自己出现两次」无法区分 repeatOnly 是否生效）
+ */
+const OPENID_ONCE = 'acct-del-fixed-once';
 /** 测试照片的假 OSS 前缀（cleanup 按它清理；不真的访问网络） */
 const OSS_BASE = 'https://oss-test.example.com/acct-del';
 let app: any;
@@ -59,6 +64,7 @@ async function cleanup() {
   await UserModel.deleteMany({ openid: OPENID });
   // 留痕按 openid 哈希精确清理（共享 dev 库，禁止裸 deleteMany）
   await AccountDeletionModel.deleteMany({ openidHash: hashOpenid(OPENID) });
+  await AccountDeletionModel.deleteMany({ openidHash: hashOpenid(OPENID_ONCE) });
 }
 
 /** 建一个有完整数据的测试用户 */
@@ -380,6 +386,20 @@ test('AD16 管理端：未带管理员凭证 401；带上后可查列表与汇�
     headers: { authorization: `Bearer ${t2}` }, payload: { confirm: '小明2' },
   });
 
+  /*
+   * 造一个「只注销过一次」的账号（不同 openid），用来反证 repeatOnly 真的在过滤：
+   * 若接口忽略 repeatOnly，这个 hash 会混进结果，下面的断言就会红。
+   */
+  const onceUser = await UserModel.create({ openid: OPENID_ONCE, nickname: '一次性注销号' });
+  await recordAccountDeletion({
+    userId: String(onceUser._id),
+    uid: Number(onceUser.uid ?? 0),
+    openid: OPENID_ONCE,
+    nickname: '一次性注销号',
+    stats: { activity: 0 } as never,
+  });
+  await UserModel.deleteOne({ _id: onceUser._id });
+
   const noAuth = await app.inject({ method: 'GET', url: '/sport-track/api/admin/account-deletions' });
   assert.equal(noAuth.statusCode, 401, '管理端接口必须拒绝普通/无凭证');
 
@@ -398,17 +418,34 @@ test('AD16 管理端：未带管理员凭证 401；带上后可查列表与汇�
   assert.ok(d.summary.repeatAccounts >= 1, '同一 openid 两次注销 → 重复注销账号数 ≥1');
   assert.ok(typeof d.summary.last7Days === 'number');
 
-  // 仅看重复注销
+  /*
+   * 仅看重复注销（repeatOnly=1）：
+   * 开发库里有历史注销记录（含手工测试留下的），所以不能断言「只有我的账号」；
+   * 但**必须守住 repeatOnly 的语义**——返回的每一行，其 openidHash 在结果集里都要出现 ≥2 次。
+   * 用 pageSize=100 拉大页，避免分页把某个 hash 的第二次截掉造成假阴性。
+   */
   const rep = await app.inject({
-    method: 'GET', url: '/sport-track/api/admin/account-deletions?repeatOnly=1',
+    method: 'GET', url: '/sport-track/api/admin/account-deletions?repeatOnly=1&pageSize=100',
     headers: { authorization: `Bearer ${adminToken}` },
   });
   assert.equal(rep.statusCode, 200);
   const rows = rep.json().data.items as Array<{ openidHash: string }>;
-  // 不能断言「只有我的账号」——开发库里有历史注销记录（含手工测试留下的），
-  // 只要求我的账号出现在重复注销列表里即可（接口本身按 hash 聚合，不会串号）
   assert.ok(
     rows.some((x) => x.openidHash === hashOpenid(OPENID)),
     `重复注销列表应包含本次测试账号，实际 ${rows.length} 条`,
   );
+  assert.ok(
+    !rows.some((x) => x.openidHash === hashOpenid(OPENID_ONCE)),
+    'repeatOnly 不该返回「只注销过一次」的账号（否则等于没过滤）',
+  );
+  const countByHash: Record<string, number> = {};
+  for (const x of rows) countByHash[x.openidHash] = (countByHash[x.openidHash] || 0) + 1;
+  if (rep.json().data.total <= rows.length) {
+    // 只在「一页装下了全部重复注销记录」时才能断言完整性，否则分页会截断
+    for (const [hash, n] of Object.entries(countByHash)) {
+      assert.ok(n >= 2, `repeatOnly 只该返回重复注销的 hash，${hash} 只出现 ${n} 次`);
+    }
+  } else {
+    assert.ok(rows.length > 0, '分页未取全时至少要返回数据');
+  }
 });

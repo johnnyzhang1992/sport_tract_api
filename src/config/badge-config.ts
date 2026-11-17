@@ -32,8 +32,6 @@ export type BadgeGroup =
 
 /** 徽章计数口径（决定 cur 从哪来） */
 export type BadgeMetric =
-  | 'breaksDistance'
-  | 'breaksDuration'
   | 'streakBest'
   | 'ringsClosed'
   | 'totalDistanceKm'
@@ -50,7 +48,6 @@ export type BadgeMetric =
 
 /**
  * 解锁日期算法类型（决定「哪天解锁的」怎么算，名次排名依赖它）：
- *   nthBreak  第 N 次刷新单日纪录的那天
  *   streak    连续天数第一次达到 N 的那天
  *   rings     第 N 个三项全达成日快照
  *   cumulative 累计量第一次跨过阈值的当天（阈值单位见 series.unit）
@@ -58,7 +55,6 @@ export type BadgeMetric =
  *   milestone 原 8 倍数里程碑：计数跨过门槛那个周期的最后一天
  */
 export type EarnKind =
-  | 'nthBreak'
   | 'streak'
   | 'rings'
   | 'cumulative'
