@@ -4,7 +4,8 @@
  *
  * 守的承诺：
  *   - 计划页/我的徽章页**同源**：同一座徽章两处结论（解锁态/名次）必须一致
- *   - 分类齐全：plan=运动计划（15 座）、data=运动数据（104 座），合计 119
+ *   - 分类齐全：plan=运动计划（15 座）、data=运动数据（96 座），合计 111
+ *     （2026-11-17 去掉「新纪录」整组 8 座，数据类 104 → 96）
  *   - 分运动类型徽章按类型生成（5 类型 × 3 维度 × 3 档 = 45）
  *   - 无数据用户不炸（全灰但分类结构完整）
  */
@@ -77,14 +78,14 @@ test('BO1 需登录', async () => {
   assert.equal(res.statusCode, 401);
 });
 
-test('BO2 全量 119 座，分类数量正确（计划 15 / 数据 104）', async () => {
+test('BO2 全量 111 座，分类数量正确（计划 15 / 数据 96）', async () => {
   const d = await overview();
-  assert.equal(d.total, 119);
-  assert.equal(d.trophies.length, 119);
+  assert.equal(d.total, 111);
+  assert.equal(d.trophies.length, 111);
   const plan = d.categories.find((c: any) => c.key === 'plan');
   const data = d.categories.find((c: any) => c.key === 'data');
   assert.equal(plan.total, 15, '计划类 = 里程碑7 + 合环4（去掉 2000 档）+ 完美周4');
-  assert.equal(data.total, 104, '数据类 = 新纪录8 + 最坚持4 + 累计12 + 分类型80');
+  assert.equal(data.total, 96, '数据类 = 最坚持4 + 累计12 + 分类型80（新纪录已下线）');
   assert.equal(plan.total + data.total, d.total);
 });
 
@@ -225,7 +226,7 @@ test('BO13 未解锁徽章也有 rankTotal（全站已获得人数），供详�
 
 test('BO9 无数据用户：结构完整、全灰、不炸', async () => {
   const d = await overview(tokenEmpty);
-  assert.equal(d.total, 119);
+  assert.equal(d.total, 111);
   assert.equal(d.earned, 0);
   assert.deepEqual(d.activityTypes, []);
   assert.equal(d.categories.length, 2);
@@ -404,15 +405,12 @@ test('BO14 已解锁的次数类徽章不再播报「已完成 N 次」；累计
     assert.match(lines(earnedTotal)[0], /已累计/, '应展示「已累计 …」');
   }
 
-  // 破纪录系列：已解锁 → detailText 为空（不播报「已刷新 N 次」），但当前纪录值仍由 detailLines 给出
-  const earnedRec = d.trophies.filter((t: any) => t.unlocked && /rec-dist|rec-dur/.test(t.key));
-  for (const t of earnedRec) {
-    assert.equal(t.detailText, '', `${t.key} 已解锁不该再播报破纪录次数`);
-    assert.ok(
-      (t.detailLines || []).some((l: string) => l.includes('当前纪录')),
-      `${t.key} 的当前纪录值应仍在 detailLines`,
-    );
-  }
+  // 「新纪录」系列已于 2026-11-17 整组下线：不该再出现在任何返回里
+  assert.equal(
+    d.trophies.filter((t: any) => /^rec-dist|^rec-dur/.test(t.key)).length,
+    0,
+    '新纪录系列应已删除',
+  );
 
   // 未解锁：进度行必须有内容（用户需要知道离目标多远）
   const locked = d.trophies.filter((t: any) => !t.unlocked).slice(0, 20);

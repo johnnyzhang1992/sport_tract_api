@@ -11,6 +11,7 @@ import { config } from '../config/index.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 import { adminAuth, adminIdOf } from '../utils/admin-auth.js';
+import { listAccountDeletions } from '../services/account-audit.js';
 import { assertObjectIdLike, isObjectIdLike } from '../utils/object-id.js';
 import { escapeRegex } from '../utils/regex.js';
 import { locateRegion } from '../services/region.js';
@@ -1796,6 +1797,27 @@ export async function adminRoutes(fastify: FastifyInstance) {
     const { id } = request.params as { id: string };
     const { note } = (request.body ?? {}) as { note?: unknown };
     return success(await revokeBoardSettlement(id, { note }, { adminId: adminIdOf(request) }));
+  });
+
+  // ==================== 账号注销记录（2026-11-17） ====================
+  /**
+   * 注销留痕列表：只读，用于客服举证与防刷排查。
+   * - 记录不随用户删除（账号删了这条还在），180 天 TTL 自动过期
+   * - `repeatOnly=1` 只看「同一微信注销过 ≥2 次」——注册→领奖→注销→再注册会在这里露出来
+   * - summary 是筛选后的汇总（不受分页影响）：总次数 / 去重账号数 / 重复注销账号数 / 近 7 天次数
+   */
+  fastify.get('/account-deletions', { onRequest: [adminAuth] }, async (request) => {
+    const q = (request.query ?? {}) as Record<string, unknown>;
+    const uid = Number(q.uid);
+    return success(
+      await listAccountDeletions({
+        page: Number(q.page) || 1,
+        pageSize: Number(q.pageSize) || 20,
+        uid: Number.isFinite(uid) && uid > 0 ? uid : undefined,
+        nickname: typeof q.nickname === 'string' ? q.nickname : undefined,
+        repeatOnly: q.repeatOnly === '1' || q.repeatOnly === 'true',
+      }),
+    );
   });
 }
 

@@ -6,6 +6,13 @@
  *     体重记录、微信步数、通知与其已读记录、登录日志、订阅授权与推送日志、活动参与记录
  *   - **保留支付订单**（xpayorders）：涉及退款/对账/审计，按合规要求留存；订单里不删 userId，
  *     后台仍能看到「谁付过」，但用户已无法登录
+ *   - **删除 OSS 照片文件**（2026-11-17 补）：轨迹打点照片与足迹照片随注销一并删除。
+ *     原实现只 deleteMany 删了数据库行，文件永久留在 OSS（URL 仍可签名访问、继续占空间），
+ *     与「注销＝清干净」的承诺不符，也与单条轨迹删除（deleteActivity 会删文件）不一致。
+ *   - **保留榜奖台账**（BoardSettlement，2026-11-17 补口径）：与支付订单同性质的钱账留痕，
+ *     后台台账仍能看到「谁拿过这期的榜奖」。代价：该用户的积分流水已删，
+ *     `revokeBoardSettlement` 会因「原流水已不存在」拒单 → **已注销用户的榜奖只能人工对账，不能自动撤回**。
+ *     这不是漏删，是有意保留（台账页 listBoardSettlements 已按「缺文档＝删号」容错显示）。
  *   - **删除用户本身**：openid 一并清掉 → 同一微信再次进入小程序是**全新账号**，
  *     不继承任何历史（这正是「注销」的语义；软删除会让用户以为没清干净）
  *
@@ -41,6 +48,7 @@ import { LoginLogModel } from '../models/login-log.model.js';
 import { CampaignMemberModel } from '../models/campaign-member.model.js';
 import { SubscribeGrantModel } from '../models/subscribe-grant.model.js';
 import { SubscribeMessageLogModel } from '../models/subscribe-message-log.model.js';
+import { deleteOssObjects } from './oss.js';
 import { AppError } from '../utils/app-error.js';
 
 /** 确认词：昵称为空时用户需输入的字样 */
@@ -69,6 +77,28 @@ export function assertConfirmWord(input: unknown, nickname: string): void {
   }
 }
 
+/**
+ * 收集该用户名下所有 OSS 照片 URL（轨迹打点 + 足迹记录），去重非空。
+ * 必须在删除数据库行之前调用。
+ */
+async function collectPhotoUrls(filter: { userId: mongoose.Types.ObjectId }): Promise<string[]> {
+  const [acts, fps] = await Promise.all([
+    ActivityModel.find(filter).select({ markers: 1 }).lean(),
+    FootprintRecordModel.find(filter).select({ photos: 1 }).lean(),
+  ]);
+  const urls: string[] = [];
+  for (const a of acts as Array<{ markers?: Array<{ photoUrl?: string; photos?: string[] }> }>) {
+    for (const m of a.markers ?? []) {
+      if (m.photoUrl) urls.push(m.photoUrl);
+      for (const u of m.photos ?? []) if (u) urls.push(u);
+    }
+  }
+  for (const f of fps as Array<{ photos?: string[] }>) {
+    for (const u of f.photos ?? []) if (u) urls.push(u);
+  }
+  return [...new Set(urls)];
+}
+
 /** 各集合的清理结果（返回给日志/测试，不返回给前端） */
 export interface PurgeStats {
   activity: number;
@@ -85,6 +115,8 @@ export interface PurgeStats {
   campaignMember: number;
   subscribeGrant: number;
   subscribeMessageLog: number;
+  /** 删除的 OSS 照片文件数（轨迹打点 + 足迹） */
+  ossPhotos: number;
 }
 
 /**
@@ -96,7 +128,14 @@ export interface PurgeStats {
  * ⚠️ 不可恢复。调用方必须已做完身份与确认词校验。
  * 支付订单（xpayorder）**不删**，理由见文件头。
  */
-export async function purgeUser(userId: string): Promise<PurgeStats> {
+/** 可注入的副作用（测试用；生产用默认实现） */
+export interface PurgeDeps {
+  /** 删除 OSS 文件；默认走 services/oss 的 deleteOssObjects */
+  deleteOss?: (urls: string[]) => Promise<void>;
+}
+
+export async function purgeUser(userId: string, opts: { deps?: PurgeDeps } = {}): Promise<PurgeStats> {
+  const removeOss = opts.deps?.deleteOss ?? deleteOssObjects;
   if (!mongoose.Types.ObjectId.isValid(userId)) {
     throw new AppError(400, '用户 ID 非法');
   }
@@ -105,7 +144,7 @@ export async function purgeUser(userId: string): Promise<PurgeStats> {
   const stats: PurgeStats = {
     activity: 0, plan: 0, planPeriod: 0, point: 0, footprint: 0, weight: 0,
     werunDay: 0, notification: 0, notificationRead: 0, loginLog: 0,
-    campaignMember: 0, subscribeGrant: 0, subscribeMessageLog: 0,
+    campaignMember: 0, subscribeGrant: 0, subscribeMessageLog: 0, ossPhotos: 0,
   };
 
   /*
@@ -124,6 +163,12 @@ export async function purgeUser(userId: string): Promise<PurgeStats> {
     const r = await model.deleteMany(filter);
     stats[key] = r.deletedCount ?? 0;
   };
+
+  /*
+   * OSS 照片必须在 deleteMany **之前**收集（删完就读不到 URL 了）。
+   * 与 deleteActivity 同一套口径：轨迹打点 photoUrl/photos + 足迹 photos。
+   */
+  const photoUrls = await collectPhotoUrls(filter);
 
   // 业务数据（按依赖顺序：先明细后主干）
   await run(ActivityModel, 'activity');
@@ -147,6 +192,20 @@ export async function purgeUser(userId: string): Promise<PurgeStats> {
   await run(CampaignMemberModel, 'campaignMember');
   await run(SubscribeGrantModel, 'subscribeGrant');
   await run(SubscribeMessageLogModel, 'subscribeMessageLog');
+
+  /*
+   * 清理 OSS 文件：放在删 DB 之后、删用户之前，失败只记日志不上抛
+   * （与 deleteActivity 同取向：文件清理失败不该让注销半途失败；
+   *  此时用户还在 → 重试注销可以补齐，但已删的 DB 行读不到 URL，故 URL 已在上面收集好）。
+   */
+  if (photoUrls.length > 0) {
+    try {
+      await removeOss(photoUrls);
+      stats.ossPhotos = photoUrls.length;
+    } catch (err) {
+      console.error('[oss] 注销时清理照片失败（账号仍会被删除）:', (err as Error).message);
+    }
+  }
 
   // 最后删账号本身（openid 一并清掉 → 再次进入是全新账号）
   await UserModel.deleteOne({ _id: uid });

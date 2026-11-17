@@ -12,6 +12,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import mongoose from 'mongoose';
+import jwt from 'jsonwebtoken';
 import { config } from 'dotenv';
 config({ path: '.env.local', quiet: true });
 
@@ -21,9 +22,14 @@ import { ActivityModel } from '../src/models/activity.model.js';
 import { PointAccountModel, PointRecordModel } from '../src/models/point.model.js';
 import { XpayOrderModel } from '../src/models/xpay-order.model.js';
 import { NotificationModel } from '../src/models/notification.model.js';
+import { FootprintRecordModel } from '../src/models/footprint-record.model.js';
 import { confirmWordMatches, purgeUser } from '../src/services/account-deletion.js';
+import { hashOpenid } from '../src/services/account-audit.js';
+import { AccountDeletionModel } from '../src/models/account-deletion.model.js';
 
 const OPENID = 'acct-del-fixed';
+/** 测试照片的假 OSS 前缀（cleanup 按它清理；不真的访问网络） */
+const OSS_BASE = 'https://oss-test.example.com/acct-del';
 let app: any;
 
 before(async () => {
@@ -42,6 +48,7 @@ async function cleanup() {
   if (u) {
     await Promise.all([
       ActivityModel.deleteMany({ userId: u._id }),
+      FootprintRecordModel.deleteMany({ userId: u._id }),
       PointAccountModel.deleteMany({ userId: u._id }),
       PointRecordModel.deleteMany({ userId: u._id }),
       XpayOrderModel.deleteMany({ userId: u._id }),
@@ -50,6 +57,8 @@ async function cleanup() {
     await UserModel.deleteOne({ _id: u._id });
   }
   await UserModel.deleteMany({ openid: OPENID });
+  // 留痕按 openid 哈希精确清理（共享 dev 库，禁止裸 deleteMany）
+  await AccountDeletionModel.deleteMany({ openidHash: hashOpenid(OPENID) });
 }
 
 /** 建一个有完整数据的测试用户 */
@@ -68,8 +77,18 @@ async function seed(nickname: string) {
   await ActivityModel.create({
     userId: u!._id, type: 'running', status: 'finished',
     startTime: Date.now() - 3600_000, endTime: Date.now(),
-    distance: 5000, duration: 1800, points: [], photos: [],
-  });
+    distance: 5000, duration: 1800, points: [],
+    markers: [{
+      id: 'm1', lat: 30, lng: 120, timestamp: Date.now(), type: 'checkpoint',
+      photoUrl: `${OSS_BASE}/track-first.jpg`,
+      photos: [`${OSS_BASE}/track-a.jpg`, `${OSS_BASE}/track-b.jpg`],
+    }],
+  } as any);
+  await FootprintRecordModel.create({
+    userId: u!._id, visitDate: '2026-11-17', title: '足迹', people: [], description: '',
+    location: { name: '测试点', latitude: 30, longitude: 120, province: '浙江省', city: '杭州市' },
+    photos: [`${OSS_BASE}/fp-a.jpg`],
+  } as any);
   await PointAccountModel.create({ userId: u!._id, balance: 100 });
   await PointRecordModel.create({
     userId: u!._id, type: 'signin', title: '签到', delta: 100, balanceAfter: 100,
@@ -203,4 +222,193 @@ test('AD8 可重入：对同一用户重复 purge 不报错，第二次全是 0'
   const second = await purgeUser(userId);
   assert.equal(second.activity, 0, '第二次没有可删的了');
   assert.equal(second.point, 0);
+});
+/* ── 2026-11-17 review 修复后的三条承诺 ─────────────────────────── */
+
+test('AD9 OSS 照片随注销删除：轨迹打点 + 足迹的照片 URL 全被收集并删除', async () => {
+  const { userId } = await seed('小明');
+  const seen: string[][] = [];
+  await purgeUser(userId, {
+    deps: { deleteOss: async (urls) => { seen.push(urls); } },
+  });
+
+  assert.equal(seen.length, 1, '应调用一次 OSS 删除');
+  const urls = seen[0];
+  assert.equal(urls.length, 4, `应收集到 4 个照片 URL，实际 ${urls.length}：${JSON.stringify(urls)}`);
+  for (const name of ['track-first.jpg', 'track-a.jpg', 'track-b.jpg', 'fp-a.jpg']) {
+    assert.ok(urls.some((u) => u.endsWith(name)), `应包含 ${name}`);
+  }
+  // 去重语义：同一个 URL 不该出现两次
+  assert.equal(new Set(urls).size, urls.length, 'URL 应去重');
+});
+
+test('AD10 OSS 清理失败不影响注销成功（只记日志）', async () => {
+  const { token, userId } = await seed('小明');
+  const original = console.error;
+  const logged: string[] = [];
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    // 走 HTTP 全链路：默认实现会真的调 OSS → 用不存在的地址/未配置都会抛，正好验证「失败不上抛」
+    const r = await app.inject({
+      method: 'POST', url: '/sport-track/api/users/me/deactivate',
+      headers: { authorization: `Bearer ${token}` }, payload: { confirm: '小明' },
+    });
+    assert.equal(r.statusCode, 200, `OSS 失败不该让注销失败：${r.body}`);
+  } finally {
+    console.error = original;
+  }
+  assert.equal(await UserModel.findById(userId), null, '账号仍必须被删除');
+});
+
+test('AD11 管理员账号不能自助注销（403/400 + 数据不动）', async () => {
+  const { token, userId } = await seed('管理员小明');
+  await UserModel.updateOne({ _id: userId }, { role: 'admin' });
+
+  const r = await app.inject({
+    method: 'POST', url: '/sport-track/api/users/me/deactivate',
+    headers: { authorization: `Bearer ${token}` }, payload: { confirm: '管理员小明' },
+  });
+  assert.equal(r.statusCode, 400, `管理员应被拦下：${r.body}`);
+  // 错误信封：{ code: <HTTP 状态>, data: <extra> } → 机器可读的错误码在 data.code
+  assert.equal(r.json().data?.code, 'ACCOUNT_PROTECTED');
+  assert.ok(await UserModel.findById(userId), '管理员账号必须还在');
+  assert.ok(await ActivityModel.countDocuments({ userId }) > 0, '管理员数据必须还在');
+});
+
+test('AD12 脏 token（userId 非 ObjectId / 用户已不存在）→ 401，不再是 500', async () => {
+  const { token } = await seed('小明');
+  // 1) 伪造 payload：userId 不是 ObjectId
+  const dirty = jwt.sign({ userId: 'not-an-id', type: 'access' }, process.env.JWT_SECRET!, { expiresIn: '5m' });
+  const r1 = await app.inject({
+    method: 'GET', url: '/sport-track/api/users/me', headers: { authorization: `Bearer ${dirty}` },
+  });
+  assert.equal(r1.statusCode, 401, `脏 userId 应 401：${r1.body}`);
+
+  // 2) 用户被删后，其（签名合法的）token 访问其它受保护接口也必须 401
+  const ghost = jwt.sign({ userId: '000000000000000000000000', type: 'access' }, process.env.JWT_SECRET!, { expiresIn: '5m' });
+  for (const url of ['/sport-track/api/plan/summary', '/sport-track/api/activities?page=1&pageSize=1', '/sport-track/api/points/items']) {
+    const r = await app.inject({ method: 'GET', url, headers: { authorization: `Bearer ${ghost}` } });
+    assert.equal(r.statusCode, 401, `${url} 应 401：${r.body}`);
+  }
+  assert.ok(token, '前置');
+});
+
+test('AD13 数据库故障不被吞成 401（否则端上「刷新失败 → 全局登出」会把全站踢下线）', async () => {
+  const { token } = await seed('小明');
+  const orig = UserModel.exists;
+  let boom = false;
+  (UserModel as unknown as { exists: unknown }).exists = async () => {
+    boom = true;
+    throw new Error('模拟 MongoDB 抖动');
+  };
+  let status = 0;
+  try {
+    const r = await app.inject({
+      method: 'GET', url: '/sport-track/api/users/me', headers: { authorization: `Bearer ${token}` },
+    });
+    status = r.statusCode;
+  } finally {
+    (UserModel as unknown as { exists: unknown }).exists = orig;
+  }
+  assert.ok(boom, '前置：应真的走到存在性校验');
+  assert.notEqual(status, 401, '数据库故障不能返回 401（会被端上当成未登录并触发全局登出）');
+  assert.ok(status >= 500, `应为 5xx，实际 ${status}`);
+});
+
+/* ── 注销留痕 + 防刷计数（2026-11-17）─────────────────────────── */
+
+test('AD14 注销写一条留痕：uid/openid 哈希/条数都对，且不存 openid 原文', async () => {
+  const { token, userId } = await seed('小明');
+  const u = await UserModel.findById(userId).lean();
+  const r = await app.inject({
+    method: 'POST', url: '/sport-track/api/users/me/deactivate',
+    headers: { authorization: `Bearer ${token}` }, payload: { confirm: '小明' },
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(r.json().data.seq, 1, '首次注销应是第 1 次');
+
+  const rec = await AccountDeletionModel.findOne({ userId }).lean();
+  assert.ok(rec, '必须写入留痕记录');
+  assert.equal(rec!.uid, Number(u!.uid), 'uid 要对上');
+  assert.equal(rec!.seq, 1);
+  assert.equal(rec!.openidHash, hashOpenid(OPENID));
+  assert.ok(!String(rec!.openidHash).includes(OPENID), '不能存 openid 原文');
+  assert.equal((rec!.stats as Record<string, number>).activity, 1, '留痕要记删了几条轨迹');
+  assert.equal((rec!.stats as Record<string, number>).ossPhotos, 4, '留痕要记删了几个照片文件');
+  assert.equal(await UserModel.findById(userId), null, '账号仍然被删除');
+});
+
+test('AD15 同一微信二次注销 → seq=2（防刷：注册-领奖-注销 反复会被计数）', async () => {
+  // 第一次注销
+  const first = await seed('小明');
+  await app.inject({
+    method: 'POST', url: '/sport-track/api/users/me/deactivate',
+    headers: { authorization: `Bearer ${first.token}` }, payload: { confirm: '小明' },
+  });
+  // 同一微信再登录 = 新账号，再注销
+  const again = await app.inject({
+    method: 'POST', url: '/sport-track/api/auth/login', payload: { code: `openid:${OPENID}` },
+  });
+  const token2 = again.json().data.accessToken;
+  const u2 = await UserModel.findOne({ openid: OPENID });
+  await UserModel.updateOne({ _id: u2!._id }, { nickname: '小明2' });
+  const second = await app.inject({
+    method: 'POST', url: '/sport-track/api/users/me/deactivate',
+    headers: { authorization: `Bearer ${token2}` }, payload: { confirm: '小明2' },
+  });
+  assert.equal(second.statusCode, 200, second.body);
+  assert.equal(second.json().data.seq, 2, '同一 openid 第二次注销应记 seq=2');
+
+  const all = await AccountDeletionModel.find({ openidHash: hashOpenid(OPENID) }).sort({ seq: 1 }).lean();
+  assert.equal(all.length, 2);
+  assert.deepEqual(all.map((x) => x.seq), [1, 2]);
+});
+
+test('AD16 管理端：未带管理员凭证 401；带上后可查列表与汇总', async () => {
+  // 造两条记录（同一 openid 两次 → 重复注销账号 1 个）
+  const first = await seed('小明');
+  await app.inject({
+    method: 'POST', url: '/sport-track/api/users/me/deactivate',
+    headers: { authorization: `Bearer ${first.token}` }, payload: { confirm: '小明' },
+  });
+  const again = await app.inject({ method: 'POST', url: '/sport-track/api/auth/login', payload: { code: `openid:${OPENID}` } });
+  const t2 = again.json().data.accessToken;
+  const u2 = await UserModel.findOne({ openid: OPENID });
+  await UserModel.updateOne({ _id: u2!._id }, { nickname: '小明2' });
+  await app.inject({
+    method: 'POST', url: '/sport-track/api/users/me/deactivate',
+    headers: { authorization: `Bearer ${t2}` }, payload: { confirm: '小明2' },
+  });
+
+  const noAuth = await app.inject({ method: 'GET', url: '/sport-track/api/admin/account-deletions' });
+  assert.equal(noAuth.statusCode, 401, '管理端接口必须拒绝普通/无凭证');
+
+  const login = await app.inject({ method: 'POST', url: '/sport-track/api/admin/login', payload: { username: 'admin', password: 'admin123456' } });
+  const adminToken = login.json().data.token;
+  const r = await app.inject({
+    method: 'GET', url: '/sport-track/api/admin/account-deletions',
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assert.equal(r.statusCode, 200, r.body);
+  const d = r.json().data;
+  assert.ok(d.total >= 2, `应有至少 2 条记录，实际 ${d.total}`);
+  assert.ok(d.items[0].seq >= 1);
+  assert.ok(d.summary.totalAll >= 2);
+  assert.ok(d.summary.uniqueAccounts >= 1);
+  assert.ok(d.summary.repeatAccounts >= 1, '同一 openid 两次注销 → 重复注销账号数 ≥1');
+  assert.ok(typeof d.summary.last7Days === 'number');
+
+  // 仅看重复注销
+  const rep = await app.inject({
+    method: 'GET', url: '/sport-track/api/admin/account-deletions?repeatOnly=1',
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  assert.equal(rep.statusCode, 200);
+  const rows = rep.json().data.items as Array<{ openidHash: string }>;
+  // 不能断言「只有我的账号」——开发库里有历史注销记录（含手工测试留下的），
+  // 只要求我的账号出现在重复注销列表里即可（接口本身按 hash 聚合，不会串号）
+  assert.ok(
+    rows.some((x) => x.openidHash === hashOpenid(OPENID)),
+    `重复注销列表应包含本次测试账号，实际 ${rows.length} 条`,
+  );
 });

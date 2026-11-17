@@ -39,7 +39,7 @@ function emptyInput(): RankInput {
   return { days: [], typeDays: {}, dailyRows: [], periodRows: [] };
 }
 
-test('TR1 破纪录：第 N 次刷新的那天解除，100 档取第 100 天', () => {
+test('TR1 连续第 N 天解锁 100 档；新纪录系列已下线不再产出解锁日（2026-11-17）', () => {
   const days: RankDailyRow[] = [];
   for (let i = 1; i <= 120; i++) {
     const d = new Date(Date.UTC(2026, 0, 1) - 8 * 3600_000 + (i - 1) * 86_400_000);
@@ -48,10 +48,11 @@ test('TR1 破纪录：第 N 次刷新的那天解除，100 档取第 100 天', (
   }
   const r = unlockDatesOf({ ...emptyInput(), days });
   const d100 = new Date(Date.UTC(2026, 0, 100) - 8 * 3600_000 + 8 * 3600_000).toISOString().slice(0, 10);
-  assert.equal(r['rec-dist-100'], d100);
-  assert.equal(r['rec-dur-100'], d100);
   assert.equal(r['streak-100'], d100, '第 100 天连续 100 天');
-  assert.equal(r['rec-dist-365'], undefined, '只有 120 次破纪录，365 档未解锁');
+  assert.equal(r['streak-365'], undefined, '只有 120 天，365 档未解锁');
+  // 「新纪录」整组下线：即使天天破纪录，也不再产出任何 rec-* 解锁日
+  assert.equal(r['rec-dist-100'], undefined, 'rec-dist-100 已删除');
+  assert.equal(r['rec-dur-100'], undefined, 'rec-dur-100 已删除');
 });
 
 test('TR3 累计里程：跨过 100km 的那天（同日多笔累加）', () => {

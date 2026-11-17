@@ -23,7 +23,6 @@ export type BadgeCategory = 'plan' | 'data';
 /** 徽章分组：决定卡片上的分区标题与分区顺序 */
 export type BadgeGroup =
   | 'plan'            // 里程碑（原 8 个倍数里程碑，特殊：计数来自周期倍数）
-  | 'record'          // 新纪录
   | 'streak'          // 最坚持
   | 'rings'           // 合上圆环
   | 'total-distance'  // 累计里程
@@ -195,7 +194,6 @@ export const BADGE_GROUPS: ReadonlyArray<{
   { key: 'plan', title: '里程碑', category: 'plan' },
   { key: 'rings', title: '合上圆环', category: 'plan' },
   { key: 'week', title: '完美周', category: 'plan' },
-  { key: 'record', title: '新纪录', category: 'data' },
   { key: 'streak', title: '最坚持', category: 'data' },
   { key: 'total-distance', title: '累计里程', category: 'data' },
   { key: 'total-duration', title: '累计时长', category: 'data' },
@@ -234,32 +232,6 @@ export const MILESTONES: readonly MilestoneDef[] = [
 
 /** 徽章系列（每个 tiers 项展开成一座独立徽章） */
 export const BADGE_SERIES: readonly BadgeSeries[] = [
-  {
-    prefix: 'rec-dist',
-    group: 'record',
-    metric: 'breaksDistance',
-    earnKind: 'nthBreak',
-    tiers: BADGE_TIERS.count,
-    icon: '📏',
-    shortLabel: '距离纪录',
-    shape: 'dist',
-    label: (t) => `新距离记录·${t}次`,
-    desc: (t) => `刷新单日运动距离纪录 ${t} 次（纪录指自然日运动距离合计的历史新高）`,
-    detail: { earned: '已刷新距离纪录 {cur} 次', locked: '还差 {remain} 次刷新距离纪录' },
-  },
-  {
-    prefix: 'rec-dur',
-    group: 'record',
-    metric: 'breaksDuration',
-    earnKind: 'nthBreak',
-    tiers: BADGE_TIERS.count,
-    icon: '⏱️',
-    shortLabel: '时长纪录',
-    shape: 'dur',
-    label: (t) => `新时长记录·${t}次`,
-    desc: (t) => `刷新单日运动时长纪录 ${t} 次`,
-    detail: { earned: '已刷新时长纪录 {cur} 次', locked: '还差 {remain} 次刷新时长纪录' },
-  },
   {
     prefix: 'streak',
     group: 'streak',

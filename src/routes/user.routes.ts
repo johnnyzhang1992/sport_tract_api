@@ -5,6 +5,7 @@ import { checkImage, checkText } from '../services/wechat-sec.js';
 import { getAvatarUrl } from '../services/oss.js';
 import { UpdateMeSchema } from '../utils/validators.js';
 import { assertConfirmWord, purgeUser, EMPTY_NICKNAME_CONFIRM_WORD } from '../services/account-deletion.js';
+import { recordAccountDeletion } from '../services/account-audit.js';
 import { success } from '../utils/response.js';
 import { AppError } from '../utils/app-error.js';
 
@@ -169,13 +170,54 @@ export async function userRoutes(fastify: FastifyInstance) {
     const user = await UserModel.findById(userId);
     if (!user) throw new AppError(404, '用户不存在');
 
+    /*
+     * 特殊账号保护（2026-11-17）：站内管理员不能自助注销。
+     * 理由：管理员账号绑着运营排障与每日数据统计通知（role='admin' 才收），
+     * 一键删号后数据不可恢复、也没法从后台重建（admins 后台账号与用户账号是两套，
+     * 但 uid 会永久空号）。要注销管理员账号请运维在库里处理。
+     */
+    if (user.role === 'admin') {
+      throw new AppError(400, '管理员账号不能自助注销，请联系运维处理', { code: 'ACCOUNT_PROTECTED' });
+    }
+
     const body = (request.body ?? {}) as { confirm?: unknown };
     // 校验放在删除之前：不匹配直接 400，绝不进入删除流程
     assertConfirmWord(body.confirm, user.nickname);
 
+    /*
+     * 注销前先把留痕要用的字段抓下来（purge 之后 users 文档就没了）。
+     * openid 只用于算哈希，落库的是 HMAC —— 见 services/account-audit.ts。
+     */
+    const snapshot = {
+      userId,
+      uid: Number(user.uid ?? 0),
+      openid: String(user.openid ?? ''),
+      nickname: String(user.nickname ?? ''),
+      createdAt: Number((user as unknown as { createdAt?: Date }).createdAt?.getTime?.() ?? 0),
+      ip: request.ip,
+      platform: String((request.headers['x-platform'] as string) ?? ''),
+      system: String((request.headers['x-system'] as string) ?? ''),
+      appVersion: String((request.headers['x-app-version'] as string) ?? ''),
+    };
+
     const stats = await purgeUser(userId);
     // 只记条数，不记明细内容（避免日志里留个人数据）
     request.log.info({ userId, ...stats }, '[users] 账号已注销');
-    return reply.send(success({ deleted: true }));
+
+    /*
+     * 审计留痕 + 防刷计数：账号已删，但这张表只追加、不随用户删除。
+     * 写失败**不能让注销失败**（用户数据已经删了，再回 500 只会让人以为没注销成功、反复重试）；
+     * 记 error 日志，由运维补录——留痕是运维诉求，注销是用户权利，后者优先。
+     */
+    let deletionSeq = 0;
+    try {
+      const rec = await recordAccountDeletion({ ...snapshot, stats });
+      deletionSeq = rec.seq;
+      request.log.info({ userId, seq: rec.seq }, '[users] 注销留痕已写入');
+    } catch (err) {
+      request.log.error({ userId, err: (err as Error).message }, '[users] 注销留痕写入失败（不影响注销结果）');
+    }
+
+    return reply.send(success({ deleted: true, seq: deletionSeq }));
   });
 }

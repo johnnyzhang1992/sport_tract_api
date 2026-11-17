@@ -67,13 +67,13 @@ test('BC4 数量 = 各系列档位之和 + 里程碑数（改 tiers 自动生效
     return acc + s.tiers.length;
   }, 0) + MILESTONES.length;
   assert.equal(BADGE_DEFS.length + MILESTONES.length, expected);
-  // 当前配置（2026-11-16）：
-  //   新纪录 2×4 + 最坚持 4 + 合环 4（三类都去掉 2000）+ 累计里程 6 + 累计时长 6 + 完美周 4 = 32
+  // 当前配置（2026-11-17，去掉「新纪录」整组）：
+  //   最坚持 4 + 合环 4 + 累计里程 6 + 累计时长 6 + 完美周 4 = 24
   //   分运动类型 5 类型 × (距离 6 + 时长 4 + 次数 6 = 16) = 80
-  //   → 系列共 112；+ 7 座里程碑 = 119
-  assert.equal(BADGE_DEFS.length, 112, '系列展开数应为 112');
+  //   → 系列共 104；+ 7 座里程碑 = 111
+  assert.equal(BADGE_DEFS.length, 104, '系列展开数应为 104');
   assert.equal(MILESTONES.length, 7, '里程碑应为 7 座');
-  assert.equal(expected, 119, '总计应为 119 座');
+  assert.equal(expected, 111, '总计应为 111 座');
 });
 
 test('BC5 每座徽章都能找到所属系列（含完美周显式 key）', () => {
@@ -181,12 +181,18 @@ test('BC12 minRatioOf：目标为 0 的项不参与（未设项不算拖后腿�
   );
   assert.equal(minRatioOf({ distanceM: 1, durationSec: 1, count: 1 }, { distanceM: 0, durationMin: 0, count: 0 }), 0);
 });
-test('BC13 次数类三类（新纪录/最坚持/合环）都去掉 2000 档，统一为 4 档', () => {
-  for (const group of ['record', 'streak', 'rings']) {
+test('BC13 次数类（最坚持/合环）统一为 4 档；新纪录整组已下线（2026-11-17）', () => {
+  for (const group of ['streak', 'rings']) {
     const tiers = BADGE_DEFS.filter((d) => d.group === group).map((d) => d.tier).sort((a, b) => a - b);
     assert.deepEqual([...new Set(tiers)], [100, 365, 500, 1000], `${group} 应为 100/365/500/1000`);
   }
-  for (const key of ['rec-dist-2000', 'rec-dur-2000', 'streak-2000', 'ring-2000']) {
+  for (const key of ['streak-2000', 'ring-2000']) {
+    assert.equal(BADGE_DEFS.find((d) => d.key === key), undefined, `${key} 不应再出现`);
+  }
+  // 「新纪录」整组下线（距离纪录/时长纪录各 4 档）
+  assert.equal(BADGE_GROUPS.find((g) => (g.key as string) === 'record'), undefined, 'record 分组应已删除');
+  assert.equal(BADGE_DEFS.filter((d) => (d.group as string) === 'record').length, 0, '不应再有 record 徽章');
+  for (const key of ['rec-dist-100', 'rec-dur-100']) {
     assert.equal(BADGE_DEFS.find((d) => d.key === key), undefined, `${key} 不应再出现`);
   }
   // 累计类仍然保留 2000/5000/10000（没有「每天一次」的约束）
