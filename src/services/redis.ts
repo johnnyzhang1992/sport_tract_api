@@ -41,9 +41,15 @@ let retryAt = 0;
 /** 连续失败只告警一次，避免日志被重连刷屏 */
 let warnedDown = false;
 
-/** 当前是否该走 Redis：降级冷却到期后做半开探测 */
+/**
+ * 当前是否该走 Redis。
+ * - 连接**未就绪**（wait/connecting/connect/reconnecting）→ 直接用内存，**不算降级也不进冷却**：
+ *   否则冷启动瞬间发命令会撞 `Stream isn't writeable and enableOfflineQueue options is false`
+ *   （ioredis 在 enableOfflineQueue:false 下对未连接的命令直接抛错），白降级 10 秒。
+ * - 已就绪但处于降级冷却期 → 到期做一次半开探测。
+ */
 function useRedis(): boolean {
-  if (!client) return false;
+  if (!client || client.status !== 'ready') return false;
   if (backend === 'redis') return true;
   if (Date.now() < retryAt) return false;
   backend = 'redis'; // 半开：放这一条命令过去试
