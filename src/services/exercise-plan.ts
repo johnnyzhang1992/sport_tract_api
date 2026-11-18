@@ -1599,6 +1599,93 @@ export function __resetBadgeCountCache(): void {
   badgeCountCache.clear();
 }
 
+/* ==================== 区间计划报告（年报 / 运动报告页共用，2026-11-19） ==================== */
+
+/** 徽章解锁日期是 YYYY-MM-DD 字符串，字典序即时间序，可直接做区间比较 */
+const EARN_DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+export interface PlanRangeReportResult {
+  plan: {
+    /** 区间内有计划快照的天数（有计划的日子） */
+    snapshotDays: number;
+    /** 区间内三项全达成的天数（合上圆环口径） */
+    achievedDays: number;
+    /** 达成率（百分比；区间内无快照为 0） */
+    achievedRate: number;
+    /** 区间内最长连续全达成天数（连续自然日） */
+    bestStreak: number;
+    /** 区间内计划期完成的累计距离（公里，快照 progress 求和） */
+    planDistanceKm: number;
+  };
+  badges: {
+    /** 区间内首次解锁的徽章数（按徽章首次获取日期） */
+    unlockedInRange: number;
+    /** 累计已解锁（全历史口径，年报里展示「累计 M/T」用） */
+    unlockedTotal: number;
+    /** 徽章总数 */
+    total: number;
+  };
+}
+
+/**
+ * 区间运动计划报告：[from, to) 内的 daily 快照达成统计 + 区间内新解锁徽章数。
+ * 徽章口径走 getPlanSummary 的 trophies（earnDateText = 首次获取日期），区间外不重复计。
+ */
+export async function planRangeReport(
+  userId: string,
+  fromMs: number,
+  toMs: number,
+): Promise<PlanRangeReportResult> {
+  if (!Types.ObjectId.isValid(userId)) throw new AppError(401, '请先登录');
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) {
+    throw new AppError(400, '时间区间不合法');
+  }
+  const fromKey = bjDateStr(fromMs);
+  const toKey = bjDateStr(toMs - 1); // to 为开区间，取前一秒所在的自然日
+  const snaps = await ExercisePlanPeriodModel.find({
+    userId: new Types.ObjectId(userId),
+    period: 'daily',
+    periodKey: { $gte: fromKey, $lte: toKey, $regex: EARN_DATE_KEY_RE.source },
+  })
+    .select({ windowStart: 1, allAchieved: 1, progress: 1 })
+    .sort({ windowStart: 1 })
+    .lean();
+  const achievedDays = snaps.filter((s) => s.allAchieved).length;
+  const planDistanceM = snaps.reduce((acc, s) => acc + (s.progress?.distanceM || 0), 0);
+  let bestStreak = 0;
+  let run = 0;
+  let prev = 0;
+  for (const s of snaps) {
+    if (!s.allAchieved) {
+      run = 0;
+      prev = 0;
+      continue;
+    }
+    run = prev > 0 && s.windowStart - prev === 86_400_000 ? run + 1 : 1;
+    prev = s.windowStart;
+    if (run > bestStreak) bestStreak = run;
+  }
+  const sum = await getPlanSummary(userId);
+  const unlockedTotal = sum.trophies.filter((t) => t.unlocked).length;
+  const unlockedInRange = sum.trophies.filter(
+    (t) => t.unlocked && t.earnDateText >= fromKey && t.earnDateText <= toKey,
+  ).length;
+  return {
+    plan: {
+      snapshotDays: snaps.length,
+      achievedDays,
+      achievedRate: snaps.length ? Math.round((achievedDays / snaps.length) * 100) : 0,
+      bestStreak,
+      planDistanceKm: Math.round(planDistanceM / 100) / 10,
+    },
+    badges: {
+      unlockedInRange,
+      unlockedTotal,
+      total: sum.trophies.length,
+    },
+  };
+}
+
 /** 记录与坚持：破纪录次数/当前纪录+日期/最长连续+结束日期/当前连续 */
 export function computeRecordStats(days: DailyTotalsRow[]): PlanRecords & { breaksDistance: number; breaksDuration: number } {
   let bestDist = 0;

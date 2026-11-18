@@ -3,10 +3,17 @@ import type { FastifyInstance } from 'fastify';
 import {
   getPlanWithProgress, upsertPlan, listPlanHistory, finalizePreviousPeriod,
   listPlanCalendar, getPlanDayDetail, getPlanSummary, getBadgeOverview, getBadgeCounts,
+  planRangeReport,
 } from '../services/exercise-plan.js';
 import { success } from '../utils/response.js';
 
 export async function planRoutes(fastify: FastifyInstance) {
+  // 区间计划报告（年报 / 运动报告页共用）：区间内计划达成 + 新解锁徽章
+  fastify.get('/report', { onRequest: [fastify.authenticate] }, async (request) => {
+    const q = request.query as { from?: string; to?: string };
+    return success(await planRangeReport(request.user.userId, Number(q.from), Number(q.to)));
+  });
+
   fastify.get('/current', { onRequest: [fastify.authenticate] }, async (request) => {
     const userId = request.user.userId;
     // 顺带补上一周期快照（fire-and-forget）：活跃用户即使错过定时任务，历史也不缺档

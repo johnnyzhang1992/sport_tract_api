@@ -1,4 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import fs from 'node:fs';
+import pino from 'pino';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import mongoose from 'mongoose';
@@ -39,6 +41,27 @@ export interface BuildAppOptions {
   logger?: boolean;
 }
 
+/**
+ * 生产日志（2026-11-19）：双写 stdout + 宿主机文件。
+ * compose 把 /app/logs 挂到宿主机 ./logs/sport-track-api，容器 force-recreate 不丢，
+ * 排障场景（查「昨天的登录失败」）不再依赖 docker logs 的存活期。
+ * 用 pino.multistream（fastify 的 logger 选项不接受 streams 数组，需给完整 pino 实例）。
+ * 文件句柄进程退出由 pino final 兜底；单文件不切分，宿主机磁盘 32G 空闲，增长可控（JSON 行 ~几KB/请求）。
+ */
+function productionLogger() {
+  const { multistream } = pino;
+  // 目录缺失时（本地模拟生产 / compose 挂载失败）先建，否则 createWriteStream 直接抛错进程起不来
+  fs.mkdirSync('/app/logs', { recursive: true });
+  const dest = fs.createWriteStream('/app/logs/app.log', { flags: 'a' });
+  return pino(
+    { level: 'info' },
+    multistream([
+      { level: 'info', stream: process.stdout },
+      { level: 'info', stream: dest },
+    ]),
+  );
+}
+
 /** 组装 Fastify 应用（插件 + 路由），供 server.ts 与测试共用 */
 export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInstance> {
   const fastify = Fastify({
@@ -49,7 +72,7 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
       opts.logger ??
       (config.isDev
         ? { transport: { target: 'pino-pretty' }, level: 'info' }
-        : true),
+        : productionLogger()),
   });
 
   // CORS：开发环境全放开；生产白名单（CORS_ORIGIN 支持逗号分隔多个，如 https://a.com,https://b.com）
