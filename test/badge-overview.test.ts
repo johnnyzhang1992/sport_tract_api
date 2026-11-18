@@ -449,9 +449,9 @@ test('BO15 「最坚持」文案：主行给「还要坚持几天」，历史最
     },
     {
       best: 10, current: 0, tier: 100, bestEndText: '2026-11-07',
-      wantMain: '最长连续纪录 10 天 · 还差 90 天',
-      wantLines: ['该纪录截至 2026-11-07'],
-      why: '完全中断：主行已报天数，附加行不重复',
+      wantMain: '再坚持 100 天解锁',
+      wantLines: ['历史最长 10 天 · 截至 2026-11-07'],
+      why: '完全中断：主行只讲还要几天，历史最长单独一行',
     },
     {
       best: 120, current: 5, tier: 100, bestEndText: '2026-11-14',
@@ -467,7 +467,7 @@ test('BO15 「最坚持」文案：主行给「还要坚持几天」，历史最
     },
     {
       best: 0, current: 0, tier: 365, bestEndText: '',
-      wantMain: '最长连续纪录 0 天 · 还差 365 天',
+      wantMain: '再坚持 365 天解锁',
       wantLines: [],
       why: '一次都没连续过：不硬造附加行',
     },
@@ -500,7 +500,7 @@ test('BO15b overview 里 streak 徽章不再出现占位符/歧义写法（数�
       assert.ok(!/\d{4}-\d{2}-\d{2} 结束/.test(text), `${t.key} 旧写法：${text}`);
     }
     // 未解锁必须有「还差 / 再坚持」这种差距提示
-    if (!t.unlocked) assert.match(t.detailText, /还差 \d+ 天|再坚持 \d+ 天/, `${t.key} 缺差距：${t.detailText}`);
+    if (!t.unlocked) assert.match(t.detailText, /再坚持 \d+ 天解锁/, `${t.key} 主行必须只讲「还要几天解锁」：${t.detailText}`);
     // 历史最长若出现在附加行，必须带主语（「历史最长」/「该纪录」）
     for (const line of t.detailLines || []) {
       assert.match(line, /^(历史最长|该纪录)/, `${t.key} 附加行缺主语：${line}`);

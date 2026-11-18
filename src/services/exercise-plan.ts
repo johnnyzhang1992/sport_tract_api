@@ -1746,8 +1746,14 @@ export function streakDetailText(p: { best: number; current: number; tier: numbe
   const now = Math.max(0, Math.floor(p.current));
   const tier = Math.max(1, Math.floor(p.tier));
   if (best >= tier) return `最长连续运动 ${best} 天`;
+  /*
+   * 未解锁时**主行只回答一个问题**：从今天起还要坚持几天才能解锁。
+   * 历史最长不在主行出现（它由 streakHistoryLines 单独一行给，顺带解释卡面进度条）——
+   * 2026-11-18 用户明确：一行塞「最长连续纪录 14 天 · 还差 351 天」太长，
+   * 而且会被读成「再连续 351 天」的混口径。
+   */
   if (now > 0) return `当前连续 ${now} 天 · 再坚持 ${Math.max(1, tier - now)} 天解锁`;
-  return `最长连续纪录 ${best} 天 · 还差 ${Math.max(0, tier - best)} 天`;
+  return `再坚持 ${tier} 天解锁`;
 }
 
 /**
@@ -1767,12 +1773,11 @@ export function streakHistoryLines(p: {
   const ongoingBest = p.current > 0 && p.current >= best;
   const when = ongoingBest ? '就是当前这段' : p.bestEndText ? `截至 ${p.bestEndText}` : '';
   /*
-   * 主行是否**已经报过这个天数**：已解锁（「最长连续运动 N 天」）与完全中断
-   * （「最长连续纪录 N 天」）都是；只有「正在连续」时主行讲的是当前这段，历史最长才需要带数字。
-   * 同一个数字出现两次会显得啰嗦，所以这里按状态切换「历史最长 N 天 · X」/「该纪录 X」。
+   * 已解锁时主行已经写了「最长连续运动 N 天」→ 这里只说哪段/哪天，避免同一数字出现两次。
+   * 未解锁时主行**只说还要几天**（不含历史最长）→ 这里必须带上数字，否则用户不知道
+   * 卡面那条进度条是什么意思（它是按历史最长算的）。
    */
-  const mainShowsNumber = p.unlocked || p.current === 0;
-  if (mainShowsNumber) return when ? [`该纪录${when}`] : [];
+  if (p.unlocked) return when ? [`该纪录${when}`] : [];
   return [`历史最长 ${best} 天${when ? ` · ${when}` : ''}`];
 }
 
