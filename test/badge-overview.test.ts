@@ -419,22 +419,30 @@ test('BO14 已解锁的次数类徽章不再播报「已完成 N 次」；累计
   }
 });
 
-test('BO15 「最坚持」文案不歧义：区分「历史最长纪录」与「当前连续」（2026-11-18 修）', async () => {
+test('BO15 「最坚持」文案按「正在连续 / 已中断」分流，且不歧义（2026-11-18）', async () => {
   const d = await overview();
   const t = d.trophies.find((x: any) => x.key === 'streak-365');
   assert.ok(t, '应有 streak-365');
 
-  // 未解锁时 detailText 必须点明是「最长连续纪录」的差距，
-  // 不能只写「还差 N 天连续运动」——那会被读成「还要再连续 N 天」
-  assert.match(t.detailText, /最长连续纪录 \d+ 天/, `应说明是历史最长纪录：${t.detailText}`);
-  assert.match(t.detailText, /还差 \d+ 天/, '仍应给出差距');
-  assert.ok(!/\{cur\}|\{remain\}|\{tier\}/.test(t.detailText), '不该残留占位符');
-
-  // 附加行：日期必须有主语（"该纪录截至"）
+  // 该账号的测试数据含「今天」，跨天跑时 current 可能为 0 也可能 >0，
+  // 所以两种分支都要认；关键是不许出现会引起误解的写法
   const lines = (t.detailLines || []).join(' | ');
-  assert.match(lines, /该纪录截至 \d{4}-\d{2}-\d{2}/, `日期行缺主语：${lines}`);
-  // 不应再出现原来那种没主语的「2026-11-14 结束」
+  // overview 不返回 records，按文案本身判断走的是哪条分支
+  const ongoing = /当前连续 \d+ 天 · 再坚持/.test(t.detailText);
+
+  if (ongoing) {
+    // 正在连续：必须告诉用户「现在连续几天」和「还要几天」
+    assert.match(t.detailText, /当前连续 \d+ 天 \u00b7 再坚持 \d+ 天解锁/, `缺当前连续/还差几天：${t.detailText}`);
+    // 主行已说过当前连续，附加行不该再重复一遍
+    assert.ok(!/当前连续 \d+ 天/.test(lines) || /已刷新|最长/.test(lines), `附加行重复了当前连续：${lines}`);
+  } else {
+    assert.match(t.detailText, /最长连续纪录 \d+ 天/, `应说明是历史最长纪录：${t.detailText}`);
+    assert.match(t.detailText, /还差 \d+ 天/, '仍应给出差距');
+    assert.match(lines, /最长那段截至 \d{4}-\d{2}-\d{2}/, `日期行缺主语：${lines}`);
+  }
+
+  // 通用：不许残留占位符 / 旧的没主语写法 / 多余的失败宣告
+  assert.ok(!/\{cur\}|\{remain\}|\{tier\}/.test(t.detailText), '不该残留占位符');
   assert.ok(!/\d{4}-\d{2}-\d{2} 结束/.test(lines), '旧的「日期 结束」写法应已替换');
-  // 连续中断时不额外宣告（2026-11-18 产品要求去掉该句）
   assert.ok(!lines.includes('当前连续已中断'), `中断态不该多一句话：${lines}`);
 });

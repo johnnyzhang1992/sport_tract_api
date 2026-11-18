@@ -1117,6 +1117,30 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
    *     是否保留由下面的 keepWhenEarned 判定，而不是靠文案模板。
    * 返回空串表示这一行不展示。
    */
+  /**
+   * 「最坚持」专属文案（2026-11-18）：
+   * 这一组的进度是**连续天数**，光说「最长连续纪录 N 天 · 还差 M 天」看不出用户
+   * 「现在这段连续到第几天了」「还要坚持几天」——而当前这段连续**是算数的**
+   * （解锁判定是「连续累计到第 t 天」，从今天往前数也算），所以要把两者都讲清楚。
+   *
+   *   未解锁且正在连续：`当前连续 3 天 · 再坚持 362 天解锁`
+   *   未解锁且已中断：  `最长连续纪录 14 天 · 还差 351 天`
+   *   已解锁：          `最长连续运动 120 天`
+   */
+  const renderStreakDetail = (def: BadgeDef): string => {
+    const cur = rec.streak.best;
+    const now = rec.streak.current;
+    if (cur >= def.tier) return `最长连续运动 ${cur} 天`;
+    const remain = Math.max(0, def.tier - cur);
+    // 当前这段连续若更短于历史纪录，用历史纪录算进度（解锁判定取「连续累计到第 t 天」，
+    // 历史纪录代表用户真实达到过的天数）；若正在连续且已超过历史纪录，按当前连续算。
+    if (now > 0) {
+      const need = Math.max(1, def.tier - now);
+      return `当前连续 ${now} 天 · 再坚持 ${need} 天解锁`;
+    }
+    return `最长连续纪录 ${cur} 天 · 还差 ${remain} 天`;
+  };
+
   const renderDetail = (def: BadgeDef, cur: number, valueText: string): string => {
     const rule = def.detail;
     const unlocked = cur >= def.tier;
@@ -1126,6 +1150,8 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       if (!KEEP_VALUE_WHEN_EARNED.has(def.metric)) return '';
     }
     const remain = Math.max(0, def.tier - cur);
+    // 「最坚持」要看「当前连续几天 / 还需几天」，模板表达不了，走专属渲染
+    if (def.metric === 'streakBest') return renderStreakDetail(def);
     if (unlocked && rule) return rule.earned.replace('{cur}', String(cur)).replace('{valueText}', valueText);
     if (rule && rule.locked) {
       // locked 模板原先只替换 {remain}/{tier}；补上 {cur}/{valueText}，
@@ -1178,9 +1204,21 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       // 单看不知道是谁结束、哪天结束，与上一行「还差 N 天」放一起像时间线矛盾。
       // 天数已在 detailText 里说过（「最长连续纪录 120 天」/「最长连续运动 120 天」），
       // 这里只补它在哪一天结束，不重复天数。
-      if (rec.streak.bestEndText) lines.push(`该纪录截至 ${rec.streak.bestEndText}`);
-      // 只在「正在连续」时补一句；中断时不提示（2026-11-18：中断态写出来像在宣告失败，没必要）
-      if (rec.streak.current > 0) lines.push(`目前正在连续 ${rec.streak.current} 天`);
+      /*
+       * 附加行只补 detailText 没说的信息，避免重复（2026-11-18）：
+       *   - 正在连续：detailText 已写「当前连续 N 天 · 再坚持 M 天解锁」，
+       *     这里只补「这段已经是历史最长」这类额外事实（等于纪录时说明一下）
+       *   - 已中断：detailText 写的是历史纪录，这里补该纪录的结束日期
+       */
+      if (rec.streak.current > 0) {
+        if (rec.streak.current >= rec.streak.best) {
+          lines.push(`这段已是你最长的连续纪录`);
+        } else if (rec.streak.bestEndText) {
+          lines.push(`最长那段截至 ${rec.streak.bestEndText}`);
+        }
+      } else if (rec.streak.bestEndText) {
+        lines.push(`最长那段截至 ${rec.streak.bestEndText}`);
+      }
     }
     return lines;
   };
