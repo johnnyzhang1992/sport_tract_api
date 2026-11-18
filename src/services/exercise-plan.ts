@@ -1127,7 +1127,15 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     }
     const remain = Math.max(0, def.tier - cur);
     if (unlocked && rule) return rule.earned.replace('{cur}', String(cur)).replace('{valueText}', valueText);
-    if (rule && rule.locked) return rule.locked.replace('{remain}', String(remain)).replace('{tier}', String(def.tier));
+    if (rule && rule.locked) {
+      // locked 模板原先只替换 {remain}/{tier}；补上 {cur}/{valueText}，
+      // 否则像 streak 的「最长连续纪录 {cur} 天」会原样露出占位符（2026-11-18）
+      return rule.locked
+        .replace('{cur}', String(cur))
+        .replace('{remain}', String(remain))
+        .replace('{tier}', String(def.tier))
+        .replace('{valueText}', valueText);
+    }
     return unlocked ? '' : `已达成 ${cur} 次 · 目标 ${def.tier} 次`;
   };
 
@@ -1166,8 +1174,13 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     const lines: string[] = [];
     if (!def) return lines;
     if (def.metric === 'streakBest') {
-      if (rec.streak.bestEndText) lines.push(`${rec.streak.bestEndText} 结束`);
-      lines.push(`目前连续 ${rec.streak.current} 天`);
+      // 明确主语与「这是历史最长」（2026-11-18）：原来写「2026-11-14 结束」「目前连续 0 天」，
+      // 单看不知道是谁结束、哪天结束，与上一行「还差 N 天」放一起像时间线矛盾。
+      // 天数已在 detailText 里说过（「最长连续纪录 120 天」/「最长连续运动 120 天」），
+      // 这里只补它在哪一天结束，不重复天数。
+      if (rec.streak.bestEndText) lines.push(`该纪录截至 ${rec.streak.bestEndText}`);
+      // 只在「正在连续」时补一句；中断时不提示（2026-11-18：中断态写出来像在宣告失败，没必要）
+      if (rec.streak.current > 0) lines.push(`目前正在连续 ${rec.streak.current} 天`);
     }
     return lines;
   };

@@ -418,3 +418,23 @@ test('BO14 已解锁的次数类徽章不再播报「已完成 N 次」；累计
     assert.ok(lines(t).length > 0, `${t.key} 未解锁应展示进度（还差多少）`);
   }
 });
+
+test('BO15 「最坚持」文案不歧义：区分「历史最长纪录」与「当前连续」（2026-11-18 修）', async () => {
+  const d = await overview();
+  const t = d.trophies.find((x: any) => x.key === 'streak-365');
+  assert.ok(t, '应有 streak-365');
+
+  // 未解锁时 detailText 必须点明是「最长连续纪录」的差距，
+  // 不能只写「还差 N 天连续运动」——那会被读成「还要再连续 N 天」
+  assert.match(t.detailText, /最长连续纪录 \d+ 天/, `应说明是历史最长纪录：${t.detailText}`);
+  assert.match(t.detailText, /还差 \d+ 天/, '仍应给出差距');
+  assert.ok(!/\{cur\}|\{remain\}|\{tier\}/.test(t.detailText), '不该残留占位符');
+
+  // 附加行：日期必须有主语（"该纪录截至"）
+  const lines = (t.detailLines || []).join(' | ');
+  assert.match(lines, /该纪录截至 \d{4}-\d{2}-\d{2}/, `日期行缺主语：${lines}`);
+  // 不应再出现原来那种没主语的「2026-11-14 结束」
+  assert.ok(!/\d{4}-\d{2}-\d{2} 结束/.test(lines), '旧的「日期 结束」写法应已替换');
+  // 连续中断时不额外宣告（2026-11-18 产品要求去掉该句）
+  assert.ok(!lines.includes('当前连续已中断'), `中断态不该多一句话：${lines}`);
+});

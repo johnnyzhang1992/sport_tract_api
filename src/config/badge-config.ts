@@ -239,7 +239,9 @@ export const BADGE_SERIES: readonly BadgeSeries[] = [
     shape: 'streak',
     label: (t) => `最坚持·连续${t}天`,
     desc: (t) => `连续 ${t} 天每天都有运动记录`,
-    detail: { earned: '最长连续运动 {cur} 天', locked: '还差 {remain} 天连续运动' },
+    // locked 用「最长连续纪录」表述：{remain} 是「历史最长连续天数」距该档的差距，
+    // 不是「还要再连续多少天」——两者完全不同，写错会让用户以为要从今天重新数（2026-11-18 修）
+    detail: { earned: '最长连续运动 {cur} 天', locked: '最长连续纪录 {cur} 天 · 还差 {remain} 天' },
   },
   {
     prefix: 'ring',
