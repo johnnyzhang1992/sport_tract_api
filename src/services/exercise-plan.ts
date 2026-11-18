@@ -1140,9 +1140,13 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
    */
   const milestoneProgressText = (m: { cur: number; need: number; tier: number; isRatio: boolean }): string => {
     if (!m.isRatio) return `已达成 ${m.cur} 次 · 目标 ${m.need} 次`;
-    // 注意：徽章 desc 已经说了「单周期完成倍数达到 N% 即可获得」，
-    // 这里再说一遍就重复了（详情半屏上下两行会一模一样）。所以只报**进度数字**。
-    return m.cur > 0 ? `已完成 ${m.cur} 次 · 再完成 ${Math.max(0, m.need - m.cur)} 次即可` : '还未达成过';
+    /*
+     * 倍率型（200%/300%/…完成目标）：`need` 恒为 1（完成一次对应倍数即解锁），
+     * 所以这里只可能是「还没达成过」——`cur > 0` 时早已 unlocked，detailText 走空串，
+     * 「已完成 N 次」那条分支永远不可达，2026-11-18 删掉（留着会被误读成「再做 N 次运动」）。
+     * 规则本身（单周期达到 N% 即可获得）写在徽章 desc 里，不再重复。
+     */
+    return '还未达成过';
   };
 
   const renderDetail = (def: BadgeDef, cur: number, valueText: string): string => {

@@ -239,9 +239,13 @@ export const BADGE_SERIES: readonly BadgeSeries[] = [
     shape: 'streak',
     label: (t) => `最坚持·连续${t}天`,
     desc: (t) => `连续 ${t} 天每天都有运动记录`,
-    // locked 用「最长连续纪录」表述：{remain} 是「历史最长连续天数」距该档的差距，
-    // 不是「还要再连续多少天」——两者完全不同，写错会让用户以为要从今天重新数（2026-11-18 修）
-    detail: { earned: '最长连续运动 {cur} 天', locked: '最长连续纪录 {cur} 天 · 还差 {remain} 天' },
+    /*
+     * **故意不配 detail 模板**（2026-11-18）：
+     * 「最坚持」的文案要看两个数（历史最长 / 当前这段连续）并按状态分流，
+     * 模板表达不了，由 services/exercise-plan.ts 的 streakDetailText +
+     * streakHistoryLines 专属渲染（已导出，表驱动测试在 BO15）。
+     * 这里配模板会被绕过，留着只会误导后来者以为改配置就能改文案。
+     */
   },
   {
     prefix: 'ring',
