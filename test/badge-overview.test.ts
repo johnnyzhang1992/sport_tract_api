@@ -446,3 +446,23 @@ test('BO15 「最坚持」文案按「正在连续 / 已中断」分流，且不
   assert.ok(!/\d{4}-\d{2}-\d{2} 结束/.test(lines), '旧的「日期 结束」写法应已替换');
   assert.ok(!lines.includes('当前连续已中断'), `中断态不该多一句话：${lines}`);
 });
+
+test('BO16 倍率型里程碑（200%完成目标）：卡面印百分比、进度不说「目标 N 次」（2026-11-18 修）', async () => {
+  const d = await overview();
+  for (const key of ['x2', 'x3', 'x4', 'x5']) {
+    const t = d.trophies.find((x: any) => x.key === key);
+    assert.ok(t, `缺 ${key}`);
+    const pct = key.slice(1) * 100;
+    // 卡面必须带 %，否则 200 会被读成「200 次」
+    assert.equal(t.badgeText, `${pct}%`, `${key} 卡面应为百分比：${t.badgeText}`);
+    // 进度文案不能把 tier(=百分比) 说成次数
+    assert.ok(!/目标 \d{3} 次/.test(t.detailText || ''), `${key} 文案把百分比说成了次数：${t.detailText}`);
+    // 不能与 desc 重复（desc 已说「单周期完成倍数达到 N% 即可获得」）
+    assert.notEqual(t.detailText, t.desc, `${key} 进度文案与描述重复`);
+  }
+
+  // 次数型里程碑不受影响：卡面仍是次数
+  const week = d.trophies.find((x: any) => x.key === 'week');
+  assert.equal(week.badgeText, '7', '次数型仍印次数');
+  if (!week.unlocked) assert.match(week.detailText, /已达成 \d+ 次 · 目标 7 次/, `次数型文案：${week.detailText}`);
+});

@@ -1056,6 +1056,8 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       need: def.times,
       // 徽章中央数字：倍数章印百分比（200/300/400/500），次数章印需要的次数（1/7/20）
       tier: def.ratio >= 2 ? def.ratio * 100 : def.times,
+      /** 是否倍率型里程碑（单周期完成倍数，如 200%）：显式带出来，别靠 tier/need 反推 */
+      isRatio: def.ratio >= 2,
       // 进度条：倍数章完成一次即满格；次数章按达成次数/需要次数
       pct: def.ratio >= 2 ? (cur >= 1 ? 100 : 0) : Math.min(Math.round((cur / def.times) * 100), 100),
     };
@@ -1139,6 +1141,19 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
       return `当前连续 ${now} 天 · 再坚持 ${need} 天解锁`;
     }
     return `最长连续纪录 ${cur} 天 · 还差 ${remain} 天`;
+  };
+
+  /**
+   * 里程碑的进度文案（2026-11-18 修）：
+   *   次数型（ratio=1，如「坚持一周」需 7 次）→ `已达成 {cur} 次 · 目标 {need} 次`
+   *   倍率型（ratio≥2，如「200%完成目标」）  → `已完成 {cur} 次 · 单周期达到 {n}% 即可获得`
+   * 倍率型的 tier 是**百分比**（200/300/…），不是次数，绝不能写成「目标 200 次」。
+   */
+  const milestoneProgressText = (m: { cur: number; need: number; tier: number; isRatio: boolean }): string => {
+    if (!m.isRatio) return `已达成 ${m.cur} 次 · 目标 ${m.need} 次`;
+    // 注意：徽章 desc 已经说了「单周期完成倍数达到 N% 即可获得」，
+    // 这里再说一遍就重复了（详情半屏上下两行会一模一样）。所以只报**进度数字**。
+    return m.cur > 0 ? `已完成 ${m.cur} 次 · 再完成 ${Math.max(0, m.need - m.cur)} 次即可` : '还未达成过';
   };
 
   const renderDetail = (def: BadgeDef, cur: number, valueText: string): string => {
@@ -1236,7 +1251,9 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
           shape: (def && def.shape) || 'plan',
           groupTitle: groupTitleOf('plan'),
           category: categoryOfGroup('plan'),
-          badgeText: String(m.tier),
+          // 卡面数字（2026-11-18）：倍率章印百分比「200%」，只印 200 会被读成「200 次」；
+          // 次数章照旧印次数。
+          badgeText: m.isRatio ? `${m.tier}%` : String(m.tier),
           unlocked: m.unlocked,
           cur: m.cur,
           tier: m.tier, // 倍数章=百分比数字（200/300/…），次数章=需要的次数
@@ -1247,8 +1264,12 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
           rankTotal: rankOf(m.key).total,
           pct: m.pct, // 直接用 milestones 算好的百分比
           group: 'plan' as BadgeGroup,
-          // 已解锁不再播报「已达成 N 次」（徽章已到手），未解锁才作为进度
-          detailText: m.unlocked ? '' : `已达成 ${m.cur} 次 · 目标 ${m.tier} 次`,
+          // 进度文案按里程碑类型分流（2026-11-18）：
+          //   次数型（坚持一周 7 次等）→「已达成 3 次 · 目标 7 次」
+          //   倍率型（200% 完成目标）  →「单周期达 200% 已 X 次 · 达成 1 次即得」
+          // 原来两者都用「目标 {tier} 次」，倍率章的 tier=200 就被说成「目标 200 次」，
+          // 与它的真实规则（单周期达到 200% 一次即可）完全不符。
+          detailText: m.unlocked ? '' : milestoneProgressText(m),
           detailLines: [],
           ...earnedTextOf((earns[m.key] && earns[m.key].earnDate) || '', rankOf(m.key).rank, rankOf(m.key).total),
         };
