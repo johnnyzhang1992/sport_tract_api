@@ -363,3 +363,48 @@ test('保存体重变化 → 记录体重日志并可查询', async () => {
   assert.equal(items.length, 2, '相同体重不重复记录，应只有 2 条（65、64）');
   assert.equal(items[0].weightKg, 64, '最新体重在前');
 });
+
+/* ── 报错语言守门（2026-11-18）：zod 原生英文不得漏给用户 ──────────────
+   Login/Refresh 是逐字段 { error } 精修；其余字段走 error-handler 的中文兜底。
+   这两条只锁「登录/刷新」这条游客第一入口，其余接口由 error-handler 单测覆盖。 */
+test('缺 code / 缺 refreshToken 的报错必须是中文（游客第一个接口）', async () => {
+  const noCode = await app.inject({ method: 'POST', url: '/sport-track/api/auth/login', payload: {} });
+  assert.equal(noCode.statusCode, 400);
+  assert.equal(noCode.json().message, '缺少微信登录 code', noCode.body);
+  assert.match(noCode.json().message, /[\u4e00-\u9fa5]/, '不得漏出 zod 原生英文');
+
+  const emptyCode = await app.inject({ method: 'POST', url: '/sport-track/api/auth/login', payload: { code: '' } });
+  assert.equal(emptyCode.statusCode, 400);
+  assert.equal(emptyCode.json().message, '缺少微信登录 code');
+
+  const noRefresh = await app.inject({ method: 'POST', url: '/sport-track/api/auth/refresh', payload: {} });
+  assert.equal(noRefresh.statusCode, 400);
+  assert.equal(noRefresh.json().message, '缺少 refreshToken');
+});
+
+/* ── error-handler 的 zod 中文兜底（2026-11-18）：纯函数直测，不起 HTTP ── */
+test('zodIssueToChinese：嵌套 path / 未登记字段 / 类型错 / 中文优先', async () => {
+  const { z } = await import('zod');
+  const { zodIssueToChinese } = await import('../src/plugins/error-handler.js');
+  const zh = (schema: any, input: unknown) => {
+    const r = schema.safeParse(input);
+    return r.success ? '(通过)' : zodIssueToChinese(r.error.issues[0]);
+  };
+
+  // 嵌套数组：path 含数字下标，取末段登记名
+  const Points = z.object({ points: z.array(z.object({ lat: z.number(), seq: z.number() })) });
+  assert.equal(zh(Points, { points: [{ lng: 1 }] }), '缺少纬度');
+  assert.equal(zh(Points, { points: [{ lat: 1 }] }), '缺少序号');
+  // 嵌套对象
+  const Loc = z.object({ location: z.object({ latitude: z.number(), longitude: z.number() }) });
+  assert.equal(zh(Loc, { location: { latitude: 30 } }), '缺少经度', 'lat 已给值，缺的是 longitude');
+  // 未登记字段：不暴露英文参数名
+  const U = z.object({ mysteryField: z.string() });
+  assert.equal(zh(U, {}), '缺少必要参数');
+  // 类型错
+  assert.equal(zh(z.object({ nickname: z.string() }), { nickname: 123 }), '昵称格式不正确');
+  // Too small/big
+  assert.equal(zh(z.object({ n: z.number().min(10) }), { n: 1 }), '请求参数取值超出范围', '未登记字段不给英文参数名');
+  // schema 已配中文 → 兜底绝不覆盖
+  assert.equal(zh(z.object({ title: z.string().min(1, '标题不能为空') }), { title: '' }), '标题不能为空');
+});

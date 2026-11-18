@@ -3,9 +3,11 @@ import { FOOTPRINT_CATEGORY_OPTIONS, invalidCategoryMessage } from './footprint-
 
 /** 登录：微信 code2session 换取 openid；uid 可选，新用户注册时生成默认昵称（如 迹路者001） */
 export const LoginSchema = z.object({
-  code: z.string().min(1, '缺少微信登录 code'),
+  // error 兜住「字段缺失/类型不对」（z.string() 的类型层错误），min(1) 兜住空串——
+  // 两层都要给中文，否则缺 code 时会漏出 Zod 原生的 "Invalid input: expected string..." 英文报错
+  code: z.string({ error: '缺少微信登录 code' }).min(1, '缺少微信登录 code'),
   uid: z
-    .string()
+    .string({ error: 'uid 仅支持字母/数字/下划线/中文/连字符，1-20 位' })
     .trim()
     .regex(/^[\w\u4e00-\u9fa5-]{1,20}$/, 'uid 仅支持字母/数字/下划线/中文/连字符，1-20 位')
     .optional(),
@@ -13,7 +15,7 @@ export const LoginSchema = z.object({
 
 /** 刷新 token */
 export const RefreshSchema = z.object({
-  refreshToken: z.string().min(1, '缺少 refreshToken'),
+  refreshToken: z.string({ error: '缺少 refreshToken' }).min(1, '缺少 refreshToken'),
 });
 
 /**

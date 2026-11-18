@@ -38,6 +38,25 @@ const bjTodayAt = (hour: number) => {
   const b = new Date(NOW + 8 * 3600_000);
   return Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate(), hour - 8) + 60_000;
 };
+/**
+ * 「东八区今天 hour 点，但保证已过去」（2026-11-19 修 EP8 午夜后必红）：
+ * 原 bjTodayAt(7) 在东八区 00:00–07:00 之间跑测试时是**未来时间**，
+ * sumActivities 的 `$lt: now` 会把种子轨迹滤掉 → 基线冻结成 0 → EP8 稳定红
+ * （与代码改动无关，纯环境时间窗）。改为：该钟点还没到就用**昨天**同一钟点，
+ * 永远落在过去且仍属「今天窗口」之外的情形不存在——昨天 < 今天窗口起点，
+ * 恰好等价于把活动挪到窗口内最近一个已过去的钟点。实际上要落在**今天窗口内**
+ * 才能参与基线，所以这里取 max(该钟点, 窗口起点 + 已流逝的至少 1 分钟)。
+ */
+const bjTodayAtPast = (hour: number) => {
+  const target = bjTodayAt(hour);
+  const now = Date.now();
+  const today0 = bjTodayAt(0);
+  if (target <= now) return target;
+  // 目标钟点还没到（东八区 00:00–hour 之间跑测试）：压到「今天窗口内已过去的时刻」。
+  // 用 now - 1min 保序（hour 越大越接近 now？不——此时一律压到同一时刻会破坏 8<9<10 的排序断言）。
+  // 折中：全部压到 now - (24 - hour) 分钟，hour 大 → 时刻越晚，相对顺序不变，且都严格小于 now。
+  return Math.max(today0 + 60_000, now - (24 - hour) * 60_000);
+};
 
 async function seedActivity(o: { type: string; start: number; distance: number; duration: number }, userId = idP) {
   await ActivityModel.create({
@@ -119,10 +138,10 @@ test('EP2 保存成功 + 覆盖更新：同用户只有一份计划', async () =
 test('EP3 每日计划：只计今天窗口的轨迹；超额封顶 pct=1', async () => {
   await putPlan({ period: 'daily', targets: { distanceM: 4000, durationMin: 30, count: 1 } });
   // 今天两条：3km/30min + 2km/20min → 合计 5km/50min/2 次（距离与次数超额）
-  await seedActivity({ type: 'running', start: bjTodayAt(8), distance: 3000, duration: 1800 });
-  await seedActivity({ type: 'walking', start: bjTodayAt(10), distance: 2000, duration: 1200 });
+  await seedActivity({ type: 'running', start: bjTodayAtPast(8), distance: 3000, duration: 1800 });
+  await seedActivity({ type: 'walking', start: bjTodayAtPast(10), distance: 2000, duration: 1200 });
   // 昨天的不计
-  await seedActivity({ type: 'running', start: bjTodayAt(8) - 86_400_000, distance: 9999, duration: 9999 });
+  await seedActivity({ type: 'running', start: bjTodayAtPast(8) - 86_400_000, distance: 9999, duration: 9999 });
 
   const res = await getCurrent();
   assert.equal(res.statusCode, 200, res.body);
@@ -156,7 +175,7 @@ test('EP6 改计划不追溯：改目标后进度不倒退，之后新增照常�
   await ActivityModel.deleteMany({ userId: idP });
   // 先建每天计划 10km，并跑一条 4km（相当于今天已完成 4km）
   await putPlan({ period: 'daily', targets: { distanceM: 10000, durationMin: 60, count: 2 } });
-  const today = bjTodayAt(9);
+  const today = bjTodayAtPast(9);  // 同 EP8 的午夜时间窗问题：保证落在已过去的时刻
   await seedActivity({ type: 'running', start: today, distance: 4000, duration: 1800 });
 
   const before = (await getCurrent()).json().data;
@@ -182,7 +201,7 @@ test('EP6 改计划不追溯：改目标后进度不倒退，之后新增照常�
 test('EP7 基线不跨周期：换天后按新窗口全量重算', async () => {
   await ActivityModel.deleteMany({ userId: idP });
   await putPlan({ period: 'daily', targets: { distanceM: 5000, durationMin: 60, count: 1 } });
-  await seedActivity({ type: 'running', start: bjTodayAt(8), distance: 2000, duration: 900 });
+  await seedActivity({ type: 'running', start: bjTodayAtPast(8), distance: 2000, duration: 900 });
 
   const now = (await getCurrent()).json().data;
   assert.equal(now.progress.distanceM, 2000);
@@ -202,7 +221,7 @@ test('EP8 下限语义：改动后即便轨迹被作废，进度也不会低于�
   const a = await ActivityModel.create({
     userId: new (await import('mongoose')).default.Types.ObjectId(idP),
     type: 'running', status: 'finished',
-    startTime: bjTodayAt(7), endTime: bjTodayAt(7) + 1800_000,
+    startTime: bjTodayAtPast(7), endTime: bjTodayAtPast(7) + 1800_000,
     duration: 1800, distance: 6000, trackPoints: [], markers: [],
   });
   // 改计划：此刻已 6km → 基线 6km
@@ -216,12 +235,12 @@ test('EP8 下限语义：改动后即便轨迹被作废，进度也不会低于�
 
 test('EP9 当期达成旗标：periodKey 为东八区周期键；三项都达标才 allAchieved', async () => {
   await putPlan({ period: 'daily', targets: { distanceM: 1000, durationMin: 10, count: 2 } }, tokenQ);
-  await seedActivity({ type: 'running', start: bjTodayAt(9), distance: 2000, duration: 1200 }, idQ);
+  await seedActivity({ type: 'running', start: bjTodayAtPast(9), distance: 2000, duration: 1200 }, idQ);
   let d = (await getCurrent(tokenQ)).json().data;
   assert.equal(d.periodKey, bjDateStr(NOW), '日计划 periodKey=东八区今天');
   assert.equal(d.allAchieved, false, '次数未达标（1/2）');
 
-  await seedActivity({ type: 'walking', start: bjTodayAt(11), distance: 100, duration: 60 }, idQ);
+  await seedActivity({ type: 'walking', start: bjTodayAtPast(11), distance: 100, duration: 60 }, idQ);
   d = (await getCurrent(tokenQ)).json().data;
   assert.equal(d.allAchieved, true, '三项都达标');
 });
