@@ -34,6 +34,13 @@ import {
 } from '../services/export.js';
 import { adminListCampaigns, adminGetCampaign, adminMemberActivities } from '../services/campaign.js';
 import {
+  adminPlanOverview,
+  adminPlanTrend,
+  adminPlanDistribution,
+  adminPlanUsers,
+  adminPlanUserDetail,
+} from '../services/admin-plan-stats.js';
+import {
   adminListTopics,
   createTopic,
   updateTopic,
@@ -1818,6 +1825,41 @@ export async function adminRoutes(fastify: FastifyInstance) {
         repeatOnly: q.repeatOnly === '1' || q.repeatOnly === 'true',
       }),
     );
+  });
+
+  // —— 运动计划数据页（docs/22，2026-11-18）：纯只读统计，口径见 services/admin-plan-stats.ts ——
+
+  // 汇总卡：渗透率（分母=近 30 天有运动用户）/ 有效计划 / 今日有运动 / 昨日与近 7 日达成率
+  fastify.get('/plans/overview', { onRequest: [adminAuth] }, async () => success(await adminPlanOverview()));
+
+  // 趋势（近 7/30/90 天）：新增计划（现存文档 createdAt，近似值）+ 总/单项达成率（快照，T-1）
+  fastify.get('/plans/trend', { onRequest: [adminAuth] }, async (request) => {
+    const q = (request.query ?? {}) as Record<string, unknown>;
+    return success(await adminPlanTrend({ days: Number(q.days) || 30 }));
+  });
+
+  // 分布：目标三档位（现存计划）+ 完成率分档（近 30 天快照）
+  fastify.get('/plans/distribution', { onRequest: [adminAuth] }, async () => success(await adminPlanDistribution()));
+
+  // 用户计划列表：状态/目标距离档筛选 + 排序 + 分页
+  fastify.get('/plans/users', { onRequest: [adminAuth] }, async (request) => {
+    const q = (request.query ?? {}) as Record<string, unknown>;
+    return success(
+      await adminPlanUsers({
+        page: Number(q.page) || 1,
+        pageSize: Number(q.pageSize) || 20,
+        status: typeof q.status === 'string' ? q.status : undefined,
+        distTier: typeof q.distTier === 'string' ? q.distTier : undefined,
+        sortBy: typeof q.sortBy === 'string' ? q.sortBy : undefined,
+        order: typeof q.order === 'string' ? q.order : undefined,
+      }),
+    );
+  });
+
+  // 用户计划详情：目标 + 近 3 个月逐日快照
+  fastify.get('/plans/users/:id', { onRequest: [adminAuth] }, async (request) => {
+    const { id } = request.params as { id: string };
+    return success(await adminPlanUserDetail(id));
   });
 }
 
