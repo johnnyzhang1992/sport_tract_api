@@ -68,11 +68,13 @@ export async function buildApp(opts: BuildAppOptions = {}): Promise<FastifyInsta
     trustProxy: true,
     // 默认 1MiB 会拒掉超长轨迹的 finish final 包（2 万点 ≈ 1.5MB JSON）→ 放宽到 4MiB
     bodyLimit: 4 * 1024 * 1024,
-    logger:
-      opts.logger ??
-      (config.isDev
-        ? { transport: { target: 'pino-pretty' }, level: 'info' }
-        : productionLogger()),
+    // ⚠️ Fastify 5：裸 pino 实例必须走 loggerInstance（logger: 只收配置对象，传实例启动即崩
+    // FST_ERR_LOG_INVALID_LOGGER_CONFIG —— 生产已踩并回滚）。loggerInstance 会把泛型 logger
+    // 收窄成 pino.Logger，与 buildApp 返回声明的 FastifyBaseLogger 不一致，tsc 过不去——
+    // 这里对整个 options 对象断言（运行时兼容：pino.Logger 满足 FastifyBaseLogger 接口）。
+    ...((config.isDev || opts.logger
+      ? { logger: opts.logger ?? { transport: { target: 'pino-pretty' }, level: 'info' } }
+      : { loggerInstance: productionLogger() }) as Record<string, unknown>),
   });
 
   // CORS：开发环境全放开；生产白名单（CORS_ORIGIN 支持逗号分隔多个，如 https://a.com,https://b.com）
