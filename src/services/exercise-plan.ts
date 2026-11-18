@@ -1129,19 +1129,8 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
    *   未解锁且已中断：  `最长连续纪录 14 天 · 还差 351 天`
    *   已解锁：          `最长连续运动 120 天`
    */
-  const renderStreakDetail = (def: BadgeDef): string => {
-    const cur = rec.streak.best;
-    const now = rec.streak.current;
-    if (cur >= def.tier) return `最长连续运动 ${cur} 天`;
-    const remain = Math.max(0, def.tier - cur);
-    // 当前这段连续若更短于历史纪录，用历史纪录算进度（解锁判定取「连续累计到第 t 天」，
-    // 历史纪录代表用户真实达到过的天数）；若正在连续且已超过历史纪录，按当前连续算。
-    if (now > 0) {
-      const need = Math.max(1, def.tier - now);
-      return `当前连续 ${now} 天 · 再坚持 ${need} 天解锁`;
-    }
-    return `最长连续纪录 ${cur} 天 · 还差 ${remain} 天`;
-  };
+  const renderStreakDetail = (def: BadgeDef): string =>
+    streakDetailText({ best: rec.streak.best, current: rec.streak.current, tier: def.tier });
 
   /**
    * 里程碑的进度文案（2026-11-18 修）：
@@ -1215,25 +1204,23 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     const lines: string[] = [];
     if (!def) return lines;
     if (def.metric === 'streakBest') {
-      // 明确主语与「这是历史最长」（2026-11-18）：原来写「2026-11-14 结束」「目前连续 0 天」，
-      // 单看不知道是谁结束、哪天结束，与上一行「还差 N 天」放一起像时间线矛盾。
-      // 天数已在 detailText 里说过（「最长连续纪录 120 天」/「最长连续运动 120 天」），
-      // 这里只补它在哪一天结束，不重复天数。
       /*
-       * 附加行只补 detailText 没说的信息，避免重复（2026-11-18）：
-       *   - 正在连续：detailText 已写「当前连续 N 天 · 再坚持 M 天解锁」，
-       *     这里只补「这段已经是历史最长」这类额外事实（等于纪录时说明一下）
-       *   - 已中断：detailText 写的是历史纪录，这里补该纪录的结束日期
+       * 「历史最长」独立一行（2026-11-18 二次调整）：
+       *
+       * 主行（detailText）在「正在连续」时讲的是**当前这段**（`当前连续 2 天 · 再坚持 98 天解锁`），
+       * 而卡面进度条是按**历史最长**算的（best/tier）。两个数并列时（10% 进度 + 再坚持 98 天）
+       * 读者会当成算错，所以这里把历史最长**单独一行、带上数值与日期**，给进度条一个明确归属。
+       *
+       * 不放主行是因为太长：`当前连续 2 天（历史最长 10 天）· 再坚持 98 天解锁` 一行读不完。
+       *
+       * 已解锁时主行已经是「最长连续运动 N 天」，这里只补日期/状态，不重复数字。
        */
-      if (rec.streak.current > 0) {
-        if (rec.streak.current >= rec.streak.best) {
-          lines.push(`这段已是你最长的连续纪录`);
-        } else if (rec.streak.bestEndText) {
-          lines.push(`最长那段截至 ${rec.streak.bestEndText}`);
-        }
-      } else if (rec.streak.bestEndText) {
-        lines.push(`最长那段截至 ${rec.streak.bestEndText}`);
-      }
+      lines.push(...streakHistoryLines({
+        best: rec.streak.best,
+        current: rec.streak.current,
+        bestEndText: rec.streak.bestEndText,
+        unlocked: rec.streak.best >= def.tier,
+      }));
     }
     return lines;
   };
@@ -1732,6 +1719,57 @@ function buildByTypeCounts(typeDays: Record<string, DailyTotalsRow[]>): TrophyCo
     };
   }
   return out;
+}
+
+/* ==========================================================================
+ * 「最坚持」文案（2026-11-18）：纯函数，便于表驱动测试（原先是 getPlanSummary 的内部闭包，
+ * 只能靠真实数据跑，分支覆盖随「今天」漂移）。
+ *
+ * 口径（产品 2026-11-18 定）：
+ *   - 主行必须回答「还要坚持多少天才能解锁」——这是用户最需要的那句话
+ *   - 历史最长放**单独一行**（主行塞不下：`当前连续 2 天（历史最长 10 天）· 再坚持 98 天解锁` 太长）
+ *   - 卡面进度条按历史最长算（best/tier），历史最长那行给它一个明确归属
+ * ======================================================================== */
+
+/**
+ * 主行文案。
+ *   已解锁：          `最长连续运动 120 天`
+ *   未解锁且正在连续：`当前连续 3 天 · 再坚持 97 天解锁`
+ *   未解锁且已中断：  `最长连续纪录 10 天 · 还差 90 天`
+ */
+export function streakDetailText(p: { best: number; current: number; tier: number }): string {
+  const best = Math.max(0, Math.floor(p.best));
+  const now = Math.max(0, Math.floor(p.current));
+  const tier = Math.max(1, Math.floor(p.tier));
+  if (best >= tier) return `最长连续运动 ${best} 天`;
+  if (now > 0) return `当前连续 ${now} 天 · 再坚持 ${Math.max(1, tier - now)} 天解锁`;
+  return `最长连续纪录 ${best} 天 · 还差 ${Math.max(0, tier - best)} 天`;
+}
+
+/**
+ * 附加行：历史最长（+ 日期或「就是这段」）。
+ *   未解锁：`历史最长 10 天 · 截至 2026-11-07` / `历史最长 3 天 · 就是当前这段`
+ *   已解锁：`该纪录截至 2026-11-07`（主行已有天数，不重复）/ `该纪录就是当前这段`
+ *   没有任何连续（best=0）：空数组
+ */
+export function streakHistoryLines(p: {
+  best: number;
+  current: number;
+  bestEndText: string;
+  unlocked: boolean;
+}): string[] {
+  const best = Math.max(0, Math.floor(p.best));
+  if (best <= 0) return [];
+  const ongoingBest = p.current > 0 && p.current >= best;
+  const when = ongoingBest ? '就是当前这段' : p.bestEndText ? `截至 ${p.bestEndText}` : '';
+  /*
+   * 主行是否**已经报过这个天数**：已解锁（「最长连续运动 N 天」）与完全中断
+   * （「最长连续纪录 N 天」）都是；只有「正在连续」时主行讲的是当前这段，历史最长才需要带数字。
+   * 同一个数字出现两次会显得啰嗦，所以这里按状态切换「历史最长 N 天 · X」/「该纪录 X」。
+   */
+  const mainShowsNumber = p.unlocked || p.current === 0;
+  if (mainShowsNumber) return when ? [`该纪录${when}`] : [];
+  return [`历史最长 ${best} 天${when ? ` · ${when}` : ''}`];
 }
 
 /** 计数 → 该指标当前值（与各奖杯 tier 对比得出解锁态） */

@@ -13,6 +13,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
+import { streakDetailText, streakHistoryLines } from '../src/services/exercise-plan.js';
 import { UserModel } from '../src/models/user.model.js';
 import { ActivityModel } from '../src/models/activity.model.js';
 import { ExercisePlanPeriodModel } from '../src/models/exercise-plan-period.model.js';
@@ -419,32 +420,92 @@ test('BO14 已解锁的次数类徽章不再播报「已完成 N 次」；累计
   }
 });
 
-test('BO15 「最坚持」文案按「正在连续 / 已中断」分流，且不歧义（2026-11-18）', async () => {
-  const d = await overview();
-  const t = d.trophies.find((x: any) => x.key === 'streak-365');
-  assert.ok(t, '应有 streak-365');
+test('BO15 「最坚持」文案：主行给「还要坚持几天」，历史最长单独一行（2026-11-18 定稿）', () => {
+  /*
+   * 表驱动（原先这条断言依赖「今天」的数据，两个分支只能概率性覆盖，且抓不到下面这种矛盾）：
+   *   best=10 / current=2 时，卡面进度条按 best 算 10%，主行却按 current 说「再坚持 98 天」，
+   *   两个数并列会被读成算错 —— 现在历史最长单独一行，明确给进度条归属。
+   */
+  const cases: Array<{
+    best: number;
+    current: number;
+    tier: number;
+    bestEndText: string;
+    wantMain: string;
+    wantLines: string[];
+    why: string;
+  }> = [
+    {
+      best: 3, current: 3, tier: 100, bestEndText: '2026-11-18',
+      wantMain: '当前连续 3 天 · 再坚持 97 天解锁',
+      wantLines: ['历史最长 3 天 · 就是当前这段'],
+      why: '正在刷新纪录',
+    },
+    {
+      best: 10, current: 2, tier: 100, bestEndText: '2026-11-07',
+      wantMain: '当前连续 2 天 · 再坚持 98 天解锁',
+      wantLines: ['历史最长 10 天 · 截至 2026-11-07'],
+      why: '当前这段短于历史纪录（原本进度条 10% 与「再坚持 98 天」打架，靠这行给归属）',
+    },
+    {
+      best: 10, current: 0, tier: 100, bestEndText: '2026-11-07',
+      wantMain: '最长连续纪录 10 天 · 还差 90 天',
+      wantLines: ['该纪录截至 2026-11-07'],
+      why: '完全中断：主行已报天数，附加行不重复',
+    },
+    {
+      best: 120, current: 5, tier: 100, bestEndText: '2026-11-14',
+      wantMain: '最长连续运动 120 天',
+      wantLines: ['该纪录截至 2026-11-14'],
+      why: '已解锁 + 中断',
+    },
+    {
+      best: 120, current: 120, tier: 100, bestEndText: '2026-11-18',
+      wantMain: '最长连续运动 120 天',
+      wantLines: ['该纪录就是当前这段'],
+      why: '已解锁 + 正在刷新',
+    },
+    {
+      best: 0, current: 0, tier: 365, bestEndText: '',
+      wantMain: '最长连续纪录 0 天 · 还差 365 天',
+      wantLines: [],
+      why: '一次都没连续过：不硬造附加行',
+    },
+  ];
 
-  // 该账号的测试数据含「今天」，跨天跑时 current 可能为 0 也可能 >0，
-  // 所以两种分支都要认；关键是不许出现会引起误解的写法
-  const lines = (t.detailLines || []).join(' | ');
-  // overview 不返回 records，按文案本身判断走的是哪条分支
-  const ongoing = /当前连续 \d+ 天 · 再坚持/.test(t.detailText);
-
-  if (ongoing) {
-    // 正在连续：必须告诉用户「现在连续几天」和「还要几天」
-    assert.match(t.detailText, /当前连续 \d+ 天 \u00b7 再坚持 \d+ 天解锁/, `缺当前连续/还差几天：${t.detailText}`);
-    // 主行已说过当前连续，附加行不该再重复一遍
-    assert.ok(!/当前连续 \d+ 天/.test(lines) || /已刷新|最长/.test(lines), `附加行重复了当前连续：${lines}`);
-  } else {
-    assert.match(t.detailText, /最长连续纪录 \d+ 天/, `应说明是历史最长纪录：${t.detailText}`);
-    assert.match(t.detailText, /还差 \d+ 天/, '仍应给出差距');
-    assert.match(lines, /最长那段截至 \d{4}-\d{2}-\d{2}/, `日期行缺主语：${lines}`);
+  for (const c of cases) {
+    const main = streakDetailText({ best: c.best, current: c.current, tier: c.tier });
+    assert.equal(main, c.wantMain, `[${c.why}] best=${c.best} current=${c.current} 主行不对`);
+    const lines = streakHistoryLines({
+      best: c.best,
+      current: c.current,
+      bestEndText: c.bestEndText,
+      unlocked: c.best >= c.tier,
+    });
+    assert.deepEqual(lines, c.wantLines, `[${c.why}] best=${c.best} current=${c.current} 附加行不对`);
+    // 通用不变量
+    assert.ok(!/\{cur\}|\{remain\}|\{tier\}/.test(main), `[${c.why}] 主行残留占位符`);
+    assert.ok(!lines.some((l) => /\d{4}-\d{2}-\d{2} 结束/.test(l)), `[${c.why}] 附加行仍是旧的「日期 结束」写法`);
   }
+});
 
-  // 通用：不许残留占位符 / 旧的没主语写法 / 多余的失败宣告
-  assert.ok(!/\{cur\}|\{remain\}|\{tier\}/.test(t.detailText), '不该残留占位符');
-  assert.ok(!/\d{4}-\d{2}-\d{2} 结束/.test(lines), '旧的「日期 结束」写法应已替换');
-  assert.ok(!lines.includes('当前连续已中断'), `中断态不该多一句话：${lines}`);
+test('BO15b overview 里 streak 徽章不再出现占位符/歧义写法（数据无关的守门）', async () => {
+  const d = await overview();
+  const streaks = d.trophies.filter((t: any) => /^streak-/.test(t.key));
+  assert.ok(streaks.length > 0, '应有 streak 系列');
+  for (const t of streaks) {
+    const all = [t.detailText, ...(t.detailLines || [])];
+    for (const text of all) {
+      assert.ok(!/\{cur\}|\{remain\}|\{tier\}|\{valueText\}/.test(text), `${t.key} 残留占位符：${text}`);
+      assert.ok(!/\d{4}-\d{2}-\d{2} 结束/.test(text), `${t.key} 旧写法：${text}`);
+    }
+    // 未解锁必须有「还差 / 再坚持」这种差距提示
+    if (!t.unlocked) assert.match(t.detailText, /还差 \d+ 天|再坚持 \d+ 天/, `${t.key} 缺差距：${t.detailText}`);
+    // 历史最长若出现在附加行，必须带主语（「历史最长」/「该纪录」）
+    for (const line of t.detailLines || []) {
+      assert.match(line, /^(历史最长|该纪录)/, `${t.key} 附加行缺主语：${line}`);
+    }
+  }
 });
 
 test('BO16 倍率型里程碑（200%完成目标）：卡面印百分比、进度不说「目标 N 次」（2026-11-18 修）', async () => {
