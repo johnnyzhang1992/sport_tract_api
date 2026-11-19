@@ -527,3 +527,29 @@ test('BO16 倍率型里程碑（200%完成目标）：卡面印百分比、进�
   assert.equal(week.badgeText, '7', '次数型仍印次数');
   if (!week.unlocked) assert.match(week.detailText, /已达成 \d+ 次 · 目标 7 次/, `次数型文案：${week.detailText}`);
 });
+
+test('BO17 年度报告返回徽章明细：列出区间内解锁的徽章，按日期倒序（2026-11-19）', async () => {
+  const { planRangeReport } = await import('../src/services/exercise-plan.js');
+  const u = await UserModel.findOne({ openid: 'trophy-preview' });
+  assert.ok(u, '需要 trophy-preview 测试账号');
+  const from = Date.parse('2026-01-01T00:00:00+08:00');
+  const to = Date.parse('2026-12-31T23:59:59+08:00');
+  const rep = await planRangeReport(String(u._id), from, to);
+
+  assert.ok(Array.isArray(rep.badges.unlockedList), '应返回 unlockedList');
+  // 数量必须与 unlockedInRange 一致（年报同时展示两者，不能对不上）
+  assert.equal(rep.badges.unlockedList.length, rep.badges.unlockedInRange,
+    `明细 ${rep.badges.unlockedList.length} 条 vs 计数 ${rep.badges.unlockedInRange}`);
+
+  for (const b of rep.badges.unlockedList) {
+    // 前端画章面需要的字段
+    for (const f of ['key', 'shortLabel', 'shape', 'badgeText', 'earnDateText'] as const) {
+      assert.ok((b as any)[f] !== undefined, `徽章明细缺 ${f}`);
+    }
+    assert.match(b.earnDateText, /^\d{4}-\d{2}-\d{2}$/, '日期格式');
+    assert.ok(b.earnDateText >= '2026-01-01' && b.earnDateText <= '2026-12-31', '不应超出区间');
+  }
+  // 倒序
+  const dates = rep.badges.unlockedList.map((b) => b.earnDateText);
+  assert.deepEqual(dates, [...dates].sort().reverse(), '应按解锁日期倒序');
+});

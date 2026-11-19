@@ -1624,6 +1624,21 @@ export interface PlanRangeReportResult {
     unlockedTotal: number;
     /** 徽章总数 */
     total: number;
+    /**
+     * 区间内首次解锁的徽章明细（2026-11-19）：按解锁日期倒序。
+     * 年度报告要把徽章列出来，只给数字看不出「解锁了哪些」。
+     * 字段够前端直接画章面（shape/badgeText/shortLabel/earnDateText），不需要再取一次 summary。
+     */
+    unlockedList: Array<{
+      key: string;
+      shortLabel: string;
+      label: string;
+      shape: string;
+      badgeText: string;
+      groupTitle: string;
+      activityIconId?: string;
+      earnDateText: string;
+    }>;
   };
 }
 
@@ -1667,9 +1682,23 @@ export async function planRangeReport(
   }
   const sum = await getPlanSummary(userId);
   const unlockedTotal = sum.trophies.filter((t) => t.unlocked).length;
-  const unlockedInRange = sum.trophies.filter(
+  const unlockedInRangeTrophies = sum.trophies.filter(
     (t) => t.unlocked && t.earnDateText >= fromKey && t.earnDateText <= toKey,
-  ).length;
+  );
+  const unlockedInRange = unlockedInRangeTrophies.length;
+  // 明细按解锁日期倒序（最近解锁的排前面），同日按 key 稳定排序避免每次顺序抖动
+  const unlockedList = [...unlockedInRangeTrophies]
+    .sort((a, b) => (a.earnDateText === b.earnDateText ? a.key.localeCompare(b.key) : b.earnDateText.localeCompare(a.earnDateText)))
+    .map((t) => ({
+      key: t.key,
+      shortLabel: t.shortLabel,
+      label: t.label,
+      shape: t.shape,
+      badgeText: t.badgeText,
+      groupTitle: t.groupTitle,
+      activityIconId: t.activityIconId,
+      earnDateText: t.earnDateText,
+    }));
   return {
     plan: {
       snapshotDays: snaps.length,
@@ -1682,6 +1711,7 @@ export async function planRangeReport(
       unlockedInRange,
       unlockedTotal,
       total: sum.trophies.length,
+      unlockedList,
     },
   };
 }
