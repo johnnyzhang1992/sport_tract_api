@@ -1636,6 +1636,8 @@ export interface PlanRangeReportResult {
       shape: string;
       badgeText: string;
       groupTitle: string;
+      /** 分组 key：前端判断合环组（rings）渲染三层三环造型（isRingBadge 同口径） */
+      group: string;
       activityIconId?: string;
       earnDateText: string;
     }>;
@@ -1696,6 +1698,8 @@ export async function planRangeReport(
       shape: t.shape,
       badgeText: t.badgeText,
       groupTitle: t.groupTitle,
+      /** 分组 key：前端判断合环组（rings）走三层三环造型，其余走单章 */
+      group: t.group,
       activityIconId: t.activityIconId,
       earnDateText: t.earnDateText,
     }));

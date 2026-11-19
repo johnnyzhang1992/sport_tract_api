@@ -542,9 +542,13 @@ test('BO17 年度报告返回徽章明细：列出区间内解锁的徽章，按
     `明细 ${rep.badges.unlockedList.length} 条 vs 计数 ${rep.badges.unlockedInRange}`);
 
   for (const b of rep.badges.unlockedList) {
-    // 前端画章面需要的字段
-    for (const f of ['key', 'shortLabel', 'shape', 'badgeText', 'earnDateText'] as const) {
+    // 前端画章面需要的字段（activityIconId 是分类型徽章白色图标的来源；
+    // group 供前端判断合环组走三层三环——2026-11-19 review 补锁）
+    for (const f of ['key', 'shortLabel', 'shape', 'badgeText', 'earnDateText', 'groupTitle', 'group'] as const) {
       assert.ok((b as any)[f] !== undefined, `徽章明细缺 ${f}`);
+    }
+    if (/^type-/.test(b.key) || b.group === 'activity-type') {
+      assert.ok(b.activityIconId, `分类型徽章 ${b.key} 必须带 activityIconId（白色图标来源）`);
     }
     assert.match(b.earnDateText, /^\d{4}-\d{2}-\d{2}$/, '日期格式');
     assert.ok(b.earnDateText >= '2026-01-01' && b.earnDateText <= '2026-12-31', '不应超出区间');
