@@ -116,29 +116,41 @@ test('CAL-1 整月按天下发：已签取库存值、未来日给名义推算�
   }
 });
 
-test('CAL-2 可补只出现在窗口内；历史月份漏签日一律 missed', async () => {
+test('CAL-2 取消窗口后：有任何签到记录 → 过去的漏签日全部可补（2026-11-20）', async () => {
   await PointSigninModel.deleteMany({ userId: uid });
-  await seed(shiftDateKey(TODAY, -1), 6); // 昨天有行 → 窗口内漏签日才谈得上可补
+  await seed(shiftDateKey(TODAY, -1), 6); // 昨天有行 → 谈得上补
 
   const cur = data<Calendar>(await getCal());
   const makeupKeys = cur.days.filter((d) => d.state === 'makeup').map((d) => d.dateKey);
-  assert.ok(makeupKeys.length > 0, '昨天签了、今天之前有漏签日 → 至少有一格可补');
-  const left = shiftDateKey(TODAY, -6);
-  assert.ok(
-    makeupKeys.every((k) => k >= left && k < TODAY),
-    `可补格必须全在 [今天-6, 昨天] 内，实际 ${makeupKeys.join(',')}`,
-  );
+  assert.ok(makeupKeys.length > 0, '有签到记录时，今天之前的漏签日都应可补');
 
+  // 新规则：不再有 [今天-6, 昨天] 的上界，只看「早于今天」
+  assert.ok(
+    makeupKeys.every((k) => k < TODAY),
+    `可补格必须都早于今天，实际 ${makeupKeys.join(',')}`,
+  );
+  // 本视图内除「昨天(已签)、今天(未签)」外，所有过去的日子都应该是 makeup
+  const past = cur.days.filter((d) => d.dateKey < TODAY && d.dateKey !== shiftDateKey(TODAY, -1));
+  const pastNotMakeup = past.filter((d) => d.state !== 'makeup');
+  assert.equal(pastNotMakeup.length, 0,
+    `过去的日子除已签外都应可补，实际非 makeup：${pastNotMakeup.map((d) => `${d.dateKey}=${d.state}`).join(',')}`);
+
+  // 历史月视图：同样按「过去即可补」处理，不再受窗口限制
   const old = data<Calendar>(await getCal(LAST_MONTH));
   const lastDim = new Date(Number(LAST_MONTH.slice(0, 4)), Number(LAST_MONTH.slice(5, 7)), 0).getDate();
   assert.equal(old.days.length, lastDim + 12, '历史月同样带前后各 6 天补位');
-  // 可补窗口是滚动的 [今天-6, 昨天]：每月头 6 天窗口会跨进上一月，历史月视图里落在窗口内的
-  // 漏签日照样可补（服务端判据只认窗口，端上七格/月历同口径）。断言按窗口收口，
-  // 不能写死「历史月一律无可补格」——那种说法只在每月 7 号之后成立
-  const winLeft = shiftDateKey(TODAY, -6);
-  const stray = old.days.filter((d) => d.state === 'makeup' && (d.dateKey < winLeft || d.dateKey >= TODAY));
-  assert.equal(stray.length, 0, `历史月视图里的可补格也必须落在窗口内：${stray.map((d) => d.dateKey).join(',')}`);
-  assert.equal(byKey(old, OLD_MISSED)!.state, 'missed', '窗口外的漏签日是 missed：端上点了由补签接口回 400，判据不能错标');
+  assert.equal(byKey(old, OLD_MISSED)!.state, 'makeup',
+    '历史月的漏签日现在也可补（旧规则是 missed）');
+});
+
+test('CAL-2b 从没有签到记录 → 一律 missed（不能凭卡从零买连签）', async () => {
+  await PointSigninModel.deleteMany({ userId: uid });
+  const cur = data<Calendar>(await getCal());
+  const makeupKeys = cur.days.filter((d) => d.state === 'makeup');
+  assert.equal(makeupKeys.length, 0, `无任何签到记录时不该有可补格：${makeupKeys.map((d) => d.dateKey).join(',')}`);
+  const past = cur.days.filter((d) => d.dateKey < TODAY);
+  assert.ok(past.every((d) => d.state === 'missed'), '过去的日子应全是 missed');
+  assert.equal(byKey(cur, TODAY)!.state, 'today', '今天仍是可签的 today 格');
 });
 
 test('CAL-3 month 参数闸门：非法格式 400 且点名收到的值', async () => {
@@ -155,16 +167,16 @@ test('CAL-4 未登录 401', async () => {
   assert.equal(res.statusCode, 401, res.body);
 });
 
-test('CAL-5 补位日期带真实窗口状态：跨月的可补日照样标 makeup', async () => {
-  // 直接调 service 钉住时钟：今天 11-02 → 补签窗口 [10-27, 11-01]，10-27 落在 11 月视图的首行补位里
+test('CAL-5 补位日期带真实状态：跨月漏签日现在也可补（2026-11-20 取消窗口）', async () => {
+  // 直接调 service 钉住时钟：今天 11-02，11-01 已签 → 11 月视图首行的跨月补位日（10 月）也应可补
   const NOW = Date.UTC(2026, 10, 2, 2, 0, 0);
   await PointSigninModel.deleteMany({ userId: uid });
   await PointSigninModel.create({
     userId: uid, dateKey: '2026-11-01', streakDay: 5, points: 5, source: 'sign', createdAt: NOW,
   });
   const c = await getSigninCalendar(userId, '2026-11', NOW);
-  assert.equal(byKey(c, '2026-10-27')!.state, 'makeup', '窗口左缘的跨月漏签日必须标成可补');
-  assert.equal(byKey(c, '2026-10-26')!.state, 'missed', '窗口外的补位日不可补');
+  assert.equal(byKey(c, '2026-10-27')!.state, 'makeup', '跨月补位里过去的漏签日可补');
+  assert.equal(byKey(c, '2026-10-26')!.state, 'makeup', '更早的补位日同样可补（旧规则里是 missed）');
   assert.equal(byKey(c, '2026-11-01')!.state, 'signed');
   assert.equal(byKey(c, '2026-11-01')!.streakDay, 5, '补位与跨月都不影响已签日取库存值');
 });

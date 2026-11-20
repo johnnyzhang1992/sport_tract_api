@@ -18,7 +18,7 @@ import { AppError } from '../utils/app-error.js';
 import { POINTS } from '../config/points.js';
 import { bjDateStr } from '../utils/bj-time.js';
 import { previousDateKey, rewardForStreakDay } from '../utils/points-domain.js';
-import { planSigninCells, windowStartKey, WINDOW_DAYS, type SigninCell } from '../utils/points-window.js';
+import { planSigninCells, streakPositionOf, type SigninCell } from '../utils/points-window.js';
 import { PointCardModel, PointSigninModel } from '../models/point.model.js';
 import { creditPoints, debitPoints, getBalance } from './points-ledger.js';
 import { creditStreakTopUp } from './points-streak.js';
@@ -60,10 +60,13 @@ function isDuplicateKey(e: unknown): boolean {
  */
 export async function getSigninState(userId: string, now = Date.now()): Promise<SigninState> {
   const todayKey = bjDateStr(now);
-  // 只读窗口这 7 天：段长判定截在窗口内（spec §4.1 第 4 条 / Ruling 2026-10-25），窗外的行不参与
+  /*
+   * 2026-11-20 取消补签日期窗口后，可补范围从「最早已签日」到今天，
+   * 因此要读该用户的全部签到行（一天一行，量很小；投影只取 dateKey/streakDay，走 userId+dateKey 索引）。
+   */
   const [rows, cards] = await Promise.all([
-    PointSigninModel.find({ userId, dateKey: { $gte: windowStartKey(todayKey), $lte: todayKey } })
-      .select({ dateKey: 1, streakDay: 1 }).lean(),
+    PointSigninModel.find({ userId, dateKey: { $lte: todayKey } })
+      .sort({ dateKey: 1 }).select({ dateKey: 1, streakDay: 1 }).lean(),
     PointCardModel.countDocuments({ userId, status: 'unused', expiresAt: { $gt: now } }),
   ]);
   const cells = planSigninCells(rows, todayKey);
@@ -196,24 +199,39 @@ export async function useMakeupCard(
   if (key >= todayKey) {
     throw new AppError(400, `只能补今天之前的日期（今天 ${todayKey}，收到 ${key}）：该日期不能补签`);
   }
-  if (key < windowStartKey(todayKey)) {
-    throw new AppError(400,
-      `已超出近 ${WINDOW_DAYS} 天补签窗口（窗口起点 ${windowStartKey(todayKey)}，收到 ${key}）：该日期不能补签`);
-  }
+  /*
+   * 2026-11-20 取消日期窗口：不再有「超出 N 天补签窗口」这一条拒绝。
+   * 能否补完全由 planSigninCells 下发的 state 决定（makeup 才行），
+   * 这样判据只有一处，不会出现「接口说能补、写接口说超窗」的不一致。
+   */
 
   const state = await getSigninState(userId, now);
-  const cell = state.cells.find((c) => c.dateKey === key);
-  // 崩溃恢复（审计 Finding 1）：残留的 makeup 行（points=0）说明上次流程没走完——
-  // 正常路径 credited<=0 会连卡带行一起回滚，不会留这种行；先于「已签到」判定处理。
+  /*
+   * 崩溃恢复（审计 Finding 1）：残留的 makeup 行（points=0）说明上次流程没走完——
+   * 正常路径 credited<=0 会连卡带行一起回滚，不会留这种行；先于「已签到」判定处理。
+   */
   const stale = await PointSigninModel.findOne({
     userId, dateKey: key, source: 'makeup', points: 0,
   }).lean();
-  if (cell?.state === 'signed' && !stale) throw new AppError(400, '该日已签到，无需补签');
-  if (cell?.state !== 'makeup' && !stale) {
-    // 段长上限读配置不写死：2026-10-25 放宽到 7（= 窗口大小）后，旧文案里的「2 天」就成了谎话
-    throw new AppError(400, state.cells.some((c) => c.state === 'signed')
-      ? `该日所在未签段超过上限 ${POINTS.MAX_MAKEUP_GAP_DAYS} 天（收到 ${key}）：该日不能补签`
-      : `窗口内还没有签到记录，补签只能接在已有记录上（收到 ${key}）：该日不能补签`);
+
+  /*
+   * 可补判定（2026-11-20 取消日期窗口后改为**直接按日期查库**，不再依赖 7 格 cells）：
+   * state.cells 只是积分页顶部那 7 格，7 格外的历史日期本来就取不到，用它当判据会把
+   * 「任意过去日期可补」变成「只有最近 7 天可补」，与产品口径相悖。
+   * 现在的判据：
+   *   1. 该日没有签到行（有就是「已签到」）
+   *   2. 该用户至少有一条签到记录（新用户不能凭卡从零买连签）
+   */
+  const existing = await PointSigninModel.findOne({ userId, dateKey: key })
+    .select({ dateKey: 1 })
+    .lean();
+  if (existing && !stale) throw new AppError(400, '该日已签到，无需补签');
+  if (!existing && !stale) {
+    const hasAny = await PointSigninModel.exists({ userId });
+    if (!hasAny) {
+      throw new AppError(400,
+        `还没有任何签到记录，补签只能接在已有记录上（收到 ${key}）：该日不能补签`);
+    }
   }
   if (state.cards <= 0 && !stale) throw new AppError(400, '没有可用的补签卡，请先兑换');
 
@@ -248,8 +266,17 @@ export async function useMakeupCard(
     await deleteOwnRow(stale._id);
   }
 
-  // 残留恢复路径下 cell 可能缺（行已存在→signed 格），位置以残留行库存值为准
-  const streakDay = cell?.streakDay ?? stale?.streakDay ?? 1;
+  /*
+   * 补签日的连签位置：
+   *   - 残留恢复路径：以残留行库存值为准
+   *   - 常规路径：按库里已有的行推算（取消日期窗口后，补签日可能在 7 格之外，拿不到 state.cells）
+   */
+  let streakDay = stale?.streakDay ?? 0;
+  if (!streakDay) {
+    const histRows = await PointSigninModel.find({ userId, dateKey: { $lte: todayKey } })
+      .sort({ dateKey: 1 }).select({ dateKey: 1, streakDay: 1 }).lean();
+    streakDay = streakPositionOf(histRows.map((r) => ({ dateKey: r.dateKey, streakDay: r.streakDay })), key);
+  }
   // 1) 先占这一行：同一天双击/两路并发只有一路能往下发分
   const row = await PointSigninModel.create({
     userId, dateKey: key, streakDay, points: 0, source: 'makeup', createdAt: now,

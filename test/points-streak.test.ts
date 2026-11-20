@@ -88,11 +88,21 @@ test('RK4 发差额：一条 makeup_topup 流水记在今天，重复调用不�
   assert.equal(lotSum, account?.balance, '余额必须有批次兜底（FIFO/过期口径不破）');
 });
 
-test('RK5 窗口外的历史行不参与校正（只看最近 7 格）', async () => {
+test('RK5 校正覆盖全部历史行（2026-11-20 取消窗口后不再只看最近 7 天）', async () => {
   await wipe();
-  await put(back(9), 1, 1); await put(back(8), 99, 7); // 明显偏离，但在窗口外
+  /*
+   * 取消补签窗口后，连签链条可能很长（用户能把去年的漏签补回来），
+   * 校正若仍只读最近 7 天，会把长链的段首当锚点、把历史压平成 1..7。
+   * 所以现在校正范围 = 该用户全部签到行。
+   */
+  await put(back(9), 3, 3);  // 段首（前面是空档）：库存值为锚，不动
+  await put(back(8), 4, 4);  // 接上 → 4，正确
+  await put(back(7), 50, 5); // 应顶到 5，记了 50 → 应被校正为 5
   const r = await reconcileStreaks(userId, NOW);
-  assert.equal(r.fixes.find((f) => f.dateKey === back(8)), undefined);
+  assert.equal(r.fixes.find((f) => f.dateKey === back(9)), undefined, '段首以库存值为锚，不动');
+  const f7 = r.fixes.find((f) => f.dateKey === back(7));
+  assert.ok(f7, '窗口外的偏离行现在会被校正');
+  assert.equal((await PointSigninModel.findOne({ userId: uid, dateKey: back(7) }).lean())?.streakDay, 5);
 });
 
 test('RK6 空档断链：段首以库存值为锚（不回按 1 起），向下归位校行不扣已拿的分', async () => {

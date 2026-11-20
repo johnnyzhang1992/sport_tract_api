@@ -234,14 +234,16 @@ test('PS5 断签 3 天（22/23/24 都漏）：段长放宽后可补，逐格接�
   assert.deepEqual(rows.map((r) => r.streakDay), [1, 2, 3, 4], '整条链被 reconcile 接回 1..4');
 });
 
-test('PS5b 补今天/补窗口外日期/补非法串/补已签日 → 各自文案的 400，且卡不消耗', async () => {
+test('PS5b 补今天/补非法串/补已签日 → 各自文案的 400，且卡不消耗', async () => {
   await wipe(uid);
   await seed('2026-10-23', 1);
   const id = await giveCard();
-  // §5.3 的错误表逐条对上：出窗/是今天/格式非法 → 「该日期不能补签」；已签 → 「该日已签到，无需补签」
+  /*
+   * 2026-11-20 取消日期窗口后，原先的「出窗」用例（2026-10-18）不再拒绝——
+   * 现在任何过去的漏签日都可补，该场景改由 PS5d 正面覆盖。
+   */
   const cases: [string, RegExp][] = [
     ['2026-10-25', /该日期不能补签/],
-    ['2026-10-18', /该日期不能补签/],
     ['2026-10-1x', /该日期不能补签/],
     ['2026-10-23', /该日已签到，无需补签/],
   ];
@@ -250,8 +252,33 @@ test('PS5b 补今天/补窗口外日期/补非法串/补已签日 → 各自文�
   }
   assert.equal((await PointCardModel.findById(id).lean())?.status, 'unused');
   assert.equal((await PointCardModel.findById(id).lean())?.usedForDate, '');
-  assert.equal(await PointSigninModel.countDocuments({ userId: uid }), 1, '四次拒绝都不新增签到行（只有 seed 的 23）');
-  assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 0, '四次拒绝都不发分');
+  assert.equal(await PointSigninModel.countDocuments({ userId: uid }), 1, '拒绝都不新增签到行（只有 seed 的 23）');
+  assert.equal(await PointRecordModel.countDocuments({ userId: uid }), 0, '拒绝都不发分');
+});
+
+test('PS5d 取消窗口：任意过去的漏签日都能补（30 天前也行）', async () => {
+  await wipe(uid);
+  await seed('2026-09-25', 1); // 一个月前
+  await seed('2026-10-23', 2);
+  await giveCard();
+  await giveCard();
+  // 9-25 与 10-23 之间的大段空白：9-26..10-22 全部可补，随便挑一天
+  const res = await useMakeupCard(userId, '2026-10-01', NOW);
+  assert.ok(res, '10-01 距今天 24 天，取消窗口后应可补');
+  const row = await PointSigninModel.findOne({ userId: uid, dateKey: '2026-10-01' }).lean();
+  assert.ok(row, '应落一行补签记录');
+  assert.equal(row!.source, 'makeup');
+});
+
+test('PS5e 从没有签到记录 → 不能凭卡从零买连签', async () => {
+  await wipe(uid);
+  await giveCard();
+  await assert.rejects(
+    () => useMakeupCard(userId, '2026-10-18', NOW),
+    /还没有任何签到记录/,
+    '无任何签到行时必须拒绝',
+  );
+  assert.equal(await PointSigninModel.countDocuments({ userId: uid }), 0, '不该落下任何行');
 });
 
 test('PS5c 拒绝文案要说清对象与实际值（旧文案把段长上限写死成 2 天，早已放宽到 7）', async () => {
@@ -266,24 +293,25 @@ test('PS5c 拒绝文案要说清对象与实际值（旧文案把段长上限写
     }
   };
 
-  // 窗口里一行签到记录都没有：新用户不能凭卡从零买连签
+  /*
+   * 一条签到记录都没有：新用户不能凭卡从零买连签。
+   * 2026-11-20 取消日期窗口后，文案不再提「窗口」，改为直说「还没有任何签到记录」。
+   */
   const noRecord = await grab('2026-10-24');
-  assert.match(noRecord, /窗口内还没有签到记录/, noRecord);
+  assert.match(noRecord, /还没有任何签到记录/, noRecord);
   assert.ok(!/断签超过 2 天/.test(noRecord), '不得再出现写死「2 天」的旧口径');
+  assert.ok(!/窗口/.test(noRecord), '取消窗口后文案不该再提窗口');
 
   await seed('2026-10-23', 1);
-  // 出窗：报窗口起点与收到的日期
-  const outOfWindow = await grab('2026-10-18');
-  assert.match(outOfWindow, /2026-10-19/, `窗口起点要出现在文案里：${outOfWindow}`);
-  assert.match(outOfWindow, /2026-10-18/, `收到的日期要出现在文案里：${outOfWindow}`);
-  // 是今天：报今天与收到的同一天，用户才知道为什么不行
+  // 「是今天」：报今天与收到的日期，用户才知道为什么不行
   const isToday = await grab('2026-10-25');
   assert.match(isToday, /今天 2026-10-25/, isToday);
+  assert.match(isToday, /2026-10-25/, '收到的日期要出现在文案里');
   // 格式非法：回显收到的串
   const malformed = await grab('2026-10-1x');
   assert.match(malformed, /2026-10-1x/, malformed);
-  // 三条新文案都保留旧契约的尾巴，老客户端按「该日期不能补签」匹配不受影响
-  for (const m of [noRecord, outOfWindow, isToday, malformed]) {
+  // 新文案都保留旧契约的尾巴，老客户端按「不能补签」匹配不受影响
+  for (const m of [noRecord, isToday, malformed]) {
     assert.match(m, /不能补签/, m);
   }
 });
@@ -477,6 +505,7 @@ test('PS22 可补格与卡数量解耦：无卡也下发 makeup 格，供前端�
   await PointSigninModel.create({ userId: uid12, dateKey: '2026-10-23', streakDay: 2, points: 2, source: 'sign', createdAt: NOW });
 
   const noCard = await getSigninState(u12, NOW);
+  // 2026-11-20 取消窗口：7 格内除已签的 23 外，过去的漏签日全部可补（原来只有段长内的才可补）
   assert.deepEqual(noCard.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
     ['2026-10-19', '2026-10-20', '2026-10-21', '2026-10-22', '2026-10-24'], '无卡也要下发可补格，前端才能引导兑换');
   assert.equal(noCard.cards, 0);
@@ -502,8 +531,8 @@ test('PS23 cells 改版：今天已签仍可补昨天（口径 3）；连漏 3 �
   assert.deepEqual(signedToday.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
     ['2026-10-19', '2026-10-20', '2026-10-21', '2026-10-22', '2026-10-24']);
 
-  // 只有 21 号一行：22/23/24 连漏 3 天 → 段长放宽后全部可补；
-  // 19/20 段长 2（左界截在窗口左缘）→ 仍是可补格
+  // 只有 21 号一行：22/23/24 连漏 3 天可补；19/20 在 21 之前、
+  // 取消窗口后同样可补（原来受段长/窗口左界限制）
   await PointSigninModel.create({ userId: uid14, dateKey: '2026-10-21', streakDay: 1, points: 1, source: 'sign', createdAt: NOW });
   const noDayBefore = await getSigninState(String(uid14), NOW);
   assert.deepEqual(noDayBefore.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey), ['2026-10-19', '2026-10-20', '2026-10-22', '2026-10-23', '2026-10-24']);
@@ -594,18 +623,29 @@ test('PS14 summary 下发 7 格：状态、分值与 todayRewardAfter 一致', a
   assert.equal((s as unknown as { makeupDate?: string }).makeupDate, undefined, '旧字段要删掉');
 });
 
-test('PS15 窗外行不参与可补判定：service 只读窗口这 7 天', async (t) => {
+test('PS15 历史行不影响最近 7 格；取消窗口后 makeup 覆盖全部过去漏签日', async (t) => {
   await wipe(uid);
   await seed('2026-10-16', 1);
   await seed('2026-10-20', 1); await seed('2026-10-21', 2);
   await seed('2026-10-22', 3); await seed('2026-10-23', 4);
-  const s = await getSigninState(userId, NOW);
-  assert.equal(s.cells[0].dateKey, '2026-10-19', '10-16 在窗外 → 19 左侧出窗即停，段长 1，仍可补');
-  assert.equal(s.cells.filter((c) => c.state === 'makeup').length, 2, '19 与 24 都可补');
+  const s = await getSigninState(userId, NOW); // NOW = 2026-10-25
+  /*
+   * 2026-11-20 取消日期窗口：7 格内除已签日外**全部**是 makeup
+   * （19 在最早已签日 16 之后、24 在今天之前，都该可补）。
+   */
+  assert.equal(s.cells[0].dateKey, '2026-10-19');
+  assert.deepEqual(
+    s.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
+    ['2026-10-19', '2026-10-24'],
+    '19 与 24 都可补（原来的 19 是受段长/窗口限制的边界）',
+  );
 
-  // 紧贴窗左界的窗外行（10-18，库存值故意离谱）：读范围契约要求 service 一行窗外都不喂给
-  // planSigninCells——positionIfSigned 往左走没有硬左界，窗外旧行一旦进 map 就当锚点、格子全错。
-  // 正确实现下 10-18 被读范围挡掉，格子与上面（等价于行集 20..23）完全一致。
+  /*
+   * 不变量（比窗口放宽后更重要）：读路径现在会读到**全部**历史行，
+   * 其中若有库存值离谱的旧行（这里是 10-18 streakDay=99），它只能作为
+   * positionIfSigned 走到段首时的锚点，不能让最近 7 格的已签值/可补性变形。
+   * 这里 18 与 20 之间隔着 19 的空档，18 自成一链，不该影响 20..23 的链条。
+   */
   const uid15b = new Types.ObjectId();
   const u15b = String(uid15b);
   t.after(() => wipe(uid15b));
@@ -615,7 +655,19 @@ test('PS15 窗外行不参与可补判定：service 只读窗口这 7 天', asyn
   await PointSigninModel.create({ userId: uid15b, dateKey: '2026-10-22', streakDay: 3, points: 3, source: 'sign', createdAt: NOW });
   await PointSigninModel.create({ userId: uid15b, dateKey: '2026-10-23', streakDay: 4, points: 4, source: 'sign', createdAt: NOW });
   const s15b = await getSigninState(u15b, NOW);
-  assert.deepEqual(s15b.cells, s.cells, '窗外 10-18 的行不得改变任何一格');
+  // 已签格一律照库存值下发，异常值不会传染到别的日子
+  for (const c of s15b.cells.filter((x) => x.state === 'signed')) {
+    const expected = { '2026-10-20': 1, '2026-10-21': 2, '2026-10-22': 3, '2026-10-23': 4 }[
+      c.dateKey as '2026-10-20'
+    ];
+    if (expected !== undefined) assert.equal(c.streakDay, expected, `${c.dateKey} 应取库存值`);
+  }
+  // 7 格内的 makeup 集合与没有那条异常行时一致（19、24）——18 不在 7 格内，不参与
+  assert.deepEqual(
+    s15b.cells.filter((c) => c.state === 'makeup').map((c) => c.dateKey),
+    ['2026-10-19', '2026-10-24'],
+    '历史异常行不得改变 7 格的可补判定',
+  );
 });
 
 test('PS16 今天签到时若并发补签刚落了昨天，今天按重排后的位置发分并补差', async () => {

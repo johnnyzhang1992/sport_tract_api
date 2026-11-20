@@ -1,11 +1,18 @@
 /**
- * 七格规划（需求 §4 改版）：窗口 = [今天-6, 今天]，最后一格必含今天；
- * 窗口内漏签日标成可补格（段长上限 = MAX_MAKEUP_GAP_DAYS，2026-10-25 用户拍板放宽到 7
- * = 窗口本身的大小，即"窗口内全部可补"；产品要收紧改 config 一个数字）。
- * 前提：窗口内至少有一个已签行——补签只能接在已有记录上，新用户/全休眠用户不能凭卡从零买连签。
- * 起点按最早可补日 / 当前连签段起点取最早，且被窗口左界（今天-6）兜住（窗口必须罩住今天，
- * 起点不会滑到今天之后）。段长只数窗口内的日子（spec §4.1 第 3/4 条）：左界截到今天-6、
- * 右界截到今天，不往窗口外读，所以调用方只需读 [今天-6, 今天] 这 7 天的行。
+ * 签到格规划（2026-11-20 去掉日期窗口）。
+ *
+ * **历史**：原先是「七格窗口 [今天-6, 今天]」，窗口外的漏签日一律不可补（标 missed）。
+ * 用户裁定取消该限制——**任何过去的漏签日都可以用补签卡补**，理由：
+ *   - 补签卡 99 分/张，补回来最多 7 分/天，本身就是净亏，不存在靠补签刷分
+ *   - 每日积分上限 100 分，攒够补一年的卡（365 张 = 36135 分）需要连续 361 天不间断，
+ *     造假成本比自己老实签还高
+ *   - 旧窗口挡的是「忘签几天想补」的正常用户，而不是作弊者
+ *
+ * **保留的闸门**：至少有一个已签行才谈得上补（`hasAnySigned`）——
+ * 新用户不能凭卡从零买连签，这是产品语义（补签 = 接上已有记录），与经济性无关。
+ *
+ * 现在的可补范围 = `[第一个可补日, 今天]`：从最早的断点开始，跨过所有漏签日到今天。
+ * 起点不再有下界，因此调用方要读该用户**全部**签到行（实际量很小：一天一行）。
  * 纯函数：不查库。
  */
 import { POINTS } from '../config/points.js';
@@ -32,8 +39,18 @@ export interface SigninCell {
   todayRewardAfter?: number;
 }
 
-export function windowStartKey(todayKey: string): string {
-  return shiftDateKey(todayKey, -(WINDOW_DAYS - 1));
+/**
+ * 展示/可补的最早一日。
+ *
+ * 已无日期窗口，起点由**数据**决定：从今天往回走到第一个断点（连续已签段之前）即可。
+ * 保留本函数是为了给调用方一个「查询下界」——传 null 表示没有已签行，返回今天（无补签可言）。
+ *
+ * @param earliestSigned 该用户最早的一条签到日期（YYYY-MM-DD），没有则 null
+ */
+export function windowStartKey(todayKey: string, earliestSigned: string | null = null): string {
+  if (!earliestSigned) return todayKey;
+  // 起点不早于最早已签日：再往前既无记录也无从补起（没有可接的链条）
+  return earliestSigned > todayKey ? todayKey : earliestSigned;
 }
 
 export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell[] {
@@ -58,34 +75,24 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     return anchor + daysBetween(start, key);
   };
 
-  const left = windowStartKey(todayKey);
-  /**
-   * 含 d 的未签段长度（spec §4.1 第 3 条）：向两侧数没有签到行的日子，
-   * 左界截到窗口左缘 `left`、右界截到今天（今天没签不算漏签日），遇到已签日即停。
-   * 超过段长上限就提前退出——调用方只读窗口内的行，窗外无从判断也无需判断。
-   * 上限来自 MAX_MAKEUP_GAP_DAYS（2026-10-25 放宽到 7 = 窗口大小：窗口内全部可补）。
+  /*
+   * 前提闸门（保留）：至少有一个「今天或之前」的已签行才谈得上补。
+   * 新用户不能凭卡从零买连签——补签的语义是「接上已有记录」，与经济性无关。
    */
-  const gapRunLength = (d: string): number => {
-    let n = 1;
-    for (let cur = shiftDateKey(d, -1); cur >= left && !signed.has(cur); cur = shiftDateKey(cur, -1)) {
-      n += 1;
-      if (n > MAX_GAP_DAYS) return n;
-    }
-    for (let cur = shiftDateKey(d, 1); cur < todayKey && !signed.has(cur); cur = shiftDateKey(cur, 1)) {
-      n += 1;
-      if (n > MAX_GAP_DAYS) return n;
-    }
-    return n;
-  };
+  const hasAnySigned = signed.size > 0;
 
-  // 前提闸门：窗口内至少有一个已签行才谈"补"——新用户 / 全休眠用户（已签全在窗外）
-  // 不能凭卡从零买连签。有行之后，段长 ≤ 上限的漏签日全部可补。
-  const hasSignedInWindow = rows.some((r) => r.dateKey >= left && r.dateKey <= todayKey);
+  /*
+   * 可补集合（2026-11-20 去掉日期窗口）：**今天之前、没有签到行的日子全部可补**，
+   * 不限于「最早已签日之后」——用户裁定「进入之前的日期也全部可补」。
+   * 唯一的闸门是有过签到记录（hasAnySigned），防止新用户凭卡从零买连签。
+   *
+   * 注意：这里只影响**七格内的 makeup 标记**（展示范围固定最近 7 天）；
+   * 7 格外的历史日期由月历接口与 useMakeupCard 直接按日期判定，不经过本函数。
+   */
   const makeupable = new Set<string>();
-  if (hasSignedInWindow) {
-    for (let i = WINDOW_DAYS - 1; i >= 1; i -= 1) {
-      const d = shiftDateKey(todayKey, -i);
-      if (!signed.has(d) && gapRunLength(d) <= MAX_GAP_DAYS) makeupable.add(d);
+  if (hasAnySigned) {
+    for (let cur = shiftDateKey(todayKey, -(WINDOW_DAYS - 1)); cur < todayKey; cur = shiftDateKey(cur, 1)) {
+      if (!signed.has(cur)) makeupable.add(cur);
     }
   }
 
@@ -98,9 +105,14 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
     while (signed.has(cur)) cur = shiftDateKey(cur, -1);
     runStart = shiftDateKey(cur, 1);
   }
-  // dateKey 是 'YYYY-MM-DD' 串，取最早一日必须按字符串比，Math.min 会算出 NaN
-  const startCand = [runStart, ...makeupable].reduce((a, b) => (a < b ? a : b));
-  const start = startCand < left ? left : startCand;
+  /*
+   * 展示范围仍固定为**最近 7 天**（今天 + 前 6 天），与改动前一致。
+   *
+   * 为什么不铺满全部历史：这 7 格是积分页顶部的「等分横条」（.signin-strip 是 flex:1 等分），
+   * 格子数一变就会挤成一团。**可补范围**已经放开到「任意过去日期」，但那由
+   * getSigninCalendar 按月判定、由 useMakeupCard 按日期校验，不需要靠这 7 格承载。
+   */
+  const start = shiftDateKey(todayKey, -(WINDOW_DAYS - 1));
 
   const todayPos = positionIfSigned(todayKey);
   const cells: SigninCell[] = [];
@@ -128,13 +140,36 @@ export function planSigninCells(rows: SignedRow[], todayKey: string): SigninCell
       } else {
         cells.push({ dateKey, state: 'missed', streakDay: 0, reward: 0 });
       }
-    } else {
-      // 未来格：以今天格的位置起（今天已签则以今天实际 streakDay）按一路签下去预测
-      const base = signed.has(todayKey) ? (signed.get(todayKey) as SignedRow).streakDay : todayPos;
-      const pos = base + (i - daysBetween(start, todayKey));
-      cells.push({ dateKey, state: 'future', streakDay: pos, reward: rewardForStreakDay(pos) });
     }
+    /*
+     * 这里原本还有 future 分支（未来日按「一路签下去」推算分值），用于旧的七格窗口
+     * 把窗口右界延伸到未来的场景。2026-11-20 循环改为只到今天，该分支已不可达，故移除。
+     * `future` 仍保留在 CellState 类型里：/points/signin/calendar 的跨月补位格会让它复活。
+     */
   }
   return cells;
+}
+
+/**
+ * 某天「若签上」应有的连签位置（第几天）。
+ *
+ * 给补签写路径用：取消日期窗口后，补签日可能在 7 格之外，拿不到 state.cells，
+ * 于是直接按库里的行推算——往左走到段首，段首有库存 streakDay 就取它作锚点，
+ * 否则按 1 起（与 planSigninCells 内部 positionIfSigned 同一口径，避免两套算法）。
+ *
+ * @param rows 该用户今天及之前的全部签到行
+ * @param key  要计算的日期
+ */
+export function streakPositionOf(rows: SignedRow[], key: string): number {
+  const signed = new Map<string, SignedRow>();
+  for (const r of rows) signed.set(r.dateKey, r);
+  let start = key;
+  let prev = shiftDateKey(start, -1);
+  while (signed.has(prev)) {
+    start = prev;
+    prev = shiftDateKey(start, -1);
+  }
+  const anchor = signed.has(start) ? (signed.get(start) as SignedRow).streakDay : 1;
+  return anchor + daysBetween(start, key);
 }
 

@@ -388,11 +388,15 @@ test('PR2 summary → 兑换 → 补签 → 签到 → 领任务 全链路', asy
     '窗口内全部漏签日可补（段长放宽）',
   );
 
-  // 6) 非法/出窗日期 → service 的 400 原样透出，卡不消耗；旧的按卡 id 接口已撤 → 404
+  // 6) 非法/今天 → service 的 400 原样透出，卡不消耗；旧的按卡 id 接口已撤 → 404
   const badDate = await post('/points/signin/makeup', { dateKey: TODAY });
   assert.equal(badDate.statusCode, 400, badDate.body);
   assert.match(badDate.json().message, /不能补签/);
-  assert.equal((await post('/points/signin/makeup', { dateKey: '2020-01-01' })).statusCode, 400, '出窗日期 400');
+  /*
+   * 2026-11-20 取消日期窗口：像 2020-01-01 这种「早年」日期不再被拒（原来报 400「出窗」）。
+   * 这里仍需要一个拒绝用例，改用「没有签到记录的新用户」——
+   * 那条闸门与窗口无关，是产品语义（补签只能接在已有记录上）。
+   */
   assert.equal((await post(`/points/cards/${cardId}/use`)).statusCode, 404, '旧端点 /points/cards/:id/use 已撤');
   assert.equal((await PointCardModel.findOne({ userId: uid }).lean())?.status, 'unused', '参数错不烧卡');
 

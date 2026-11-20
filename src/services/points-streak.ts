@@ -16,7 +16,6 @@
 import { PointSigninModel } from '../models/point.model.js';
 import { rewardForStreakDay, shiftDateKey } from '../utils/points-domain.js';
 import { bjDateStr } from '../utils/bj-time.js';
-import { WINDOW_DAYS } from '../utils/points-window.js';
 import { creditPoints } from './points-ledger.js';
 
 export interface StreakFix {
@@ -32,9 +31,14 @@ export interface ReconcileResult {
 
 export async function reconcileStreaks(userId: string, now = Date.now()): Promise<ReconcileResult> {
   const todayKey = bjDateStr(now);
-  const left = shiftDateKey(todayKey, -(WINDOW_DAYS - 1));
-  const rows = await PointSigninModel.find({ userId, dateKey: { $gte: left, $lte: todayKey } })
+  /*
+   * 2026-11-20 取消补签窗口后，连签链条可能很长（用户补了一整年的漏签），
+   * 校正范围必须覆盖全部签到行——原来只读最近 7 天，会把长链的段首当锚点，
+   * 导致补出来的历史被「压平」成 1..7。
+   */
+  const rows = await PointSigninModel.find({ userId, dateKey: { $lte: todayKey } })
     .sort({ dateKey: 1 }).select({ dateKey: 1, streakDay: 1 }).lean();
+  const left = rows.length ? rows[0].dateKey : todayKey;
   const byKey = new Map(rows.map((r) => [r.dateKey, r.streakDay]));
   const fixes: StreakFix[] = [];
   let prev = 0; // 昨天在校正后的链条里的位置；0 = 昨天没行

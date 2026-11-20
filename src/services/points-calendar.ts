@@ -64,18 +64,27 @@ export async function getSigninCalendar(
     ...monthKeys,
     ...Array.from({ length: PAD_DAYS }, (_, i) => shiftDateKey(monthKeys[monthKeys.length - 1], i + 1)),
   ];
-  const [rows, state] = await Promise.all([
+  const [rows, state, anySigned] = await Promise.all([
     PointSigninModel.find({ userId, dateKey: { $gte: dates[0], $lte: dates[dates.length - 1] } })
       .select({ dateKey: 1, streakDay: 1 }).lean(),
     // 只借它的 cells 当判据，顺带拿到今天的位置
     getSigninState(userId, now),
+    // 闸门：有过任何签到记录才谈得上补（新用户不能凭卡从零买连签）
+    PointSigninModel.exists({ userId }),
   ]);
+  const hasAnySigned = anySigned !== null;
   const stored = new Map(rows.map((r) => [r.dateKey, r.streakDay]));
   const cellByKey = new Map(state.cells.map((c) => [c.dateKey, c]));
   const todayCell = cellByKey.get(todayKey);
   // 未来日推算基准：今天接得上的链长（今天有行取今天库存值，没签取「今天若签」的位置）
   const base = stored.get(todayKey) ?? todayCell?.streakDay ?? state.streakDay;
 
+  /*
+   * 2026-11-20 取消补签日期窗口：月历里**任何过去的漏签日**都可补（用户裁定）。
+   * 判据按"这一次查看的月份"来定——日历本来就是按月展示，没必要为一次请求算全部历史。
+   * 唯一的闸门仍是「该用户有过签到记录」（补签 = 接上已有记录，新用户不能凭卡从零买连签），
+   * 该闸门由 hasAnySigned 给出（getSigninState 已按此计算 isMakeupable 之外的整体可用性）。
+   */
   const days = dates.map<CalendarDay>((dateKey) => {
     const s = stored.get(dateKey);
     if (s !== undefined) return { dateKey, state: 'signed', streakDay: s, reward: rewardForStreakDay(s) };
@@ -86,11 +95,23 @@ export async function getSigninCalendar(
     if (dateKey === todayKey) {
       return { dateKey, state: 'today', streakDay: base, reward: rewardForStreakDay(base) };
     }
+    // 过去的漏签日：有签到记录就能补
+    if (!hasAnySigned) return { dateKey, state: 'missed', streakDay: 0, reward: 0 };
     const cell = cellByKey.get(dateKey);
-    if (cell?.state === 'makeup') {
-      return { dateKey, state: 'makeup', streakDay: cell.streakDay, reward: cell.reward };
-    }
-    return { dateKey, state: 'missed', streakDay: 0, reward: 0 };
+    /*
+     * 连签位置：state 里算过的（与七格同口径）优先。
+     * 更早的月份 state 不覆盖，这里按「该日接上前一天的位置」估算：
+     * 已签则取库存 streakDay，否则取 1（段首）。月历只用来展示/点选，精确分值以补签时的
+     * 写路径为准（useMakeupCard 会重算并落库），这里不做第二套精算。
+     */
+    const prev = stored.get(shiftDateKey(dateKey, -1));
+    const streakDay = cell?.streakDay ?? (prev !== undefined ? prev + 1 : 1);
+    return {
+      dateKey,
+      state: 'makeup',
+      streakDay,
+      reward: rewardForStreakDay(streakDay),
+    };
   });
 
   return { month: key, today: todayKey, days };

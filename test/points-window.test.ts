@@ -60,13 +60,15 @@ test('MW4 连漏 3 天：段长上限放宽到窗口大小（2026-10-25），三
   assert.equal(at(cells, back(1))!.todayRewardAfter, 2, '只补 24：今天接在它后面第 2 天');
 });
 
-test('MW5 全新用户（窗口内无已签日）：没有补签格，今天在第 1 格', () => {
+test('MW5 全新用户：没有任何可补格，今天在最末一格（2026-11-20 改为固定最近 7 天）', () => {
   const cells = planSigninCells([], T);
-  assert.equal(cells.filter((c) => c.state === 'makeup').length, 0);
-  assert.equal(cells[0].dateKey, T);
-  assert.equal(cells[0].state, 'today');
-  assert.equal(cells[6].state, 'future');
-  assert.equal(cells[6].reward, 7, '未来格按连续签下去预测');
+  assert.equal(cells.length, 7, '七格横条长度固定（等分布局，格子数不能变）');
+  assert.equal(cells.filter((c) => c.state === 'makeup').length, 0, '新用户不能凭卡从零买连签');
+  // 展示范围固定为 [今天-6, 今天]，今天落在最后一格
+  assert.equal(cells[0].dateKey, back(6));
+  assert.equal(cells[6].dateKey, T);
+  assert.equal(cells[6].state, 'today');
+  assert.ok(cells.slice(0, 6).every((c) => c.state === 'missed'), '过去的日子对空用户是 missed');
 });
 
 test('MW6 长连签 10 天：起点被今天-6 兜住，分值随位置递增后封顶 7', () => {
@@ -90,16 +92,23 @@ test('MW7 段长只数窗口内：左界截到今天-6，窗口外的行不参�
   assert.deepEqual(withOutside, cells, '10-16 在窗外，读不读都一样');
 });
 
-test('MW7b 全新用户/全休眠用户：窗口内没有已签行 → 无可补格（补签只能接在已有记录上）', () => {
+test('MW7b 全新用户无可补格；休眠用户在 7 格内同样无可补日（2026-11-20）', () => {
   assert.equal(planSigninCells([], T).filter((c) => c.state === 'makeup').length, 0, '新用户不能凭卡从零买连签');
-  // 已签行全在窗外（休眠超过 7 天）同样不可补
+  /*
+   * 休眠用户（最后一行在 9 天前，落在 7 格之外）：7 格内所有日子都是漏签。
+   * 取消日期窗口后这些日子**应该**可补（用户裁定「进入之前全部可补」），
+   * 所以这里断言的是「有行 → 可补」，与旧口径（窗外行不得参与）相反。
+   * 更早的历史日期由月历接口 / useMakeupCard 按日期判定，不经过本函数。
+   */
   const dormant = planSigninCells([{ dateKey: back(9), streakDay: 3 }], T);
-  assert.equal(dormant.filter((c) => c.state === 'makeup').length, 0);
+  assert.equal(dormant.filter((c) => c.state === 'makeup').length, 6, '7 格内 6 个过去的日子都可补');
 });
 
-test('MW8 windowStartKey 是今天-6', () => {
-  assert.equal(windowStartKey(T), back(6));
-  assert.equal(windowStartKey('2026-01-03'), '2025-12-28');
+test('MW8 windowStartKey 改为由最早已签日决定（2026-11-20 取消日期窗口）', () => {
+  // 不再有固定 7 天窗口：传 null（没有签到）返回今天，传最早已签日就返回那一天
+  assert.equal(windowStartKey(T), T, '没有签到记录时返回今天');
+  assert.equal(windowStartKey(T, '2026-09-01'), '2026-09-01', '有记录时起点=最早已签日');
+  assert.equal(windowStartKey('2026-01-03', '2026-01-10'), '2026-01-03', '最早已签日晚于今天时收敛到今天');
 });
 
 test('MW9 连签从窗口外带进来：段首按库存值当锚，不按窗口里有行的天数', () => {
