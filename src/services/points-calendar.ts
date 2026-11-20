@@ -85,6 +85,14 @@ export async function getSigninCalendar(
    * 唯一的闸门仍是「该用户有过签到记录」（补签 = 接上已有记录，新用户不能凭卡从零买连签），
    * 该闸门由 hasAnySigned 给出（getSigninState 已按此计算 isMakeupable 之外的整体可用性）。
    */
+  /*
+   * 补签位置的**滚动估算表**（2026-11-20 修）：
+   * 原来的实现只在 `stored`（真实签到行）里找前一天，连续多天漏签时只有第一格接得上，
+   * 后面全部塌回「第 1 天」（实测：已签 1~10 号 → 11 号第 11 天 ✓、12 号第 1 天 ✗）。
+   * 本表记录**本次遍历里已经推算出的位置**（含 makeup 格），后面的日子接着它往下数。
+   * days 是按日期升序铺的（当月前 PAD → 当月 → 后 PAD），所以单趟遍历即可。
+   */
+  const estimated = new Map<string, number>();
   const days = dates.map<CalendarDay>((dateKey) => {
     const s = stored.get(dateKey);
     if (s !== undefined) return { dateKey, state: 'signed', streakDay: s, reward: rewardForStreakDay(s) };
@@ -99,13 +107,22 @@ export async function getSigninCalendar(
     if (!hasAnySigned) return { dateKey, state: 'missed', streakDay: 0, reward: 0 };
     const cell = cellByKey.get(dateKey);
     /*
-     * 连签位置：state 里算过的（与七格同口径）优先。
-     * 更早的月份 state 不覆盖，这里按「该日接上前一天的位置」估算：
-     * 已签则取库存 streakDay，否则取 1（段首）。月历只用来展示/点选，精确分值以补签时的
-     * 写路径为准（useMakeupCard 会重算并落库），这里不做第二套精算。
+     * 连签位置：state（七格窗口，与补签写路径同口径）算过的优先；
+     * 其余按「接上前一天」滚动推算：前一天的位置先查 estimated（本次已推算的，含 makeup），
+     * 再查 stored（真实签到行）。两者都没有 = 段首，取 1。
+     *
+     * 口径说明：月历只用于展示/点选，**精确分值以补签写路径为准**
+     * （useMakeupCard 会用 streakPositionOf 按全量历史重算并落库）。
+     * 也就是说：如果用户不按顺序补，实际落库的分值可能与这里显示的不同——
+     * 显示的是「按日期顺序补齐」的投影，这是月历能做到的最合理近似。
+     *
+     * 另一条语义：**最早已签日之前**的漏签日也会显示 makeup，且位置从第 1 天起
+     * （那里没有可接的链条，补了就是新段起点）。见 utils/points-window.ts 的 windowStartKey 注释。
      */
-    const prev = stored.get(shiftDateKey(dateKey, -1));
+    const prevKey = shiftDateKey(dateKey, -1);
+    const prev = estimated.get(prevKey) ?? stored.get(prevKey);
     const streakDay = cell?.streakDay ?? (prev !== undefined ? prev + 1 : 1);
+    estimated.set(dateKey, streakDay);
     return {
       dateKey,
       state: 'makeup',
