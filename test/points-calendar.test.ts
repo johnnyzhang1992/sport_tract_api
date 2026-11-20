@@ -180,3 +180,38 @@ test('CAL-5 补位日期带真实状态：跨月漏签日现在也可补（2026-
   assert.equal(byKey(c, '2026-11-01')!.state, 'signed');
   assert.equal(byKey(c, '2026-11-01')!.streakDay, 5, '补位与跨月都不影响已签日取库存值');
 });
+
+/* ── 补签位置滚动估算（2026-11-20 review 修）─────────────────────────
+   原实现只在真实签到行里找前一天 → 连续多天漏签时只有第一格接得上，
+   之后全部塌回「第 1 天」，与补签写路径（streakPositionOf 全量精算）不一致。
+   现在用 estimated 表滚动：每一天接前一天的位置（含推算出的 makeup 格）。 */
+test('CAL-6 连续多天漏签：位置逐日滚动（第 N、N+1、N+2…），不再塌回第 1 天', async () => {
+  await PointSigninModel.deleteMany({ userId: uid });
+  // 历史月：1~10 号已签（第 1..10 天），11 号起连续漏签
+  const month = LAST_MONTH;
+  const first = Date.parse(`${month}-01T00:00:00+08:00`);
+  for (let i = 0; i < 10; i += 1) {
+    await seed(bjDateStr(first + i * 86_400_000), i + 1);
+  }
+  const cal = data<Calendar>(await getCal(month));
+
+  const streakOf = (day: string) => byKey(cal, `${month}-${String(day).padStart(2, '0')}`)!;
+  // 11 号 = 第 11 天（接 10 号的第 10 天）
+  assert.equal(streakOf(11).state, 'makeup');
+  assert.equal(streakOf(11).streakDay, 11, '11 号应接第 10 天 → 第 11 天');
+  // 12~15 号逐日 +1（这是修复前塌回 1 的那几天）
+  for (const [day, want] of [[12, 12], [13, 13], [14, 14], [15, 15]] as const) {
+    assert.equal(streakOf(day).streakDay, want, `${day} 号应是第 ${want} 天（滚动估算）`);
+  }
+  // 分值跟着位置走（封顶 7 分）
+  assert.equal(streakOf(15).reward, rewardForStreakDay(15));
+});
+
+test('CAL-6b 七格窗口内的补签格仍以 state 为准（不被滚动估算覆盖）', async () => {
+  await PointSigninModel.deleteMany({ userId: uid });
+  await seed(shiftDateKey(TODAY, -2), 5); // 前天第 5 天
+  const cal = data<Calendar>(await getCal());
+  const y = byKey(cal, shiftDateKey(TODAY, -1))!;
+  assert.equal(y.state, 'makeup');
+  assert.equal(y.streakDay, 6, '昨天应接前天的第 5 天 → 第 6 天（两条路径同值）');
+});
