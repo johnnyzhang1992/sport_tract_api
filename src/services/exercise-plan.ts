@@ -25,6 +25,7 @@ import {
 import {
   computeBadgeEarns,
   minRatioOf as minRatioOfShared,
+  distanceRatioOf,
   perfectWeekCounts as perfectWeekCountsShared,
   tierOf as tierOfRatio,
   type BadgeDailyRow,
@@ -1001,7 +1002,14 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
     totals.distanceM += progress.distanceM;
     totals.durationSec += progress.durationSec;
     totals.count += progress.count;
-    const tier = tierOf(minRatioOf(progress, targets));
+    /*
+     * 倍率档只看距离（2026-11-20 产品裁定）：原来取三项最弱，导致
+     * 「跑了 18km（目标 3km）但次数没补齐」的用户拿不到 200% 徽章。
+     * 与 badge-earn.ts 的解锁日必须同口径（那里也用 distanceRatioOf）。
+     * 注意：下面的 overStreak 仍用 minRatioOf——那是「建议加量」的信号，
+     * 语义是「整体已轻松超额」，三项都高才算，不要一起改。
+     */
+    const tier = tierOf(distanceRatioOf(progress, targets));
     if (tier > 0) ratioCount[tier] += 1;
   }
 
@@ -1022,7 +1030,12 @@ export async function getPlanSummary(userId: string): Promise<PlanSummaryResult>
   let current = 0;
   for (let i = seq.length - 1; i >= 0 && seq[i].allAchieved; i -= 1) current += 1;
 
-  // 连续超额：从最后一次往前数连续 minRatio ≥ OVER_RATIO 的期数（加量建议的触发信号）
+  /*
+   * 连续超额：从最后一次往前数连续 minRatio ≥ OVER_RATIO 的期数（加量建议的触发信号）。
+   * ⚠️ 这里**故意**仍用三项最弱（minRatioOf），与倍率徽章的距离口径不同：
+   * 建议加量的前提是「三项整体都轻松超额，目标定低了」；
+   * 只看距离会把「距离很远但次数总差一点」的用户也劝去加量，反而更挫败。
+   */
   const OVER_RATIO = 2;
   const ratioOfRow = (r: (typeof seq)[number]) =>
     minRatioOf(

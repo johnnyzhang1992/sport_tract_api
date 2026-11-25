@@ -220,10 +220,10 @@ export const MILESTONES: readonly MilestoneDef[] = [
   { key: 'first', label: '首次达成', desc: '完成 1 次目标', ratio: 1, times: 1, shortLabel: '首次达成', shape: 'plan', icon: '🥇' },
   { key: 'week', label: '坚持一周', desc: '达成 7 次', ratio: 1, times: 7, shortLabel: '坚持一周', shape: 'plan', icon: '📅' },
   { key: 'habit', label: '习惯养成', desc: '达成 20 次', ratio: 1, times: 20, shortLabel: '习惯养成', shape: 'plan', icon: '💪' },
-  { key: 'x2', label: '200%完成目标', desc: '单周期完成倍数达到 200% 即可获得', ratio: 2, times: 1, shortLabel: '200%完成目标', shape: 'plan', icon: '🔥' },
-  { key: 'x3', label: '300%完成目标', desc: '单周期完成倍数达到 300% 即可获得', ratio: 3, times: 1, shortLabel: '300%完成目标', shape: 'plan', icon: '👑' },
-  { key: 'x4', label: '400%完成目标', desc: '单周期完成倍数达到 400% 即可获得', ratio: 4, times: 1, shortLabel: '400%完成目标', shape: 'plan', icon: '🚀' },
-  { key: 'x5', label: '500%完成目标', desc: '单周期完成倍数达到 500% 即可获得', ratio: 5, times: 1, shortLabel: '500%完成目标', shape: 'plan', icon: '🏆' },
+  { key: 'x2', label: '200%完成目标', desc: '单周期运动距离达到目标的 200% 即可获得', ratio: 2, times: 1, shortLabel: '200%完成目标', shape: 'plan', icon: '🔥' },
+  { key: 'x3', label: '300%完成目标', desc: '单周期运动距离达到目标的 300% 即可获得', ratio: 3, times: 1, shortLabel: '300%完成目标', shape: 'plan', icon: '👑' },
+  { key: 'x4', label: '400%完成目标', desc: '单周期运动距离达到目标的 400% 即可获得', ratio: 4, times: 1, shortLabel: '400%完成目标', shape: 'plan', icon: '🚀' },
+  { key: 'x5', label: '500%完成目标', desc: '单周期运动距离达到目标的 500% 即可获得', ratio: 5, times: 1, shortLabel: '500%完成目标', shape: 'plan', icon: '🏆' },
 ];
 
 /** 徽章系列（每个 tiers 项展开成一座独立徽章） */

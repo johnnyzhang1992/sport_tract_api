@@ -77,6 +77,31 @@ function weekKeyOfDate(dateStr: string): string {
   return new Date(monday + 8 * 3600_000).toISOString().slice(0, 10);
 }
 
+/**
+ * 倍率里程碑（200%/300%/400%/500% 完成目标）的**距离倍数**（2026-11-20 产品裁定）。
+ *
+ * 口径变更：原先是「三项里最弱一项的倍数」（minRatioOf），导致
+ * 「跑了 18km（目标 3km = 600%）、但次数只完成 1/2 次」的用户拿不到 200% 徽章——
+ * 距离明明远超目标，却被次数卡住，用户认为没意义。
+ *
+ * 现在只按**距离**算：距离达成率 = progress.distanceM / targets.distanceM。
+ *   - 距离目标为 0（用户没设距离）→ 返回 0：这一期不计入任何倍率档。
+ *     倍率徽章的语义就是「距离倍数」，没设距离目标的计划没有可比的分母。
+ *   - 时长/次数不参与，哪怕只完成 10% 也不影响。
+ *
+ * ⚠️ 两处调用（cur 计数 / 解锁日）**必须**都用本函数：
+ *    exercise-plan.ts 的 ratioCount、badge-earn.ts 的 ratioCount。
+ *    历史上不同口径导致过「已解锁但没有获得日期」的自相矛盾卡面。
+ */
+export function distanceRatioOf(
+  progress: { distanceM: number },
+  targets: { distanceM: number },
+): number {
+  const target = Number(targets.distanceM) || 0;
+  if (target <= 0) return 0;
+  return (Number(progress.distanceM) || 0) / target;
+}
+
 /** 周期三项最弱一项的完成倍数（目标为 0 的项不参与） */
 export function minRatioOf(
   progress: { distanceM: number; durationSec: number; count: number },
@@ -331,7 +356,8 @@ export function computeBadgeEarns(input: BadgeEarnInput): Record<string, BadgeEa
   let achieved = 0;
   const ratioCount: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
   for (const r of periodRows) {
-    const tier = tierOf(minRatioOf(r.progress, r.targets));
+    // 倍率档只看距离（2026-11-20）：与 exercise-plan.ts 的 cur 计数同口径，别改回 minRatioOf
+    const tier = tierOf(distanceRatioOf(r.progress, r.targets));
     if (tier > 0) ratioCount[tier] += 1;
     if (r.allAchieved) achieved += 1;
     const end = bjDateStr(r.windowEnd - 1); // windowEnd 是「下一期 0 点」，减 1ms 取本期最后一天

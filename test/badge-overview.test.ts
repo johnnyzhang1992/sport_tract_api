@@ -518,7 +518,7 @@ test('BO16 倍率型里程碑（200%完成目标）：卡面印百分比、进�
     assert.equal(t.badgeText, `${pct}%`, `${key} 卡面应为百分比：${t.badgeText}`);
     // 进度文案不能把 tier(=百分比) 说成次数
     assert.ok(!/目标 \d{3} 次/.test(t.detailText || ''), `${key} 文案把百分比说成了次数：${t.detailText}`);
-    // 不能与 desc 重复（desc 已说「单周期完成倍数达到 N% 即可获得」）
+    // 不能与 desc 重复（desc 已说「单周期运动距离达到目标的 N% 即可获得」）
     assert.notEqual(t.detailText, t.desc, `${key} 进度文案与描述重复`);
   }
 
