@@ -26,7 +26,7 @@ import {
   reachedTier,
   seriesOfBadge,
 } from '../src/config/badge-config.js';
-import { computeBadgeEarns, minRatioOf, tierOf } from '../src/services/badge-earn.js';
+import { computeBadgeEarns, distanceRatioOf, minRatioOf, tierOf } from '../src/services/badge-earn.js';
 
 test('BC1 key 全局唯一（含里程碑，含完美周显式 key）', () => {
   const keys = allBadgeKeys();
@@ -227,4 +227,25 @@ test('BC16 分类型徽章总数：5 类型 × (距离 6 + 时长 4 + 次数 6) 
   for (const t of ACTIVITY_BADGE_TYPES) {
     assert.equal(typed.filter((d) => d.activityType === t).length, 16, `${t} 应有 16 座`);
   }
+});
+
+/* ── 倍率里程碑改为「只看距离」（2026-11-20 产品裁定）──────────────────
+   用户原话：距离明明远超目标，却因为次数没补齐拿不到 200% 徽章，没意义。 */
+test('BC17 distanceRatioOf：倍率徽章的倍数只取距离，时长/次数不参与', () => {
+  // 距离 600%，但次数只完成 1/2 → 新口径 6，旧口径 0.5（连 1 倍档都进不去）
+  const progress = { distanceM: 18000, durationSec: 7200, count: 1 };
+  const targets = { distanceM: 3000, durationMin: 30, count: 2 };
+  assert.equal(distanceRatioOf(progress, targets), 6, '距离 18/3 = 600%，不受次数 1/2 影响');
+  assert.equal(minRatioOf(progress, targets), 0.5, '（对照）旧口径取最弱项 = 次数 50% → 什么徽章都拿不到');
+  assert.equal(tierOf(distanceRatioOf(progress, targets)), 5, '归 5 倍档');
+
+  // 距离没达标但时长/次数超额 → 倍数为 0.x，不进任何档
+  assert.equal(distanceRatioOf({ distanceM: 1500 }, { distanceM: 3000 }), 0.5);
+  assert.equal(tierOf(0.5), 0, '不足 1 倍不进档');
+
+  // 没设距离目标 → 0（没有可比的分母，该期不计入任何倍率档）
+  assert.equal(distanceRatioOf({ distanceM: 99999 }, { distanceM: 0 }), 0);
+  // 脏数据（undefined/NaN）不炸
+  assert.equal(distanceRatioOf({ distanceM: undefined as unknown as number }, { distanceM: 3000 }), 0);
+  assert.equal(distanceRatioOf({ distanceM: 6000 }, { distanceM: 0 }), 0);
 });
